@@ -30,6 +30,7 @@ pub struct LeadRuntime {
     pub projects: Vec<LeadProject>,
     pub teams: rhapsody_config::teams::Teams,
     pub prs: std::sync::Arc<dyn crate::ghsummons::PrStateSource>,
+    pub comments: Option<std::sync::Arc<dyn crate::ghsummons::PrCommentSink>>,
     pub room: Option<std::sync::Arc<dyn rhapsody_config::room::RoomLog>>,
     pub memory: Option<std::sync::Arc<dyn rhapsody_config::memory::MemoryBackend>>,
     pub findings_dir: Option<std::path::PathBuf>,
@@ -432,20 +433,46 @@ impl LeadHost for RuntimeHost<'_> {
     async fn paper_trail(&self, trail: &LeadTrail) -> Result<(), String> {
         let mut failures = Vec::new();
         let text = self.tokenless(&trail.text);
-        if !trail.ticket.id.is_empty()
-            && self
+        if !trail.ticket.id.is_empty() {
+            if self
                 .project
                 .tracker
                 .create_comment(&trail.ticket.id, &text)
                 .await
                 .is_err()
-        {
-            failures.push("ticket line");
+            {
+                failures.push("ticket line");
+            }
+        } else if let Some(pr) = self.pr.as_deref() {
+            let coord = crate::managerintervention::parse_pr_key(pr).filter(|p| {
+                crate::ghsummons::parse_repo(&self.project.repo_url).is_some_and(|(owner, repo)| {
+                    p.owner.eq_ignore_ascii_case(&owner) && p.repo.eq_ignore_ascii_case(&repo)
+                })
+            });
+            match (coord, self.runtime.comments.as_ref()) {
+                (Some(p), Some(comments)) => {
+                    if comments
+                        .post_pr_comment(&p.owner, &p.repo, p.number, &text)
+                        .await
+                        .is_err()
+                    {
+                        failures.push("PR line");
+                    }
+                }
+                _ => failures.push("PR line unavailable or outside configured project"),
+            }
+        } else {
+            failures.push("ticket or PR line unavailable: no subject target");
         }
+        let subject = if trail.ticket.identifier.is_empty() {
+            self.pr.clone().unwrap_or_default()
+        } else {
+            trail.ticket.identifier.clone()
+        };
         if let Some(room) = &self.runtime.room {
             let mut message =
                 rhapsody_config::room::Message::room("manager", chrono::Utc::now(), &text);
-            message.refs = vec![trail.ticket.identifier.clone()];
+            message.refs = vec![subject.clone()];
             if room.append(&message).is_err() {
                 failures.push("room post");
             }
@@ -456,7 +483,7 @@ impl LeadHost for RuntimeHost<'_> {
             let record = rhapsody_config::memory::Record {
                 identity: "lead".into(),
                 document_id: format!("lead-decision-{}", trail.decision_id),
-                ticket: trail.ticket.identifier.clone(),
+                ticket: subject,
                 at: chrono::Utc::now(),
                 content: format!("by: lead; context, not precedent. {text}"),
                 ..Default::default()
@@ -859,12 +886,12 @@ async fn apply_action(
             if !stored(store.reserve_lead_route_back(case.item.id))? {
                 return Err("second route_back refused; commission or escalate".into());
             }
-            host.prepend(ticket, &crate::managerapply::strip_summon_tokens(answer))
-                .await?;
-            if let Some(pr) = &case.subject.pr {
-                host.clear_review(pr).await?;
-            }
-            host.todo(ticket).await?;
+            return_to_author(
+                host,
+                &case.subject,
+                &crate::managerapply::strip_summon_tokens(answer),
+            )
+            .await?;
         }
         LeadAction::Requeue { .. } => host.todo(ticket).await?,
         LeadAction::ClearReview { pr } => host.clear_review(pr).await?,
@@ -885,11 +912,7 @@ async fn apply_action(
                     "Diagnose, do not fix. Question: {question}\nHypothesis: {hypothesis}\nReport findings to ~/.rhapsody/docs/{}-findings.md, then hand off.",
                     ticket.identifier
                 ));
-                host.prepend(ticket, &instructions).await?;
-                if let Some(pr) = &case.subject.pr {
-                    host.clear_review(pr).await?;
-                }
-                host.todo(ticket).await?;
+                return_to_author(host, &case.subject, &instructions).await?;
                 ticket.identifier.clone()
             } else {
                 host.commission(ticket, question, hypothesis).await?
@@ -903,6 +926,31 @@ async fn apply_action(
             result.commission_ticket = Some(commissioned);
         }
         LeadAction::Escalate { need } => result.escalation = Some(need.clone()),
+    }
+    Ok(())
+}
+
+/// A work transition is several remote writes. Description changes are our own effect, but the
+/// ticket's state/labels and PR head must still match before each subsequent write.
+async fn return_to_author(
+    host: &dyn LeadHost,
+    subject: &LeadSubject,
+    text: &str,
+) -> Result<(), String> {
+    host.prepend(&subject.ticket, text).await?;
+    if let Some(pr) = &subject.pr {
+        recheck_effect(host, subject).await?;
+        host.clear_review(pr).await?;
+    }
+    recheck_effect(host, subject).await?;
+    host.todo(&subject.ticket).await
+}
+
+async fn recheck_effect(host: &dyn LeadHost, expected: &LeadSubject) -> Result<(), String> {
+    host.admit_action().await?;
+    let fresh = host.subject().await?;
+    if !same_subject(expected, &fresh) {
+        return Err("subject changed between effects; remaining writes refused".into());
     }
     Ok(())
 }

@@ -75,7 +75,9 @@ explicit lead authority; the older triage path's additive-only label rule is unc
 Migration **31** adds `rhapsody_lead_decisions` (with its timestamp index) and
 `rhapsody_lead_execution`. The decision rows are also the durable digest input; they carry actions,
 reasoning, evidence, harness/model and overrule fields for the subsequent reporting slice. Effects
-leave tokenless ticket and room lines and a context retain (`by: lead`) to `operator-decisions`.
+leave a tokenless ticket line (or a configured-repository PR line for PR-only subjects), a room
+line and a context retain (`by: lead`) to `operator-decisions`. Decisions without a ticket or PR
+target explicitly record the subject line as unavailable; they never report a complete paper trail.
 Missing mirrors are reported and recorded without replaying effects. There is at most **one**
 route-back per durable subject/question, reserved before external writes. A repeated block reopens
 the item for commission/escalation; a completed escalation is not recreated by duplicate detection.

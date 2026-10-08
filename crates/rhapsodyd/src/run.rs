@@ -684,6 +684,9 @@ where
             projects: Vec::new(),
             teams: teams_cfg.clone(),
             prs: Arc::new(rhapsody_orchestrator::ghsummons::GH::new("", None)),
+            comments: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+                "", None,
+            ))),
             room: o
                 .teams_room
                 .as_ref()

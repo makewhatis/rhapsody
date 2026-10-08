@@ -19,18 +19,58 @@ struct RecordingHost {
     findings: Mutex<Option<String>>,
     read_err: bool,
     action_err: bool,
+    change_after: Option<(&'static str, &'static str)>,
 }
 
 impl RecordingHost {
     fn record(&self, text: String) {
         self.calls.lock().expect("calls").push(text);
     }
+
+    fn changed(&self, change: &str) -> bool {
+        self.change_after.is_some_and(|(effect, kind)| {
+            kind == change
+                && self
+                    .calls
+                    .lock()
+                    .expect("calls")
+                    .iter()
+                    .any(|c| c.starts_with(effect))
+        })
+    }
+
+    fn after_effect(&self, effect: &str) {
+        let Some((after, change)) = self.change_after else {
+            return;
+        };
+        if after != effect {
+            return;
+        }
+        let mut subject = self.subject.lock().expect("subject");
+        match change {
+            "closed" => {
+                subject.open = false;
+                subject.ticket.state = "Done".into();
+            }
+            "moved" => subject.ticket.state = "In Progress".into(),
+            "relabeled" => subject.ticket.labels = Some(vec!["rhapsody:@alice".into()]),
+            "head" => subject.head = "head-b".into(),
+            _ => {}
+        }
+    }
 }
 
 #[async_trait]
 impl LeadHost for RecordingHost {
+    async fn admit_action(&self) -> Result<(), String> {
+        if self.changed("revoked") {
+            Err("admission revoked".into())
+        } else {
+            Ok(())
+        }
+    }
     async fn subject(&self) -> Result<LeadSubject, String> {
-        if self.read_err {
+        if self.read_err || self.changed("unreadable") {
             return Err("source unavailable".into());
         }
         Ok(self.subject.lock().expect("subject").clone())
@@ -40,6 +80,7 @@ impl LeadHost for RecordingHost {
         if self.action_err {
             return Err("uncertain description write".into());
         }
+        self.after_effect("prepend:");
         Ok(())
     }
     async fn todo(&self, ticket: &Issue) -> Result<(), String> {
@@ -49,6 +90,7 @@ impl LeadHost for RecordingHost {
     }
     async fn clear_review(&self, pr: &str) -> Result<(), String> {
         self.record(format!("clear:{pr}"));
+        self.after_effect("clear:");
         Ok(())
     }
     async fn reassign(&self, ticket: &Issue, identity: &str) -> Result<(), String> {
@@ -341,6 +383,68 @@ async fn stale_subject_rechecked_before_action() {
             "{change}"
         );
     }
+}
+
+async fn refuses_subject_change_between_effects(action: serde_json::Value) {
+    for (effect, attached_pr) in [("prepend:", false), ("prepend:", true), ("clear:", true)] {
+        for change in [
+            "closed",
+            "moved",
+            "relabeled",
+            "head",
+            "unreadable",
+            "revoked",
+        ] {
+            let (store, mut host, mut case) = setup("concurrent subject change");
+            if !attached_pr {
+                case.subject.pr = None;
+                host.subject.lock().expect("subject").pr = None;
+            }
+            host.change_after = Some((effect, change));
+            let result = replay(store.as_ref(), &host, &case, serde_json::json!([action])).await;
+            let calls = host.calls.lock().expect("calls");
+            assert!(
+                !calls.iter().any(|c| c.starts_with("todo:")),
+                "{effect}/{change}: {calls:?}"
+            );
+            if effect == "prepend:" {
+                assert!(
+                    !calls.iter().any(|c| c.starts_with("clear:")),
+                    "{change}: {calls:?}"
+                );
+            }
+            assert!(result.escalation.is_some(), "{effect}/{change}");
+            assert_eq!(store.load_lead_items().expect("items")[0].state, "done");
+            assert!(
+                store.load_lead_decisions().expect("rows")[0]
+                    .decision
+                    .starts_with("escalate:")
+            );
+            assert!(!host.trail.lock().expect("trail").is_empty());
+            assert!(
+                store
+                    .lead_execution(case.item.id)
+                    .expect("execution")
+                    .is_none()
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn route_back_refuses_subject_change_between_effects() {
+    refuses_subject_change_between_effects(serde_json::json!({
+        "action":"route_back", "ticket":"TEST-100", "answer":"Use LimitObs."
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn author_commission_refuses_subject_change_between_effects() {
+    refuses_subject_change_between_effects(serde_json::json!({
+        "action":"commission", "kind":"author", "question":"diagnose", "hypothesis":"cold cache"
+    }))
+    .await;
 }
 
 #[tokio::test]
@@ -870,6 +974,7 @@ async fn real_tracker_writes_and_findings_use_only_the_scoped_subject() {
         projects: Vec::new(),
         teams: rhapsody_config::teams::Teams::disabled(),
         prs: Arc::new(crate::ghsummons::GH::new("", None)),
+        comments: None,
         room: Some(room.clone()),
         memory: Some(bank.clone()),
         findings_dir: Some(dir.path.clone().into()),
@@ -962,4 +1067,142 @@ async fn real_tracker_writes_and_findings_use_only_the_scoped_subject() {
     std::os::unix::fs::symlink(&path, &file).expect("symlink");
     assert!(host.findings("TEST-200", old).await.is_err());
     task.abort();
+}
+
+#[derive(Default)]
+struct RecordingComments {
+    calls: Mutex<Vec<(String, String, i64, String)>>,
+    fail: bool,
+}
+
+#[async_trait]
+impl crate::ghsummons::PrCommentSink for RecordingComments {
+    async fn post_pr_comment(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        body: &str,
+    ) -> crate::ghsummons::PrCommentResult {
+        self.calls
+            .lock()
+            .expect("comments")
+            .push((owner.into(), repo.into(), number, body.into()));
+        if self.fail {
+            Err("comment unavailable".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+#[tokio::test]
+async fn pr_only_decision_writes_subject_paper_trail() {
+    use rhapsody_config::{
+        memory::LocalBank,
+        room::{Cursor, LocalRoom},
+    };
+    for target in [
+        "pr",
+        "failed",
+        "missing_sink",
+        "off_project",
+        "invalid",
+        "no_target",
+        "ticket",
+    ] {
+        let dir = crate::testsupport::TempDir::new();
+        let (store, _, _) = setup("PR-only decision");
+        let mut o = crate::Orchestrator::new("WORKFLOW.md");
+        o.set_store(store.clone());
+        let comments = Arc::new(RecordingComments {
+            fail: target == "failed",
+            ..Default::default()
+        });
+        let room = Arc::new(LocalRoom::new(dir.child("room")));
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let runtime = LeadRuntime {
+            control: o.control(),
+            store,
+            projects: Vec::new(),
+            teams: rhapsody_config::teams::Teams::disabled(),
+            prs: Arc::new(crate::ghsummons::GH::new("", None)),
+            comments: if target == "missing_sink" {
+                None
+            } else {
+                Some(comments.clone())
+            },
+            room: Some(room.clone()),
+            memory: Some(Arc::new(LocalBank::new(dir.child("banks"), "agent-"))),
+            findings_dir: None,
+        };
+        let project = LeadProject {
+            tracker: tracker.clone(),
+            repo_url: "https://github.com/o/r.git".into(),
+            terminal_states: Default::default(),
+            summon_token: "@custom-bot".into(),
+        };
+        let host = RuntimeHost {
+            runtime: &runtime,
+            project: &project,
+            ticket: String::new(),
+            pr: match target {
+                "no_target" => None,
+                "off_project" => Some("other/repo#290".into()),
+                "invalid" => Some("not-a-pr".into()),
+                _ => Some("o/r#290".into()),
+            },
+        };
+        let text = format!(
+            "Lead decision 1 @custom-bot {}",
+            rhapsody_core::SUMMON_TOKEN_SYMPHONY
+        );
+        let ticket = if target == "ticket" {
+            Issue {
+                id: "uuid-100".into(),
+                identifier: "TEST-100".into(),
+                ..Default::default()
+            }
+        } else {
+            Issue::default()
+        };
+        let result = host
+            .paper_trail(&LeadTrail {
+                text,
+                decision_id: 1,
+                ticket,
+            })
+            .await;
+        let calls = comments.calls.lock().expect("comments");
+        if matches!(target, "pr" | "failed") {
+            assert_eq!(calls.len(), 1, "{target}: {result:?}");
+            assert_eq!(
+                (&calls[0].0, &calls[0].1, calls[0].2),
+                (&"o".into(), &"r".into(), 290)
+            );
+            assert_eq!(calls[0].3, "Lead decision 1  ");
+        } else {
+            assert!(calls.is_empty(), "{target}");
+        }
+        if matches!(target, "pr" | "ticket") {
+            assert!(result.is_ok(), "{target}: {result:?}");
+        } else {
+            assert!(
+                result.is_err(),
+                "missing subject line must not succeed: {target}"
+            );
+        }
+        assert_eq!(
+            tracker.create_comment_calls().len(),
+            usize::from(target == "ticket")
+        );
+        assert_eq!(
+            room.read_since("jerry", &Cursor::default(), 10)
+                .expect("room")
+                .messages
+                .len(),
+            1
+        );
+        assert!(std::path::Path::new(&dir.child("banks/operator-decisions")).is_dir());
+    }
 }
