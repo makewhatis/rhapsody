@@ -1180,6 +1180,10 @@ impl Orchestrator {
             // arriving between ticks can choose reviewers without a tracker read. A hard no-op with
             // the quorum off (§0.12).
             self.record_quorum_state(tagged.iter().map(|t| &t.iss));
+            self.observe_lead_review_departures(
+                tagged.iter().map(|t| (&t.iss, t.proj)),
+                read_the_board,
+            );
             // Ticketless review ADOPTION (STUDIO-838): the same snapshot again, for the repair
             // path. A pull request whose handoff never introduced it is invisible to every other
             // mechanism, and this fetch — active ∪ review — is already holding the one fact that
@@ -1294,6 +1298,7 @@ impl Orchestrator {
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
         self.record_quorum_state(issues.iter());
+        self.observe_lead_review_departures(issues.iter().map(|iss| (iss, None)), true);
         // The legacy ladder's half of the adoption sweep (STUDIO-838). Untagged, so each candidate
         // resolves its repository through the top-level binding.
         self.sweep_review_adoptions(

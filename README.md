@@ -93,6 +93,12 @@ bank verbatim (without the personal prefix); failures now identify that bank and
 failure reason in the lead packet/log, while decisions continue from current evidence. No frozen
 Go behavior, schema or golden is changed.
 
+A resolved `in_review_no_pr` occurrence remains deduped while the ticket stays in review. An
+authoritative poll observing it leave review (or disappear from a fully read board) retires only
+that occurrence's dedupe key, preserving its decisions/execution. Returning to review without a PR
+creates a fresh item and attempts. A partial/failed poll never infers departure from missing rows;
+escalations and other completed trigger kinds retain their existing dedupe behavior.
+
 ### Tech-lead reporting, daily budgets and operator overrules (STUDIO-1138)
 
 The opt-in lead adds `GET /api/v1/lead/decisions?since=` (RFC3339) and the

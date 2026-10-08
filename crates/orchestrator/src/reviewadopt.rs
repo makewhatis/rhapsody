@@ -729,6 +729,95 @@ mod tests {
         }
     }
 
+    /// Both poll ladders must distinguish repeated observation from a later incident, without
+    /// recycling exhausted execution state or waiting for the old PR-probe pace to expire.
+    #[tokio::test]
+    async fn a_resolved_missing_pr_incident_can_recur_after_a_state_departure() {
+        for multi in [false, true] {
+            let mut teams = teams_with(true, ReviewMode::Ticketless, &[]);
+            teams.manager.lead.enabled = true;
+            let mut o = orch(teams);
+            if let Some(eff) = o.eff.as_mut() {
+                eff.cfg.repo = REPO_URL.into();
+                eff.max_concurrent = 0;
+                if !multi {
+                    eff.projects.clear();
+                }
+            }
+            let mut rx = o.open_review_intro_channel();
+            assert!(o.lead_missing_pr("STUDIO-598"));
+            let first = o.store().load_lead_items().unwrap()[0].id;
+            o.store()
+                .save_lead_execution(&rhapsody_store::LeadExecution {
+                    item: first,
+                    run_attempts: 3,
+                    findings: "old findings".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            o.store()
+                .save_lead_decision(&rhapsody_store::LeadDecisionRow {
+                    item: first,
+                    decision: "done: document-only review".into(),
+                    actions: r#"[{"action":"resolve","reason":"document confirmed"}]"#.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            o.store().set_lead_item_state(first, "done").unwrap();
+            let mut first_request = None;
+            for state in ["In Review", "Todo", "In Review"] {
+                let mut tracker = Fake::new();
+                let mut ticket = parked("STUDIO-598");
+                ticket.state = state.into();
+                tracker.candidates = vec![ticket];
+                let tracker = Arc::new(tracker);
+                if let Some(eff) = o.eff.as_mut() {
+                    eff.tracker = tracker.clone();
+                    if multi {
+                        eff.projects[0].tracker = tracker.clone();
+                    }
+                }
+                o.on_tick().await;
+                assert!(
+                    tracker.candidate_calls() > 0,
+                    "the tick must have read the board"
+                );
+                if state == "In Review" && first_request.is_none() {
+                    let request = rx.try_recv().unwrap();
+                    o.handle_lead_missing_pr(&request);
+                    assert_eq!(o.store().load_lead_items().unwrap().len(), 1);
+                    assert_eq!(
+                        o.store().load_lead_items().unwrap()[0].state,
+                        "done",
+                        "the same condition remains deduped"
+                    );
+                    first_request = Some(request);
+                }
+            }
+            // An authoritative empty PR lookup after the away/back transition is a new incident.
+            let new_request = rx
+                .try_recv()
+                .expect("departure must clear the old PR-probe pace");
+            assert_eq!(
+                new_request.introduced_by,
+                first_request.unwrap().introduced_by
+            );
+            o.handle_lead_missing_pr(&new_request);
+            let items = o.store().load_lead_items().unwrap();
+            assert_eq!(
+                items.len(),
+                2,
+                "multi={multi}: later incident was suppressed"
+            );
+            assert_eq!(items[0].id, first);
+            assert_eq!(items[0].state, "done");
+            assert_ne!(items[1].id, first);
+            assert_eq!(items[1].state, "queued");
+            assert_eq!(items[1].attempts_on_question, 0);
+            assert!(o.store().lead_execution(items[1].id).unwrap().is_none());
+        }
+    }
+
     /// The wiring, through the daemon's real tick: a poll that returns an orphaned review-state
     /// ticket ends with an ADOPTION on the introduction task's channel — no live run, no
     /// re-dispatch, and nothing an operator had to press.
