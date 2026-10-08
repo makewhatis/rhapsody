@@ -86,6 +86,9 @@ use crate::web::{WebDist, serve_web};
 /// Every handler tests against a fake, exactly as Go's `server_test.go` uses `fakeProvider`.
 #[async_trait]
 pub trait StateProvider: Send + Sync {
+    fn lead_reports(&self) -> Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>> {
+        None
+    }
     /// Read-only account ledger snapshot (STUDIO-1123); no control round-trip or provider I/O.
     fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
         Vec::new()
@@ -913,6 +916,14 @@ where
         // `/history/issues` keeps only each key's newest run and so cannot be summed into a cost.
         .route("/api/v1/history/costs", any(handle_history_costs))
         .route("/api/v1/events", any(handle_event_search))
+        .route(
+            "/api/v1/lead/decisions",
+            any(crate::handlers_lead::handle_decisions),
+        )
+        .route(
+            "/api/v1/lead/decisions/{id}/overrule",
+            operator_write(crate::handlers_lead::handle_overrule),
+        )
         .route("/api/v1/metrics", any(handle_metrics))
         // The same daily rollup split by provider (STUDIO-957). A route of its own rather than a
         // field on `/metrics`: that body is byte-pinned to the Go capture and cannot gain the

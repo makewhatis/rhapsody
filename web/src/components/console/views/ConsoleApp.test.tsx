@@ -22,6 +22,7 @@ const h = vi.hoisted(() => {
   const downCbs = new Set<() => void>();
   return {
     fetchVersion: vi.fn(),
+    fetchLeadDecisions: vi.fn(),
     fetchIssueRuns: vi.fn(),
     getStatus: vi.fn(),
     hasOverlayTitlebar: vi.fn(() => false),
@@ -66,6 +67,7 @@ vi.mock("@/lib/api", async (orig) => {
   return {
     ...actual,
     fetchVersion: h.fetchVersion,
+    fetchLeadDecisions: h.fetchLeadDecisions,
     fetchAccounts: vi.fn(async () => []),
     fetchLimitHandoffs: vi.fn(async () => []),
     fetchState: vi.fn(async () => ({
@@ -176,6 +178,7 @@ beforeEach(() => {
   ]);
   h.probeTools.mockResolvedValue([]);
   h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
+  h.fetchLeadDecisions.mockResolvedValue({ decisions: [], queued: [] });
 });
 
 afterEach(() => {
@@ -206,6 +209,39 @@ describe("the rail is capability-gated on /api/v1/version (§2.2)", () => {
     h.fetchVersion.mockResolvedValue({ version: "v0.3.0", commit: "old", built_at: "" });
     mount();
     await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "settings"]));
+  });
+});
+
+describe("Lead's effective capability (STUDIO-1138)", () => {
+  it.each([false, undefined])("omits Lead and redirects its deep link with lead_enabled=%s", async (lead_enabled) => {
+    h.fetchVersion.mockResolvedValue({ ...version(true), lead_enabled });
+    mount("#lead");
+    await waitFor(() => expect(window.location.hash).toBe("#jobs"));
+    expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]);
+    expect(h.fetchLeadDecisions).not.toHaveBeenCalled();
+  });
+
+  it("waits for capability before fetching Lead and preserves an enabled deep link", async () => {
+    let resolve!: (data: DaemonVersion) => void;
+    h.fetchVersion.mockReturnValue(new Promise<DaemonVersion>((done) => { resolve = done; }));
+    mount("#lead");
+    await waitFor(() => expect(h.fetchVersion).toHaveBeenCalled());
+    expect(window.location.hash).toBe("#lead");
+    expect(document.querySelector("[data-nav='lead']")).toBeNull();
+    expect(h.fetchLeadDecisions).not.toHaveBeenCalled();
+    await act(async () => resolve({ ...version(true), lead_enabled: true }));
+    await waitFor(() => expect(screen.getByText("No lead decisions yet.")).toBeTruthy());
+    expect(window.location.hash).toBe("#lead");
+    expect(activeNavs()).toEqual(["lead"]);
+    expect(h.fetchLeadDecisions).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps Lead unreachable with Teams off even if a stale capability says enabled", async () => {
+    h.fetchVersion.mockResolvedValue({ ...version(false), lead_enabled: true });
+    mount("#lead");
+    await waitFor(() => expect(window.location.hash).toBe("#jobs"));
+    expect(document.querySelector("[data-nav='lead']")).toBeNull();
+    expect(h.fetchLeadDecisions).not.toHaveBeenCalled();
   });
 });
 

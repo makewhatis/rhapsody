@@ -349,6 +349,7 @@ mod router_tests {
     /// Every mutating route. A route added to `build_router` with a POST side must be added here
     /// and wrapped in `operator_write`, or `every_route_refuses_an_unguarded_unsafe_request` fails.
     const MUTATING: &[&str] = &[
+        "/api/v1/lead/decisions/7/overrule",
         "/api/v1/manager/investigate",
         "/api/v1/refresh",
         "/api/v1/drain",
@@ -634,6 +635,7 @@ mod router_tests {
     /// to a provider call.
     fn valid_body(path: &str) -> &'static str {
         match path {
+            "/api/v1/lead/decisions/7/overrule" => r#"{"note":"Prefer diagnosis before retry."}"#,
             "/api/v1/manager/investigate" => {
                 r#"{"ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cmd":"true"}"#
             }

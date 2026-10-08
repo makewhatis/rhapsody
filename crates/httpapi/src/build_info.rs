@@ -45,8 +45,8 @@ pub(crate) fn current() -> VersionJson {
     }
 }
 
-/// The full `GET /api/v1/version` body: the build identity, flattened, plus the one **runtime**
-/// bit a client must know before it may fetch anything else (STUDIO-652).
+/// The full `GET /api/v1/version` body: the build identity, flattened, plus the **runtime**
+/// capabilities a client must know before it may fetch gated surfaces (STUDIO-652, STUDIO-1138).
 ///
 /// Why a feature flag rides on the version route: a Teams-off dashboard must issue **zero**
 /// requests against `/api/v1/teams*` — asking a Teams endpoint whether Teams is on is exactly the
@@ -63,13 +63,18 @@ pub(crate) struct VersionResponse {
     pub build: VersionJson,
     /// Rhapsody Teams is configured and on (`~/.rhapsody/teams.yaml` with `enabled: true`).
     pub teams_enabled: bool,
+    /// The reporting service is installed (lead enabled and durable storage available).
+    /// Omitted when off so lead-disabled installations keep their existing payload.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub lead_enabled: bool,
 }
 
 /// The served `GET /api/v1/version` body.
-pub(crate) fn response(teams_enabled: bool) -> VersionResponse {
+pub(crate) fn response(teams_enabled: bool, lead_enabled: bool) -> VersionResponse {
     VersionResponse {
         build: current(),
         teams_enabled,
+        lead_enabled,
     }
 }
 

@@ -644,6 +644,8 @@ pub struct Orchestrator {
     pub manager_apply: Option<std::sync::Arc<dyn crate::managerapply::ManagerApplySink>>,
     /// T2: owned off-loop lead dependencies; bookkeeping below remains control-confined.
     pub lead_runtime: Option<Arc<crate::leadexec::LeadRuntime>>,
+    pub lead_reports: Option<Arc<crate::leadreport::LeadReports>>,
+    pub lead_report_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
     pub(crate) lead_pending: HashSet<i64>,
     pub(crate) lead_cursor: i64,
     pub(crate) lead_cases:
@@ -1192,6 +1194,8 @@ impl Orchestrator {
             ),
             manager_apply: None,
             lead_runtime: None,
+            lead_reports: None,
+            lead_report_tx: None,
             lead_pending: HashSet::new(),
             lead_cursor: 0,
             lead_cases: HashMap::new(),

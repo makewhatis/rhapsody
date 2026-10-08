@@ -13,6 +13,7 @@
 export const CONSOLE_ROUTES = [
   "jobs",
   "accounts",
+  "lead",
   "job",
   "teams",
   "memory",
@@ -47,6 +48,7 @@ export const DEFAULT_CONSOLE_ROUTE: ConsoleRoute = { name: "jobs", key: "" };
  * a surface the daemon cannot serve.
  */
 export const TEAMS_ONLY_ROUTES = [
+  "lead",
   "teams",
   "memory",
   "manage",
@@ -125,8 +127,14 @@ export function consoleRouteHash(route: ConsoleRoute): string {
  * Applies the §2.2 capability gate: with Teams off, every teams-only route falls back to Jobs.
  * A `job/:key` route is NOT gated — a job is a daemon surface, not a Teams one, and a solo
  * daemon's issue history stays readable.
+ * Lead additionally requires the effective reporting capability, even with Teams on.
  */
-export function gateConsoleRoute(route: ConsoleRoute, teamsEnabled: boolean): ConsoleRoute {
+export function gateConsoleRoute(
+  route: ConsoleRoute,
+  teamsEnabled: boolean,
+  leadEnabled = false,
+): ConsoleRoute {
+  if (route.name === "lead" && !leadEnabled) return DEFAULT_CONSOLE_ROUTE;
   if (teamsEnabled) return route;
   return (TEAMS_ONLY_ROUTES as readonly ConsoleRouteName[]).includes(route.name)
     ? DEFAULT_CONSOLE_ROUTE

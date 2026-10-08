@@ -54,6 +54,7 @@ pub mod issuelog;
 pub mod leaddecision;
 pub mod leadexec;
 pub mod leaditems;
+pub mod leadreport;
 pub mod lifecycle;
 pub mod limitpolicy;
 pub mod limitreport;

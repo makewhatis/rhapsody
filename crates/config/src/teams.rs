@@ -279,11 +279,57 @@ where
     Ok(entries)
 }
 
-/// The tech-lead trigger gate (STUDIO-1134). Other lead controls belong to subsequent slices.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Boot-loaded tech-lead controls. Absent/disabled preserves the legacy human feed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct Lead {
-    #[serde(default)]
     pub enabled: bool,
+    pub authority: LeadAuthority,
+    pub digest_at: String,
+    pub max_lead_runs_per_day: i64,
+    pub investigate: LeadInvestigate,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LeadAuthority {
+    #[default]
+    Act,
+    Advise,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LeadInvestigate {
+    pub enabled: bool,
+    pub cpus: u32,
+    pub memory: String,
+    pub cmd_timeout_minutes: u64,
+    pub session_timeout_minutes: u64,
+}
+
+impl Default for LeadInvestigate {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            cpus: 2,
+            memory: "4g".into(),
+            cmd_timeout_minutes: 10,
+            session_timeout_minutes: 30,
+        }
+    }
+}
+
+impl Default for Lead {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            authority: LeadAuthority::Act,
+            digest_at: "08:00".into(),
+            max_lead_runs_per_day: 30,
+            investigate: LeadInvestigate::default(),
+        }
+    }
 }
 
 impl Lead {
@@ -1642,6 +1688,28 @@ impl Teams {
     /// rather than with a second implementation of these rules that could
     /// disagree with the one that decides whether the file loads at boot.
     pub fn validate(&self) -> Result<(), TeamsError> {
+        let lead = &self.manager.lead;
+        if lead.digest_at.len() != 5
+            || chrono::NaiveTime::parse_from_str(&lead.digest_at, "%H:%M").is_err()
+        {
+            return Err(TeamsError::Invalid(
+                "manager.lead.digest_at must be HH:MM local time".into(),
+            ));
+        }
+        let investigation = &lead.investigate;
+        let memory = investigation
+            .memory
+            .strip_suffix('g')
+            .and_then(|n| n.parse::<u32>().ok());
+        if lead.max_lead_runs_per_day < 0
+            || investigation.cpus == 0
+            || investigation.cpus > 2
+            || !matches!(memory, Some(1..=4))
+            || !(1..=10).contains(&investigation.cmd_timeout_minutes)
+            || !(1..=30).contains(&investigation.session_timeout_minutes)
+        {
+            return Err(TeamsError::Invalid("manager.lead limits must be non-negative; investigate must stay within 2 CPUs, 4g, 10 command minutes and 30 session minutes".into()));
+        }
         let mut seen: HashSet<&str> = HashSet::with_capacity(self.roster.len());
         for entry in &self.roster {
             if !is_label_safe(&entry.name) {
@@ -3880,6 +3948,37 @@ mod tests {
             serde_yaml_ng::from_str::<Manager>(&on_yaml).expect("round trip"),
             on
         );
+    }
+
+    #[test]
+    fn lead_reporting_keys_default_roundtrip_and_validate() {
+        let default = Lead::default();
+        assert_eq!(default.authority, LeadAuthority::Act);
+        assert_eq!(default.digest_at, "08:00");
+        assert_eq!(default.max_lead_runs_per_day, 30);
+        let teams = Teams::parse("enabled: true\nmanager:\n  lead:\n    enabled: true\n    authority: advise\n    digest_at: '09:30'\n    max_lead_runs_per_day: 2\n    investigate: {enabled: false, cpus: 1, memory: 2g, cmd_timeout_minutes: 5, session_timeout_minutes: 15}\n").unwrap();
+        assert_eq!(teams.manager.lead.authority, LeadAuthority::Advise);
+        teams.validate().unwrap();
+        assert_eq!(
+            Teams::parse(&serde_yaml_ng::to_string(&teams).unwrap()).unwrap(),
+            teams
+        );
+        for config in [
+            "digest_at: '25:00'",
+            "digest_at: '8:00'",
+            "authority: approve",
+            "max_lead_runs_per_day: -1",
+            "investigate: {cpus: 0}",
+            "investigate: {memory: 100g}",
+            "investigate: {cmd_timeout_minutes: 0}",
+        ] {
+            assert!(
+                Teams::parse(&format!("manager:\n  lead: {{{config}}}\n"))
+                    .and_then(|t| t.validate())
+                    .is_err(),
+                "{config}"
+            );
+        }
     }
 
     // ── STUDIO-1013: the manager identity's config keys ───────────────────────

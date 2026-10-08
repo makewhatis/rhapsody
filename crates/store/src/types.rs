@@ -11,6 +11,16 @@
 /// Tech-lead work (STUDIO-1134); no Go counterpart. Shared here to avoid a store/orchestrator cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeadTrigger {
+    Overrule {
+        subject: String,
+        decision: i64,
+        note: String,
+    },
+    /// Already judged to require the operator; it pages without another model run.
+    Escalation {
+        subject: String,
+        need: String,
+    },
     BlockedHandoff {
         ticket: String,
         question: String,
@@ -36,6 +46,7 @@ pub enum LeadTrigger {
 impl LeadTrigger {
     pub fn subject(&self) -> &str {
         match self {
+            Self::Overrule { subject, .. } | Self::Escalation { subject, .. } => subject,
             Self::BlockedHandoff { ticket, .. } => ticket,
             Self::ReviewEscalation { pr, .. } => pr,
             Self::ImpossibleState { subject, .. } => subject,
@@ -47,6 +58,10 @@ impl LeadTrigger {
     /// SQL discriminator, dedupe question, and variant payload. Detection never charges attempts.
     pub(crate) fn queue_parts(&self) -> (&'static str, String, &str) {
         match self {
+            Self::Overrule { decision, note, .. } => {
+                ("overrule", format!("overrule:{decision}"), note)
+            }
+            Self::Escalation { need, .. } => ("escalation", need.clone(), need),
             Self::BlockedHandoff { question, .. } => (
                 "blocked_handoff",
                 question.split_whitespace().collect::<Vec<_>>().join(" "),
@@ -101,6 +116,13 @@ pub struct LeadExecution {
     pub commissioned_at: String,
     pub findings: String,
     pub run_attempts: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeadRunReservation {
+    Reserved,
+    DailyCap,
+    Exhausted,
 }
 
 // --- outcome taxonomy v2 (INF-272) -----------------------------------------------------------

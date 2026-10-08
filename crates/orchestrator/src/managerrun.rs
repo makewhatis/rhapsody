@@ -348,6 +348,22 @@ impl Orchestrator {
         let Some(runtime) = self.lead_dependencies() else {
             return;
         };
+        let day = (self.now)()
+            .with_timezone(&chrono::Local)
+            .date_naive()
+            .to_string();
+        let cap = self
+            .teams
+            .as_ref()
+            .map_or(30, |t| t.manager.lead.max_lead_runs_per_day);
+        match self.store().lead_report_count(&format!("runs:{day}")) {
+            Ok(used) if used < cap => {}
+            Ok(_) => return,
+            Err(error) => {
+                tracing::warn!(%error, "lead daily budget unreadable; deferring work");
+                return;
+            }
+        }
         let items = match self.store().load_lead_items() {
             Ok(items) => items,
             Err(e) => {
@@ -362,8 +378,17 @@ impl Orchestrator {
         }
         let Some(item) = items
             .iter()
-            .find(|i| i.state != "done" && i.id > self.lead_cursor)
-            .or_else(|| items.iter().find(|i| i.state != "done"))
+            .find(|i| {
+                matches!(i.state.as_str(), "queued" | "parked" | "running")
+                    && !matches!(i.trigger, rhapsody_store::LeadTrigger::Escalation { .. })
+                    && i.id > self.lead_cursor
+            })
+            .or_else(|| {
+                items.iter().find(|i| {
+                    matches!(i.state.as_str(), "queued" | "parked" | "running")
+                        && !matches!(i.trigger, rhapsody_store::LeadTrigger::Escalation { .. })
+                })
+            })
             .cloned()
         else {
             return;
@@ -433,6 +458,15 @@ impl Orchestrator {
             let outcome = self.dispatch_manager(run.clone());
             if outcome == ManagerDispatchOutcome::Dispatched {
                 self.lead_cases.insert(re.issue.id.clone(), (case, run));
+                return;
+            }
+            if matches!(outcome, ManagerDispatchOutcome::Refused(ref reason) if reason == "lead daily cap; queued for tomorrow")
+            {
+                // A fallback is a new model run. Preserve its cursor and queue the item, rather
+                // than converting a daily spending deferral into an infrastructure page.
+                if let Err(error) = self.store().set_lead_item_state(case.item.id, "queued") {
+                    tracing::warn!(%error, item = case.item.id, "lead fallback deferral could not be recorded");
+                }
                 return;
             }
         }
@@ -594,9 +628,25 @@ impl Orchestrator {
                 .teams
                 .as_ref()
                 .map_or(12, |t| t.manager.max_runs_per_generation);
-            match self.store().reserve_lead_run(item, &pr, max) {
-                Ok(true) => {}
-                Ok(false) => {
+            let day = (self.now)()
+                .with_timezone(&chrono::Local)
+                .date_naive()
+                .to_string();
+            let daily_max = self
+                .teams
+                .as_ref()
+                .map_or(30, |t| t.manager.lead.max_lead_runs_per_day);
+            match self
+                .store()
+                .reserve_lead_run_daily(item, &pr, max, &day, daily_max)
+            {
+                Ok(rhapsody_store::LeadRunReservation::Reserved) => {}
+                Ok(rhapsody_store::LeadRunReservation::DailyCap) => {
+                    return ManagerDispatchOutcome::Refused(
+                        "lead daily cap; queued for tomorrow".into(),
+                    );
+                }
+                Ok(rhapsody_store::LeadRunReservation::Exhausted) => {
                     return ManagerDispatchOutcome::Refused(
                         "lead manager run budget exhausted".into(),
                     );

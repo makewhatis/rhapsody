@@ -429,6 +429,9 @@ where
 /// and assert on a failure without an HTTP server.
 #[async_trait::async_trait]
 pub trait NotifyChannel: Send + Sync {
+    async fn send_lead(&self, title: &str, body: &str, _link: &str) -> Result<(), String> {
+        self.send_account(title, body).await
+    }
     /// Account-level reporting shares the transport, without pretending an account is a PR.
     async fn send_account(&self, _title: &str, _body: &str) -> Result<(), String> {
         Err("account notifications unsupported on this channel".into())
@@ -503,6 +506,24 @@ impl NtfyChannel {
 
 #[async_trait::async_trait]
 impl NotifyChannel for NtfyChannel {
+    async fn send_lead(&self, title: &str, body: &str, link: &str) -> Result<(), String> {
+        let request = self
+            .client
+            .post(&self.url)
+            .header("Title", title)
+            .body(body.to_string());
+        let request = if link.is_empty() {
+            request
+        } else {
+            request.header("Click", link)
+        };
+        let res = request.send().await.map_err(|e| e.to_string())?;
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("ntfy returned HTTP {}", res.status()))
+        }
+    }
     async fn send_account(&self, title: &str, body: &str) -> Result<(), String> {
         let res = self
             .client

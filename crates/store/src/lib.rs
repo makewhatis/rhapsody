@@ -159,6 +159,37 @@ pub trait Store {
     fn reserve_lead_run(&self, _item: i64, _pr: &str, _max: i64) -> Result<bool, StoreError> {
         Ok(false)
     }
+    fn reserve_lead_run_daily(
+        &self,
+        _item: i64,
+        _pr: &str,
+        _max: i64,
+        _day: &str,
+        _daily_max: i64,
+    ) -> Result<LeadRunReservation, StoreError> {
+        Ok(LeadRunReservation::Exhausted)
+    }
+    fn lead_report_count(&self, _key: &str) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+    /// Reserve reporting before delivery; failures are logged, never a per-tick retry storm.
+    fn reserve_lead_report(&self, _key: &str, _max: i64) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    /// Admit a page once, atomically rechecking that the decision is still an escalation and
+    /// has not been overruled. Delivery admitted before an overrule cannot be recalled.
+    fn reserve_lead_page(&self, _decision: i64) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    /// Atomically mark the decision and queue its undo/redo work. Repeats return the same item.
+    fn overrule_lead_decision(
+        &self,
+        _id: i64,
+        _note: &str,
+        _at: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(None)
+    }
     // --- run lifecycle (write-through from the orchestrator actor) ---
     fn start_run(&self, r: RunStart) -> Result<i64, StoreError>;
     fn end_run(&self, run_id: i64, e: RunEnd) -> Result<(), StoreError>;

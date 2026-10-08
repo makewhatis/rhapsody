@@ -39,14 +39,20 @@ function readHash(): string {
  */
 export function useConsoleRoute(
   teamsEnabled: boolean | undefined,
+  leadEnabled: boolean | undefined,
 ): [ConsoleRoute, (to: ConsoleRoute) => void] {
   const hash = useSyncExternalStore(subscribe, readHash, () => "");
   const route = useMemo(() => {
     const parsed = parseConsoleRoute(hash);
-    return teamsEnabled === undefined ? parsed : gateConsoleRoute(parsed, teamsEnabled);
-  }, [hash, teamsEnabled]);
+    // Lead also requires its own capability. Preserve its deep link while /version is pending.
+    if (teamsEnabled === undefined || (teamsEnabled && parsed.name === "lead" && leadEnabled === undefined)) {
+      return parsed;
+    }
+    return gateConsoleRoute(parsed, teamsEnabled, leadEnabled === true);
+  }, [hash, teamsEnabled, leadEnabled]);
 
-  const known = teamsEnabled !== undefined;
+  const known = teamsEnabled !== undefined &&
+    (!teamsEnabled || route.name !== "lead" || leadEnabled !== undefined);
   const wanted = consoleRouteHash(route);
   useEffect(() => {
     if (typeof window === "undefined" || !known) return;
