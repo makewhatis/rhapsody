@@ -356,6 +356,55 @@ pub(crate) fn run_key(issue_id: &str, started_at: chrono::DateTime<chrono::Utc>)
 }
 
 impl crate::Orchestrator {
+    /// Dispatch gates must not hide work that arrived while they were closed. This read-only
+    /// pass observes the queue without selecting, claiming, enriching or priming decision ledgers.
+    /// Successful dispatch passes already observe their candidate set and need no extra reads.
+    pub(crate) async fn refresh_gated_chatgpt_queue(&mut self) {
+        let Some(eff) = self.eff.as_ref() else {
+            return;
+        };
+        let trackers: Vec<_> = if eff.projects.is_empty() {
+            vec![(String::new(), eff.tracker.clone())]
+        } else {
+            eff.projects
+                .iter()
+                .filter(|p| !p.disabled)
+                .map(|p| (p.slug.clone(), p.tracker.clone()))
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut complete = !trackers.is_empty();
+        let mut queued = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (project, tracker) in trackers {
+            match tokio::time::timeout_at(deadline, tracker.fetch_candidate_issues()).await {
+                Ok(Ok(issues)) => {
+                    queued.extend(
+                        issues
+                            .into_iter()
+                            .filter(|i| seen.insert(i.id.clone()))
+                            .map(|i| (i, project.clone())),
+                    );
+                }
+                Ok(Err(error)) => {
+                    complete = false;
+                    tracing::warn!(%project, %error, "limit: gated queue observation failed");
+                }
+                Err(_) => {
+                    complete = false;
+                    tracing::warn!("limit: gated queue observation timed out");
+                    break;
+                }
+            }
+        }
+        self.record_chatgpt_queue(
+            queued
+                .iter()
+                .map(|(issue, project)| (issue, project.as_str())),
+            complete,
+        );
+    }
+
     pub(crate) fn chatgpt_probe_path(&self, boot: bool) -> Option<std::path::PathBuf> {
         let openai_run = |run: &crate::RunningEntry| {
             let (harness, model) =
@@ -632,6 +681,126 @@ mod tests {
             !o.credit_approved("ticket", "chatgpt-subscription"),
             "credit permission cannot bypass the independent budget wall"
         );
+    }
+
+    #[tokio::test]
+    async fn queued_openai_work_behind_dispatch_gates_keeps_probe_admitted() {
+        use crate::testsupport::{empty_effective, empty_resolved_project, issue};
+        use rhapsody_tracker::fake::Fake;
+        use std::sync::Arc;
+
+        struct DeadCredential;
+        #[async_trait::async_trait]
+        impl crate::preflight::CredentialProbe for DeadCredential {
+            async fn probe(
+                &self,
+                _: &crate::preflight::ProbeRequest,
+            ) -> crate::preflight::ProbeOutcome {
+                crate::preflight::ProbeOutcome::Dead("test login unavailable".into())
+            }
+        }
+
+        for gate in ["validation", "drain", "credential"] {
+            for projects in [false, true] {
+                let mut candidate = issue("queued", "MT-1", "Todo");
+                candidate.labels = Some(vec![
+                    "rhapsody:harness/opencode".into(),
+                    "rhapsody:model/openai/test".into(),
+                    "rhapsody:human".into(),
+                ]);
+                let mut o = crate::Orchestrator::new("not-read.md");
+                let mut eff = empty_effective(Arc::new(Fake::new()));
+                eff.poll_interval = std::time::Duration::from_secs(3600);
+                eff.cfg.opencode.auth_source = "/test/operator/auth.json".into();
+                if projects {
+                    eff.projects = vec![empty_resolved_project("test", eff.tracker.clone())];
+                }
+                o.eff = Some(eff);
+                match gate {
+                    "validation" => o.eff.as_mut().unwrap().cfg.tracker.api_key.clear(),
+                    "drain" => {
+                        o.drain
+                            .arm(chrono::Utc::now(), crate::drain::DrainReason::Operator);
+                    }
+                    _ => o.set_credential_probe(Arc::new(DeadCredential)),
+                }
+                // Work arrives after boot while the dispatch gate remains closed.
+                for (queued, failed) in
+                    [(false, false), (true, false), (false, true), (false, false)]
+                {
+                    let mut tracker = Fake::new();
+                    if queued {
+                        tracker.candidates = vec![candidate.clone()];
+                    }
+                    if failed {
+                        tracker.candidates_err = Some(rhapsody_tracker::TrackerError::Other(
+                            "test board unavailable".into(),
+                        ));
+                    }
+                    let tracker = Arc::new(tracker);
+                    let eff = o.eff.as_mut().unwrap();
+                    if projects {
+                        eff.projects[0].tracker = tracker;
+                    } else {
+                        eff.tracker = tracker;
+                    }
+                    o.on_tick().await;
+                    if let Some(timer) = o.tick_timer.take() {
+                        timer.abort();
+                    }
+                    assert_eq!(
+                        o.chatgpt_probe_path(false).is_some(),
+                        queued || failed,
+                        "queue observation must survive {gate} (projects={projects}, queued={queued}, failed={failed})"
+                    );
+                    assert!(o.running.is_empty());
+                    assert!(o.claimed.is_empty());
+                    assert!(o.retry_attempts.is_empty());
+                    assert!(o.preparing.is_empty());
+                    assert!(!o.human_holds.labelled_and_primed().1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gated_queue_observation_keeps_partial_reads_and_skips_disabled_projects() {
+        use crate::testsupport::{empty_effective, empty_resolved_project, issue};
+        use rhapsody_tracker::fake::Fake;
+        use std::sync::Arc;
+
+        let mut openai = Fake::new();
+        openai.candidates = vec![issue("queued", "MT-1", "Todo")];
+        let openai = Arc::new(openai);
+        let empty = Arc::new(Fake::new());
+        let mut failed = Fake::new();
+        failed.candidates_err = Some(rhapsody_tracker::TrackerError::Other("unavailable".into()));
+        let failed = Arc::new(failed);
+        let mut eff = empty_effective(empty.clone());
+        eff.cfg.agent.backend = "opencode".into();
+        let mut project = empty_resolved_project("openai", openai.clone());
+        project.mcfg.opencode.model = "openai/test".into();
+        let mut disabled = empty_resolved_project("disabled", openai.clone());
+        disabled.disabled = true;
+        eff.projects = vec![project, empty_resolved_project("failed", failed), disabled];
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.eff = Some(eff);
+        o.refresh_gated_chatgpt_queue().await;
+        assert!(o.chatgpt_probe_path(false).is_some());
+        assert_eq!(
+            openai.candidate_calls(),
+            1,
+            "disabled project must not be read"
+        );
+        o.eff.as_mut().unwrap().projects[0].tracker = empty.clone();
+        o.refresh_gated_chatgpt_queue().await;
+        assert!(
+            o.chatgpt_probe_path(false).is_some(),
+            "a partial board cannot clear queued work"
+        );
+        o.eff.as_mut().unwrap().projects[1].tracker = empty;
+        o.refresh_gated_chatgpt_queue().await;
+        assert!(o.chatgpt_probe_path(false).is_none());
     }
 
     #[test]

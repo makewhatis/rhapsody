@@ -1105,6 +1105,7 @@ impl Orchestrator {
         self.publish_snapshot();
         if let Err(e) = self.validate() {
             tracing::error!(err = %e, "dispatch preflight validation failed; skipping dispatch");
+            self.refresh_gated_chatgpt_queue().await;
             // This early return and the credential preflight just below both skip dispatch
             // entirely, so the reset at the top of `dispatch_decisions` never runs and the last
             // successful pass's tally would stand.
@@ -1118,8 +1119,8 @@ impl Orchestrator {
             return;
         }
         // STUDIO-880: the drain gate. Same seam, same property as the credential preflight below —
-        // skip ALL dispatch WITHOUT claiming anything, before candidate fetch — because a drain that
-        // claimed a ticket and then declined to run it would leave exactly the abandoned claim the
+        // skip ALL dispatch WITHOUT claiming anything, before dispatch's candidate fetch — a drain
+        // that claimed a ticket and then declined to run it would leave the abandoned claim that the
         // "nothing is claimed" invariant exists to prevent. Deliberately ONE gate rather than a
         // second "should we dispatch" test somewhere else: two of them is how one gets forgotten.
         //
@@ -1127,16 +1128,18 @@ impl Orchestrator {
         // `claude -p` probe). A daemon that has been told to stop dispatching has no use for the
         // answer, so asking would spend a subprocess every tick for a decision already made.
         if self.drain_preflight() {
+            self.refresh_gated_chatgpt_queue().await;
             self.set_held_for_capacity(HashMap::new()); // see the retirement note above
             self.schedule_tick(poll);
             return;
         }
         // BO-59: agent credential-liveness preflight. A dead backend credential (e.g. an expired Claude
         // OAuth login) skips ALL dispatch WITHOUT claiming anything, so an infrastructure fault fails
-        // fast instead of claim→dispatch→die every ~5 min. Runs BEFORE candidate fetch (nothing is
-        // claimed); cached per TTL; logs the transition + rate-limits the steady-state repeat itself, so
-        // this call site stays quiet rather than error-logging every 30s forever.
+        // fast instead of claim→dispatch→die every ~5 min. Runs BEFORE dispatch's candidate fetch
+        // (nothing is claimed); cached per TTL; logs the transition + rate-limits the steady-state
+        // repeat itself, so this call site stays quiet rather than error-logging every 30s forever.
         if !self.credential_preflight().await {
+            self.refresh_gated_chatgpt_queue().await;
             self.set_held_for_capacity(HashMap::new()); // see the retirement note above
             self.schedule_tick(poll);
             return;

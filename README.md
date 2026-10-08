@@ -293,6 +293,8 @@ an access-only, non-inference `wham/usage` GET supplies advance visibility (`pro
 The probe never refreshes a login or follows redirects, is bounded to one attempt
 per account per ten minutes, and is scheduled by the daemon once after boot's API
 listener starts, then while OpenCode/OpenAI work is active, queued or held (STUDIO-1143).
+Closed dispatch preflights still make a bounded, read-only candidate pass to observe queued
+work; this pass never selects, claims, enriches or primes review-decision ledgers.
 Each attempt reads a fresh access-only copy of the operator login, rather than a
 runner's retained login. Failed probes preserve the last known data and explicitly
 mark the account stale with a closed reason, including unauthorized and timeout.
