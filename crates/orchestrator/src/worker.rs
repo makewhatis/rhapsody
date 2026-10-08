@@ -151,6 +151,8 @@ pub struct WorkerDeclaration {
     /// `None` on every non-manager run. Carried rather than re-read: the worker still holds the
     /// final text when it builds this, exactly as `review_verdict` is.
     pub manager_text: Option<String>,
+    /// A ticket run's decision request, detected off-loop only when the tech lead is enabled.
+    pub blocked_question: Option<String>,
 }
 
 /// Sent on continuation turns instead of re-rendering the full task prompt, which is already in the
@@ -335,6 +337,9 @@ pub struct WorkerDeps {
     pub prepared_harness: Option<Arc<dyn Harness>>,
     /// A limit-policy switch starts fresh and seeds turn 1 with the carried note path.
     pub engine: Option<crate::dispatch::DispatchEngine>,
+    /// Tech-lead detection is opt-in; progress notes are read only on this worker task.
+    pub lead_enabled: bool,
+    pub lead_progress_dir: Option<std::path::PathBuf>,
 }
 
 /// Returns the prompt template for this run. When `prompt_file` is empty the inline `prompt_tmpl` is
@@ -610,6 +615,7 @@ async fn run_manager_attempt(
             // The manager's final text is parsed at the exit path, where the finding ledger is in
             // hand: the decision's dismissals name finding revisions only the daemon knows.
             manager_text: Some(result_text),
+            blocked_question: None,
         },
         loop_err,
     )
@@ -1185,12 +1191,26 @@ pub async fn run_agent_attempt(
         .review
         .as_ref()
         .and_then(|_| reviewfindings::parse_verdict_block(&result_text));
+    let blocked_question = if deps.lead_enabled && deps.review.is_none() {
+        let progress = if crate::leaditems::detect_blocked_handoff(&result_text, None).is_none()
+            && !crate::leaditems::final_declares_complete(&result_text)
+        {
+            crate::leaditems::read_progress(deps.lead_progress_dir.as_deref(), &issue.identifier)
+                .await
+        } else {
+            None
+        };
+        crate::leaditems::detect_blocked_handoff(&result_text, progress.as_deref())
+    } else {
+        None
+    };
     (
         final_state,
         WorkerDeclaration {
             declared_handoff: has_handoff_marker(&result_text),
             review_verdict,
             manager_text: None,
+            blocked_question,
         },
         loop_err,
     )
@@ -1617,6 +1637,8 @@ mod tests {
         max_turns: i64,
     ) -> WorkerDeps {
         WorkerDeps {
+            lead_enabled: false,
+            lead_progress_dir: None,
             workspace: ws,
             agent: ag,
             tracker: tr,
@@ -3106,6 +3128,67 @@ mod tests {
             turns.load(Ordering::SeqCst),
             1,
             "a drained review ends at its boundary, not at max_turns"
+        );
+    }
+
+    #[tokio::test]
+    async fn lead_worker_carries_a_blocked_in_review_ending() {
+        for enabled in [false, true] {
+            let ag = fake_agent(vec![agentfake::TurnScript {
+                result: TurnResult {
+                    status: TURN_SUCCEEDED.to_string(),
+                    result_text: "Blocked pending two human decisions.\nAuthorize a credential source and clarify the Event representation.\nHANDOFF: in-review".into(),
+                    ..Default::default()
+                }, ..Default::default()
+            }]);
+            let mut tr = trackerfake::Fake::new();
+            tr.states_by_ids_func = Some(Box::new(|_| Ok(vec![issue("1", "MT-1", "In Review")])));
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let mut d = make_deps(ws, ag, Arc::new(tr), "do it", 1);
+            d.lead_enabled = enabled;
+            let (_, declared, err) =
+                run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+            assert!(err.is_none());
+            assert_eq!(declared.blocked_question.is_some(), enabled);
+            if enabled {
+                assert!(
+                    declared
+                        .blocked_question
+                        .expect("question")
+                        .contains("Event representation")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn lead_worker_reads_current_progress_beside_a_plain_handoff() {
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: "HANDOFF: in-review".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let dir = std::path::PathBuf::from(&root.path);
+        std::fs::write(
+            dir.join("MT-1-progress.md"),
+            "## Current blocker\nBLOCKED: Human must decide the Event representation.",
+        )
+        .expect("progress");
+        let mut d = make_deps(ws, ag, Arc::new(trackerfake::Fake::new()), "do it", 1);
+        d.lead_enabled = true;
+        d.lead_progress_dir = Some(dir);
+        let (_, declaration, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none());
+        assert!(
+            declaration
+                .blocked_question
+                .expect("question")
+                .contains("Event representation")
         );
     }
 

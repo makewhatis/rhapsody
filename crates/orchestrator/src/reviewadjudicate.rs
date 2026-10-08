@@ -337,6 +337,7 @@ impl Adjudication {
 /// while awaiting.
 #[derive(Default)]
 pub struct AdjudicationLedger {
+    lead_enabled: bool,
     entries: Mutex<HashMap<String, Adjudication>>,
     /// How many turns have FAILED per pull request since its last successful decision or its last
     /// `clear`. Kept apart from `entries` because a failure deliberately CLEARS the entry so the
@@ -367,6 +368,11 @@ impl std::fmt::Debug for AdjudicationLedger {
 }
 
 impl AdjudicationLedger {
+    pub fn with_lead_enabled(mut self, enabled: bool) -> Self {
+        self.lead_enabled = enabled;
+        self
+    }
+
     /// A ledger whose settled decisions are written through to `store` (STUDIO-956). The daemon's
     /// composition root builds it with the same store handle the orchestrator holds, so the
     /// decision and the round counter it belongs beside land in one row.
@@ -668,7 +674,36 @@ pub async fn perform_adjudication(
     // contradicting `SHIP`. Recording first makes the window unrepresentable rather than merely
     // brief. The success path's `InFlight` marker already survives its awaits, so this ordering is
     // only load-bearing for the failure path — but one ordering for both keeps them from drifting.
+    let exhausted_attempts = deps.ledger.failures(&plan.pr) >= MAX_ADJUDICATION_ATTEMPTS;
     deps.ledger.record(&plan.pr, adjudication.clone());
+
+    if deps.ledger.lead_enabled
+        && matches!(adjudication, Adjudication::Escalate { .. })
+        && let Some(store) = deps.ledger.store.as_ref()
+    {
+        let trigger = if exhausted_attempts {
+            Ok(rhapsody_store::LeadTrigger::ImpossibleState {
+                subject: plan.pr.to_string(),
+                kind: "repeated_failed_attempts".into(),
+            })
+        } else {
+            crate::leaditems::review_escalation_trigger(
+                store.as_ref(),
+                &plan.pr.to_string(),
+                &plan.head,
+            )
+        };
+        match trigger {
+            Ok(trigger) => {
+                if crate::leaditems::enqueue(store.as_ref(), trigger) > 0 {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::warn!(pr = %plan.pr, err = %e, "lead: review evidence unreadable; preserving human audit")
+            }
+        }
+    }
 
     let refs = vec![plan.pr.to_string()];
     if let Some(room) = deps.room.as_ref() {
@@ -1588,6 +1623,62 @@ mod tests {
                 reason: "the migration needs a DBA".to_string(),
             })
         );
+    }
+
+    #[tokio::test]
+    async fn lead_adjudication_queues_instead_of_sending_human_audit() {
+        let store = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        let room = Arc::new(RecordingRoom(Mutex::new(Vec::new())));
+        let comments = Arc::new(RecordingComments::default());
+        let ledger =
+            Arc::new(AdjudicationLedger::with_store(store.clone()).with_lead_enabled(true));
+        let plan = plan();
+        let deps = deps(
+            Arc::new(FixedVerdict(Verdict::Escalate {
+                reason: "B1 needs a decision".into(),
+            })),
+            room.clone(),
+            comments.clone(),
+            ledger,
+        );
+        perform_adjudication(&plan, &deps, Utc::now()).await;
+        assert_eq!(store.load_lead_items().expect("items").len(), 1);
+        assert!(room.0.lock().expect("room").is_empty());
+        assert!(comments.0.lock().expect("comments").is_empty());
+    }
+
+    #[tokio::test]
+    async fn lead_exhausted_adjudication_is_repeated_failed_attempts() {
+        let store = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        );
+        let room = Arc::new(RecordingRoom(Mutex::new(Vec::new())));
+        let comments = Arc::new(RecordingComments::default());
+        let ledger =
+            Arc::new(AdjudicationLedger::with_store(store.clone()).with_lead_enabled(true));
+        let deps = deps(
+            Arc::new(BrokenVerdict),
+            room.clone(),
+            comments.clone(),
+            ledger,
+        );
+        let plan = plan();
+        for _ in 0..MAX_ADJUDICATION_ATTEMPTS {
+            perform_adjudication(&plan, &deps, Utc::now()).await;
+        }
+        let items = store.load_lead_items().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(
+            items[0].trigger,
+            rhapsody_store::LeadTrigger::ImpossibleState {
+                subject: plan.pr.to_string(),
+                kind: "repeated_failed_attempts".into()
+            }
+        );
+        assert!(room.0.lock().expect("room").is_empty());
+        assert!(comments.0.lock().expect("comments").is_empty());
     }
 
     #[tokio::test]

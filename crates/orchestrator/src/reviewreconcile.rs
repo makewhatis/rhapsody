@@ -1279,6 +1279,7 @@ impl Orchestrator {
         // §10.2 gate defers, or whose manager is unavailable, must not be swallowed: it stays on the
         // human feed wearing the manager's own wording (§10.2). `off` is byte-identical: nothing is
         // routed and nothing is dropped.
+        self.route_lead_divergences(&mut found);
         let routing = self.route_stalls_to_manager(&found);
         if !routing.adopted.is_empty() {
             found.retain(|d| {
@@ -1344,6 +1345,7 @@ impl Orchestrator {
                 }
             }
         }
+        self.route_lead_manager_endings(&mut found);
         self.set_review_divergences(found);
     }
 
