@@ -270,11 +270,27 @@ where
     Ok(entries)
 }
 
+/// The tech-lead trigger gate (STUDIO-1134). Other lead controls belong to subsequent slices.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lead {
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Lead {
+    fn disabled(&self) -> bool {
+        !self.enabled
+    }
+}
+
 /// The `manager:` block (§2.2). Carried as config in T1; the routing function
 /// that reads `default_identity` is T3a and the model turn that reads `model` /
 /// `max_tokens` / `timeout_ms` is T3b's off-loop triage task (§0.11.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manager {
+    /// Tech-lead trigger routing; absent/false preserves the existing human feed (STUDIO-1134).
+    #[serde(default, skip_serializing_if = "Lead::disabled")]
+    pub lead: Lead,
     #[serde(default)]
     pub mode: ManagerMode,
     /// Who takes a ticket nothing matched; empty ⇒ run without an identity.
@@ -349,6 +365,7 @@ impl Default for Manager {
     fn default() -> Self {
         Self {
             mode: ManagerMode::default(),
+            lead: Lead::default(),
             default_identity: String::new(),
             model: String::new(),
             harness: String::new(),
@@ -3731,6 +3748,7 @@ mod tests {
             enabled: true,
             manager: Manager {
                 mode: ManagerMode::Off,
+                lead: Lead::default(),
                 default_identity: "alice".to_string(),
                 model: "m".to_string(),
                 harness: "opencode".to_string(),
@@ -3819,6 +3837,22 @@ mod tests {
         assert!(yaml.contains("labels+model"), "wire spelling: {yaml}");
         assert!(yaml.contains("hindsight"), "wire spelling: {yaml}");
         assert_eq!(Teams::parse(&yaml).expect("reparse"), other);
+    }
+
+    #[test]
+    fn lead_gate_defaults_off_and_round_trips_without_changing_old_bytes() {
+        let manager = Manager::default();
+        let before = serde_yaml_ng::to_string(&manager).expect("serialize");
+        assert!(!before.contains("lead:"));
+        let off: Manager = serde_yaml_ng::from_str("lead: {enabled: false}").expect("off");
+        assert_eq!(serde_yaml_ng::to_string(&off).expect("serialize"), before);
+        let on: Manager = serde_yaml_ng::from_str("lead: {enabled: true}").expect("on");
+        assert!(on.lead.enabled);
+        let on_yaml = serde_yaml_ng::to_string(&on).expect("serialize");
+        assert_eq!(
+            serde_yaml_ng::from_str::<Manager>(&on_yaml).expect("round trip"),
+            on
+        );
     }
 
     // ── STUDIO-1013: the manager identity's config keys ───────────────────────

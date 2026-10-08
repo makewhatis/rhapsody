@@ -138,7 +138,7 @@ impl Orchestrator {
         now: Instant,
     ) -> AdoptSweep {
         let mut out = AdoptSweep::default();
-        if !self.review_ticketless_enabled() {
+        if !self.review_ticketless_enabled() && !self.lead_enabled() {
             return out;
         }
         // Read ONCE per tick rather than once per candidate: the origins are a whole-table read and
@@ -179,8 +179,10 @@ impl Orchestrator {
                 Verdict::Considered => probed.push(iss.identifier.clone()),
                 Verdict::Adopt(req) => {
                     probed.push(iss.identifier.clone());
-                    out.repaired
-                        .push((self.adopt_group(proj), iss.identifier.clone()));
+                    if !req.reviewers.is_empty() {
+                        out.repaired
+                            .push((self.adopt_group(proj), iss.identifier.clone()));
+                    }
                     out.planned.push(*req);
                 }
                 Verdict::Refuse(why) => {
@@ -338,8 +340,10 @@ impl Orchestrator {
         // EXCLUDE, and "the author is not the reviewer" is a guard rather than a nicety — so a
         // ticket parked in review that this daemon never ran as a teammate is not adopted at all.
         // `plan_review_intro` refuses the same case as `re.identity.is_empty()`.
-        let Some(author) = self.adopt_author(&iss.identifier) else {
-            return Verdict::Considered;
+        let author = match self.adopt_author(&iss.identifier) {
+            Some(author) if self.review_ticketless_enabled() => author,
+            _ if self.lead_enabled() => String::new(),
+            _ => return Verdict::Considered,
         };
         // Gate: the repository parses. Everything past here is a REFUSAL rather than a skip: the
         // ticket is an orphan candidate on this daemon's own terms, and the reasons it cannot be
@@ -360,10 +364,16 @@ impl Orchestrator {
         // Ranked over a LIVE load snapshot, exactly as `plan_review_intro` ranks: `quorum_load` is
         // always empty under `ticketless`, so ranking against it would name the same first teammate
         // for every pull request in the sweep.
-        let mut reviewers =
-            crate::quorum::rank_reviewers(teams, &author, load, &self.reviewer_exclusions(teams));
+        // Lead-only probes have no reviewer and can never introduce a watch row. They reuse the
+        // existing bounded lookup and pace to detect an In Review ticket with no PR, even if this
+        // daemon never ran it or ticketless review is off.
+        let mut reviewers = if author.is_empty() {
+            Vec::new()
+        } else {
+            crate::quorum::rank_reviewers(teams, &author, load, &self.reviewer_exclusions(teams))
+        };
         reviewers.truncate(teams.review.effective_reviewers());
-        if reviewers.is_empty() {
+        if reviewers.is_empty() && !self.lead_enabled() {
             return Verdict::Refuse("the roster holds nobody but the author");
         }
         // STUDIO-875: the repair sweep repairs the attachment too. An orphaned pull request is
@@ -564,6 +574,24 @@ mod tests {
             state: REVIEW_STATE.to_string(),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn lead_probes_an_in_review_ticket_even_without_an_author_or_reviewer() {
+        let mut teams = teams_with(true, ReviewMode::Ticketless, &[]);
+        teams.manager.lead.enabled = true;
+        let mut o = orch(teams);
+        let issues = [parked("STUDIO-1123")];
+        let now = Instant::now();
+        let first = sweep(&mut o, &issues, now);
+        assert_eq!(first.planned.len(), 1);
+        assert!(first.planned[0].reviewers.is_empty());
+        assert!(first.planned[0].author.is_empty());
+        assert!(first.repaired.is_empty(), "a probe is not an adoption");
+        assert!(
+            sweep(&mut o, &issues, now).planned.is_empty(),
+            "reuse the existing probe pace"
+        );
     }
 
     /// Records that `identity`'s run of `identifier` happened and ended — this daemon's own ledger,

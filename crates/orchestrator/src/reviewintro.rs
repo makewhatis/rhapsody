@@ -215,6 +215,8 @@ pub enum ReviewIntroOutcome {
 #[async_trait]
 pub trait ReviewIntroSink: Send + Sync {
     async fn introduce(&self, pr: IntroducedPr) -> ReviewIntroOutcome;
+    /// An authoritative empty branch lookup; errors and absent attachments do not imply no PR.
+    async fn missing_pr(&self, _req: &ReviewIntroRequest) {}
 }
 
 /// The production [`ReviewIntroSink`]: the control channel, through the same [`ControlHandle`] seam
@@ -233,6 +235,16 @@ impl ControlIntroSink {
 impl ReviewIntroSink for ControlIntroSink {
     async fn introduce(&self, pr: IntroducedPr) -> ReviewIntroOutcome {
         self.control.introduce_review(pr).await
+    }
+    async fn missing_pr(&self, req: &ReviewIntroRequest) {
+        if self
+            .control
+            .events
+            .send(Event::ReviewMissingPr(req.clone()))
+            .is_err()
+        {
+            tracing::warn!(origin = %req.introduced_by, "lead: control task gone; missing PR was not queued");
+        }
     }
 }
 
@@ -298,6 +310,9 @@ pub async fn run_review_intro_task(
         {
             Ok(Some(pr)) => pr.url,
             Ok(None) => {
+                if req.only_if_unwatched {
+                    deps.sink.missing_pr(&req).await;
+                }
                 tracing::debug!(
                     owner = %req.owner, repo = %req.repo, branch = %req.head_branch,
                     "ticketless review: no open pull request on the run's branch; nothing to review yet"
@@ -312,6 +327,9 @@ pub async fn run_review_intro_task(
                 continue;
             }
         };
+        if req.only_if_unwatched && req.reviewers.is_empty() {
+            continue; // a lead-only probe found a PR; it never introduces reviews or links it.
+        }
         let Some(pr) = pr_from_url(&url, &req.owner, &req.repo) else {
             tracing::warn!(
                 url = %url, owner = %req.owner, repo = %req.repo,
@@ -2118,6 +2136,46 @@ mod tests {
             introduced_by: "handoff:STUDIO-720".to_string(),
             only_if_unwatched: false,
             link: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn lead_missing_pr_report_requires_an_answer_not_a_lookup_error() {
+        #[derive(Default)]
+        struct MissingSink(Mutex<Vec<String>>);
+        #[async_trait]
+        impl ReviewIntroSink for MissingSink {
+            async fn introduce(&self, _: IntroducedPr) -> ReviewIntroOutcome {
+                panic!("no PR")
+            }
+            async fn missing_pr(&self, req: &ReviewIntroRequest) {
+                self.0.lock().expect("sink").push(req.introduced_by.clone());
+            }
+        }
+        for answered in [false, true] {
+            let sink = Arc::new(MissingSink::default());
+            let deps = ReviewIntroDeps {
+                pr_source: Some(Arc::new(FakeOpenPr(Box::new(move || {
+                    if answered {
+                        Ok(None)
+                    } else {
+                        Err("GitHub unavailable".into())
+                    }
+                })))),
+                sink: sink.clone(),
+                linker: None,
+            };
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            tx.send(ReviewIntroRequest {
+                introduced_by: "adopt:STUDIO-1123".into(),
+                only_if_unwatched: true,
+                ..request()
+            })
+            .expect("send");
+            drop(tx);
+            let signal = CancelSignal::new();
+            run_review_intro_task(signal.wait(), deps, rx).await;
+            assert_eq!(sink.0.lock().expect("sink").len(), usize::from(answered));
         }
     }
 
