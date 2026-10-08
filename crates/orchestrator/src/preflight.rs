@@ -244,6 +244,7 @@ fn definite_credential_failure(stdout: &[u8], stderr: &[u8]) -> Option<&'static 
         }
         if [
             "api error: 401",
+            "apierror: status 401",
             "http 401",
             "status code: 401",
             "\"statuscode\":401",
@@ -783,6 +784,24 @@ mod tests {
         }
     }
 
+    #[test]
+    fn apierror_status_401_is_a_definite_rejection_on_either_output_stream() {
+        let diagnostic = b"APIError: status 401 token=secret-canary";
+        for (stdout, stderr) in [
+            (diagnostic.as_slice(), b"".as_slice()),
+            (b"".as_slice(), diagnostic.as_slice()),
+        ] {
+            let ProbeOutcome::Dead(reason) = classify_probe(false, Some(1), stdout, stderr) else {
+                panic!("an explicit APIError status 401 must hold, not dispatch as unknown");
+            };
+            assert_eq!(
+                reason,
+                "claude credential rejected (401/invalid key); refresh the login"
+            );
+            assert!(!reason.contains("secret-canary"));
+        }
+    }
+
     // --- backend gating (requirement 3) ------------------------------------------------------------
 
     #[test]
@@ -1058,6 +1077,51 @@ mod tests {
                 .unwrap()
                 .contains("expired")
         );
+    }
+
+    #[tokio::test]
+    async fn scoped_apierror_status_401_holds_only_affected_account() {
+        struct Status401Probe;
+
+        #[async_trait]
+        impl CredentialProbe for Status401Probe {
+            async fn probe(&self, req: &ProbeRequest) -> ProbeOutcome {
+                if req.billing_guard {
+                    classify_probe(
+                        false,
+                        Some(1),
+                        b"",
+                        b"APIError: status 401 token=secret-canary",
+                    )
+                } else {
+                    ProbeOutcome::Healthy
+                }
+            }
+        }
+
+        let (mut o, sink, _dir) = mixed_accounts(false);
+        o.cred_probe = Some(Arc::new(Status401Probe));
+        drive_tick(&mut o).await;
+        let entries = sink.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().any(|e| e.issue.id == "api"));
+        assert!(entries.iter().any(|e| e.issue.id == "chatgpt"));
+        assert!(entries.iter().all(|e| e.issue.id != "subscription"));
+        assert!(!o.claimed.contains("subscription"));
+        assert!(o.retry_attempts.is_empty());
+        let accounts = o.control().accounts((o.now)().timestamp());
+        let held = accounts
+            .iter()
+            .find(|a| a.account == "claude-subscription")
+            .unwrap();
+        assert_eq!(held.status, "credential_held");
+        assert_eq!(held.level.as_deref(), Some("stop_new"));
+        let wire = serde_json::to_value(held).unwrap();
+        assert_eq!(
+            wire["probe_reason"],
+            "claude credential rejected (401/invalid key); refresh the login"
+        );
+        assert!(!wire.to_string().contains("secret-canary"));
     }
 
     #[tokio::test]
