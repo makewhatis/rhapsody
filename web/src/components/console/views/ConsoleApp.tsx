@@ -31,6 +31,7 @@ import { ReviewsView } from "./ReviewsView";
 import { SettingsView } from "./SettingsView";
 import { LogsView, ProvidersView, ToolsView, UpdatesView } from "./SettingsTabView";
 import { WorkflowView } from "./WorkflowView";
+import { AccountsPage } from "./AccountsPanel";
 
 // The Rhapsody Console shell — STUDIO-681 §2, built by STUDIO-683. The persistent rail on every
 // view, the capability gate that decides what it contains, and the router that decides what the
@@ -98,6 +99,7 @@ export function ConsoleApp() {
   const items = useMemo<NavItemSpec[]>(
     () => [
       { id: "jobs", label: "Jobs", icon: <JobsIcon />, count: openJobs },
+      { id: "accounts", label: "Accounts", icon: <SettingsIcon /> },
       // Unknown is treated as off HERE, deliberately: the rail must not advertise a surface the
       // daemon has not confirmed it has. Unlike the route gate this costs nothing if it is
       // briefly wrong — an item appears a moment later; it does not rewrite anyone's URL.
@@ -214,6 +216,8 @@ function ConsoleBody({
   }
 
   switch (route.name) {
+    case "accounts":
+      return <AccountsPage />;
     case "job":
       return <JobDetailView issue={route.key} onNavigate={(to) => go(to)} />;
     case "settings":

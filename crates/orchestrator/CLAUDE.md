@@ -154,7 +154,7 @@ the `Orchestrator` struct itself. Concretely:
 
   - `breaker.rs`'s `NotificationsState` (`Orchestrator::notifications: Arc<NotificationsState>`,
     STUDIO-1026) — a `Mutex`-guarded bounded queue of pending desktop notifications. The off-loop
-    breaker task's `MacosChannel` is the only writer; the control task's `build_snapshot` is its only
+    breaker and account-report tasks' `MacosChannel` is the writer; the control task's `build_snapshot` is its only
     reader (for the conditional `notifications` key on `/api/v1/state`). A ninth seam of the
     `BudgetLedger` shape: both sides genuinely touch it, neither can wait for the other, and the
     lock is never held across an `.await`. The breaker's other two pieces are NOT seams — `breaker_tx`

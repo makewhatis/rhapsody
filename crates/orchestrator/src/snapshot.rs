@@ -156,6 +156,7 @@ pub struct Snapshot {
     pub budget_held: Vec<crate::budget::BudgetHeld>,
     pub limit_held: Vec<String>,
     pub limit_items: Vec<crate::limitpolicy::LimitItem>,
+    pub limit_jobs: Vec<crate::limitreport::LimitJobReport>,
     /// Pending desktop notifications for the runaway-loop breaker (STUDIO-1026), oldest first.
     ///
     /// Empty is the load-bearing half, exactly as [`Snapshot::budget_held`]'s is:
@@ -282,6 +283,7 @@ impl Orchestrator {
             budget_held: self.budget_ledger.held(self.budget_hold_ttl()),
             limit_held: self.limit_holds(),
             limit_items: self.limit_policy.items.clone(),
+            limit_jobs: self.limit_job_reports(),
             // STUDIO-1026: the pending desktop notifications; empty on a daemon with no macOS
             // channel, which keeps the wire payload — and the golden — unchanged.
             notifications: self.notifications.pending(),

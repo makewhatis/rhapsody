@@ -1297,6 +1297,7 @@ pub(crate) fn empty_snapshot() -> Snapshot {
         budget_held: Vec::new(),
         limit_held: Vec::new(),
         limit_items: Vec::new(),
+        limit_jobs: Vec::new(),
         notifications: Vec::new(),
     }
 }

@@ -66,6 +66,30 @@ export interface LimitDecisionItem {
   }[];
 }
 
+export interface AccountView {
+  account: string;
+  windows: { window: string; utilization: number; resets_at_s: number }[];
+  status: string;
+  using_credits: boolean;
+  last_seen_s: number;
+  source: string;
+  stale: boolean;
+  detection: string;
+  level?: string;
+  today_usd?: number | null;
+  cost_kind?: string;
+}
+
+export interface LimitJobReport {
+  ticket: string;
+  account: string;
+  state: string;
+  resume_at_s?: number;
+  model?: string;
+  identity?: string;
+  note?: string;
+}
+
 export interface StateResponse {
   status: "ok" | "degraded";
   poll_interval_ms: number;
@@ -92,6 +116,7 @@ export interface StateResponse {
   review_divergence?: ReviewDivergence[];
   // L4 decisions the rules could not resolve; human-owned until manager limit actions land.
   limit_items?: LimitDecisionItem[];
+  limit_jobs?: LimitJobReport[];
   // Tickets the dispatcher is holding because they wear `rhapsody:human` (STUDIO-949), or ABSENT
   // when it holds none. Optional for `drain`'s reason: emitted only while the hold set is non-empty
   // so a Go-identical delta is absent. Read it as `state.held_for_human?.length`.
@@ -651,6 +676,11 @@ export async function fetchState(): Promise<StateResponse> {
   return s;
 }
 
+export async function fetchAccounts(): Promise<AccountView[]> {
+  const response = await getJSON<{ accounts: AccountView[] }>("/api/v1/accounts");
+  return response.accounts ?? [];
+}
+
 // fetchRunDetail fetches one run's unified detail by run id (GET /api/v1/runs/{id}). It
 // serves a running run (live snapshot) and a finished run (history store) identically — the
 // caller polls while outcome === "running" and goes static once it terminates.
@@ -1149,6 +1179,12 @@ export async function fetchRunIdentityEvents(issue: string): Promise<EventHit[]>
     search(UNROUTED_EVENT_KIND),
   ]);
   return [...routed, ...unrouted];
+}
+
+export async function fetchLimitHandoffs(issue: string): Promise<EventHit[]> {
+  const params = new URLSearchParams({ issue, kind: "limit.handoff", limit: "1" });
+  const response = await getJSON<EventSearchResponse>(`/api/v1/events?${params}`);
+  return response.hits ?? [];
 }
 
 export async function fetchMetrics(days = 30): Promise<MetricsResponse> {
