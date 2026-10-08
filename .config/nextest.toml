@@ -1,0 +1,14 @@
+# CI must bound tests independently of their Tokio runtimes: a blocking deadlock cannot poll an
+# in-test timer. nextest runs each test in its own process and names it when terminating it.
+[profile.ci]
+fail-fast = false
+slow-timeout = { period = "60s", terminate-after = 5, grace-period = "2s" }
+
+[[profile.ci.overrides]]
+filter = 'test(run::tests::) | test(prune::tests::)'
+slow-timeout = { period = "30s", terminate-after = 2, grace-period = "2s" }
+
+# Opt-in blocking canary, absent from normal builds. Keep this short enough to exercise in CI.
+[[profile.ci.overrides]]
+filter = 'test(=testutil::deliberately_hanging_timeout_canary)'
+slow-timeout = { period = "1s", terminate-after = 1, grace-period = "0s" }

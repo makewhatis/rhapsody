@@ -15,6 +15,7 @@ lint:
 	harness/prompt/prompt_test.sh
 	.github/scripts/check-plugin.sh
 	.github/scripts/check-plugin_test.sh
+	python3 harness/ci/check-process-leaks_test.py
 
 # Recapture golden fixtures from the reference Go daemon (operator machine only; see harness/capture/)
 fixtures:

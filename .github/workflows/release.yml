@@ -39,6 +39,7 @@ concurrency:
 
 jobs:
   release-please:
+    timeout-minutes: 10
     name: Release Please
     # Self-hosted only, matching ci.yml — this repo runs no ubuntu-latest/GitHub-hosted runners.
     # release-please-action is a node action, so it runs on the runner's bundled node (TRA-239).
@@ -102,6 +103,7 @@ jobs:
   # the runner's Developer ID, verify Gatekeeper acceptance, and attach the installer assets to the
   # GitHub Release. Self-hosted (davds-macbook-pro-rhapsody), matching ci.yml's `desktop` job.
   build:
+    timeout-minutes: 90
     name: Signed dmg build & release upload
     needs: release-please
     # Real path: release-please created a release this run. Dry-run path: a human dispatched the
@@ -317,6 +319,7 @@ jobs:
   # desktop/README.md "Homebrew tap") this job cleanly SKIPS with a warning rather than turning the release
   # red. Skips on workflow_dispatch dry-runs (release_created is false).
   homebrew-bump:
+    timeout-minutes: 10
     name: Bump Homebrew cask
     needs: [release-please, build]
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
@@ -418,6 +421,7 @@ jobs:
   # first prerelease run creates it (the idempotency guard below stages the file *before* diffing, so a
   # brand-new file registers as a change rather than looking like a no-op) and pushes it to tap main.
   homebrew-bump-rc:
+    timeout-minutes: 10
     name: Bump Homebrew @rc cask
     needs: [release-please, build]
     if: ${{ github.event_name == 'workflow_dispatch' }}

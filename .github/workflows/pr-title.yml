@@ -37,6 +37,7 @@ jobs:
   # Job id `pr-title` is the branch-protection context name. Add it to the required checks alongside
   # lint/test/web (needs admin — see the PR body) or a bad title still merges.
   pr-title:
+    timeout-minutes: 5
     # Same fork-PR guard as ci.yml: on the self-hosted Linux runner every job runs only for a same-repo
     # PR, so a fork PR skips all of them and stays unmergeable until a maintainer pulls it to a
     # same-repo branch — at which point this check runs on that PR's title.

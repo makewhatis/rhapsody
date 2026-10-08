@@ -14,6 +14,36 @@ FIX="$ROOT/harness/fixtures"
 NORMALIZE="$ROOT/harness/capture/normalize.sh"
 WORK="$(mktemp -d)"
 
+# Separate groups for the two background children so cleanup also reaches their descendants.
+set -m
+STUB_PID=""
+DAEMON_PID=""
+cleanup() {
+  local pid
+  for pid in "$DAEMON_PID" "$STUB_PID"; do
+    [ -n "$pid" ] || continue
+    kill -TERM -- "-$pid" 2>/dev/null || true
+  done
+  # TERM alone + an unbounded wait used to hang cleanup if daemon shutdown got stuck.
+  for _ in $(seq 1 50); do
+    local alive=0
+    for pid in "$DAEMON_PID" "$STUB_PID"; do
+      [ -n "$pid" ] && kill -0 -- "-$pid" 2>/dev/null && alive=1
+    done
+    [ "$alive" = 0 ] && break
+    sleep 0.1
+  done
+  for pid in "$DAEMON_PID" "$STUB_PID"; do
+    [ -n "$pid" ] || continue
+    kill -KILL -- "-$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  done
+  rm -rf "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 # Build the dashboard bundle into crates/httpapi/web-dist/ (the rust-embed source), THEN the daemon —
 # the embed is compile-time, so the daemon MUST build after the dist exists for the dashboard to be
 # non-empty. Then linear-stub (the scripted Linear GraphQL double).
@@ -23,16 +53,6 @@ echo "boot-e2e: building rhapsodyd + linear-stub" >&2
 ( cd "$ROOT" && cargo build -p rhapsodyd -p linear-stub )
 RHAPSODYD="$ROOT/target/debug/rhapsodyd"
 STUB="$ROOT/target/debug/linear-stub"
-
-STUB_PID=""
-DAEMON_PID=""
-cleanup() {
-  [ -n "$DAEMON_PID" ] && kill "$DAEMON_PID" 2>/dev/null || true
-  [ -n "$STUB_PID" ] && kill "$STUB_PID" 2>/dev/null || true
-  wait 2>/dev/null || true
-  rm -rf "$WORK"
-}
-trap cleanup EXIT
 
 # --- start linear-stub (success scenario, ephemeral port) ---
 "$STUB" --scenario "$ROOT/harness/capture/scenarios/success.json" --port 0 >"$WORK/stub.log" 2>&1 &

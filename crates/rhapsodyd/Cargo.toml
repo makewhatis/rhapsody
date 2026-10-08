@@ -5,6 +5,10 @@ version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Test-only, deliberately blocking canary for the CI process-level timeout guard.
+test-timeout-canary = []
+
 [dependencies]
 # tokio: the daemon's async runtime. `rt-multi-thread` + `macros` for `#[tokio::main]` / the loop +
 # server tasks; `signal` for the SIGINT/SIGTERM graceful-shutdown handler (Go's
