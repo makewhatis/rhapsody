@@ -47,7 +47,7 @@ Cargo's cached files are copied into the session's scratch home. Build from a sc
 ```sh
 cp -R /repo /scratch/project
 cd /scratch/project
-cargo test --locked --offline
+TMPDIR=/scratch cargo test --locked --offline
 ```
 
 For npm, copy the project's `node_modules` from `/cache/npm/<repository-relative-project-path>` into

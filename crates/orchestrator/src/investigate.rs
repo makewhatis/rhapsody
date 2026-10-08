@@ -354,9 +354,8 @@ impl Session {
         if state.exit_code != 0 || state.stdout.trim() != "true false" {
             return Err(InvestigateError::SessionLost);
         }
-        if matches!(output.exit_code, 124 | 137) {
-            return Err(InvestigateError::CommandTimeout);
-        }
+        // The executor's wall-clock deadline is authoritative. Shells can legitimately return
+        // GNU timeout's reserved status values too; do not invent a cause from an exit code.
         Ok(output)
     }
 
@@ -1071,7 +1070,10 @@ mod tests {
                 || cmd.contains(".ssh")
                 || cmd.contains("opencode");
             Ok(CommandOutput {
-                exit_code: i32::from(is_refusal && !escaped),
+                exit_code: cmd
+                    .strip_prefix("exit ")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or_else(|| i32::from(is_refusal && !escaped)),
                 stdout: if args[0] == "inspect" {
                     let state = self.state.lock().unwrap();
                     if state.is_empty() {
@@ -1214,6 +1216,24 @@ mod tests {
         let out = run_process(cmd, Duration::from_secs(3)).await.unwrap();
         assert!(out.truncated);
         assert_eq!(out.stdout.len() + out.stderr.len(), 65536);
+    }
+
+    #[tokio::test]
+    async fn ordinary_exit_codes_are_values_not_deadlines() {
+        let exec = Arc::new(Fake::default());
+        let session = Session::create(exec, "codes".into(), "/owned/tree", "cache", "image")
+            .await
+            .unwrap();
+        for code in [124, 137] {
+            assert_eq!(
+                session
+                    .command(&format!("exit {code}"))
+                    .await
+                    .unwrap()
+                    .exit_code,
+                code
+            );
+        }
     }
 
     #[tokio::test]
@@ -1580,8 +1600,18 @@ mod tests {
         )
         .await
         .unwrap();
-        let out = session.command("cp -R /repo /scratch/project && cd /scratch/project && cargo run --locked --offline && rg investigate Cargo.toml && ! touch /cache/write-probe && ! env | cut -d= -f1 | rg '(_TOKEN|_KEY)$'").await.unwrap();
+        let out = session.command("cp -R /repo /scratch/project && cd /scratch/project && TMPDIR=/scratch cargo run --locked --offline && rg investigate Cargo.toml && ! touch /cache/write-probe && ! env | cut -d= -f1 | rg '(_TOKEN|_KEY)$'").await.unwrap();
         assert_eq!(out.exit_code, 0, "{} {}", out.stdout, out.stderr);
+        for code in [124, 137] {
+            assert_eq!(
+                session
+                    .command(&format!("exit {code}"))
+                    .await
+                    .unwrap()
+                    .exit_code,
+                code
+            );
+        }
         println!(
             "offline build/grep/read-only cache proof: {} {}",
             out.stdout, out.stderr
