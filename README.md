@@ -65,7 +65,11 @@ reference (the parity goldens stay byte-strict).
 
 The isolated manager role adds `docs_read(path)`, `docs_list(glob)` and
 `tracker_documents(project|issue, query, excerpt)` via GET-only `/api/v1/manager/docs/{read,list}`
-and `/api/v1/manager/tracker/documents`. A live host-bound manager role is required. Claude's
+and `/api/v1/manager/tracker/documents`. A live host-bound manager role is required. These new
+docs/tracker GETs also require the operator browser-origin proof: socket-bound loopback Host,
+exactly one `X-Rhapsody-Operator: 1`, and no cookie, preflight or foreign Origin/fetch metadata.
+The MCP facade supplies the header; a public live run id alone cannot authorize a browser read.
+This excludes remote pages/DNS rebinding, not other same-user local processes. Claude's
 explicit MCP allowlist and OpenCode's server-prefixed permissions allow these reads without
 enabling any built-in file, shell or web tool. The daemon keeps the tracker key; no document-write
 tool is added. Manager `symphony_ticket` augments its existing run/review history with the scoped

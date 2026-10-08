@@ -537,6 +537,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn commissioned_evidence_refuses_browser_reads_before_touching_the_provider() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_manager_outcome(Ok(
+            serde_json::json!({"content":"private findings", "untrusted":true}),
+        )));
+        let base = spawn(provider.clone()).await;
+        let port = base.rsplit(':').next().unwrap();
+        let client = reqwest::Client::new();
+        let good_host = format!("127.0.0.1:{port}");
+        let good_origin = format!("http://{good_host}");
+        for suffix in [
+            "docs/read?run_id=7&path=STUDIO-1142-findings.md",
+            "docs/list?run_id=7&glob=*",
+            "tracker/documents?run_id=7&project=rhapsody",
+            "tracker/ticket?run_id=7&identifier=STUDIO-598",
+        ] {
+            let path = format!("{base}/api/v1/manager/{suffix}");
+            for headers in [
+                vec![],
+                vec![("x-rhapsody-operator", "0".to_string())],
+                vec![("x-rhapsody-operator", "1, 1".to_string())],
+                vec![
+                    ("x-rhapsody-operator", "1".to_string()),
+                    ("x-rhapsody-operator", "1".to_string()),
+                ],
+                // Same-origin after rebinding, even if the page knew the public manager id.
+                vec![
+                    ("host", format!("rebind.example:{port}")),
+                    ("origin", format!("http://rebind.example:{port}")),
+                    ("sec-fetch-site", "same-origin".to_string()),
+                ],
+                vec![
+                    ("x-rhapsody-operator", "1".to_string()),
+                    ("host", format!("rebind.example:{port}")),
+                    ("x-forwarded-host", good_host.clone()),
+                ],
+                vec![
+                    ("x-rhapsody-operator", "1".to_string()),
+                    ("origin", "https://evil.example".to_string()),
+                ],
+                vec![
+                    ("x-rhapsody-operator", "1".to_string()),
+                    ("origin", "null".to_string()),
+                ],
+                vec![
+                    ("x-rhapsody-operator", "1".to_string()),
+                    ("origin", good_origin.clone()),
+                    ("origin", good_origin.clone()),
+                ],
+                vec![
+                    ("x-rhapsody-operator", "1".to_string()),
+                    ("sec-fetch-site", "cross-site".to_string()),
+                ],
+                vec![
+                    ("x-rhapsody-operator", "1".to_string()),
+                    ("cookie", "session=x".to_string()),
+                ],
+            ] {
+                let mut request = client.get(&path);
+                for (name, value) in headers {
+                    request = request.header(name, value);
+                }
+                let response = request.send().await.unwrap();
+                assert_eq!(response.status(), 403, "{suffix}");
+                assert_eq!(
+                    body_json(response).await["error"]["code"],
+                    "operator_read_forbidden"
+                );
+                assert_eq!(provider.calls(), 0, "a denied read touched the provider");
+            }
+            let response = client
+                .request(reqwest::Method::OPTIONS, &path)
+                .header("origin", "https://evil.example")
+                .header("access-control-request-method", "GET")
+                .header("access-control-request-headers", "x-rhapsody-operator")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 403);
+            assert!(
+                !response
+                    .headers()
+                    .contains_key("access-control-allow-origin")
+            );
+            assert_eq!(provider.calls(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn commissioned_evidence_routes_are_get_only_and_forward_declared_args() {
         for (suffix, signature) in [
             (
@@ -559,7 +647,15 @@ mod tests {
             );
             let url = spawn(provider.clone()).await;
             let path = format!("{url}/api/v1/manager/{suffix}");
-            assert_eq!(reqwest::get(&path).await.unwrap().status(), 200);
+            assert_eq!(
+                crate::testutil::operator_client()
+                    .get(&path)
+                    .send()
+                    .await
+                    .unwrap()
+                    .status(),
+                200
+            );
             assert_eq!(provider.manager_asked().as_deref(), Some(signature));
             for method in [
                 reqwest::Method::POST,
@@ -590,7 +686,9 @@ mod tests {
                 FakeProvider::ok(empty_snapshot()).with_manager_outcome(Err(error)),
             ))
             .await;
-            let response = reqwest::get(format!("{url}/api/v1/manager/docs/read?run_id=7&path=x"))
+            let response = crate::testutil::operator_client()
+                .get(format!("{url}/api/v1/manager/docs/read?run_id=7&path=x"))
+                .send()
                 .await
                 .unwrap();
             assert_eq!(response.status(), status);

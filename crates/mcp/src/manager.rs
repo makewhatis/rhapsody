@@ -170,7 +170,7 @@ impl Facade {
             "/api/v1/manager/tracker/ticket{}",
             encode_query(vec![("run_id", run_id), ("identifier", identifier.into())])
         );
-        let tracker = match self.client.get(&path).await {
+        let tracker = match self.client.get_operator(&path).await {
             Ok(body) => body,
             Err(e) => return err_result(&e),
         };
@@ -214,7 +214,7 @@ impl Facade {
         query.push(("run_id", run_id));
         match self
             .client
-            .get(&format!("{endpoint}{}", encode_query(query)))
+            .get_operator(&format!("{endpoint}{}", encode_query(query)))
             .await
         {
             Ok(body) => text_result(&body),
@@ -642,10 +642,10 @@ mod tests {
     #[tokio::test]
     async fn evidence_tools_proxy_own_run_and_ticket_preserves_history_fields() {
         let router = Router::new()
-            .route("/api/v1/manager/docs/read", get(|uri: axum::http::Uri| async move { assert_eq!(uri.query(), Some("path=STUDIO-1142-findings.md&run_id=42")); r#"{"content":"valid document-only review","untrusted":true}"# }))
-            .route("/api/v1/manager/docs/list", get(|uri: axum::http::Uri| async move { assert_eq!(uri.query(), Some("glob=STUDIO-%2A&run_id=42")); r#"{"files":[],"truncated":false}"# }))
-            .route("/api/v1/manager/tracker/documents", get(|uri: axum::http::Uri| async move { assert_eq!(uri.query(), Some("excerpt=true&project=rhapsody&query=plugins&run_id=42")); r#"{"documents":[{"title":"plugins","url":"https://linear.app/document/plugins","updated_at":"2026-08-29"}],"truncated":false,"untrusted":true}"# }))
-            .route("/api/v1/manager/tracker/ticket", get(|uri: axum::http::Uri| async move { assert_eq!(uri.query(), Some("identifier=STUDIO-598&run_id=42")); r#"{"issue":{"identifier":"STUDIO-598","description":"design only"},"documents":[{"url":"https://linear.app/document/plugins"}],"documents_truncated":false,"untrusted":true}"# }))
+            .route("/api/v1/manager/docs/read", get(|uri: axum::http::Uri, headers: axum::http::HeaderMap| async move { assert_eq!(headers.get(crate::client::OPERATOR_HEADER).and_then(|v| v.to_str().ok()), Some("1")); assert_eq!(uri.query(), Some("path=STUDIO-1142-findings.md&run_id=42")); r#"{"content":"valid document-only review","untrusted":true}"# }))
+            .route("/api/v1/manager/docs/list", get(|uri: axum::http::Uri, headers: axum::http::HeaderMap| async move { assert_eq!(headers.get(crate::client::OPERATOR_HEADER).and_then(|v| v.to_str().ok()), Some("1")); assert_eq!(uri.query(), Some("glob=STUDIO-%2A&run_id=42")); r#"{"files":[],"truncated":false}"# }))
+            .route("/api/v1/manager/tracker/documents", get(|uri: axum::http::Uri, headers: axum::http::HeaderMap| async move { assert_eq!(headers.get(crate::client::OPERATOR_HEADER).and_then(|v| v.to_str().ok()), Some("1")); assert_eq!(uri.query(), Some("excerpt=true&project=rhapsody&query=plugins&run_id=42")); r#"{"documents":[{"title":"plugins","url":"https://linear.app/document/plugins","updated_at":"2026-08-29"}],"truncated":false,"untrusted":true}"# }))
+            .route("/api/v1/manager/tracker/ticket", get(|uri: axum::http::Uri, headers: axum::http::HeaderMap| async move { assert_eq!(headers.get(crate::client::OPERATOR_HEADER).and_then(|v| v.to_str().ok()), Some("1")); assert_eq!(uri.query(), Some("identifier=STUDIO-598&run_id=42")); r#"{"issue":{"identifier":"STUDIO-598","description":"design only"},"documents":[{"url":"https://linear.app/document/plugins"}],"documents_truncated":false,"untrusted":true}"# }))
             .route("/api/v1/issues/STUDIO-598/history", get(|| async { r#"{"identifier":"STUDIO-598","runs":[{"id":7}],"reviews":[{"id":8}],"verdicts":[]}"# }));
         let port = spawn_router(router).await;
         let client = connect(Facade::new(

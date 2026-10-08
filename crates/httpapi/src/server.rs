@@ -901,13 +901,16 @@ where
         // the run's own `run_id`. `/api/v1/manager/pr/activity` and `/pr/commits` are more specific
         // than `/pr`; axum's matchit dispatches them regardless of order.
         .route("/api/v1/manager/file", any(handle_manager_file))
-        .route("/api/v1/manager/docs/read", any(handle_docs_read))
-        .route("/api/v1/manager/docs/list", any(handle_docs_list))
+        .route("/api/v1/manager/docs/read", operator_read(handle_docs_read))
+        .route("/api/v1/manager/docs/list", operator_read(handle_docs_list))
         .route(
             "/api/v1/manager/tracker/documents",
-            any(handle_tracker_documents),
+            operator_read(handle_tracker_documents),
         )
-        .route("/api/v1/manager/tracker/ticket", any(handle_manager_ticket))
+        .route(
+            "/api/v1/manager/tracker/ticket",
+            operator_read(handle_manager_ticket),
+        )
         .route(
             "/api/v1/manager/operator-preferences",
             any(handle_operator_preferences),
@@ -1051,6 +1054,17 @@ where
     T: 'static,
 {
     any(handler).layer(axum::middleware::from_fn(require_operator_write))
+}
+
+/// New sensitive evidence GETs share the browser-origin proof, without enabling any mutation.
+fn operator_read<H, T>(handler: H) -> MethodRouter<ApiState>
+where
+    H: Handler<T, ApiState>,
+    T: 'static,
+{
+    any(handler).layer(axum::middleware::from_fn(
+        crate::operator_guard::require_operator_read,
+    ))
 }
 
 /// The router state: the read [`StateProvider`] + the optional process-log [`LogSource`]. Mirrors Go's
