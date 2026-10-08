@@ -126,6 +126,14 @@ impl From<rusqlite::Error> for StoreError {
 /// err)` triple for a single lookup becomes `Result<Option<_>, _>`, and Go pointer fields map to
 /// [`Option`].
 pub trait Store {
+    /// Atomically deduplicates tech-lead work on (subject, question). Zero means storage is off.
+    fn enqueue_lead_item(&self, _trigger: &LeadTrigger, _at: &str) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+    /// Durable lead queue, oldest first, including parked/completed items.
+    fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
+        Ok(Vec::new())
+    }
     // --- run lifecycle (write-through from the orchestrator actor) ---
     fn start_run(&self, r: RunStart) -> Result<i64, StoreError>;
     fn end_run(&self, run_id: i64, e: RunEnd) -> Result<(), StoreError>;

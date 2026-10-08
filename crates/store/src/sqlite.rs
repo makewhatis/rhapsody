@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 28;
+const SCHEMA_VERSION: i64 = 29;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -630,6 +630,20 @@ CREATE TABLE rhapsody_turn_spend (
 CREATE INDEX rhapsody_turn_spend_at ON rhapsody_turn_spend(at);
 CREATE INDEX rhapsody_turn_spend_model ON rhapsody_turn_spend(provider, model, harness_priced);
 "#,
+    // v28 -> v29: tech-lead queue (STUDIO-1134). Go-owned schema remains byte-identical.
+    r#"
+CREATE TABLE rhapsody_lead_items (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  trigger TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  question TEXT NOT NULL,
+  detail TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  state TEXT NOT NULL DEFAULT 'queued' CHECK (state IN ('queued', 'running', 'parked', 'done')),
+  attempts_on_question INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (subject, question)
+);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1157,6 +1171,70 @@ impl Sqlite {
 }
 
 impl Store for Sqlite {
+    fn enqueue_lead_item(&self, trigger: &LeadTrigger, at: &str) -> Result<i64, StoreError> {
+        let (kind, question, detail) = trigger.queue_parts();
+        let subject = trigger.subject();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO rhapsody_lead_items (trigger, subject, question, detail, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (subject, question) DO NOTHING",
+            params![kind, subject, question, detail, at],
+        )?;
+        let id = tx.query_row(
+            "SELECT id FROM rhapsody_lead_items WHERE subject = ?1 AND question = ?2",
+            params![subject, question],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(id)
+    }
+
+    fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT id, trigger, subject, detail, created_at, state, attempts_on_question \
+             FROM rhapsody_lead_items ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let kind: String = row.get(1)?;
+            let subject: String = row.get(2)?;
+            let detail: String = row.get(3)?;
+            let trigger = match kind.as_str() {
+                "blocked_handoff" => LeadTrigger::BlockedHandoff {
+                    ticket: subject.clone(),
+                    question: detail,
+                },
+                "review_escalation" => LeadTrigger::ReviewEscalation {
+                    pr: subject.clone(),
+                    head: detail,
+                },
+                "impossible_state" => LeadTrigger::ImpossibleState {
+                    subject: subject.clone(),
+                    kind: detail,
+                },
+                "limit_judgment" => LeadTrigger::LimitJudgment {
+                    account: subject.clone(),
+                },
+                _ => {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        1,
+                        "trigger".into(),
+                        rusqlite::types::Type::Text,
+                    ));
+                }
+            };
+            Ok(LeadItem {
+                id: row.get(0)?,
+                trigger,
+                subject,
+                created_at: row.get(4)?,
+                state: row.get(5)?,
+                attempts_on_question: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<Vec<_>, _>>()?)
+    }
     fn start_run(&self, r: RunStart) -> Result<i64, StoreError> {
         let started = if r.started_at.is_empty() {
             now_rfc3339()
@@ -8008,6 +8086,7 @@ mod tests {
                 "rhapsody_turn_spend".to_string(),
                 "rhapsody_turn_spend_at".to_string(),
                 "rhapsody_turn_spend_model".to_string(),
+                "rhapsody_lead_items".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
@@ -9703,6 +9782,107 @@ mod tests {
     #[test]
     fn v25_upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs() {
         upgrade_counts_verdicts_not_failed_or_clean_undeclared_runs(25);
+    }
+
+    #[test]
+    fn lead_queue_upgrades_reopens_and_round_trips_every_trigger() {
+        let dir = scratch_dir();
+        let db = dir.join("lead.db");
+        {
+            let conn = Connection::open(&db).expect("old db");
+            for migration in &MIGRATIONS[..28] {
+                conn.execute_batch(migration).expect("migration");
+            }
+            conn.pragma_update(None, "user_version", 28)
+                .expect("version");
+        }
+        let triggers = [
+            LeadTrigger::BlockedHandoff {
+                ticket: "STUDIO-1123".into(),
+                question: "Which Event representation?\nAuthorize the source?".into(),
+            },
+            LeadTrigger::ReviewEscalation {
+                pr: "owner/repo#294".into(),
+                head: "head-a".into(),
+            },
+            LeadTrigger::ImpossibleState {
+                subject: "owner/repo#290".into(),
+                kind: "zero_verdict_escalation".into(),
+            },
+            LeadTrigger::LimitJudgment {
+                account: "claude-subscription".into(),
+            },
+        ];
+        let store = Sqlite::open(StorePath::Disk(db.clone())).expect("upgrade");
+        for trigger in &triggers {
+            let id = store
+                .enqueue_lead_item(trigger, "2026-10-07T00:00:00Z")
+                .expect("enqueue");
+            assert!(id > 0);
+            assert_eq!(
+                store
+                    .enqueue_lead_item(trigger, "2026-10-08T00:00:00Z")
+                    .expect("dedupe"),
+                id
+            );
+        }
+        let before = store.load_lead_items().expect("items");
+        assert_eq!(
+            before.iter().map(|i| &i.trigger).collect::<Vec<_>>(),
+            triggers.iter().collect::<Vec<_>>()
+        );
+        assert!(before.iter().all(|i| i.created_at == "2026-10-07T00:00:00Z"
+            && i.state == "queued"
+            && i.attempts_on_question == 0));
+        drop(store);
+        let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
+        assert_eq!(store.load_lead_items().expect("items"), before);
+    }
+
+    #[test]
+    fn lead_queue_concurrent_detections_share_one_item_and_do_not_charge_attempts() {
+        let store = std::sync::Arc::new(open_mem());
+        let trigger = LeadTrigger::BlockedHandoff {
+            ticket: "STUDIO-1123".into(),
+            question: "authorize  the\nsource?".into(),
+        };
+        let a = store.clone();
+        let t = trigger.clone();
+        let task = std::thread::spawn(move || {
+            a.enqueue_lead_item(&t, "2026-10-07T00:00:00Z")
+                .expect("enqueue")
+        });
+        let id = store
+            .enqueue_lead_item(
+                &LeadTrigger::BlockedHandoff {
+                    ticket: "STUDIO-1123".into(),
+                    question: "authorize the source?".into(),
+                },
+                "2026-10-07T00:00:00Z",
+            )
+            .expect("enqueue");
+        assert_eq!(task.join().expect("thread"), id);
+        let items = store.load_lead_items().expect("items");
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].attempts_on_question, 0);
+    }
+
+    #[test]
+    fn lead_queue_storage_errors_are_returned() {
+        let store = open_mem();
+        store
+            .lock()
+            .execute_batch("DROP TABLE rhapsody_lead_items;")
+            .expect("failure injection");
+        let trigger = LeadTrigger::LimitJudgment {
+            account: "claude-subscription".into(),
+        };
+        assert!(
+            store
+                .enqueue_lead_item(&trigger, "2026-10-07T00:00:00Z")
+                .is_err()
+        );
+        assert!(store.load_lead_items().is_err());
     }
 
     #[test]
