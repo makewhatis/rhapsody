@@ -110,6 +110,8 @@ pub struct TriageSnapshot {
 /// must never be logged).
 #[derive(Default, Clone)]
 pub struct ReadsTarget {
+    /// Policy thresholds for the read-only Accounts panel, published on workflow reload.
+    pub limits: rhapsody_config::Limits,
     pub tracker: Option<Arc<dyn Tracker>>,
     pub api_key: String,
     /// Every ENABLED project's slug-bound tracker, in poll order (STUDIO-671), each carrying the
