@@ -274,7 +274,12 @@ impl Orchestrator {
             projects: self.project_statuses(),
             // STUDIO-898: empty unless the reconciliation sweep reported something, which keeps the
             // wire payload — and the golden — exactly as it was on every healthy daemon.
-            review_divergence: self.review_divergences().to_vec(),
+            review_divergence: self
+                .review_divergences()
+                .iter()
+                .cloned()
+                .chain(self.lead_human_feed())
+                .collect(),
             // STUDIO-949: the current hold set, replaced every selection pass; empty on a daemon with
             // no human-gated ticket, which keeps the wire payload — and the golden — unchanged.
             held_for_human: self.human_holds.held(),

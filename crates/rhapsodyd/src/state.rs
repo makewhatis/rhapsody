@@ -179,6 +179,9 @@ impl DaemonState {
 
 #[async_trait]
 impl StateProvider for DaemonState {
+    fn lead_reports(&self) -> Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>> {
+        self.handle.lead_reports()
+    }
     fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
         self.handle.accounts(Utc::now().timestamp())
     }

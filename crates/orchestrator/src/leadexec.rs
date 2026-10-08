@@ -51,6 +51,47 @@ struct RuntimeHost<'a> {
     pr: Option<String>,
 }
 
+pub(crate) fn overrule_context(
+    store: &dyn Store,
+    item: &LeadItem,
+) -> Result<Option<(LeadItem, rhapsody_store::LeadDecisionRow)>, String> {
+    let rhapsody_store::LeadTrigger::Overrule { decision, .. } = &item.trigger else {
+        return Ok(None);
+    };
+    let rows = stored(store.load_lead_decisions())?;
+    let items = stored(store.load_lead_items())?;
+    let row = rows
+        .iter()
+        .find(|r| r.id == *decision)
+        .ok_or("overruled decision missing")?
+        .clone();
+    let mut current = items
+        .iter()
+        .find(|i| i.id == row.item)
+        .ok_or("overruled subject missing")?
+        .clone();
+    let mut previous = row.id;
+    while let rhapsody_store::LeadTrigger::Overrule { decision, .. } = current.trigger {
+        if decision >= previous {
+            return Err("invalid overrule ancestry".into());
+        }
+        let ancestor = rows
+            .iter()
+            .find(|r| r.id == decision)
+            .ok_or("overruled ancestor missing")?;
+        current = items
+            .iter()
+            .find(|i| i.id == ancestor.item)
+            .ok_or("overruled ancestor subject missing")?
+            .clone();
+        previous = decision;
+    }
+    if current.subject != item.subject {
+        return Err("overrule subject changed".into());
+    }
+    Ok(Some((current, row)))
+}
+
 impl RuntimeHost<'_> {
     fn tokenless(&self, text: &str) -> String {
         let text = crate::managerapply::strip_summon_tokens(text);
@@ -67,6 +108,8 @@ impl LeadRuntime {
         &self,
         item: LeadItem,
     ) -> Result<Option<(LeadCase, crate::managerrun::ManagerRun)>, String> {
+        let original = overrule_context(self.store.as_ref(), &item)?;
+        let trigger = original.as_ref().map_or(&item.trigger, |(i, _)| &i.trigger);
         let pr = crate::managerintervention::parse_pr_key(&item.subject);
         let ticket = if pr.is_some() {
             stored(self.store.load_review_watch())?
@@ -78,10 +121,7 @@ impl LeadRuntime {
                 .and_then(|row| crate::reviewdone::origin_ticket(&row.introduced_by))
                 .unwrap_or("")
                 .to_string()
-        } else if matches!(
-            item.trigger,
-            rhapsody_store::LeadTrigger::LimitJudgment { .. }
-        ) {
+        } else if matches!(trigger, rhapsody_store::LeadTrigger::LimitJudgment { .. }) {
             String::new()
         } else {
             item.subject.clone()
@@ -109,7 +149,7 @@ impl LeadRuntime {
             let pr_key = pr
                 .as_ref()
                 .map(|p| format!("{}/{}#{}", p.owner, p.repo, p.number))
-                .or_else(|| match &item.trigger {
+                .or_else(|| match trigger {
                     rhapsody_store::LeadTrigger::BreakerHold { pr, .. } if !pr.is_empty() => {
                         Some(pr.clone())
                     }
@@ -154,7 +194,7 @@ impl LeadRuntime {
                 return Ok(None);
             }
             let previous = stored(self.store.lead_execution(item.id))?.unwrap_or_default();
-            let evidence = crate::managerapply::strip_summon_tokens(&format!(
+            let mut evidence = crate::managerapply::strip_summon_tokens(&format!(
                 "Lead item {}\nTrigger: {:?}\nSubject snapshot: {}\nPrior route backs on this question: {}\nCommission findings: {}",
                 item.id,
                 item.trigger,
@@ -162,6 +202,9 @@ impl LeadRuntime {
                 item.attempts_on_question,
                 previous.findings
             ));
+            if let Some((_, row)) = &original {
+                evidence.push_str(&format!("\nThe operator overruled decision {}: {}. Decide how to undo or redo. Previous actions: {}\nPrevious reasoning: {}", row.id, row.overrule_note.as_deref().unwrap_or_default(), row.actions, row.reasoning));
+            }
             // Host prose can contain credentials from a tracker; never carry them into model/audit.
             if crate::managerdecision::contains_secret_shape(&evidence) {
                 return Err(
@@ -221,12 +264,20 @@ impl LeadRuntime {
             ticket: case.subject.ticket.identifier.clone(),
             pr: case.subject.pr.clone(),
         };
-        execute(self.store.as_ref(), &host, case, text, harness, model).await
+        let result = execute(self.store.as_ref(), &host, case, text, harness, model).await;
+        self.control.wake_lead_reports();
+        result
     }
 }
 
 #[async_trait]
 impl LeadHost for RuntimeHost<'_> {
+    fn report_ready(&self) {
+        self.runtime.control.wake_lead_reports();
+    }
+    fn advises(&self) -> bool {
+        self.runtime.teams.manager.lead.authority == rhapsody_config::teams::LeadAuthority::Advise
+    }
     async fn admit_action(&self) -> Result<(), String> {
         if self
             .runtime
@@ -573,6 +624,10 @@ pub struct LeadResult {
 
 #[async_trait]
 pub trait LeadHost: Send + Sync {
+    fn report_ready(&self) {}
+    fn advises(&self) -> bool {
+        false
+    }
     /// Admission is checked for effects, not for their read-back: moving to Todo may legitimately
     /// start an author before the confirmation read. Reads themselves grant no authority.
     async fn admit_action(&self) -> Result<(), String> {
@@ -768,7 +823,16 @@ pub async fn execute(
         return Err("lead requires durable decision storage".into());
     }
     let mut expected = current;
-    if result.state != "queued" && result.escalation.is_none() {
+    if result.state != "queued"
+        && result.escalation.is_none()
+        && let Some(LeadAction::Escalate { need }) = actions.first()
+    {
+        result.escalation = Some(need.clone());
+    }
+    if host.advises() && result.state != "queued" && result.escalation.is_none() {
+        result.state = "proposed".into();
+    }
+    if result.state != "queued" && result.state != "proposed" && result.escalation.is_none() {
         for action in &actions {
             if host.admit_action().await.is_err() {
                 result.escalation =
@@ -851,7 +915,15 @@ pub async fn execute(
     };
     row.decision = summary.clone();
     stored(store.save_lead_decision(&row))?;
-    stored(store.set_lead_item_state(item.id, &result.state))?;
+    host.report_ready();
+    stored(store.set_lead_item_state(
+        item.id,
+        if result.state == "proposed" {
+            "done"
+        } else {
+            &result.state
+        },
+    ))?;
     let trail = LeadTrail {
         text: crate::managerapply::strip_summon_tokens(&format!(
             "Lead decision {} ({} via {}): {summary}",

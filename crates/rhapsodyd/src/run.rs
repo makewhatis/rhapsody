@@ -457,14 +457,16 @@ where
         o.teams = Some(teams_cfg.clone());
         // A failed sandbox self-test disables only investigate, never manager authority.
         if teams_cfg.enabled
+            && teams_cfg.manager.lead.investigate.enabled
             && (teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off
                 || teams_cfg.manager.lead.enabled)
             && let Some(cfg) = resolved.as_ref()
         {
             o.investigate = Some(
-                rhapsody_orchestrator::investigate::Investigations::boot(std::path::PathBuf::from(
-                    &cfg.workspace.root,
-                ))
+                rhapsody_orchestrator::investigate::Investigations::boot_configured(
+                    std::path::PathBuf::from(&cfg.workspace.root),
+                    teams_cfg.manager.lead.investigate.clone(),
+                )
                 .await,
             );
         }
@@ -675,6 +677,14 @@ where
     ))
         as Arc<dyn rhapsody_orchestrator::ghsummons::ManagerGhSource>);
 
+    let (lead_report_tx, lead_report_rx) = tokio::sync::mpsc::unbounded_channel();
+    if teams_cfg.enabled && teams_cfg.manager.lead.enabled && durable_store {
+        o.lead_reports = Some(Arc::new(rhapsody_orchestrator::leadreport::LeadReports {
+            store: store.clone(),
+            memory: o.teams_memory.as_ref().map(|m| m.backend()),
+        }));
+        o.lead_report_tx = Some(lead_report_tx);
+    }
     // The off-loop HTTP surface, snapshotted BEFORE the orchestrator moves into the control-loop task.
     let handle = o.control();
     if teams_cfg.enabled && teams_cfg.manager.lead.enabled && durable_store {
@@ -1304,6 +1314,22 @@ where
         }
     }
     let limit_report_ctx = shutdown.wait();
+    let lead_report_task = o.lead_reports.clone().map(|reports| {
+        let ctx = shutdown.wait();
+        let digest_at = teams_cfg.manager.lead.digest_at.clone();
+        let dashboard = manager_api_port
+            .map(|port| format!("http://127.0.0.1:{port}/#lead"))
+            .unwrap_or_default();
+        let channels = limit_channels.clone();
+        tokio::spawn(rhapsody_orchestrator::leadreport::run_report_task(
+            ctx,
+            reports,
+            digest_at,
+            dashboard,
+            channels,
+            lead_report_rx,
+        ))
+    });
     let limit_report_comments = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
         &resolved
             .as_ref()
@@ -1681,6 +1707,9 @@ where
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     let _ = tokio::time::timeout(SHUTDOWN_DRAIN, limit_report_task).await;
+    if let Some(task) = lead_report_task {
+        let _ = tokio::time::timeout(SHUTDOWN_DRAIN, task).await;
+    }
     // The manager applier task (STUDIO-1016) is drained last of the review tasks: its receive ends
     // when the control task drops the orchestrator (and with it the sender), so the wait is bounded
     // by whatever `gh pr comment` or ticket move is already in flight.

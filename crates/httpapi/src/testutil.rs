@@ -55,6 +55,7 @@ impl FakeResumeHoldError {
 /// fake. The history store defaults to a [`Noop`] (Go's `fakeProvider.Store()` returns `store.Noop()`
 /// when `hist == nil`), so an endpoint that reads history without a seeded store still degrades to `[]`.
 pub(crate) struct FakeProvider {
+    lead_reports: Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>>,
     snap: Snapshot,
     snap_err: Option<String>,
     history: Arc<dyn HistoryStore>,
@@ -183,6 +184,13 @@ pub(crate) struct FakeProvider {
 }
 
 impl FakeProvider {
+    pub(crate) fn with_lead_reports(
+        mut self,
+        reports: Arc<rhapsody_orchestrator::leadreport::LeadReports>,
+    ) -> Self {
+        self.lead_reports = Some(reports);
+        self
+    }
     pub(crate) fn with_accounts(
         mut self,
         accounts: Vec<rhapsody_orchestrator::accounts::AccountView>,
@@ -232,6 +240,7 @@ impl FakeProvider {
             workflow_path: String::new(),
             capabilities_registry: None,
             teams_memory: None,
+            lead_reports: None,
             teams_config_path: String::new(),
             issue_lifecycles: HashMap::new(),
             issue_lifecycles_asked: Mutex::new(Vec::new()),
@@ -652,6 +661,10 @@ impl FakeProvider {
 
 #[async_trait]
 impl StateProvider for FakeProvider {
+    fn lead_reports(&self) -> Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>> {
+        self.touch();
+        self.lead_reports.clone()
+    }
     fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
         self.accounts.clone()
     }

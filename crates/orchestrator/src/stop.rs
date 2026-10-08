@@ -196,6 +196,12 @@ pub struct ControlHandle {
     /// The SAME off-loop investigation runtime as the orchestrator (STUDIO-1135). Only live
     /// manager run ids are bound; requests never carry a caller-selected repository or host path.
     pub(crate) investigate: Option<std::sync::Arc<crate::investigate::Investigations>>,
+
+    /// Boot-loaded lead reporting service; HTTP reads/overrules stay off the control task.
+    pub(crate) lead_reports: Option<std::sync::Arc<crate::leadreport::LeadReports>>,
+
+    /// Wake the off-loop reporter as soon as an escalation decision is durable.
+    pub(crate) lead_report_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
 }
 
 impl crate::orchestrator::Orchestrator {
@@ -229,6 +235,8 @@ impl crate::orchestrator::Orchestrator {
             diff: self.diff_deps.as_ref().map(std::sync::Arc::clone),
             manager_gh: self.manager_gh_deps.as_ref().map(std::sync::Arc::clone),
             investigate: self.investigate.clone(),
+            lead_reports: self.lead_reports.clone(),
+            lead_report_tx: self.lead_report_tx.clone(),
         }
     }
 }

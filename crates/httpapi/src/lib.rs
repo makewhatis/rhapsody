@@ -50,6 +50,7 @@ mod handlers;
 mod handlers_config;
 mod handlers_drain;
 mod handlers_history;
+mod handlers_lead;
 mod handlers_linear;
 mod handlers_logs;
 mod handlers_manager;

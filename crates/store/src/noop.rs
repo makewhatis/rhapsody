@@ -12,6 +12,30 @@ use crate::*;
 pub struct Noop;
 
 impl Store for Noop {
+    fn reserve_lead_run_daily(
+        &self,
+        _item: i64,
+        _pr: &str,
+        _max: i64,
+        _day: &str,
+        _daily_max: i64,
+    ) -> Result<LeadRunReservation, StoreError> {
+        Ok(LeadRunReservation::Exhausted)
+    }
+    fn lead_report_count(&self, _key: &str) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+    fn reserve_lead_report(&self, _key: &str, _max: i64) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn overrule_lead_decision(
+        &self,
+        _id: i64,
+        _note: &str,
+        _at: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(None)
+    }
     fn enqueue_lead_item(&self, _trigger: &LeadTrigger, _at: &str) -> Result<i64, StoreError> {
         Ok(0)
     }

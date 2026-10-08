@@ -61,6 +61,33 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Tech-lead reporting, daily budgets and operator overrules (STUDIO-1138)
+
+The opt-in lead adds `GET /api/v1/lead/decisions?since=` (RFC3339) and the
+operator-guarded `POST /api/v1/lead/decisions/{id}/overrule {note}`. Decisions name their
+subject/trigger, reasoning, evidence, actions, harness/model and overrule status. Overrule
+atomically records the note and queues distinct undo/redo work, retaining the operator's preference
+to `operator-decisions` with `by: David`. Missing memory is explicitly reported after the durable
+note/work commit; retrying the same note does not create another item. Overrule is not a direct
+rollback: the lead rechecks the subject before deciding how to undo or redo.
+
+`manager.lead` gains `authority: act|advise`, `digest_at: "08:00"` local,
+`max_lead_runs_per_day: 30`, and the investigation controls from the tech-lead specification.
+Investigation settings can tighten its existing hard ceilings (2 CPUs, 4g, 10-minute commands,
+30-minute sessions); disabling it leaves the manager's isolation/self-test intact.
+Advise decisions become terminal proposals in the human feed, without work mutations. Explicit
+escalations still page with the stated need. The console's Lead page lists the paper trail and
+offers Overrule in both the browser dashboard and desktop window.
+
+Migration **32** adds `rhapsody_lead_reporting`: local-day launch counts are charged atomically
+with the existing attempt/generation reservation, and notification dedupe survives restarts.
+At the daily cap, ordinary items stay queued until tomorrow; known escalation items and finalized
+escalation decisions page independently of model admission. The off-loop reporter sends one daily
+digest of yesterday's decisions/escalations plus queued work and links to `/#lead` (ntfy `Click`).
+Notification delivery is best-effort and bounded; a reservation precedes delivery, so failed
+channels log rather than repeatedly page. With the lead disabled, existing human-feed and
+Go-owned schema/payload goldens remain unchanged.
+
 ### Tech-lead decisions and guarded execution (STUDIO-1136)
 
 With the opt-in lead enabled, queued items launch on the manager's isolated, boot-self-tested

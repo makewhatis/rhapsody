@@ -20,6 +20,7 @@ struct RecordingHost {
     read_err: bool,
     action_err: bool,
     change_after: Option<(&'static str, &'static str)>,
+    advise: bool,
 }
 
 impl RecordingHost {
@@ -62,6 +63,9 @@ impl RecordingHost {
 
 #[async_trait]
 impl LeadHost for RecordingHost {
+    fn advises(&self) -> bool {
+        self.advise
+    }
     async fn admit_action(&self) -> Result<(), String> {
         if self.changed("revoked") {
             Err("admission revoked".into())
@@ -156,6 +160,29 @@ fn setup(question: &str) -> (Arc<Sqlite>, RecordingHost, LeadCase) {
         ..Default::default()
     };
     (store, host, case)
+}
+
+#[tokio::test]
+async fn lead_authority_advise_turns_actions_into_proposals() {
+    let (store, mut host, case) = setup("should retry?");
+    host.advise = true;
+    let result = replay(store.as_ref(), &host, &case, serde_json::json!([{ "action": "route_back", "ticket": "TEST-100", "answer": "Retry with a narrow diagnostic." }])).await;
+    assert_eq!(result.state, "proposed");
+    assert!(
+        host.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| !c.starts_with("prepend:")
+                && !c.starts_with("todo:")
+                && !c.starts_with("clear:"))
+    );
+    assert!(
+        store.load_lead_decisions().unwrap()[0]
+            .decision
+            .starts_with("proposed:")
+    );
+    assert_eq!(store.load_lead_items().unwrap()[0].attempts_on_question, 0);
 }
 
 async fn replay(
@@ -729,7 +756,7 @@ fn lead_launch_reuses_selftest_ordered_fallback_and_generation_budget() {
     use rhapsody_config::teams::{
         Identity, ManagerHarnessEntry, ReviewAuthority, ReviewMode, Teams,
     };
-    for limited_default in [false, true] {
+    for (limited_default, daily_cap) in [(false, false), (true, false), (false, true)] {
         let (store, _, case) = setup("which event shape?");
         store
             .save_lead_execution(&rhapsody_store::LeadExecution {
@@ -751,6 +778,9 @@ fn lead_launch_reuses_selftest_ordered_fallback_and_generation_budget() {
         let mut teams = Teams::disabled();
         teams.enabled = true;
         teams.manager.lead.enabled = true;
+        if daily_cap {
+            teams.manager.lead.max_lead_runs_per_day = 1;
+        }
         teams.manager.review_authority = ReviewAuthority::Act;
         teams.review.mode = ReviewMode::Ticketless;
         teams.manager.harnesses = vec![
@@ -853,6 +883,20 @@ fn lead_launch_reuses_selftest_ordered_fallback_and_generation_budget() {
             manager_text: None,
             refused: false,
         });
+        if daily_cap {
+            assert_eq!(dispatched.lock().unwrap().len(), 1);
+            assert_eq!(store.load_lead_items().unwrap()[0].state, "queued");
+            assert!(
+                o.lead_pending.is_empty(),
+                "a daily cap must not schedule an infrastructure escalation"
+            );
+            assert!(store.load_lead_decisions().unwrap().is_empty());
+            let tomorrow = chrono::Utc::now() + chrono::Duration::days(1);
+            o.now = Box::new(move || tomorrow);
+            o.handle_lead_prepared(case.item.id, Ok(Some((case, run))));
+            assert_eq!(dispatched.lock().unwrap().len(), 2);
+            continue;
+        }
         let spawned = dispatched.lock().expect("spawn");
         assert_eq!(spawned.len(), 2);
         assert_eq!(spawned[1].harness, "claude");

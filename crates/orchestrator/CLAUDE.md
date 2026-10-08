@@ -177,6 +177,10 @@ the `Orchestrator` struct itself. Concretely:
     reservations stay on the control task. The off-loop executor owns only the new
     lead decision/execution records and parked findings linkage, using the Store's
     existing connection lock. No new shared bookkeeping mutex is introduced.
+    `leadreport.rs` (STUDIO-1138) shares only that Store and memory backend with HTTP requests
+    and an off-loop reporting task. The control task reserves daily launches in the same Store
+    transaction as attempts/generations. Executor notifications wake the reporting task over a
+    channel; pages/digests are independent of launch admission and never perform I/O on control.
 
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from

@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 31;
+const SCHEMA_VERSION: i64 = 32;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -678,6 +678,13 @@ CREATE TABLE rhapsody_lead_execution (
   run_attempts INTEGER NOT NULL DEFAULT 0
 );
 "#,
+    // v31 -> v32: durable local-day run budgets and reporting dedupe (STUDIO-1138).
+    r#"
+CREATE TABLE rhapsody_lead_reporting (
+  key TEXT PRIMARY KEY,
+  count INTEGER NOT NULL DEFAULT 0
+);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1235,7 +1242,7 @@ impl Store for Sqlite {
     fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, trigger, subject, detail, created_at, state, attempts_on_question, kinds \
+            "SELECT id, trigger, subject, detail, created_at, state, attempts_on_question, kinds, question \
              FROM rhapsody_lead_items ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1243,6 +1250,22 @@ impl Store for Sqlite {
             let subject: String = row.get(2)?;
             let detail: String = row.get(3)?;
             let trigger = match kind.as_str() {
+                "overrule" => {
+                    let question: String = row.get(8)?;
+                    let decision = question
+                        .strip_prefix("overrule:")
+                        .and_then(|n| n.parse().ok())
+                        .ok_or(rusqlite::Error::InvalidQuery)?;
+                    LeadTrigger::Overrule {
+                        subject: subject.clone(),
+                        decision,
+                        note: detail,
+                    }
+                }
+                "escalation" => LeadTrigger::Escalation {
+                    subject: subject.clone(),
+                    need: detail,
+                },
                 "blocked_handoff" => LeadTrigger::BlockedHandoff {
                     ticket: subject.clone(),
                     question: detail,
@@ -1302,16 +1325,42 @@ impl Store for Sqlite {
     }
 
     fn reserve_lead_run(&self, item: i64, pr: &str, max: i64) -> Result<bool, StoreError> {
+        Ok(self.reserve_lead_run_daily(item, pr, max, "", i64::MAX)?
+            == LeadRunReservation::Reserved)
+    }
+
+    fn reserve_lead_run_daily(
+        &self,
+        item: i64,
+        pr: &str,
+        max: i64,
+        day: &str,
+        daily_max: i64,
+    ) -> Result<LeadRunReservation, StoreError> {
         self.ensure_review_generation(pr)?;
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let key = format!("runs:{day}");
+        if !day.is_empty() {
+            let used: i64 = tx
+                .query_row(
+                    "SELECT count FROM rhapsody_lead_reporting WHERE key = ?1",
+                    params![key],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or(0);
+            if used >= daily_max {
+                return Ok(LeadRunReservation::DailyCap);
+            }
+        }
         let available: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_lead_execution WHERE item = ?1 AND run_attempts < 3)", params![item], |r| r.get(0))?;
         if !available {
-            return Ok(false);
+            return Ok(LeadRunReservation::Exhausted);
         }
         let changed = tx.execute("UPDATE rhapsody_review_bound SET manager_runs_used = manager_runs_used + 1 WHERE pr = ?1 AND manager_runs_used < ?2", params![pr, max])?;
         if changed == 0 {
-            return Ok(false);
+            return Ok(LeadRunReservation::Exhausted);
         }
         tx.execute(
             "UPDATE rhapsody_lead_execution SET run_attempts = run_attempts + 1 WHERE item = ?1",
@@ -1321,8 +1370,54 @@ impl Store for Sqlite {
             "UPDATE rhapsody_lead_items SET state = 'running' WHERE id = ?1",
             params![item],
         )?;
+        if !day.is_empty() {
+            tx.execute("INSERT INTO rhapsody_lead_reporting (key, count) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET count = count + 1", params![key])?;
+        }
         tx.commit()?;
-        Ok(true)
+        Ok(LeadRunReservation::Reserved)
+    }
+
+    fn lead_report_count(&self, key: &str) -> Result<i64, StoreError> {
+        Ok(self
+            .lock()
+            .query_row(
+                "SELECT count FROM rhapsody_lead_reporting WHERE key = ?1",
+                params![key],
+                |r| r.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    fn reserve_lead_report(&self, key: &str, max: i64) -> Result<bool, StoreError> {
+        if max <= 0 {
+            return Ok(false);
+        }
+        Ok(self.lock().execute("INSERT INTO rhapsody_lead_reporting (key, count) VALUES (?1, 1) ON CONFLICT(key) DO UPDATE SET count = count + 1 WHERE count < ?2", params![key, max])? == 1)
+    }
+
+    fn overrule_lead_decision(
+        &self,
+        id: i64,
+        note: &str,
+        at: &str,
+    ) -> Result<Option<i64>, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let subject: Option<String> = tx.query_row("SELECT i.subject FROM rhapsody_lead_decisions d JOIN rhapsody_lead_items i ON i.id = d.item WHERE d.id = ?1 AND d.decision != 'applying'", params![id], |r| r.get(0)).optional()?;
+        let Some(subject) = subject else {
+            return Ok(None);
+        };
+        let question = format!("overrule:{id}");
+        tx.execute("INSERT INTO rhapsody_lead_items (trigger, subject, question, detail, created_at) VALUES ('overrule', ?1, ?2, ?3, ?4) ON CONFLICT(subject, question) DO NOTHING", params![subject, question, note, at])?;
+        tx.execute("UPDATE rhapsody_lead_decisions SET overruled_at = ?2, overrule_note = ?3 WHERE id = ?1 AND overruled_at IS NULL", params![id, at, note])?;
+        let item = tx.query_row(
+            "SELECT id FROM rhapsody_lead_items WHERE subject = ?1 AND question = ?2",
+            params![subject, question],
+            |r| r.get(0),
+        )?;
+        tx.commit()?;
+        Ok(Some(item))
     }
 
     fn save_lead_execution(&self, row: &LeadExecution) -> Result<(), StoreError> {
@@ -8286,6 +8381,7 @@ mod tests {
                 "rhapsody_lead_decisions".to_string(),
                 "rhapsody_lead_decisions_at".to_string(),
                 "rhapsody_lead_execution".to_string(),
+                "rhapsody_lead_reporting".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

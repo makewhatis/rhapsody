@@ -1,6 +1,7 @@
 //! Disposable lead investigation shell (STUDIO-1135; tech-lead-design §3.4).
 //! No Go counterpart. Docker execution and cache warm-up run off the control task.
 
+use rhapsody_config::teams::LeadInvestigate;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -109,6 +110,30 @@ fn container_args(name: &str, repo: &str, cache: &str, image: &str) -> Vec<Strin
         "sleep",
         "1800",
     ])
+}
+
+fn configured_args(mut args: Vec<String>, limits: &LeadInvestigate) -> Vec<String> {
+    for (flag, value) in [
+        ("--cpus", limits.cpus.to_string()),
+        ("--memory", limits.memory.clone()),
+    ] {
+        if let Some(index) = args.iter().position(|a| a == flag)
+            && let Some(argument) = args.get_mut(index + 1)
+        {
+            *argument = value;
+        }
+    }
+    if let Some(index) = args.iter().position(|a| a == "sleep")
+        && let Some(argument) = args.get_mut(index + 1)
+    {
+        *argument = (limits.session_timeout_minutes * 60).to_string();
+    }
+    if let Some(index) = args.iter().position(|a| a == "--signal=KILL")
+        && let Some(argument) = args.get_mut(index + 1)
+    {
+        *argument = (limits.cmd_timeout_minutes * 60).to_string();
+    }
+    args
 }
 
 // /inputs carries only dependency metadata and empty Cargo targets, never sources or config.
@@ -271,6 +296,7 @@ fn exec_args(name: &str, cmd: &str) -> Vec<String> {
 }
 
 struct Session {
+    limits: LeadInvestigate,
     exec: Arc<dyn Executor>,
     name: String,
     started: tokio::time::Instant,
@@ -280,12 +306,14 @@ struct Session {
 impl Session {
     fn guard(exec: Arc<dyn Executor>, name: String) -> Self {
         Self {
+            limits: LeadInvestigate::default(),
             exec,
             name,
             started: tokio::time::Instant::now(),
             removed: false,
         }
     }
+    #[cfg(test)]
     async fn create(
         exec: Arc<dyn Executor>,
         name: String,
@@ -293,12 +321,26 @@ impl Session {
         cache: &str,
         image: &str,
     ) -> Result<Self, InvestigateError> {
+        Self::create_configured(exec, name, repo, cache, image, LeadInvestigate::default()).await
+    }
+    async fn create_configured(
+        exec: Arc<dyn Executor>,
+        name: String,
+        repo: &str,
+        cache: &str,
+        image: &str,
+        limits: LeadInvestigate,
+    ) -> Result<Self, InvestigateError> {
         // Arm removal before Docker runs: a timeout may have created the named container.
-        let session = Self::guard(exec, name);
+        let mut session = Self::guard(exec, name);
+        session.limits = limits;
         let output = session
             .exec
             .run(
-                container_args(&session.name, repo, cache, image),
+                configured_args(
+                    container_args(&session.name, repo, cache, image),
+                    &session.limits,
+                ),
                 Duration::from_secs(30),
             )
             .await?;
@@ -314,7 +356,7 @@ impl Session {
                     &session.name,
                     "if [ -d /cache/cargo ]; then cp -R /cache/cargo /scratch/.cargo; fi",
                 ),
-                COMMAND_TIMEOUT,
+                Duration::from_secs(session.limits.cmd_timeout_minutes * 60),
             )
             .await?;
         if setup.exit_code != 0 {
@@ -326,13 +368,17 @@ impl Session {
     }
 
     async fn command(&self, cmd: &str) -> Result<CommandOutput, InvestigateError> {
-        let remaining = SESSION_TIMEOUT.saturating_sub(self.started.elapsed());
+        let remaining = Duration::from_secs(self.limits.session_timeout_minutes * 60)
+            .saturating_sub(self.started.elapsed());
         if remaining.is_zero() {
             return Err(InvestigateError::SessionEnded);
         }
         let output = self
             .exec
-            .run(exec_args(&self.name, cmd), remaining.min(COMMAND_TIMEOUT))
+            .run(
+                configured_args(exec_args(&self.name, cmd), &self.limits),
+                remaining.min(Duration::from_secs(self.limits.cmd_timeout_minutes * 60)),
+            )
             .await
             .map_err(|e| match e {
                 InvestigateError::DockerMissing => InvestigateError::SessionLost,
@@ -557,6 +603,7 @@ impl Default for RunSlot {
 /// Shared off-loop runtime. Control only binds/releases ids; Docker, git and async locks belong
 /// to request tasks. A released slot cannot create another session.
 pub struct Investigations {
+    limits: LeadInvestigate,
     exec: Arc<dyn Executor>,
     image: Result<String, InvestigateError>,
     root: PathBuf,
@@ -566,6 +613,9 @@ pub struct Investigations {
 
 impl Investigations {
     pub async fn boot(root: PathBuf) -> Arc<Self> {
+        Self::boot_configured(root, LeadInvestigate::default()).await
+    }
+    pub async fn boot_configured(root: PathBuf, limits: LeadInvestigate) -> Arc<Self> {
         let root = root.join("investigate");
         let exec: Arc<dyn Executor> = Arc::new(Docker {
             config: root.join("docker-config"),
@@ -576,15 +626,24 @@ impl Investigations {
                 .filter(|s| s.starts_with("unix://"))
                 .unwrap_or_else(|| "unix:///var/run/docker.sock".into()),
         });
-        Self::boot_with_executor(root, exec).await
+        Self::boot_with_limits(root, exec, limits).await
     }
 
+    #[cfg(test)]
     async fn boot_with_executor(root: PathBuf, exec: Arc<dyn Executor>) -> Arc<Self> {
-        let image = Self::boot_test(exec.clone(), &root).await;
+        Self::boot_with_limits(root, exec, LeadInvestigate::default()).await
+    }
+    async fn boot_with_limits(
+        root: PathBuf,
+        exec: Arc<dyn Executor>,
+        limits: LeadInvestigate,
+    ) -> Arc<Self> {
+        let image = Self::boot_test(exec.clone(), &root, &limits).await;
         if let Err(reason) = &image {
             tracing::warn!(code = reason.code(), detail = %reason, "investigate unavailable; manager continues without the tool");
         }
         Arc::new(Self {
+            limits,
             exec,
             image,
             root,
@@ -593,7 +652,11 @@ impl Investigations {
         })
     }
 
-    async fn boot_test(exec: Arc<dyn Executor>, root: &Path) -> Result<String, InvestigateError> {
+    async fn boot_test(
+        exec: Arc<dyn Executor>,
+        root: &Path,
+        limits: &LeadInvestigate,
+    ) -> Result<String, InvestigateError> {
         std::fs::create_dir_all(root.join("docker-config")).map_err(|_| {
             InvestigateError::Unavailable("could not create private Docker config".into())
         })?;
@@ -647,7 +710,10 @@ impl Investigations {
         let guard = Session::guard(exec.clone(), name.clone());
         let result = selftest(
             exec.as_ref(),
-            container_args(&name, &repo.0.to_string_lossy(), &cache, &image),
+            configured_args(
+                container_args(&name, &repo.0.to_string_lossy(), &cache, &image),
+                limits,
+            ),
         )
         .await;
         guard.destroy().await;
@@ -728,9 +794,17 @@ impl Investigations {
                     .map_err(|_| InvestigateError::Unavailable("PR export task failed".into()))??;
                 let cache = self.warm_cache(&ws.path, &image).await?;
                 let name = format!("rhapsody-investigate-{}-{id}", unique());
-                let container =
-                    Session::create(self.exec.clone(), name, &ws.path, &cache, &image).await?;
-                let deadline = container.started + SESSION_TIMEOUT;
+                let container = Session::create_configured(
+                    self.exec.clone(),
+                    name,
+                    &ws.path,
+                    &cache,
+                    &image,
+                    self.limits.clone(),
+                )
+                .await?;
+                let deadline = container.started
+                    + Duration::from_secs(self.limits.session_timeout_minutes * 60);
                 *session = Some(InvestigationSession {
                     container,
                     head: head.into(),
@@ -791,7 +865,10 @@ impl Investigations {
         let started = self
             .exec
             .run(
-                warmup_args(&name, &inputs.0.to_string_lossy(), &cache, image),
+                configured_args(
+                    warmup_args(&name, &inputs.0.to_string_lossy(), &cache, image),
+                    &self.limits,
+                ),
                 Duration::from_secs(30),
             )
             .await?;
@@ -1121,6 +1198,7 @@ mod tests {
         );
         let exec = Arc::new(Fake::default());
         let runtime = Arc::new(Investigations {
+            limits: LeadInvestigate::default(),
             exec: exec.clone(),
             image: Ok("pinned".into()),
             root: PathBuf::from(&root.path),
@@ -1240,6 +1318,31 @@ mod tests {
     }
 
     #[test]
+    fn configured_limits_preserve_isolation_and_literal_commands() {
+        let limits = LeadInvestigate {
+            cpus: 1,
+            memory: "2g".into(),
+            cmd_timeout_minutes: 5,
+            session_timeout_minutes: 15,
+            ..Default::default()
+        };
+        let args = configured_args(
+            container_args("s", "/owned/tree", "cache", "image"),
+            &limits,
+        );
+        assert!(args.windows(2).any(|a| a == ["--cpus", "1"]));
+        assert!(args.windows(2).any(|a| a == ["--memory", "2g"]));
+        assert!(args.windows(2).any(|a| a == ["sleep", "900"]));
+        assert!(args.windows(2).any(|a| a == ["--network", "none"]));
+        assert!(args.contains(&"--read-only".into()));
+        for command in ["sleep", "--cpus", "--memory", "--signal=KILL"] {
+            let args = configured_args(exec_args("s", command), &limits);
+            assert_eq!(args.last().map(String::as_str), Some(command));
+            assert!(args.windows(2).any(|a| a == ["--signal=KILL", "300"]));
+        }
+    }
+
+    #[test]
     fn no_host_paths_mounted() {
         let args = container_args("s", "/owned/tree", "cache", "image");
         let mounts: Vec<_> = args
@@ -1351,6 +1454,7 @@ mod tests {
         // Exercise the actual dispatch/exit seam too, without a Docker dependency in CI.
         let root = crate::testsupport::TempDir::new();
         let runtime = Arc::new(Investigations {
+            limits: LeadInvestigate::default(),
             exec: exec.clone(),
             image: Ok("pinned".into()),
             root: PathBuf::from(&root.path),
@@ -1548,9 +1652,13 @@ mod tests {
             host: std::env::var("DOCKER_HOST")
                 .unwrap_or_else(|_| "unix:///var/run/docker.sock".into()),
         });
-        let image = Investigations::boot_test(exec.clone(), Path::new(&root.path))
-            .await
-            .unwrap();
+        let image = Investigations::boot_test(
+            exec.clone(),
+            Path::new(&root.path),
+            &LeadInvestigate::default(),
+        )
+        .await
+        .unwrap();
         let repo = OwnedDir::create(Path::new(&root.path), "repo").unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&repo.0, std::fs::Permissions::from_mode(0o777)).unwrap();
@@ -1645,9 +1753,13 @@ mod tests {
             host: std::env::var("DOCKER_HOST")
                 .unwrap_or_else(|_| "unix:///var/run/docker.sock".into()),
         })));
-        let image = Investigations::boot_test(exec.clone(), Path::new(&root.path))
-            .await
-            .unwrap();
+        let image = Investigations::boot_test(
+            exec.clone(),
+            Path::new(&root.path),
+            &LeadInvestigate::default(),
+        )
+        .await
+        .unwrap();
         let repo = OwnedDir::create(Path::new(&root.path), "repo").unwrap();
         std::fs::create_dir(repo.0.join("src")).unwrap();
         std::fs::write(repo.0.join("Cargo.toml"), "[package]\nname='investigate-canary'\nversion='0.1.0'\nedition='2021'\n[dependencies]\nitoa='=1.0.18'\n").unwrap();
@@ -1667,6 +1779,7 @@ mod tests {
         std::fs::write(repo.0.join(".npmrc"), "registry=http://127.0.0.1:9\n").unwrap();
         std::fs::write(repo.0.join(".env"), "CANARY_TOKEN=synthetic-nonsecret\n").unwrap();
         let runtime = Investigations {
+            limits: LeadInvestigate::default(),
             exec: exec.clone(),
             image: Ok(image.clone()),
             root: PathBuf::from(&root.path),
