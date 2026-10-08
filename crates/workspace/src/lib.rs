@@ -21,6 +21,7 @@
 mod gc;
 pub mod gtguard;
 mod hooks;
+mod investigate;
 mod labeler;
 mod manager;
 mod read;

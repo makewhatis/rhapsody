@@ -965,6 +965,23 @@ impl StateProvider for FakeProvider {
         self.take_manager(format!("file:{run_id}:{sha}:{path}"))
     }
 
+    async fn investigate(
+        &self,
+        _run_id: i64,
+        _head: String,
+        _cmd: String,
+    ) -> Result<
+        rhapsody_orchestrator::investigate::CommandOutput,
+        rhapsody_orchestrator::investigate::InvestigateError,
+    > {
+        self.touch();
+        Err(
+            rhapsody_orchestrator::investigate::InvestigateError::Unavailable(
+                "investigate is disabled on this daemon".into(),
+            ),
+        )
+    }
+
     async fn manager_ls(&self, run_id: i64, sha: String, path: String) -> ManagerReadOutcome {
         self.touch();
         self.take_manager(format!("ls:{run_id}:{sha}:{path}"))

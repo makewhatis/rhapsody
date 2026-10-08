@@ -134,7 +134,7 @@ pub fn manager_coordinate(run: &RunSummary) -> Result<ManagerCoordinate, Manager
 impl crate::ControlHandle {
     /// Resolves a run's manager coordinate from its own row. Every manager route starts here, so a
     /// review run's id can never be read through the manager's surface.
-    async fn manager_coordinate_for(
+    pub(crate) async fn manager_coordinate_for(
         &self,
         run_id: i64,
     ) -> Result<ManagerCoordinate, ManagerReadError> {
@@ -150,7 +150,7 @@ impl crate::ControlHandle {
     /// uses ([`crate::ControlHandle::workspace_gc_plan`]), so a read always uses the live root
     /// rather than a boot-time snapshot. Only the REPOSITORY reads need this; the store-backed ones
     /// do not, so they never fail merely because the workspace is not built yet.
-    async fn manager_workspace(&self) -> Result<Arc<Manager>, ManagerReadError> {
+    pub(crate) async fn manager_workspace(&self) -> Result<Arc<Manager>, ManagerReadError> {
         self.workspace_gc_plan()
             .await
             .and_then(|plan| plan.mgr)

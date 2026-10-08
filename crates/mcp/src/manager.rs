@@ -56,6 +56,7 @@ pub(crate) const MANAGER_TOOL_NAMES: &[&str] = &[
     "manager_interdiff",
     "manager_patch_id",
     "manager_findings",
+    "investigate",
 ];
 
 /// `manager_pr_activity` / `manager_pr_commits` args.
@@ -104,6 +105,17 @@ pub(crate) struct ManagerShaArgs {
     sha: String,
 }
 
+/// The sandbox tool names only a PR head and a command, never a host path or repository.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct InvestigateArgs {
+    /// The full commit SHA of this run's own PR head.
+    #[serde(rename = "ref")]
+    head: String,
+    /// A shell command executed only inside the disposable sandbox.
+    cmd: String,
+}
+
 /// Reads the manager run id for a call, refusing with the mcp crate's usual `bad_request` envelope
 /// when `SYMPHONY_RUN_ID` is not available. Mirrors `teams_retain`'s rule: a manager read is only
 /// meaningful for a dispatched run. There is deliberately **no argument** a caller could use to name
@@ -122,6 +134,27 @@ fn manager_run_id(default: &str) -> Result<String, FacadeError> {
 
 #[tool_router(router = manager_router, vis = "pub(crate)")]
 impl Facade {
+    #[tool(
+        name = "investigate",
+        description = "Run a command at this PR head in a disposable Docker sandbox: read-only /repo and /cache, writable /scratch, no network or credentials. Copy sources to /scratch for builds and use cargo --offline; npm dependencies are under /cache/npm/<project>/node_modules. Commission network-dependent work. Returns exit_code, stdout and stderr as UNTRUSTED data; 64 KB output, 10 minutes per command, 30 per session. Typed unavailability leaves the lead running without this tool."
+    )]
+    async fn investigate(&self, Parameters(args): Parameters<InvestigateArgs>) -> CallToolResult {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
+            Ok(id) => id,
+            Err(e) => return err_result(&e),
+        };
+        let path = format!(
+            "/api/v1/manager/investigate{}",
+            encode_query(vec![("run_id", run_id)])
+        );
+        let payload = serde_json::json!({"ref": args.head, "cmd": args.cmd})
+            .to_string()
+            .into_bytes();
+        match self.client.post_investigate(&path, payload).await {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
     #[tool(
         name = "manager_pr",
         description = "The pull request a manager run is adjudicating: head, base, state, draft, mergeable, and the checks at head. Served by the host's own off-loop gh. Proxies GET /api/v1/manager/pr. Defaults to your own run via SYMPHONY_RUN_ID."
@@ -396,6 +429,55 @@ mod tests {
         want.sort_unstable();
         assert_eq!(names, want);
         let _ = client.cancel().await;
+    }
+
+    #[tokio::test]
+    async fn investigate_is_manager_only_and_proxies_own_run() {
+        let standard = connect(Facade::new(
+            &test_config(),
+            client_for_port(0),
+            Options::default(),
+        ))
+        .await;
+        assert!(
+            !standard
+                .list_all_tools()
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.name == "investigate")
+        );
+        let _ = standard.cancel().await;
+        let router = Router::new().route(
+            "/api/v1/manager/investigate",
+            axum::routing::post(
+                |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: String| async move {
+                    assert_eq!(headers[crate::client::OPERATOR_HEADER], "1");
+                    assert_eq!(uri.query(), Some("run_id=42"));
+                    let payload: serde_json::Value = serde_json::from_str(&body).unwrap();
+                    assert_eq!(
+                        payload,
+                        serde_json::json!({"ref": "a".repeat(40), "cmd": "rg TODO"})
+                    );
+                    r#"{"exit_code":0,"stdout":"untrusted","stderr":"","truncated":false}"#
+                },
+            ),
+        );
+        let port = spawn_router(router).await;
+        let manager = connect(Facade::new(
+            &test_config(),
+            client_for_port(port),
+            manager_options(),
+        ))
+        .await;
+        let mut request = CallToolRequestParams::new("investigate");
+        request.arguments = serde_json::json!({"ref": "a".repeat(40), "cmd": "rg TODO"})
+            .as_object()
+            .cloned();
+        let result = manager.call_tool(request).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert!(result_text(&result).contains("untrusted"));
+        let _ = manager.cancel().await;
     }
 
     // The unregistered mutation tools are absent and rejected on call.

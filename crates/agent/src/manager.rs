@@ -163,6 +163,7 @@ pub const MANAGER_MCP_TOOLS: &[&str] = &[
     "manager_interdiff",
     "manager_patch_id",
     "manager_findings",
+    "investigate",
 ];
 
 /// Every built-in the CLI is known to expose, named in `--disallowedTools` (§4.3). This list is a
