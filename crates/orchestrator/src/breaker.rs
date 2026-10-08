@@ -429,6 +429,10 @@ where
 /// and assert on a failure without an HTTP server.
 #[async_trait::async_trait]
 pub trait NotifyChannel: Send + Sync {
+    /// Account-level reporting shares the transport, without pretending an account is a PR.
+    async fn send_account(&self, _title: &str, _body: &str) -> Result<(), String> {
+        Err("account notifications unsupported on this channel".into())
+    }
     /// Delivers one notification. `Err` is logged by the caller; delivery is best-effort, so one
     /// refusing channel never stops another.
     async fn send(&self, plan: &BreakerPlan, body: &str) -> Result<(), String>;
@@ -499,6 +503,21 @@ impl NtfyChannel {
 
 #[async_trait::async_trait]
 impl NotifyChannel for NtfyChannel {
+    async fn send_account(&self, title: &str, body: &str) -> Result<(), String> {
+        let res = self
+            .client
+            .post(&self.url)
+            .header("Title", title)
+            .body(body.to_string())
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("ntfy returned HTTP {}", res.status()))
+        }
+    }
     async fn send(&self, plan: &BreakerPlan, body: &str) -> Result<(), String> {
         let res = self
             .client
@@ -533,6 +552,16 @@ impl MacosChannel {
 
 #[async_trait::async_trait]
 impl NotifyChannel for MacosChannel {
+    async fn send_account(&self, title: &str, body: &str) -> Result<(), String> {
+        self.state.push(
+            Utc::now(),
+            title.into(),
+            body.into(),
+            String::new(),
+            String::new(),
+        );
+        Ok(())
+    }
     async fn send(&self, plan: &BreakerPlan, body: &str) -> Result<(), String> {
         self.state.push(
             Utc::now(),

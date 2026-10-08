@@ -12,6 +12,7 @@
 /** Every route the console serves (§2.3). `job` is the only one that carries a key. */
 export const CONSOLE_ROUTES = [
   "jobs",
+  "accounts",
   "job",
   "teams",
   "memory",
