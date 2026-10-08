@@ -22,12 +22,14 @@ export function AccountsPanel({ accounts, nowS }: { accounts: AccountView[]; now
       return <section key={account.account} aria-label={account.account} style={{ padding: 18, borderBottom: "1px solid var(--line)" }}>
         <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
           <b>{account.account}</b>
+          {account.source === "budget" ? <Chip disabled>Rhapsody budget</Chip> : null}
           <Pill variant={variant}>{label}</Pill>
           <Chip disabled>{account.detection.replaceAll("_", "-")}</Chip>
           {account.using_credits ? <Pill variant="blocked">credits in use</Pill> : <span className="sub">credits off</span>}
           <span className="mono">{account.today_usd == null ? `${kind} today unknown` : `$${account.today_usd.toFixed(2)} ${kind} today`}</span>
         </div>
         {account.stale ? <p className="sub">last known {level} · last observed {new Date(account.last_seen_s * 1000).toLocaleString()}</p> : null}
+        {account.stale_reason ? <p className="sub">Probe unavailable: {account.stale_reason.replaceAll("_", " ")}</p> : null}
         {account.windows.length === 0 ? <p className="sub">Utilization and reset not yet observed.</p> : account.windows.map((window) => {
           const percent = Math.round(Math.max(0, Math.min(1, window.utilization)) * 100);
           return <div key={window.window} style={{ marginTop: 14 }}>

@@ -68,6 +68,13 @@ pub fn level(ledger: &AccountLedger, account: &str, cfg: &Limits, now_s: i64) ->
         return Level::Ok;
     };
     let t = cfg.for_account(account);
+    if account == "openai" && view.source == "budget" {
+        return if view.status == "rejected" {
+            Level::Wall
+        } else {
+            Level::Ok
+        };
+    }
     if cfg.credits == "always" && t.warn == 100.0 && t.stop_new == 100.0 && t.handoff == 100.0 {
         return Level::Ok;
     }
@@ -176,6 +183,23 @@ struct ResumeRecord {
 pub(crate) const RETRY_LIMIT_PREFIX: &str = "limit continuation: ";
 
 impl Orchestrator {
+    fn account_level(&self, account: &str, cfg: &Limits, now: i64) -> Level {
+        let plan = level(&self.accounts, account, cfg, now);
+        // Keep reporting the real plan independently; its workers still obey the operator's
+        // runaway budget wall, even when credit spending or plan thresholds are disabled.
+        if account == "chatgpt-subscription" && self.openai_budget_rejected(now) {
+            Level::Wall
+        } else {
+            plan
+        }
+    }
+
+    pub(crate) fn openai_budget_rejected(&self, now: i64) -> bool {
+        self.accounts
+            .snapshot(now)
+            .iter()
+            .any(|a| a.account == "openai" && a.source == "budget" && a.status == "rejected")
+    }
     pub(crate) fn limits_config(&self) -> Limits {
         self.eff
             .as_ref()
@@ -198,7 +222,7 @@ impl Orchestrator {
                 return false;
             }
         }
-        level(&self.accounts, account, &cfg, now) < Level::StopNew
+        self.account_level(account, &cfg, now) < Level::StopNew
     }
 
     pub(crate) fn engine_list(&self, identity: &str, primary: EngineSpec) -> Vec<EngineSpec> {
@@ -508,11 +532,12 @@ impl Orchestrator {
                 && ((cfg.credits == "never"
                     || (cfg.credits == "manager_urgent" && !self.credit_approved(id, &account)))
                     || (cfg.credits == "daily_cap" && spent >= cfg.credits_daily_usd));
-            let lvl = level(&self.accounts, &account, &cfg, now);
+            let lvl = self.account_level(&account, &cfg, now);
             let approved = self.credit_approved(id, &account);
             let provider_rejected = views
                 .iter()
-                .any(|v| v.account == account && v.status == "rejected");
+                .any(|v| v.account == account && v.status == "rejected")
+                || (account == "chatgpt-subscription" && self.openai_budget_rejected(now));
             if credit_wall || (lvl == Level::Wall && (!approved || provider_rejected)) {
                 if credit_wall && cfg.credits != "manager_urgent" {
                     self.accounts.reject_until_reset(&account, now);

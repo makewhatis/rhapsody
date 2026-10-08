@@ -67,6 +67,7 @@ export interface LimitDecisionItem {
 }
 
 export interface AccountView {
+  stale_reason?: string;
   account: string;
   windows: { window: string; utilization: number; resets_at_s: number }[];
   status: string;

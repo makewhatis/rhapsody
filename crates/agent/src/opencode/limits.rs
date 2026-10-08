@@ -117,12 +117,16 @@ fn access_only(path: &Path, now_s: i64) -> Result<AccessOnly, &'static str> {
     Ok(AccessOnly { access, account })
 }
 
-async fn fetch(endpoint: &str, access: AccessOnly) -> Result<LimitObs, &'static str> {
+async fn fetch(
+    endpoint: &str,
+    access: AccessOnly,
+    timeout: std::time::Duration,
+) -> Result<LimitObs, &'static str> {
     let client = reqwest::Client::builder()
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .http1_only()
-        .timeout(std::time::Duration::from_secs(20))
+        .timeout(timeout)
         .build()
         .map_err(|_| "client_unavailable")?;
     let mut req = client
@@ -133,13 +137,28 @@ async fn fetch(endpoint: &str, access: AccessOnly) -> Result<LimitObs, &'static 
     if let Some(account) = access.account {
         req = req.header("ChatGPT-Account-Id", account);
     }
-    let mut response = req.send().await.map_err(|_| "usage_unavailable")?;
+    let mut response = req.send().await.map_err(|e| {
+        if e.is_timeout() {
+            "usage_timeout"
+        } else {
+            "usage_unavailable"
+        }
+    })?;
+    if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("usage_unauthorized");
+    }
     if !response.status().is_success() {
         return Err("usage_refused");
     }
     const MAX_BODY: usize = 64 * 1024;
     let mut bytes = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| "usage_unavailable")? {
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
+        if e.is_timeout() {
+            "usage_timeout"
+        } else {
+            "usage_unavailable"
+        }
+    })? {
         if bytes.len().saturating_add(chunk.len()) > MAX_BODY {
             return Err("usage_oversized");
         }
@@ -148,13 +167,13 @@ async fn fetch(endpoint: &str, access: AccessOnly) -> Result<LimitObs, &'static 
     parse_usage(&bytes, chrono::Utc::now().timestamp()).ok_or("usage_unknown")
 }
 
-pub(crate) struct UsageProbe {
+pub struct UsageProbe {
     gate: ProbeGate,
     endpoint: String,
     monotonic_origin: std::time::Instant,
 }
 
-pub(crate) fn shared_probe() -> Arc<UsageProbe> {
+pub fn shared_probe() -> Arc<UsageProbe> {
     static PROBE: OnceLock<Arc<UsageProbe>> = OnceLock::new();
     Arc::clone(PROBE.get_or_init(|| {
         #[cfg(not(test))]
@@ -172,8 +191,8 @@ pub(crate) fn shared_probe() -> Arc<UsageProbe> {
 }
 
 impl UsageProbe {
-    #[cfg(test)]
-    pub(crate) fn for_test(endpoint: String) -> Self {
+    /// Endpoint injection for hermetic daemon transport tests; production uses `shared_probe`.
+    pub fn new(endpoint: String) -> Self {
         Self {
             gate: ProbeGate::default(),
             endpoint,
@@ -181,9 +200,9 @@ impl UsageProbe {
         }
     }
 
-    /// Called only from a live OAuth OpenAI turn. Admission is shared across ALL sessions/runners,
+    /// Called by the daemon at boot and while OpenAI work is active or queued. Admission is shared,
     /// and claimed before credential or network I/O, including failed attempts.
-    pub(crate) async fn observe(&self, path: &Path) -> Option<LimitObs> {
+    pub async fn observe(&self, path: &Path) -> Option<Result<LimitObs, &'static str>> {
         let now_s = chrono::Utc::now().timestamp();
         // A wall-clock adjustment must not permit a second request inside ten real minutes.
         let elapsed_s =
@@ -192,19 +211,10 @@ impl UsageProbe {
             return None;
         }
         let result = match access_only(path, now_s) {
-            Ok(access) => fetch(&self.endpoint, access).await,
+            Ok(access) => fetch(&self.endpoint, access, std::time::Duration::from_secs(20)).await,
             Err(reason) => Err(reason),
         };
-        match result {
-            Ok(obs) => Some(obs),
-            Err(reason) => {
-                tracing::warn!(
-                    reason,
-                    "ChatGPT account usage probe unavailable; keeping last known limits"
-                );
-                None
-            }
-        }
+        Some(result)
     }
 }
 
@@ -253,6 +263,7 @@ mod tests {
                 access: "test-access".into(),
                 account: Some("test-account".into()),
             },
+            std::time::Duration::from_secs(20),
         )
         .await;
         (result, server.join().unwrap())
@@ -288,6 +299,34 @@ mod tests {
         ))
         .await;
         assert_eq!(result.err(), Some("usage_oversized"));
+        let (result, _) = served(
+            "HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+        )
+        .await;
+        assert_eq!(result.err(), Some("usage_unauthorized"));
+    }
+
+    #[tokio::test]
+    async fn timeout_is_a_closed_failure_and_concurrent_attempts_are_coalesced() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/usage", listener.local_addr().unwrap());
+        let result = fetch(
+            &endpoint,
+            AccessOnly {
+                access: "test-access".into(),
+                account: None,
+            },
+            std::time::Duration::from_millis(20),
+        )
+        .await;
+        assert_eq!(result.err(), Some("usage_timeout"));
+        let dir = super::super::testdir::TempDir::new();
+        let path = dir.path().join("auth.json");
+        std::fs::write(&path, b"malformed-secret-canary").unwrap();
+        let probe = UsageProbe::new(endpoint);
+        let (a, b) = tokio::join!(probe.observe(&path), probe.observe(&path));
+        assert_eq!(a.unwrap().err(), Some("login_malformed"));
+        assert!(b.is_none());
     }
 
     #[test]

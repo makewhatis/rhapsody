@@ -35,6 +35,8 @@ pub struct AccountView {
     pub last_seen_s: i64,
     pub source: String,
     pub stale: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stale_reason: Option<String>,
     pub detection: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
@@ -60,6 +62,7 @@ struct AccountState {
     windows: BTreeMap<String, WindowState>,
     last_seen_s: i64,
     source: String,
+    probe_failure: Option<String>,
 }
 
 struct WindowState {
@@ -170,6 +173,9 @@ impl AccountLedger {
         if accepted && obs.observed_at_s >= account.last_seen_s {
             account.last_seen_s = obs.observed_at_s;
             account.source = obs.source.into();
+            if obs.source == "probe" {
+                account.probe_failure = None;
+            }
         }
     }
 
@@ -220,9 +226,11 @@ impl AccountLedger {
                     using_credits,
                     last_seen_s: account.last_seen_s,
                     source: account.source.clone(),
-                    stale: !active
-                        && (account.windows.is_empty()
-                            || now_s.saturating_sub(account.last_seen_s) >= 1800),
+                    stale: account.probe_failure.is_some()
+                        || ((!active || name == "chatgpt-subscription")
+                            && (account.windows.is_empty()
+                                || now_s.saturating_sub(account.last_seen_s) >= 1800)),
+                    stale_reason: account.probe_failure.clone(),
                     // The passive WHAM probe was measured successfully. The detection capability
                     // stays probe even when the latest observation is a stream rejection.
                     detection: if name == "chatgpt-subscription" {
@@ -247,6 +255,21 @@ impl AccountLedger {
             .windows
             .into_iter()
             .max_by(|a, b| a.utilization.total_cmp(&b.utilization))
+    }
+
+    pub fn probe_failed(&self, reason: &str) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let account = state
+            .accounts
+            .entry("chatgpt-subscription".into())
+            .or_default();
+        account.probe_failure = Some(reason.into());
+        if account.source.is_empty() {
+            account.source = "probe".into();
+        }
     }
 
     /// Idempotent per-run activity binding; no lock is held across I/O or awaits.
@@ -333,6 +356,96 @@ pub(crate) fn run_key(issue_id: &str, started_at: chrono::DateTime<chrono::Utc>)
 }
 
 impl crate::Orchestrator {
+    /// Dispatch gates must not hide work that arrived while they were closed. This read-only
+    /// pass observes the queue without selecting, claiming, enriching or priming decision ledgers.
+    /// Successful dispatch passes already observe their candidate set and need no extra reads.
+    pub(crate) async fn refresh_gated_chatgpt_queue(&mut self) {
+        let Some(eff) = self.eff.as_ref() else {
+            return;
+        };
+        let trackers: Vec<_> = if eff.projects.is_empty() {
+            vec![(String::new(), eff.tracker.clone())]
+        } else {
+            eff.projects
+                .iter()
+                .filter(|p| !p.disabled)
+                .map(|p| (p.slug.clone(), p.tracker.clone()))
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut complete = !trackers.is_empty();
+        let mut queued = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for (project, tracker) in trackers {
+            match tokio::time::timeout_at(deadline, tracker.fetch_candidate_issues()).await {
+                Ok(Ok(issues)) => {
+                    queued.extend(
+                        issues
+                            .into_iter()
+                            .filter(|i| seen.insert(i.id.clone()))
+                            .map(|i| (i, project.clone())),
+                    );
+                }
+                Ok(Err(error)) => {
+                    complete = false;
+                    tracing::warn!(%project, %error, "limit: gated queue observation failed");
+                }
+                Err(_) => {
+                    complete = false;
+                    tracing::warn!("limit: gated queue observation timed out");
+                    break;
+                }
+            }
+        }
+        self.record_chatgpt_queue(
+            queued
+                .iter()
+                .map(|(issue, project)| (issue, project.as_str())),
+            complete,
+        );
+    }
+
+    pub(crate) fn chatgpt_probe_path(&self, boot: bool) -> Option<std::path::PathBuf> {
+        let openai_run = |run: &crate::RunningEntry| {
+            let (harness, model) =
+                self.resolved_harness_model(&run.harness, &run.model_override, &run.project_slug);
+            harness == "opencode" && model.starts_with("openai/")
+        };
+        if !boot
+            && !self.chatgpt_queued
+            && !self.running.values().any(openai_run)
+            && !self
+                .limit_policy
+                .suspended
+                .values()
+                .any(|s| openai_run(&s.run))
+        {
+            return None;
+        }
+        let source = &self.eff.as_ref()?.cfg.opencode.auth_source;
+        Some(if source.is_empty() {
+            rhapsody_agent::opencode::state::default_auth_source()
+        } else {
+            source.into()
+        })
+    }
+
+    /// Called before selection discards candidates held by capacity, labels, budgets or limits.
+    pub(crate) fn record_chatgpt_queue<'a>(
+        &mut self,
+        mut issues: impl Iterator<Item = (&'a rhapsody_core::Issue, &'a str)>,
+        complete: bool,
+    ) {
+        let queued = issues.any(|(issue, project)| {
+            let run = self.limit_projection(issue, project);
+            let (harness, model) =
+                self.resolved_harness_model(&run.harness, &run.model_override, project);
+            harness == "opencode" && model.starts_with("openai/")
+        });
+        if complete || queued {
+            self.chatgpt_queued = queued;
+        }
+    }
     pub(crate) fn bind_account(
         &mut self,
         issue_id: &str,
@@ -373,6 +486,19 @@ impl crate::Orchestrator {
 }
 
 impl crate::ControlHandle {
+    pub async fn chatgpt_probe_path(&self, boot: bool) -> Option<std::path::PathBuf> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.events
+            .send(crate::control_loop::Event::ChatgptProbePath { boot, reply })
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
+    pub fn record_chatgpt_probe(&self, result: Result<LimitObs, &'static str>) {
+        let _ = self
+            .events
+            .send(crate::control_loop::Event::ChatgptProbeResult(result));
+    }
     /// Read-only ledger plus today's stored costs and configured levels. No credential reads,
     /// network or control round-trip; raw policy snapshots never acquire reporting fields.
     pub fn accounts(&self, now_s: i64) -> Vec<AccountView> {
@@ -431,6 +557,251 @@ impl crate::ControlHandle {
 mod tests {
     use super::*;
     use rhapsody_agent::ratelimit::{LimitStatus, WindowObs};
+
+    #[test]
+    fn probe_failure_stays_stale_during_active_work_until_success() {
+        let ledger = AccountLedger::default();
+        let mut usage = obs(0.31, 5000, 1000);
+        usage.source = "probe";
+        ledger.observe("chatgpt-subscription", usage.clone());
+        ledger.bind_run("active", "chatgpt-subscription");
+        ledger.probe_failed("usage_unauthorized");
+        let view = &ledger.snapshot(1100)[0];
+        assert!(view.stale);
+        assert_eq!(view.stale_reason.as_deref(), Some("usage_unauthorized"));
+        assert_eq!(view.windows[0].utilization, 0.31);
+        ledger.observe("chatgpt-subscription", obs(0.5, 5000, 1200));
+        assert!(
+            ledger.snapshot(1200)[0].stale,
+            "stream traffic cannot repair a failed probe"
+        );
+        usage.observed_at_s = 1300;
+        ledger.observe("chatgpt-subscription", usage);
+        assert!(!ledger.snapshot(1300)[0].stale);
+        assert!(ledger.snapshot(1300)[0].stale_reason.is_none());
+        assert!(
+            ledger.snapshot(3100)[0].stale,
+            "live work cannot keep probe data fresh forever"
+        );
+        let empty = AccountLedger::default();
+        empty.probe_failed("usage_timeout");
+        assert_eq!(empty.snapshot(1000)[0].status, "unknown");
+        assert!(empty.snapshot(1000)[0].stale);
+    }
+
+    #[test]
+    fn queued_and_held_openai_work_keeps_probe_admitted_without_a_runner() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.agent.backend = "opencode".into();
+        eff.cfg.opencode.model = "openai/test".into();
+        eff.cfg.opencode.auth_source = "/test/operator/auth.json".into();
+        o.eff = Some(eff);
+        assert!(o.chatgpt_probe_path(false).is_none());
+        assert!(o.chatgpt_probe_path(true).is_some());
+        let issue = rhapsody_core::Issue {
+            id: "queued".into(),
+            labels: Some(vec!["rhapsody:human".into()]),
+            ..Default::default()
+        };
+        o.record_chatgpt_queue(std::iter::once((&issue, "")), true);
+        assert_eq!(
+            o.chatgpt_probe_path(false),
+            Some("/test/operator/auth.json".into())
+        );
+        o.record_chatgpt_queue(std::iter::empty(), false);
+        assert!(
+            o.chatgpt_probe_path(false).is_some(),
+            "failed board reads cannot erase queued work"
+        );
+        o.record_chatgpt_queue(std::iter::empty(), true);
+        assert!(o.chatgpt_probe_path(false).is_none());
+    }
+
+    #[test]
+    fn plan_thresholds_and_operator_budget_wall_remain_separate() {
+        use crate::limitpolicy::{Level, level};
+        let ledger = AccountLedger::default();
+        let mut plan = obs(0.91, 5000, 1000);
+        plan.source = "probe";
+        ledger.observe("chatgpt-subscription", plan.clone());
+        let mut budget = obs(0.96, 5000, 1000);
+        budget.source = "budget";
+        budget.windows[0].window = "daily".into();
+        ledger.observe("openai", budget.clone());
+        let cfg = rhapsody_config::Limits::default();
+        assert_eq!(
+            level(&ledger, "chatgpt-subscription", &cfg, 1100),
+            Level::StopNew
+        );
+        assert_eq!(level(&ledger, "openai", &cfg, 1100), Level::Ok);
+        plan.windows[0].utilization = 0.96;
+        ledger.observe("chatgpt-subscription", plan);
+        assert_eq!(
+            level(&ledger, "chatgpt-subscription", &cfg, 1100),
+            Level::Handoff
+        );
+        budget.status = LimitStatus::Rejected;
+        budget.windows[0].utilization = 1.0;
+        ledger.observe("openai", budget);
+        let view = ledger
+            .snapshot(1100)
+            .into_iter()
+            .find(|a| a.account == "openai")
+            .unwrap();
+        assert_eq!(view.source, "budget");
+        assert_eq!(view.detection, "budget");
+        assert_eq!(
+            level(&ledger, "chatgpt-subscription", &cfg, 1100),
+            Level::Handoff
+        );
+        assert_eq!(level(&ledger, "openai", &cfg, 1100), Level::Wall);
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(1100, 0).unwrap());
+        o.accounts = std::sync::Arc::new(ledger);
+        let mut healthy_plan = obs(0.31, 6000, 1100);
+        healthy_plan.source = "probe";
+        o.accounts.observe("chatgpt-subscription", healthy_plan);
+        assert_eq!(
+            level(&o.accounts, "chatgpt-subscription", &cfg, 1100),
+            Level::Ok
+        );
+        assert!(!o.account_usable("chatgpt-subscription"));
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.limits.credits = "manager_urgent".into();
+        o.eff = Some(eff);
+        o.limit_policy
+            .credit_approvals
+            .insert("ticket".into(), ("chatgpt-subscription".into(), 5000));
+        assert!(
+            !o.credit_approved("ticket", "chatgpt-subscription"),
+            "credit permission cannot bypass the independent budget wall"
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_openai_work_behind_dispatch_gates_keeps_probe_admitted() {
+        use crate::testsupport::{empty_effective, empty_resolved_project, issue};
+        use rhapsody_tracker::fake::Fake;
+        use std::sync::Arc;
+
+        struct DeadCredential;
+        #[async_trait::async_trait]
+        impl crate::preflight::CredentialProbe for DeadCredential {
+            async fn probe(
+                &self,
+                _: &crate::preflight::ProbeRequest,
+            ) -> crate::preflight::ProbeOutcome {
+                crate::preflight::ProbeOutcome::Dead("test login unavailable".into())
+            }
+        }
+
+        for gate in ["validation", "drain", "credential"] {
+            for projects in [false, true] {
+                let mut candidate = issue("queued", "MT-1", "Todo");
+                candidate.labels = Some(vec![
+                    "rhapsody:harness/opencode".into(),
+                    "rhapsody:model/openai/test".into(),
+                    "rhapsody:human".into(),
+                ]);
+                let mut o = crate::Orchestrator::new("not-read.md");
+                let mut eff = empty_effective(Arc::new(Fake::new()));
+                eff.poll_interval = std::time::Duration::from_secs(3600);
+                eff.cfg.opencode.auth_source = "/test/operator/auth.json".into();
+                if projects {
+                    eff.projects = vec![empty_resolved_project("test", eff.tracker.clone())];
+                }
+                o.eff = Some(eff);
+                match gate {
+                    "validation" => o.eff.as_mut().unwrap().cfg.tracker.api_key.clear(),
+                    "drain" => {
+                        o.drain
+                            .arm(chrono::Utc::now(), crate::drain::DrainReason::Operator);
+                    }
+                    _ => o.set_credential_probe(Arc::new(DeadCredential)),
+                }
+                // Work arrives after boot while the dispatch gate remains closed.
+                for (queued, failed) in
+                    [(false, false), (true, false), (false, true), (false, false)]
+                {
+                    let mut tracker = Fake::new();
+                    if queued {
+                        tracker.candidates = vec![candidate.clone()];
+                    }
+                    if failed {
+                        tracker.candidates_err = Some(rhapsody_tracker::TrackerError::Other(
+                            "test board unavailable".into(),
+                        ));
+                    }
+                    let tracker = Arc::new(tracker);
+                    let eff = o.eff.as_mut().unwrap();
+                    if projects {
+                        eff.projects[0].tracker = tracker;
+                    } else {
+                        eff.tracker = tracker;
+                    }
+                    o.on_tick().await;
+                    if let Some(timer) = o.tick_timer.take() {
+                        timer.abort();
+                    }
+                    assert_eq!(
+                        o.chatgpt_probe_path(false).is_some(),
+                        queued || failed,
+                        "queue observation must survive {gate} (projects={projects}, queued={queued}, failed={failed})"
+                    );
+                    assert!(o.running.is_empty());
+                    assert!(o.claimed.is_empty());
+                    assert!(o.retry_attempts.is_empty());
+                    assert!(o.preparing.is_empty());
+                    assert!(!o.human_holds.labelled_and_primed().1);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn gated_queue_observation_keeps_partial_reads_and_skips_disabled_projects() {
+        use crate::testsupport::{empty_effective, empty_resolved_project, issue};
+        use rhapsody_tracker::fake::Fake;
+        use std::sync::Arc;
+
+        let mut openai = Fake::new();
+        openai.candidates = vec![issue("queued", "MT-1", "Todo")];
+        let openai = Arc::new(openai);
+        let empty = Arc::new(Fake::new());
+        let mut failed = Fake::new();
+        failed.candidates_err = Some(rhapsody_tracker::TrackerError::Other("unavailable".into()));
+        let failed = Arc::new(failed);
+        let mut eff = empty_effective(empty.clone());
+        eff.cfg.agent.backend = "opencode".into();
+        let mut project = empty_resolved_project("openai", openai.clone());
+        project.mcfg.opencode.model = "openai/test".into();
+        let mut disabled = empty_resolved_project("disabled", openai.clone());
+        disabled.disabled = true;
+        eff.projects = vec![project, empty_resolved_project("failed", failed), disabled];
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.eff = Some(eff);
+        o.refresh_gated_chatgpt_queue().await;
+        assert!(o.chatgpt_probe_path(false).is_some());
+        assert_eq!(
+            openai.candidate_calls(),
+            1,
+            "disabled project must not be read"
+        );
+        o.eff.as_mut().unwrap().projects[0].tracker = empty.clone();
+        o.refresh_gated_chatgpt_queue().await;
+        assert!(
+            o.chatgpt_probe_path(false).is_some(),
+            "a partial board cannot clear queued work"
+        );
+        o.eff.as_mut().unwrap().projects[1].tracker = empty;
+        o.refresh_gated_chatgpt_queue().await;
+        assert!(o.chatgpt_probe_path(false).is_none());
+    }
 
     #[test]
     fn chatgpt_wall_and_probe_share_window_generations() {
