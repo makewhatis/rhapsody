@@ -281,15 +281,15 @@ impl Orchestrator {
     fn lead_dependencies(&self) -> Option<std::sync::Arc<LeadRuntime>> {
         let mut runtime = self.lead_runtime.as_deref()?.clone();
         // Commission preferences follow effective profiles, not just the roster's optional model.
+        // Do not hydrate a dispatch here: route_teams also acknowledges room catch-up cursors.
         for identity in &mut runtime.teams.roster {
-            let issue = Issue {
-                labels: Some(vec![format!("rhapsody:@{}", identity.name)]),
-                ..Default::default()
-            };
-            if let Some(dispatch) = self.route_teams(&issue)
-                && !dispatch.model_override.model.is_empty()
+            if let Some(profile) = self
+                .teams_profiles_dir
+                .as_ref()
+                .and_then(|dir| rhapsody_config::profiles::resolve(dir, &identity.profile).ok())
+                && !profile.model.is_empty()
             {
-                identity.model = dispatch.model_override.model;
+                identity.model = profile.model;
             }
         }
         runtime.projects = self
@@ -652,10 +652,27 @@ impl Orchestrator {
             return None;
         }
         let iss = run.synthetic_issue();
-        let inherited = self
-            .route_teams(&iss)
-            .map(|td| td.model_override)
-            .unwrap_or_default();
+        let inherited = if run.lead_item.is_some() {
+            self.teams
+                .as_ref()
+                .and_then(|teams| {
+                    let identity = self.planned_identity(&iss, &self.teammate_load())?;
+                    let profile = teams.roster.iter().find(|i| i.name == identity)?;
+                    let dir = self.teams_profiles_dir.as_ref()?;
+                    let resolved =
+                        rhapsody_config::profiles::resolve(dir, &profile.profile).ok()?;
+                    Some(rhapsody_agent::ModelOverride {
+                        identity,
+                        model: resolved.model,
+                        effort: resolved.effort,
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            self.route_teams(&iss)
+                .map(|td| td.model_override)
+                .unwrap_or_default()
+        };
         let model = self.manager_model_override(inherited, entry);
         let pricing = self.run_pricing_for(&entry.harness, &model, project);
         let mut held = if !self.account_usable(&pricing.account) {
@@ -903,6 +920,73 @@ mod tests {
             team_id: String::new(),
             case_packet: String::new(),
         }
+    }
+
+    #[test]
+    fn lead_preparation_never_consumes_teammate_room_cursor() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        let dir = crate::testsupport::TempDir::new();
+        std::fs::write(
+            dir.child("swe.md"),
+            "---\nharness: opencode\nmodel: openai/gpt-test\n---\nProfile\n",
+        )
+        .expect("profile");
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(&dir.path));
+        let room = Arc::new(rhapsody_config::room::LocalRoom::new(dir.child("room")));
+        room.append(&rhapsody_config::room::Message::room(
+            "operator",
+            chrono::Utc::now(),
+            "Pending teammate context",
+        ))
+        .expect("post");
+        let cursors = Arc::new(rhapsody_config::room::Cursors::new(
+            dir.child("banks"),
+            "agent-",
+        ));
+        o.teams_room = Some(room);
+        o.teams_cursors = Some(cursors.clone());
+        o.lead_runtime = Some(Arc::new(LeadRuntime {
+            control: o.control(),
+            store: o.store.clone(),
+            projects: Vec::new(),
+            teams: o.teams.clone().expect("teams"),
+            prs: Arc::new(crate::ghsummons::GH::new("", None)),
+            room: None,
+            memory: None,
+            findings_dir: None,
+        }));
+        let before = cursors.load("alice");
+        let deps = o.lead_dependencies().expect("dependencies");
+        assert_eq!(deps.teams.roster[0].model, "openai/gpt-test");
+        assert_eq!(
+            cursors.load("alice"),
+            before,
+            "metadata reads must not acknowledge the teammate's pending room context"
+        );
+        o.teams.as_mut().expect("teams").manager.default_identity = "alice".into();
+        o.eff.as_mut().expect("eff").cfg.budgets.insert(
+            "anthropic".into(),
+            rhapsody_config::ProviderBudget {
+                daily_usd: 1.0,
+                ..Default::default()
+            },
+        );
+        let mut run = manager_run();
+        run.lead_item = Some(7);
+        let _ = o.manager_usd_budget_hold(
+            &run,
+            "rhapsody",
+            &rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "claude".into(),
+                model: "claude-test".into(),
+                effort: "high".into(),
+            },
+        );
+        assert_eq!(
+            cursors.load("alice"),
+            before,
+            "lead budget reads must not hydrate a dispatch either"
+        );
     }
 
     /// Mark the §4.7 self-test as passed on the installed version, so the launch gate opens.

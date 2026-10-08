@@ -82,6 +82,9 @@ pub fn render(s: &Snapshot) -> Value {
         if !s.limit_items.is_empty() {
             obj.insert("limit_items".into(), json!(s.limit_items));
         }
+        if !s.limit_jobs.is_empty() {
+            obj.insert("limit_jobs".into(), json!(s.limit_jobs));
+        }
     }
     if !s.review_divergence.is_empty()
         && let Some(obj) = out.as_object_mut()

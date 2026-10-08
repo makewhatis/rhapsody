@@ -36,6 +36,12 @@ pub struct AccountView {
     pub source: String,
     pub stale: bool,
     pub detection: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub level: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub today_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_kind: Option<String>,
 }
 
 #[derive(Default)]
@@ -196,6 +202,9 @@ impl AccountLedger {
                     })
                     .collect();
                 AccountView {
+                    level: None,
+                    today_usd: None,
+                    cost_kind: None,
                     account: name.clone(),
                     windows,
                     status: if account.windows.is_empty() {
@@ -364,9 +373,57 @@ impl crate::Orchestrator {
 }
 
 impl crate::ControlHandle {
-    /// Read-only, in-memory view; no credential reads, network or control round-trip.
+    /// Read-only ledger plus today's stored costs and configured levels. No credential reads,
+    /// network or control round-trip; raw policy snapshots never acquire reporting fields.
     pub fn accounts(&self, now_s: i64) -> Vec<AccountView> {
-        self.accounts.snapshot(now_s)
+        let cfg = self
+            .reads
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limits
+            .clone();
+        let since = chrono::DateTime::from_timestamp(now_s, 0)
+            .map(crate::budget::local_day_start_at)
+            .unwrap_or_default();
+        let costs = self.store.turn_spend_since(&since);
+        self.accounts
+            .snapshot(now_s)
+            .into_iter()
+            .map(|mut view| {
+                view.level = Some(
+                    crate::limitreport::level_label(crate::limitpolicy::level(
+                        &self.accounts,
+                        &view.account,
+                        &cfg,
+                        now_s,
+                    ))
+                    .into(),
+                );
+                view.cost_kind = Some(
+                    if matches!(
+                        view.account.as_str(),
+                        "claude-subscription" | "chatgpt-subscription"
+                    ) {
+                        "api_equivalent"
+                    } else {
+                        "usd"
+                    }
+                    .into(),
+                );
+                if self.store.usd_accounting_available()
+                    && let Ok(rows) = &costs
+                {
+                    let mut total = Some(0.0);
+                    for row in rows.iter().filter(|r| r.account == view.account) {
+                        total = total
+                            .zip(row.usd.filter(|v| v.is_finite() && *v >= 0.0))
+                            .map(|(a, b)| a + b);
+                    }
+                    view.today_usd = total.filter(|v| v.is_finite());
+                }
+                view
+            })
+            .collect()
     }
 }
 

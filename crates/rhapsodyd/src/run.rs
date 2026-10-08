@@ -545,6 +545,7 @@ where
     // notifications. Spawned on exactly the introduction's condition: a round can only exist where
     // one was introduced, so a non-ticketless daemon has nothing to bound.
     let breaker_rx = spawn_review_intro(&teams_cfg).then(|| o.open_breaker_channel());
+    let limit_report_rx = o.open_limit_report_channel();
     // --- ticketless review watcher (STUDIO-721, slice 5; design record §14.1, §14.4) ---
     //
     // The slice that makes reviews actually fire. It owns its own poll cadence and every `gh` call
@@ -925,6 +926,7 @@ where
     // The breaker's room line (STUDIO-1026), another clone of the same handle for the same reason:
     // it must serialize with every other appender's.
     let breaker_room = teams_room.clone();
+    let limit_report_room = teams_room.clone();
     let quorum_room = teams_room;
     // --- the manager's OWN resolved tuple (STUDIO-989, P8) ---
     //
@@ -1251,6 +1253,38 @@ where
     // must park this task and nothing else. The control task already DECIDED the crossing and
     // persisted it; this task only performs the consequences.
     let breaker_notifications = o.notifications_state();
+    let mut limit_channels: Vec<Arc<dyn rhapsody_orchestrator::breaker::NotifyChannel>> =
+        Vec::new();
+    if let Some(cfg) = resolved.as_ref() {
+        if cfg.notify.macos {
+            limit_channels.push(Arc::new(rhapsody_orchestrator::breaker::MacosChannel::new(
+                breaker_notifications.clone(),
+            )));
+        }
+        if !cfg.notify.ntfy.trim().is_empty() {
+            limit_channels.push(Arc::new(rhapsody_orchestrator::breaker::NtfyChannel::new(
+                cfg.notify.ntfy.trim().into(),
+            )));
+        }
+    }
+    let limit_report_ctx = shutdown.wait();
+    let limit_report_comments = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+        &resolved
+            .as_ref()
+            .map(|c| c.tracker.summon_token.clone())
+            .unwrap_or_default(),
+        None,
+    ));
+    let limit_report_task = tokio::spawn(async move {
+        rhapsody_orchestrator::limitreport::run_limit_report_task(
+            limit_report_ctx,
+            limit_report_room.map(|r| r as Arc<dyn rhapsody_config::room::RoomLog>),
+            limit_channels,
+            limit_report_comments,
+            limit_report_rx,
+        )
+        .await;
+    });
     let breaker_task = breaker_rx.map(|rx| {
         let breaker_ctx = shutdown.wait();
         let hold_handle = handle.clone();
@@ -1603,6 +1637,7 @@ where
     if let Some(t) = breaker_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
+    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, limit_report_task).await;
     // The manager applier task (STUDIO-1016) is drained last of the review tasks: its receive ends
     // when the control task drops the orchestrator (and with it the sender), so the wait is bounded
     // by whatever `gh pr comment` or ticket move is already in flight.
