@@ -1069,6 +1069,14 @@ impl OpencodeSession {
                 super::limits::auth_kind(&login_path, provider)
             }
         });
+        // Classification is known before exec; a silent child must still bind its live account.
+        if let Some(oauth) = self.account_oauth() {
+            on_event(Event {
+                event_type: crate::EVENT_ACCOUNT_AUTH.into(),
+                message: if oauth { "oauth" } else { "api" }.into(),
+                ..Default::default()
+            });
+        }
         // The same containment invariant the claude runner enforces before every exec (§9.5): the
         // workspace must be inside the root and equal to the cwd.
         if let Err(e) = rhapsody_workspace::validate_launch(

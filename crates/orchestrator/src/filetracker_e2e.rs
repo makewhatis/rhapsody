@@ -435,6 +435,80 @@ async fn file_tracker_opencode_wall_flow_uses_actual_api_auth_and_releases_on_fa
     teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn file_tracker_silent_opencode_run_binds_account_while_active() {
+    let dir = TempDir::new();
+    let state = TempDir::new();
+    let src = dir.child("issues.json");
+    write_tracker_file(
+        &src,
+        &[FIssue {
+            id: "silent",
+            identifier: "SILENT-1",
+            title: "silent account smoke",
+            state: "Todo",
+            team_id: "",
+            latest_summon_at: "",
+        }],
+    );
+    let script = dir.child("silent.sh");
+    let ready = dir.child("ready");
+    std::fs::write(&script, format!("touch '{ready}'\nsleep 30\n")).unwrap();
+    let auth = dir.child("auth.json");
+    std::fs::write(&auth, br#"{"openai":{"type":"api","key":"test-only-key"}}"#).unwrap();
+    let mut ft = build_file_tracker_orch(&src, "");
+    ft.o.set_store(Arc::new(rhapsody_store::Noop));
+    let eff = ft.o.eff.as_mut().unwrap();
+    eff.agent = Arc::new(rhapsody_agent::opencode::Runner::new(
+        rhapsody_agent::opencode::Config {
+            command: format!("bash {script}"),
+            workspace_root: ft._root.path.clone(),
+            state_root: std::fs::canonicalize(&state.path)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned(),
+            auth_source: auth,
+            model: "openai/test".into(),
+            ..Default::default()
+        },
+    ));
+    eff.cfg.agent.backend = "opencode".into();
+    eff.cfg.opencode.model = "openai/test".into();
+    let handle = ft.o.control();
+    ft.o.on_tick().await;
+    let live = pump(&mut ft.o, &mut ft.rx, Duration::from_secs(5), |o| {
+        std::path::Path::new(&ready).exists() && o.running.contains_key("silent")
+    })
+    .await;
+    // Drain anything already queued: the child is live but emits no stdout or stderr.
+    while let Ok(event) = ft.rx.try_recv() {
+        ft.o.drive_event(event).await;
+    }
+    let now = chrono::Utc::now().timestamp() + 1800;
+    let active = handle.accounts(now);
+    if let Some(re) = ft.o.terminate("silent") {
+        ft.o.persist_end_run(&re, OUTCOME_STOPPED, "test cancellation");
+    }
+    let released = handle.accounts(now);
+    teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
+
+    assert!(live, "silent OpenCode child must actually launch");
+    assert_eq!(active.len(), 1, "every active run must bind its account");
+    assert_eq!(active[0].account, "openai");
+    assert!(!active[0].stale, "silent live account remains fresh");
+    assert_eq!(active[0].status, "unknown");
+    assert!(active[0].windows.is_empty());
+    assert_eq!(
+        active[0].last_seen_s, 0,
+        "binding is not a usage observation"
+    );
+    assert_eq!(released.len(), 1);
+    assert!(
+        released[0].stale,
+        "storage-off cancellation releases activity"
+    );
+}
+
 // Mirrors Go `TestFileTrackerE2E_DispatchContinuedRedispatch`.
 #[tokio::test(flavor = "multi_thread")]
 async fn file_tracker_e2e_dispatch_continued_redispatch() {

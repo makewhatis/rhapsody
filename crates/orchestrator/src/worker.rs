@@ -1226,6 +1226,11 @@ impl WorkerDeps {
                             ..Default::default()
                         });
                     }
+                    // OpenCode reports auth before exec, independently of child output. The
+                    // once-per-run classification above consumes that marker without duplicates.
+                    if e.event_type == agent::EVENT_ACCOUNT_AUTH {
+                        return;
+                    }
                     tracing::debug!(
                         issue_identifier = %ident,
                         event = %e.event_type,
