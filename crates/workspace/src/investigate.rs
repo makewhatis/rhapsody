@@ -91,14 +91,18 @@ impl Manager {
 
     // Git archive can apply content filters too. Use only the mirror's object database, never
     // its config/info/refs: this empty Git directory has no filter definitions or hooks.
+    // Read attributes from a separate empty worktree, never the PR tree or tar's destination:
+    // export-ignore/export-subst and checkout conversions must not hide or rewrite evidence.
     // Never use a custom archive format, a shell pipeline or lifecycle hooks.
     async fn investigate_archive(&self, mirror: &str, sha: &str, path: &str) -> Result<(), Error> {
         use std::process::Stdio;
         let git_dir = std::path::Path::new(path).join("git");
+        let attributes = git_dir.join("attributes");
         let repo = std::path::Path::new(path).join("repo");
         std::fs::create_dir(&git_dir)
             .and_then(|_| std::fs::create_dir(git_dir.join("objects")))
             .and_then(|_| std::fs::create_dir(git_dir.join("refs")))
+            .and_then(|_| std::fs::create_dir(&attributes))
             .and_then(|_| std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/export\n"))
             .and_then(|_| std::fs::create_dir(&repo))
             .map_err(|e| Error::WorkspaceCreate(e.to_string()))?;
@@ -108,6 +112,7 @@ impl Manager {
             .env("HOME", "/nonexistent")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_ATTR_NOSYSTEM", "1")
             .env("GIT_TERMINAL_PROMPT", "0")
             .env(
                 "GIT_OBJECT_DIRECTORY",
@@ -118,10 +123,14 @@ impl Manager {
                 "core.hooksPath=/dev/null",
                 "-c",
                 "core.fsmonitor=false",
+                "-c",
+                "core.attributesFile=/dev/null",
                 "--git-dir",
             ])
             .arg(&git_dir)
-            .args(["archive", "--format=tar", sha])
+            .arg("--work-tree")
+            .arg(&attributes)
+            .args(["archive", "--format=tar", "--worktree-attributes", sha])
             .kill_on_drop(true)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -317,6 +326,112 @@ mod tests {
             .await
             .unwrap();
         assert!(!hook_marker.exists(), "export removal executed a host hook");
+    }
+
+    #[tokio::test]
+    async fn pr_export_preserves_tracked_content_despite_archive_attributes() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = TempDir::new();
+        let root_path = Path::new(&root.path);
+        let origin = root_path.join("origin");
+        std::fs::create_dir(&origin).unwrap();
+        git(&origin, &["init", "-b", "main"]);
+        std::fs::create_dir(origin.join("directory")).unwrap();
+        std::fs::create_dir(origin.join("nested")).unwrap();
+        for (path, bytes) in [
+            ("hidden", "tracked code must stay visible\n"),
+            ("visible", "$Format:%H$\n$Id$\noriginal line endings\n"),
+            ("directory/file", "ignored directories must stay visible\n"),
+            ("nested/file", "$Format:%H$\nnested tracked code\n"),
+            ("script", "#!/bin/sh\nexit 0\n"),
+        ] {
+            std::fs::write(origin.join(path), bytes).unwrap();
+        }
+        std::fs::set_permissions(
+            origin.join("script"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("../hidden", origin.join("nested/link")).unwrap();
+        // Stage raw blobs before attributes exist, so the fixture itself cannot convert bytes.
+        git(&origin, &["add", "."]);
+        std::fs::write(
+            origin.join(".gitattributes"),
+            "* export-subst text eol=crlf ident\nhidden export-ignore\ndirectory export-ignore\n",
+        )
+        .unwrap();
+        std::fs::write(
+            origin.join("nested/.gitattributes"),
+            "* export-ignore export-subst\n",
+        )
+        .unwrap();
+        git(&origin, &["add", ".gitattributes", "nested/.gitattributes"]);
+        git(&origin, &["commit", "-m", "untrusted archive attributes"]);
+        let sha = git(&origin, &["rev-parse", "HEAD"]);
+        std::fs::write(origin.join("visible"), "newer content\n").unwrap();
+        git(&origin, &["add", "visible"]);
+        git(&origin, &["commit", "-m", "newer than the pinned head"]);
+        let mirror = root_path
+            .join(".mirrors")
+            .join(format!("{}.git", crate::repo_key(origin.to_str().unwrap())));
+        std::fs::create_dir_all(mirror.parent().unwrap()).unwrap();
+        git(
+            root_path,
+            &[
+                "clone",
+                "--bare",
+                origin.to_str().unwrap(),
+                mirror.to_str().unwrap(),
+            ],
+        );
+        let manager = Manager::new(crate::Config {
+            root: root.path.clone(),
+            hooks: crate::HookScripts::default(),
+            hook_timeout: std::time::Duration::from_secs(1),
+        })
+        .unwrap();
+        let tree = manager
+            .ensure_investigate_export(origin.to_str().unwrap(), 42, &sha)
+            .await
+            .unwrap();
+        let mut mismatches = Vec::new();
+        for path in git(&mirror, &["ls-tree", "-r", "--name-only", &sha]).lines() {
+            let exported = Path::new(&tree.path).join(path);
+            if path == "nested/link" {
+                if std::fs::read_link(&exported).ok().as_deref() != Some(Path::new("../hidden")) {
+                    mismatches.push(format!("{path}: missing or altered symlink"));
+                }
+            } else if !exported.is_file() {
+                mismatches.push(format!("{path}: tracked file omitted"));
+            } else {
+                let expected = git(&mirror, &["rev-parse", &format!("{sha}:{path}")]);
+                let actual = git(
+                    root_path,
+                    &["hash-object", "--no-filters", exported.to_str().unwrap()],
+                );
+                if actual != expected {
+                    mismatches.push(format!("{path}: tracked bytes rewritten"));
+                }
+            }
+        }
+        assert!(
+            mismatches.is_empty(),
+            "PR archive differs from the verified head: {mismatches:?}"
+        );
+        assert_ne!(
+            std::fs::metadata(Path::new(&tree.path).join("script"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert!(!Path::new(&tree.path).join(".git").exists());
+        manager
+            .remove_investigate_export(origin.to_str().unwrap(), 42)
+            .await
+            .unwrap();
+        assert!(!Path::new(&tree.path).exists());
     }
 
     #[tokio::test]

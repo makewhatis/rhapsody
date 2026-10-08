@@ -28,6 +28,9 @@ revision of the same source version. The runtime pins the resulting immutable im
   gives a typed refusal; commission the author to supply the evidence instead.
   Archive reads only the mirror's object database through an empty daemon-owned Git directory:
   invoking archive in the mirror itself can still run its configured smudge/process filters.
+  Attributes are read from a separate empty worktree, excluding committed, mirror and operator
+  attributes: `export-ignore`, `export-subst` and checkout conversions cannot omit tracked files
+  or rewrite their bytes. This attribute source is separate from the unpack destination.
 - `/repo` is a read-only PR-head export without `.git` metadata (Git history commands are unavailable);
   `/cache` is a read-only cache volume; `/scratch` is a
   1 GiB executable tmpfs. The root filesystem is read-only. Containers have no network, capabilities
