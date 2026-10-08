@@ -687,9 +687,13 @@ mod tests {
     // --- CredentialResolver: the daemon-wide OwnerUnavailable/OwnerUnauthorized states -------------
 
     fn unix_socket_path(name: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
         // Unix socket paths are capped at ~104 bytes (`sun_path`); `/tmp` directly with a short
         // name keeps well under that regardless of the ambient `$TMPDIR`.
-        std::path::PathBuf::from("/tmp").join(format!("rd-cc-{name}-{}.sock", std::process::id()))
+        std::path::PathBuf::from("/tmp")
+            .join(format!("rd-cc-{name}-{}-{seq}.sock", std::process::id()))
     }
 
     #[tokio::test]

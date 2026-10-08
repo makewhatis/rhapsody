@@ -65,8 +65,15 @@ async fn smoke_supervises_real_release_rhapsodyd() {
     // STUDIO-1041: point the real daemon at a private HOME so the smoke run never publishes
     // `~/.rhapsody/runtime.json` for, or writes logs into, the operator's live runtime home (which a
     // self-hosted runner's daemon may own).
-    let home = std::env::temp_dir().join(format!("rhapsody-smoke-home-{}", std::process::id()));
-    std::fs::create_dir_all(&home).expect("create smoke home");
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let home = std::env::temp_dir().join(format!(
+        "rhapsody-smoke-home-{}-{nonce}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&home).expect("create smoke home");
 
     let sup = Supervisor::new(Options {
         binary_path: resolved,

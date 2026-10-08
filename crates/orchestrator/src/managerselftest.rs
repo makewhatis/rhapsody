@@ -1949,18 +1949,15 @@ mod tests {
         let command =
             std::env::var("RHAPSODY_MANAGER_CANARY_CLI").unwrap_or_else(|_| "claude".to_string());
         let version = probe_cli_version(&command).expect("probe the installed claude");
-        let root =
-            std::env::temp_dir().join(format!("rhapsody-canary-live-{}", std::process::id()));
-        std::fs::create_dir_all(&root).expect("canary root");
+        let root = crate::testsupport::TempDir::new();
         let runner = CliCanaryRunner {
             command,
-            workspace_root: root.to_string_lossy().into_owned(),
+            workspace_root: root.path.clone(),
             daemon_bin: String::new(),
             workflow_path: String::new(),
         };
         let observations = runner.run_canary(&version).await;
         let verdict = evaluate(&version, &observations);
-        let _ = std::fs::remove_dir_all(&root);
         assert_eq!(
             verdict,
             SelfTestVerdict::Passed,
@@ -1975,17 +1972,16 @@ mod tests {
     async fn a_canary_that_cannot_start_fails_closed() {
         // A workspace_root that is a regular FILE, so creating the canary directory under it fails
         // and the runner takes its `failed()` path.
-        let file =
-            std::env::temp_dir().join(format!("rhapsody-canary-file-{}", std::process::id()));
+        let root = crate::testsupport::TempDir::new();
+        let file = root.child("not-a-dir");
         std::fs::write(&file, b"not a dir").expect("write file");
         let runner = CliCanaryRunner {
             command: "/nonexistent/definitely-not-claude".to_string(),
-            workspace_root: file.to_string_lossy().into_owned(),
+            workspace_root: file,
             daemon_bin: String::new(),
             workflow_path: String::new(),
         };
         let observations = runner.run_canary("0.0.0").await;
-        let _ = std::fs::remove_file(&file);
         assert!(
             observations.iter().all(|o| !o.refused),
             "a canary that cannot run must observe NO refusal: {observations:?}"

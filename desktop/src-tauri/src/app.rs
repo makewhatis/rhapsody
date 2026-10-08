@@ -1416,10 +1416,8 @@ mod tests {
     // `TestStartDaemonRefusesWhenNotConfigured`.
     #[test]
     fn start_daemon_refuses_when_not_configured() {
-        let absent = std::env::temp_dir()
-            .join(format!("rhapsody-d3-{}", std::process::id()))
-            .join("absent")
-            .join("WORKFLOW.md"); // does not exist
+        let dir = temp_dir();
+        let absent = dir.join("absent").join("WORKFLOW.md"); // does not exist
         let a = App::new(Some(absent), PathBuf::new());
         a.set_sup(Supervisor::new(Options::default()));
         assert!(
