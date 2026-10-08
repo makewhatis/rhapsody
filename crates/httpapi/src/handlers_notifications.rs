@@ -176,11 +176,27 @@ async fn observe(
         {
             continue;
         }
-        let system = d.capacity_held.is_some() || d.kind.as_str() == "manager_deferred";
-        let kind = if system {
-            Kind::ManagerDisabled
-        } else {
-            Kind::StuckPr
+        use rhapsody_orchestrator::reviewreconcile::DivergenceKind as D;
+        let kind = match d.kind {
+            D::CredentialInfrastructure => Kind::LoginCheck,
+            D::ManagerDeferred => Kind::ManagerDisabled,
+            D::ChangesRequestedNoRun
+            | D::ReviewRequestedNoRun
+            | D::AuthorTokenCeilingStopped
+            | D::ReviewTokenCeilingStopped
+            | D::ApprovedStillOpen
+            | D::HeldForHuman
+            | D::RoundBudgetExhausted
+            | D::ReviewEscalated
+            | D::ReviewShipped
+            | D::MergedTicketNotTerminal
+            | D::ReviewInfrastructure => {
+                if d.capacity_held.is_some() {
+                    Kind::ManagerDisabled
+                } else {
+                    Kind::StuckPr
+                }
+            }
         };
         let summary = if d.reason.is_empty() {
             d.kind.detail()
@@ -210,7 +226,11 @@ async fn observe(
             ),
             &d.pr,
             &summary,
-            pr_link(&d.pr),
+            if d.kind == D::CredentialInfrastructure {
+                "#accounts".into()
+            } else {
+                pr_link(&d.pr)
+            },
             &rhapsody_store::format_summon_at(when),
             true,
         ));
@@ -257,8 +277,24 @@ async fn observe(
         ));
     }
     for account in provider.accounts() {
+        if let Some(reason) = account
+            .probe_reason
+            .as_ref()
+            .or(account.stale_reason.as_ref())
+        {
+            rows.push(notice(
+                Kind::LoginCheck,
+                format!("account-probe:{}:{reason}", account.account),
+                &account.account,
+                reason,
+                "#accounts".into(),
+                &at,
+                true,
+            ));
+        }
         if matches!(account.status.as_str(), "rejected" | "warning")
-            || account.level.as_deref().is_some_and(|s| s != "ok")
+            || (account.status != "credential_held"
+                && account.level.as_deref().is_some_and(|s| s != "ok"))
         {
             rows.push(notice(
                 Kind::LimitWall,
@@ -613,6 +649,9 @@ mod tests {
                 level: Some("wall".into()),
                 today_usd: None,
                 cost_kind: None,
+                stale_reason: None,
+                probe_reason: None,
+                credential_probes: vec![],
             }])
             .with_lead_reports(Arc::new(rhapsody_orchestrator::leadreport::LeadReports {
                 store,
@@ -820,5 +859,44 @@ mod tests {
         assert_eq!(rows[0].group, "activity");
         assert_eq!(rows[0].kind, "auto_merge");
         assert_eq!(rows[0].href, "https://github.com/owner/repo/pull/7");
+    }
+
+    #[tokio::test]
+    async fn credential_probe_infrastructure_is_system_status_not_a_fake_pr_or_operator_hold() {
+        let mut snapshot = empty_snapshot();
+        let mut row = divergence(
+            rhapsody_orchestrator::reviewreconcile::DivergenceKind::CredentialInfrastructure,
+        );
+        row.pr = "claude credential probe (claude-subscription)".into();
+        row.ticket.clear();
+        row.reviewer.clear();
+        row.reason = "claude probe: 3 consecutive timeouts. Dispatch continues.".into();
+        snapshot.review_divergence.push(row);
+        let rows = observe(&FakeProvider::ok(snapshot), None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].group, "system");
+        assert_eq!(rows[0].kind, "login_check");
+        assert_eq!(rows[0].href, "#accounts");
+        assert!(
+            rows[0]
+                .summary
+                .contains("3 consecutive timeouts. Dispatch continues.")
+        );
+    }
+
+    #[tokio::test]
+    async fn credential_held_account_reports_its_login_reason_without_inventing_a_quota_wall() {
+        let account = serde_json::from_value(serde_json::json!({
+            "account": "chatgpt-subscription", "windows": [], "status": "credential_held",
+            "using_credits": false, "last_seen_s": 0, "source": "probe", "stale": true,
+            "detection": "inactive", "level": "stop_new", "probe_reason": "401: refresh the login"
+        }))
+        .unwrap();
+        let provider = FakeProvider::ok(empty_snapshot()).with_accounts(vec![account]);
+        let rows = observe(&provider, None).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].kind, "login_check");
+        assert_eq!(rows[0].group, "system");
+        assert_eq!(rows[0].summary, "401: refresh the login");
     }
 }

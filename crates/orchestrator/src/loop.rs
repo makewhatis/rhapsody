@@ -257,8 +257,16 @@ pub enum Event {
         started_at: DateTime<Utc>,
         obs: agent::ratelimit::LimitObs,
     },
+    ChatgptProbePath {
+        boot: bool,
+        reply: oneshot::Sender<Option<std::path::PathBuf>>,
+    },
+    ChatgptProbeResult(Result<agent::ratelimit::LimitObs, &'static str>),
     /// The concrete per-run transcript path the worker opened (Go `evTranscriptOpened`).
-    TranscriptOpened { issue_id: String, path: String },
+    TranscriptOpened {
+        issue_id: String,
+        path: String,
+    },
     /// A fired retry timer (Go `evRetry`).
     Retry(EvRetry),
     /// A WORKFLOW.md change observed by the watcher (Go `evReload`).
@@ -789,6 +797,19 @@ impl Orchestrator {
                 started_at,
                 obs,
             } => self.observe_account(&issue_id, started_at, obs),
+            Event::ChatgptProbePath { boot, reply } => {
+                let _ = reply.send(self.chatgpt_probe_path(boot));
+            }
+            Event::ChatgptProbeResult(result) => {
+                match result {
+                    Ok(obs) => self.accounts.observe("chatgpt-subscription", obs),
+                    Err(reason) => {
+                        self.accounts.probe_failed(reason);
+                        tracing::warn!(reason, "ChatGPT usage probe failed; account marked stale");
+                    }
+                }
+                self.enforce_limits();
+            }
             Event::TranscriptOpened { issue_id, path } => {
                 self.on_transcript_opened(&issue_id, &path)
             }
@@ -1084,11 +1105,12 @@ impl Orchestrator {
         self.publish_snapshot();
         if let Err(e) = self.validate() {
             tracing::error!(err = %e, "dispatch preflight validation failed; skipping dispatch");
-            // This early return and the credential preflight just below both skip dispatch
+            self.refresh_gated_chatgpt_queue().await;
+            // This early return and the drain gate just below both skip dispatch
             // entirely, so the reset at the top of `dispatch_decisions` never runs and the last
             // successful pass's tally would stand.
             // Retire it here instead (STUDIO-805): unlike the tracker outage that reset covers,
-            // NEITHER of these clears up on its own — a bad config or a dead agent credential skips
+            // NEITHER of these clears up on its own — a bad config or an armed drain skips
             // dispatch every tick until a human intervenes — so a survivor would render "N queued"
             // indefinitely against a teammate who is neither queued nor running. This count exists
             // to tell "queued" apart from "broken"; on these paths the honest answer is "broken".
@@ -1096,9 +1118,9 @@ impl Orchestrator {
             self.schedule_tick(poll);
             return;
         }
-        // STUDIO-880: the drain gate. Same seam, same property as the credential preflight below —
-        // skip ALL dispatch WITHOUT claiming anything, before candidate fetch — because a drain that
-        // claimed a ticket and then declined to run it would leave exactly the abandoned claim the
+        // STUDIO-880: the drain gate. Like validation above, it must
+        // skip ALL dispatch WITHOUT claiming anything, before dispatch's candidate fetch — a drain
+        // that claimed a ticket and then declined to run it would leave the abandoned claim that the
         // "nothing is claimed" invariant exists to prevent. Deliberately ONE gate rather than a
         // second "should we dispatch" test somewhere else: two of them is how one gets forgotten.
         //
@@ -1106,20 +1128,14 @@ impl Orchestrator {
         // `claude -p` probe). A daemon that has been told to stop dispatching has no use for the
         // answer, so asking would spend a subprocess every tick for a decision already made.
         if self.drain_preflight() {
+            self.refresh_gated_chatgpt_queue().await;
             self.set_held_for_capacity(HashMap::new()); // see the retirement note above
             self.schedule_tick(poll);
             return;
         }
-        // BO-59: agent credential-liveness preflight. A dead backend credential (e.g. an expired Claude
-        // OAuth login) skips ALL dispatch WITHOUT claiming anything, so an infrastructure fault fails
-        // fast instead of claim→dispatch→die every ~5 min. Runs BEFORE candidate fetch (nothing is
-        // claimed); cached per TTL; logs the transition + rate-limits the steady-state repeat itself, so
-        // this call site stays quiet rather than error-logging every 30s forever.
-        if !self.credential_preflight().await {
-            self.set_held_for_capacity(HashMap::new()); // see the retirement note above
-            self.schedule_tick(poll);
-            return;
-        }
+        // BO-59/STUDIO-1144: refresh per-context verdicts before selection; only a definite failure
+        // holds that credential's work. Timeouts are unknown and never skip the whole tick.
+        self.credential_preflight().await;
         // symphony.poll wraps this tick's candidate fetch + dispatch decisions (a short control-loop
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
@@ -1168,6 +1184,21 @@ impl Orchestrator {
         let has_projects = self.eff.as_ref().is_some_and(|e| !e.projects.is_empty());
         if has_projects {
             let (tagged, read_the_board) = self.poll_all_projects().await;
+            let queued: Vec<_> = tagged
+                .iter()
+                .map(|t| {
+                    (
+                        &t.iss,
+                        self.route_for(t.proj).map(|r| r.slug).unwrap_or_default(),
+                    )
+                })
+                .collect();
+            self.record_chatgpt_queue(
+                queued
+                    .iter()
+                    .map(|(issue, project)| (*issue, project.as_str())),
+                read_the_board,
+            );
             // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448,
             // O6 `message.rs`).
             self.deliver_mid_run_summons_tagged(&tagged);
@@ -1290,6 +1321,7 @@ impl Orchestrator {
         // `poll_all_projects`. Two ladders means two seams; the ONLY way a candidate reaches
         // dispatch without its remembered summons is for one of them to be missing.
         self.restore_summon_watermarks(issues.iter_mut());
+        self.record_chatgpt_queue(issues.iter().map(|issue| (issue, "")), true);
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
@@ -2981,6 +3013,7 @@ mod tests {
     /// login skips dispatch every tick until a human re-authenticates. See the sibling test above.
     #[tokio::test]
     async fn a_dead_credential_retires_the_published_count() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
         struct DeadProbe;
         #[async_trait::async_trait]
         impl crate::preflight::CredentialProbe for DeadProbe {

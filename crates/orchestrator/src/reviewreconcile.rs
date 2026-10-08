@@ -270,6 +270,8 @@ pub enum DivergenceKind {
     ManagerDeferred,
     /// The reviewer exhausted no-verdict attempts (STUDIO-1129), not a findings loop.
     ReviewInfrastructure,
+    /// Repeated credential-probe timeouts; dispatch continues with an unknown login state.
+    CredentialInfrastructure,
 }
 
 impl DivergenceKind {
@@ -289,6 +291,7 @@ impl DivergenceKind {
             DivergenceKind::MergedTicketNotTerminal => "merged_ticket_not_terminal",
             DivergenceKind::ManagerDeferred => "manager_deferred",
             DivergenceKind::ReviewInfrastructure => "review_infrastructure",
+            DivergenceKind::CredentialInfrastructure => "credential_infrastructure",
         }
     }
     /// The operator-facing sentence: what was expected to happen, and what did not. Phrased as an
@@ -339,6 +342,9 @@ impl DivergenceKind {
             }
             DivergenceKind::ReviewInfrastructure => {
                 "review infrastructure failed before a reviewer could give a verdict; see the reason"
+            }
+            DivergenceKind::CredentialInfrastructure => {
+                "credential probe infrastructure repeatedly timed out; dispatch continues; see the reason"
             }
         }
     }

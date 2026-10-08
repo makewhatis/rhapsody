@@ -279,6 +279,7 @@ impl Orchestrator {
                 .iter()
                 .cloned()
                 .chain(self.lead_human_feed())
+                .chain(self.credential_human_feed())
                 .collect(),
             // STUDIO-949: the current hold set, replaced every selection pass; empty on a daemon with
             // no human-gated ticket, which keeps the wire payload — and the golden — unchanged.
@@ -372,11 +373,8 @@ impl Orchestrator {
                 }
             }
         }
-        // BO-59: while the dispatch credential probe reports the backend dead, ALL dispatch is paused;
-        // surface that as a per-project advisory so an operator reading the project status sees the
-        // cause (the log stream is the primary surface). Empty while healthy → the wire shape and the
-        // existing status fixtures are unaffected.
-        let credential_dead = self.credential_probe_dead();
+        // BO-59/STUDIO-1144: a project's default credential hold is an account advisory, not a
+        // daemon-wide pause. The account ledger names the exact affected harness and reason.
         // STUDIO-880: same treatment for the same reason — while a drain is armed ALL dispatch is
         // paused, and an operator reading a project that has quietly stopped taking work needs to be
         // told why. Empty while not draining → the wire shape and the status fixtures are unaffected.
@@ -444,7 +442,11 @@ impl Orchestrator {
             // Per-project advisories merged from the two off-loop resolvers (INF-277 slug + INF-279
             // prompt-file), recorded by O7's `warnings` resolver. Empty until a resolver stores one.
             let mut warnings = self.project_warnings_for(group);
-            if credential_dead {
+            if self.eff.as_ref().is_some_and(|e| {
+                e.projects
+                    .iter()
+                    .any(|p| &p.group == group && self.credential_probe_held("", &p.slug))
+            }) {
                 warnings.push(crate::preflight::CREDENTIAL_DEAD_WARNING.to_string());
             }
             if draining {

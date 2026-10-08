@@ -61,6 +61,23 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Account-scoped credential preflight (STUDIO-1144)
+
+The BO-59 Claude credential-liveness probe has no Go counterpart. Its verdict is now scoped by
+account, harness and effective command/billing-guard policy, including project and profile engines.
+Supported contexts probe concurrently within a ten-second window; healthy answers cache for five
+minutes, while unknown/dead answers retry next tick. Only an explicit expired, missing or rejected
+login holds new work for that context; a timeout, launch failure or unexpected reply permits dispatch.
+OpenCode and brokered providers retain their own credential handling and are not held by Claude's probe.
+Selection checks before consuming slots/claims, fallback admission rechecks its own harness, and
+ticketless reviews check before watch writes. Existing usage-limit policy and live runs are unaffected.
+
+Three consecutive timeouts report a credential infrastructure problem in logs and the human feed,
+naming the harness/account, and disappear on a subsequent answer or context removal. `/api/v1/accounts`
+adds optional `credential_probes` and `probe_reason`; a held credential reports `status: credential_held`
+and `level: stop_new`. Usage windows remain independent. Probe diagnostics use closed reasons, never
+raw command/output/credential contents. Go-owned schema and payload goldens are unchanged.
+
 ### Tech-lead reporting, daily budgets and operator overrules (STUDIO-1138)
 
 The opt-in lead adds `GET /api/v1/lead/decisions?since=` (RFC3339) and the
@@ -305,8 +322,15 @@ Claude's account windows arrive from `rate_limit_event` or CLI rejection diagnos
 ChatGPT's OpenCode success stream/logs expose tokens but no account utilization;
 an access-only, non-inference `wham/usage` GET supplies advance visibility (`probe`).
 The probe never refreshes a login or follows redirects, is bounded to one attempt
-per account per ten minutes across concurrent runners, and runs only during active
-OAuth OpenAI turns. Failed probes preserve the last known data. Stream 429 and
+per account per ten minutes, and is scheduled by the daemon once after boot's API
+listener starts, then while OpenCode/OpenAI work is active, queued or held (STUDIO-1143).
+Closed dispatch preflights still make a bounded, read-only candidate pass to observe queued
+work; this pass never selects, claims, enriches or primes review-decision ledgers.
+Each attempt reads a fresh access-only copy of the operator login, rather than a
+runner's retained login. Failed probes preserve the last known data and explicitly
+mark the account stale with a closed reason, including unauthorized and timeout.
+The real plan drives advance thresholds; the separately reported OpenAI token budget
+is an independent runaway wall, labelled **Rhapsody budget** on the dashboard. Stream 429 and
 `usage_limit_reached` errors remain wall signals. A probe reports no credits-use
 claim: the usage response's `has_credits` describes availability, not spending.
 

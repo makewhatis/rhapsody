@@ -13,6 +13,15 @@ const account = (level: string, extra = {}): AccountView => ({
 });
 
 describe("AccountsPanel", () => {
+  it("distinguishes a Rhapsody budget wall from the real ChatGPT plan and shows probe failures", () => {
+    render(<AccountsPanel nowS={1000} accounts={[
+      account("wall", { account: "openai", source: "budget", detection: "budget" }),
+      account("ok", { account: "chatgpt-subscription", source: "probe", detection: "probe", stale: true, stale_reason: "usage_unauthorized" }),
+    ]} />);
+    expect(screen.getByText("Rhapsody budget")).toBeTruthy();
+    expect(screen.getByText("Probe unavailable: usage unauthorized")).toBeTruthy();
+    expect(screen.getByText("stale")).toBeTruthy();
+  });
   it("renders bars, countdown, a state chip per level, credits, USD or API-equivalent, and detection mode", () => {
     render(<AccountsPanel nowS={1000} accounts={[
       ...["ok", "warn", "stop-new", "handoff", "wall"].map((level) => account(level)),
