@@ -78,6 +78,31 @@ pub struct LeadItem {
     pub attempts_on_question: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeadDecisionRow {
+    pub id: i64,
+    pub item: i64,
+    pub at: String,
+    pub decision: String,
+    pub reasoning: String,
+    pub evidence: String,
+    pub actions: String,
+    pub harness: String,
+    pub model: String,
+    pub overruled_at: Option<String>,
+    pub overrule_note: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LeadExecution {
+    pub item: i64,
+    pub snapshot: String,
+    pub commission_ticket: String,
+    pub commissioned_at: String,
+    pub findings: String,
+    pub run_attempts: i64,
+}
+
 // --- outcome taxonomy v2 (INF-272) -----------------------------------------------------------
 // Values for runs.outcome. Segment dispositions; the UI derives the four job-level statuses from
 // these. The v4->v5 migration rewrites the old strings to exactly this six-value set.

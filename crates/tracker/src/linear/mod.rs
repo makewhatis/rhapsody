@@ -51,6 +51,19 @@ macro_rules! tracker_span {
 
 #[async_trait]
 impl crate::Tracker for Client {
+    async fn fetch_issue_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<Issue>, TrackerError> {
+        by_ids::fetch_issue_by_identifier(self, identifier).await
+    }
+    async fn update_issue_description(
+        &self,
+        id: &str,
+        description: &str,
+    ) -> Result<(), TrackerError> {
+        by_ids::update_issue_description(self, id, description).await
+    }
     async fn fetch_parked_issue(&self, id: &str) -> Result<Option<Issue>, TrackerError> {
         candidates::fetch_parked_issue(self, id).await
     }

@@ -642,6 +642,12 @@ pub struct Orchestrator {
     /// never applies (the composition root installs the real task). A missing applier means effects
     /// are retried on recovery rather than applied inline on the control task.
     pub manager_apply: Option<std::sync::Arc<dyn crate::managerapply::ManagerApplySink>>,
+    /// T2: owned off-loop lead dependencies; bookkeeping below remains control-confined.
+    pub lead_runtime: Option<Arc<crate::leadexec::LeadRuntime>>,
+    pub(crate) lead_pending: HashSet<i64>,
+    pub(crate) lead_cursor: i64,
+    pub(crate) lead_cases:
+        HashMap<String, (crate::leadexec::LeadCase, crate::managerrun::ManagerRun)>,
     /// Intervention ids already handed to the off-loop applier THIS PROCESS, so a `validated` or
     /// `applying` row is not re-submitted on every tick while its effects are in flight. A restart
     /// starts empty, which is exactly how recovery re-submits after a crash. Control-task-confined.
@@ -1185,6 +1191,10 @@ impl Orchestrator {
                 crate::managerselftest::ManagerSelfTestState::default(),
             ),
             manager_apply: None,
+            lead_runtime: None,
+            lead_pending: HashSet::new(),
+            lead_cursor: 0,
+            lead_cases: HashMap::new(),
             investigate: None,
             manager_apply_submitted: std::collections::HashSet::new(),
             review_rounds: HashMap::new(),

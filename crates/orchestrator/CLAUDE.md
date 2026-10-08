@@ -170,6 +170,14 @@ the `Orchestrator` struct itself. Concretely:
     writes belong on the control task; HTTP only reads a synchronous snapshot. The ledger's
     mutex protects short map operations and is never held across I/O or an `.await`.
 
+  - `leadexec.rs` (STUDIO-1136) uses owned off-loop `LeadRuntime` dependencies for
+    tracker/PR freshness reads and guarded effects. It never holds an `Orchestrator`.
+    `LeadPrepared`, `LeadFinished` and `LeadAllowed` round-trip the existing control
+    channel; pending item IDs, active cases, launch/fallback cursors and generation
+    reservations stay on the control task. The off-loop executor owns only the new
+    lead decision/execution records and parked findings linkage, using the Store's
+    existing connection lock. No new shared bookkeeping mutex is introduced.
+
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
   worker code; add an event variant instead.

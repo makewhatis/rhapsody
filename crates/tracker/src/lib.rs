@@ -121,6 +121,21 @@ pub struct NewIssue {
 /// adds no method to the contract surface).
 #[async_trait]
 pub trait Tracker: Any + Send + Sync {
+    /// Tech-lead freshness read, scoped to this tracker's configured project (STUDIO-1136).
+    async fn fetch_issue_by_identifier(
+        &self,
+        _identifier: &str,
+    ) -> Result<Option<Issue>, TrackerError> {
+        Err(TrackerError::Other("full issue read unsupported".into()))
+    }
+    /// Tech-lead answer prepend; only the description is mutated (STUDIO-1136).
+    async fn update_issue_description(
+        &self,
+        _id: &str,
+        _description: &str,
+    ) -> Result<(), TrackerError> {
+        Err(TrackerError::Other("description update unsupported".into()))
+    }
     /// FetchCandidateIssues returns issues in the configured active states for the configured
     /// project.
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError>;

@@ -730,9 +730,27 @@ impl Orchestrator {
                 return;
             }
         };
+        let lead_active = match self.store().load_lead_items() {
+            Ok(items) => Some(
+                items
+                    .into_iter()
+                    .filter(|item| item.state != "done")
+                    .map(|item| format!("lead-{}", item.id))
+                    .collect::<std::collections::HashSet<_>>(),
+            ),
+            Err(error) => {
+                tracing::warn!(%error, "manager: lead queue unreadable; preserving lead fallback cursors");
+                None
+            }
+        };
         self.manager_attempts.retain(|key, attempt| {
             // Limit cases have no PR intervention row; their episode owns cursor cleanup.
             key.starts_with("limit:")
+                || self.lead_cases.contains_key(key)
+                || (key.starts_with("lead:")
+                    && lead_active
+                        .as_ref()
+                        .is_none_or(|active| active.contains(&attempt.intervention_id)))
                 || all.iter().any(|row| {
                     row.id == attempt.intervention_id
                         && !manager_intervention_is_terminal(&row.state)
@@ -1043,6 +1061,7 @@ impl Orchestrator {
             .find(|p| !p.disabled && crate::reviewintro::same_repository(&p.repo, &candidate))
             .map(|p| p.repo.clone())?;
         Some(ManagerRun {
+            lead_item: None,
             limit_account: String::new(),
             owner: coord.owner,
             repo: coord.repo,

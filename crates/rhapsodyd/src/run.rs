@@ -433,7 +433,8 @@ where
         if (install_probe || manager_canary.is_some())
             && (teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off
                 || (teams_cfg.enabled
-                    && teams_cfg.manager.mode != rhapsody_config::teams::ManagerMode::Off))
+                    && teams_cfg.manager.mode != rhapsody_config::teams::ManagerMode::Off)
+                || teams_cfg.manager.lead.enabled)
         {
             o.manager_selftest_state()
                 .configure(teams_cfg.manager.effective_harnesses());
@@ -456,7 +457,8 @@ where
         o.teams = Some(teams_cfg.clone());
         // A failed sandbox self-test disables only investigate, never manager authority.
         if teams_cfg.enabled
-            && teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off
+            && (teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off
+                || teams_cfg.manager.lead.enabled)
             && let Some(cfg) = resolved.as_ref()
         {
             o.investigate = Some(
@@ -675,6 +677,25 @@ where
 
     // The off-loop HTTP surface, snapshotted BEFORE the orchestrator moves into the control-loop task.
     let handle = o.control();
+    if teams_cfg.enabled && teams_cfg.manager.lead.enabled && durable_store {
+        o.lead_runtime = Some(Arc::new(rhapsody_orchestrator::leadexec::LeadRuntime {
+            control: handle.clone(),
+            store: store.clone(),
+            projects: Vec::new(),
+            teams: teams_cfg.clone(),
+            prs: Arc::new(rhapsody_orchestrator::ghsummons::GH::new("", None)),
+            comments: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+                "", None,
+            ))),
+            room: o
+                .teams_room
+                .as_ref()
+                .map(|r| r.clone() as Arc<dyn rhapsody_config::room::RoomLog>),
+            memory: o.teams_memory.as_ref().map(|m| m.backend()),
+            findings_dir: std::env::var_os("HOME")
+                .map(|h| std::path::PathBuf::from(h).join(".rhapsody/docs")),
+        }));
+    }
 
     // The observability server + prune scheduler run until `run` decides to exit. Their shutdown is a
     // SEPARATE signal `run` cancels AFTER the control loop returns — mirroring Go's `pruneCancel` +

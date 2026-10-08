@@ -23,6 +23,7 @@ use rhapsody_core::Issue;
 
 use rhapsody_config::teams::ReviewAuthority;
 
+use crate::leadexec::{LeadCase, LeadProject, LeadRuntime};
 use crate::orchestrator::Orchestrator;
 use crate::retry::DispatchRoute;
 
@@ -170,6 +171,8 @@ impl ManagerAttempt {
 /// repository, so all it needs is the run's key (to name the per-run directory) and the run timeout.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ManagerCheckout {
+    /// A tech-lead run shares the manager posture, with a different output contract.
+    pub lead_item: Option<i64>,
     /// The run's key (`pr:owner/repo#n@manager`), used to name the daemon-owned per-run directory.
     pub key: String,
     /// `manager.run_timeout_ms` (§10.1), the run's wall-clock ceiling.
@@ -184,6 +187,7 @@ pub struct ManagerCheckout {
 /// trusted repository origin its project route is resolved from.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ManagerRun {
+    pub lead_item: Option<i64>,
     /// Account-scoped judgment call; empty preserves the PR review-loop run kind.
     pub limit_account: String,
     pub owner: String,
@@ -204,6 +208,12 @@ pub struct ManagerRun {
 impl ManagerRun {
     /// The run's issue id and identifier: `pr:owner/repo#number@manager`.
     pub(crate) fn key(&self) -> String {
+        if let Some(item) = self.lead_item {
+            return format!(
+                "lead:{}/{}#{}:{item}@manager",
+                self.owner, self.repo, self.number
+            );
+        }
         if !self.limit_account.is_empty() {
             return crate::managerlimits::limit_manager_key(&self.limit_account);
         }
@@ -213,6 +223,7 @@ impl ManagerRun {
     /// The worker-facing checkout coordinates.
     pub(crate) fn checkout(&self, run_timeout_ms: i64) -> ManagerCheckout {
         ManagerCheckout {
+            lead_item: self.lead_item,
             key: self.key(),
             run_timeout_ms,
             case_packet: self.case_packet.clone(),
@@ -282,6 +293,190 @@ pub enum ManagerDispatchOutcome {
 }
 
 impl Orchestrator {
+    fn lead_dependencies(&self) -> Option<std::sync::Arc<LeadRuntime>> {
+        let mut runtime = self.lead_runtime.as_deref()?.clone();
+        // Commission preferences follow effective profiles, not just the roster's optional model.
+        // Do not hydrate a dispatch here: route_teams also acknowledges room catch-up cursors.
+        for identity in &mut runtime.teams.roster {
+            if let Some(profile) = self
+                .teams_profiles_dir
+                .as_ref()
+                .and_then(|dir| rhapsody_config::profiles::resolve(dir, &identity.profile).ok())
+                && !profile.model.is_empty()
+            {
+                identity.model = profile.model;
+            }
+        }
+        runtime.projects = self
+            .eff
+            .as_ref()?
+            .projects
+            .iter()
+            .filter(|p| !p.disabled)
+            .map(|p| LeadProject {
+                tracker: p.tracker.clone(),
+                repo_url: p.repo.clone(),
+                terminal_states: p.terminal_states.clone(),
+                summon_token: p.mcfg.tracker.summon_token.clone(),
+            })
+            .collect();
+        Some(std::sync::Arc::new(runtime))
+    }
+
+    pub(crate) fn pump_lead_items(&mut self) {
+        if !self.lead_enabled() || self.drain.is_draining() {
+            return;
+        }
+        // Limit stops/cancellation can remove a running entry before its exit is admitted.
+        // Never retain an ownerless manager slot; a fresh run stays behind all normal gates,
+        // with its already-spent attempt preserved in the durable reservation.
+        let lost: Vec<_> = self
+            .lead_cases
+            .keys()
+            .filter(|key| !self.running.contains_key(*key))
+            .cloned()
+            .collect();
+        for key in lost {
+            if let Some((case, _)) = self.lead_cases.remove(&key) {
+                self.claimed.remove(&key);
+                self.persist_complete(&key);
+                if let Err(e) = self.store().set_lead_item_state(case.item.id, "queued") {
+                    tracing::warn!(item = case.item.id, err = %e, "lead lost-owner recovery failed");
+                }
+            }
+        }
+        let Some(runtime) = self.lead_dependencies() else {
+            return;
+        };
+        let items = match self.store().load_lead_items() {
+            Ok(items) => items,
+            Err(e) => {
+                tracing::warn!(err = %e, "lead queue unreadable");
+                return;
+            }
+        };
+        // One isolated lead at a time, rotating parked/queued items so missing findings cannot
+        // starve other work. The shared manager cap and generation reservations bound attempts.
+        if !self.lead_pending.is_empty() || !self.lead_cases.is_empty() {
+            return;
+        }
+        let Some(item) = items
+            .iter()
+            .find(|i| i.state != "done" && i.id > self.lead_cursor)
+            .or_else(|| items.iter().find(|i| i.state != "done"))
+            .cloned()
+        else {
+            return;
+        };
+        self.lead_cursor = item.id;
+        self.lead_pending.insert(item.id);
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let id = item.id;
+            let result = runtime.prepare(item).await;
+            let _ = events.send(crate::Event::LeadPrepared {
+                item: id,
+                result: Box::new(result),
+            });
+        });
+    }
+
+    pub(crate) fn handle_lead_prepared(
+        &mut self,
+        item: i64,
+        result: Result<Option<(LeadCase, ManagerRun)>, String>,
+    ) {
+        self.lead_pending.remove(&item);
+        match result {
+            Ok(Some((case, run))) if self.lead_enabled() => {
+                if !case.subject.ticket.identifier.is_empty()
+                    && self.ticket_run_live(&case.subject.ticket.identifier)
+                {
+                    return;
+                }
+                let key = run.key();
+                let outcome = self.dispatch_manager(run.clone());
+                if outcome == ManagerDispatchOutcome::Dispatched {
+                    self.lead_cases.insert(key, (case, run));
+                } else {
+                    tracing::warn!(item, reason = ?outcome, "lead launch deferred or unavailable");
+                    if matches!(outcome, ManagerDispatchOutcome::Refused(ref s) if s == "lead manager run budget exhausted")
+                        || (matches!(outcome, ManagerDispatchOutcome::SelfTestFailed(_))
+                            && !self.manager_selftest.has_pending_canary())
+                    {
+                        self.submit_lead_execution(case, run, "```rhapsody-lead-decision\n{\"actions\":[{\"action\":\"escalate\",\"need\":\"Lead manager unavailable or run budget exhausted; operator must inspect the launch refusal and decide.\"}]}\n```".into(), String::new(), String::new());
+                    }
+                }
+            }
+            Err(reason) => {
+                tracing::warn!(item, reason, "lead preparation failed; item remains queued")
+            }
+            _ => {}
+        }
+    }
+
+    pub(crate) fn settle_lead_exit(
+        &mut self,
+        re: &crate::orchestrator::RunningEntry,
+        exit: &crate::retry::EvWorkerExit,
+    ) {
+        let Some((mut case, run)) = self.lead_cases.remove(&re.issue.id) else {
+            tracing::warn!(key = %re.issue.id, "lead exit has no current case");
+            return;
+        };
+        if exit.failed
+            && self
+                .manager_attempts
+                .get(&re.issue.id)
+                .is_some_and(|a| a.next_index > a.selected.index)
+        {
+            let outcome = self.dispatch_manager(run.clone());
+            if outcome == ManagerDispatchOutcome::Dispatched {
+                self.lead_cases.insert(re.issue.id.clone(), (case, run));
+                return;
+            }
+        }
+        if let Some(attempt) = self.manager_attempts.get(&re.issue.id) {
+            case.evidence
+                .push_str(&format!("\nDecided by: {:?}", attempt.decided_by()));
+        }
+        let text = if exit.failed {
+            "```rhapsody-lead-decision\n{\"actions\":[{\"action\":\"escalate\",\"need\":\"Lead harness infrastructure failed and no fallback can run; inspect the run.\"}]}\n```".into()
+        } else {
+            exit.manager_text.clone().unwrap_or_default()
+        };
+        self.submit_lead_execution(
+            case,
+            run,
+            text,
+            re.harness.clone(),
+            re.model_override.model.clone(),
+        );
+        self.manager_attempts.remove(&re.issue.id);
+    }
+
+    fn submit_lead_execution(
+        &mut self,
+        case: LeadCase,
+        run: ManagerRun,
+        text: String,
+        harness: String,
+        model: String,
+    ) {
+        let Some(runtime) = self.lead_dependencies() else {
+            return;
+        };
+        self.lead_pending.insert(case.item.id);
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let id = case.item.id;
+            let result = runtime
+                .apply(&case, &run.repo_url, &text, &harness, &model)
+                .await;
+            let _ = events.send(crate::Event::LeadFinished { item: id, result });
+        });
+    }
+
     /// Dispatches one manager run, or refuses and explains why. This is the manager's own launch
     /// (design §10.1); M8 is its first production caller. It rides the SAME dispatch funnel a
     /// ticketless review does — [`Orchestrator::dispatch_issue_prepared`] — so there is no second
@@ -299,13 +494,27 @@ impl Orchestrator {
         // §10.2: `review_authority: off` means the manager does not act. This is the config gate the
         // whole feature hangs on, and `off` must remain byte-identical — so it is checked first.
         let is_limit = !run.limit_account.is_empty();
-        if !is_limit && self.manager_review_authority() == ReviewAuthority::Off {
+        if run.lead_item.is_some() && is_limit {
+            return ManagerDispatchOutcome::Refused("ambiguous manager run kind".into());
+        }
+        if !is_limit
+            && run.lead_item.is_none()
+            && self.manager_review_authority() == ReviewAuthority::Off
+        {
+            return ManagerDispatchOutcome::AuthorityOff;
+        }
+        if run.lead_item.is_some() && !self.lead_enabled() {
             return ManagerDispatchOutcome::AuthorityOff;
         }
         if !is_limit && (run.owner.is_empty() || run.repo.is_empty()) {
             return ManagerDispatchOutcome::Refused("pull request has no owner/repo".to_string());
         }
-        if !is_limit && run.number <= 0 {
+        if run.lead_item.is_some_and(|item| item <= 0)
+            || (run.lead_item.is_some() && run.number < 0)
+        {
+            return ManagerDispatchOutcome::Refused("invalid lead run coordinates".into());
+        }
+        if !is_limit && run.number <= 0 && run.lead_item.is_none() {
             return ManagerDispatchOutcome::Refused(
                 "pull-request number is not positive".to_string(),
             );
@@ -375,10 +584,39 @@ impl Orchestrator {
             return ManagerDispatchOutcome::Refused(reason);
         }
         self.release_budget_hold(&id);
+        if let Some(item) = run.lead_item {
+            let pr = if run.number > 0 {
+                format!("{}/{}#{}", run.owner, run.repo, run.number)
+            } else {
+                format!("lead:{item}")
+            };
+            let max = self
+                .teams
+                .as_ref()
+                .map_or(12, |t| t.manager.max_runs_per_generation);
+            match self.store().reserve_lead_run(item, &pr, max) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return ManagerDispatchOutcome::Refused(
+                        "lead manager run budget exhausted".into(),
+                    );
+                }
+                Err(e) => {
+                    return ManagerDispatchOutcome::Refused(format!(
+                        "lead storage unavailable: {e}"
+                    ));
+                }
+            }
+        }
         let iss = run.synthetic_issue();
-        let intervention_id = crate::managerintervention::manager_pr_key(&id)
-            .and_then(|pr| self.store().active_manager_intervention(&pr).ok().flatten())
-            .map(|r| r.id)
+        let intervention_id = run
+            .lead_item
+            .map(|item| format!("lead-{item}"))
+            .or_else(|| {
+                crate::managerintervention::manager_pr_key(&id)
+                    .and_then(|pr| self.store().active_manager_intervention(&pr).ok().flatten())
+                    .map(|r| r.id)
+            })
             .unwrap_or_default();
         let prior_reason = self
             .manager_attempts
@@ -416,7 +654,19 @@ impl Orchestrator {
                 fallback_reason,
             },
         );
+        let lead_item = run.lead_item;
+        let key = run.key();
         self.finish_manager_dispatch(run, route, iss);
+        if let Some(item) = lead_item
+            && !self.running.contains_key(&key)
+        {
+            self.pending_manager.remove(&key);
+            self.manager_attempts.remove(&key);
+            if let Err(e) = self.store().set_lead_item_state(item, "queued") {
+                tracing::warn!(item, err = %e, "lead admission changed; restoring queue state failed");
+            }
+            return ManagerDispatchOutcome::Refused("lead dispatch admission changed".into());
+        }
         ManagerDispatchOutcome::Dispatched
     }
 
@@ -487,10 +737,27 @@ impl Orchestrator {
             return None;
         }
         let iss = run.synthetic_issue();
-        let inherited = self
-            .route_teams(&iss)
-            .map(|td| td.model_override)
-            .unwrap_or_default();
+        let inherited = if run.lead_item.is_some() {
+            self.teams
+                .as_ref()
+                .and_then(|teams| {
+                    let identity = self.planned_identity(&iss, &self.teammate_load())?;
+                    let profile = teams.roster.iter().find(|i| i.name == identity)?;
+                    let dir = self.teams_profiles_dir.as_ref()?;
+                    let resolved =
+                        rhapsody_config::profiles::resolve(dir, &profile.profile).ok()?;
+                    Some(rhapsody_agent::ModelOverride {
+                        identity,
+                        model: resolved.model,
+                        effort: resolved.effort,
+                    })
+                })
+                .unwrap_or_default()
+        } else {
+            self.route_teams(&iss)
+                .map(|td| td.model_override)
+                .unwrap_or_default()
+        };
         let model = self.manager_model_override(inherited, entry);
         let pricing = self.run_pricing_for(&entry.harness, &model, project);
         // The isolated manager credential is native OAuth; retain the workflow's independent
@@ -541,9 +808,14 @@ impl Orchestrator {
         run: &ManagerRun,
     ) -> Result<crate::managerselftest::SelectedEntry, crate::managerselftest::ManagerUnavailable>
     {
-        let active_id = crate::managerintervention::manager_pr_key(&run.key())
-            .and_then(|pr| self.store().active_manager_intervention(&pr).ok().flatten())
-            .map(|r| r.id)
+        let active_id = run
+            .lead_item
+            .map(|item| format!("lead-{item}"))
+            .or_else(|| {
+                crate::managerintervention::manager_pr_key(&run.key())
+                    .and_then(|pr| self.store().active_manager_intervention(&pr).ok().flatten())
+                    .map(|r| r.id)
+            })
             .unwrap_or_default();
         let start = self
             .manager_attempts
@@ -631,7 +903,10 @@ impl Orchestrator {
         // M8: settle the intervention the run belonged to (§7.2). The run has ended, so the
         // intervention must not stay `running` until its lease expires — a clean exit with a valid
         // decision becomes `decided`/`validated`, and anything else a `failed_attempt`.
-        self.settle_manager_intervention(&re.issue.id, e);
+        let is_lead = re.issue.id.starts_with("lead:");
+        if !is_lead {
+            self.settle_manager_intervention(&re.issue.id, e);
+        }
         if e.failed
             && self
                 .teams
@@ -657,7 +932,12 @@ impl Orchestrator {
                 attempt.fallback_reason.push_str(&reason);
             }
             // The same intervention returns through the ordinary launch gates and atomic budget.
-            self.pump_manager_interventions();
+            if !is_lead {
+                self.pump_manager_interventions();
+            }
+        }
+        if is_lead {
+            self.settle_lead_exit(re, e);
         }
     }
 }
@@ -764,6 +1044,7 @@ mod tests {
 
     fn manager_run() -> ManagerRun {
         ManagerRun {
+            lead_item: None,
             limit_account: String::new(),
             owner: "makewhatis".to_string(),
             repo: "rhapsody".to_string(),
@@ -772,6 +1053,175 @@ mod tests {
             team_id: String::new(),
             case_packet: String::new(),
         }
+    }
+
+    #[test]
+    fn lead_preparation_never_consumes_teammate_room_cursor() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        let dir = crate::testsupport::TempDir::new();
+        std::fs::write(
+            dir.child("swe.md"),
+            "---\nharness: opencode\nmodel: openai/gpt-test\n---\nProfile\n",
+        )
+        .expect("profile");
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(&dir.path));
+        let room = Arc::new(rhapsody_config::room::LocalRoom::new(dir.child("room")));
+        room.append(&rhapsody_config::room::Message::room(
+            "operator",
+            chrono::Utc::now(),
+            "Pending teammate context",
+        ))
+        .expect("post");
+        let cursors = Arc::new(rhapsody_config::room::Cursors::new(
+            dir.child("banks"),
+            "agent-",
+        ));
+        o.teams_room = Some(room);
+        o.teams_cursors = Some(cursors.clone());
+        o.lead_runtime = Some(Arc::new(LeadRuntime {
+            control: o.control(),
+            store: o.store.clone(),
+            projects: Vec::new(),
+            teams: o.teams.clone().expect("teams"),
+            prs: Arc::new(crate::ghsummons::GH::new("", None)),
+            comments: None,
+            room: None,
+            memory: None,
+            findings_dir: None,
+        }));
+        let before = cursors.load("alice");
+        let deps = o.lead_dependencies().expect("dependencies");
+        assert_eq!(deps.teams.roster[0].model, "openai/gpt-test");
+        assert_eq!(
+            cursors.load("alice"),
+            before,
+            "metadata reads must not acknowledge the teammate's pending room context"
+        );
+        o.teams.as_mut().expect("teams").manager.default_identity = "alice".into();
+        o.eff.as_mut().expect("eff").cfg.budgets.insert(
+            "anthropic".into(),
+            rhapsody_config::ProviderBudget {
+                daily_usd: 1.0,
+                ..Default::default()
+            },
+        );
+        let mut run = manager_run();
+        run.lead_item = Some(7);
+        let _ = o.manager_usd_budget_hold(
+            &run,
+            "rhapsody",
+            &rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "claude".into(),
+                model: "claude-test".into(),
+                effort: "high".into(),
+            },
+        );
+        assert_eq!(
+            cursors.load("alice"),
+            before,
+            "lead budget reads must not hydrate a dispatch either"
+        );
+    }
+
+    #[tokio::test]
+    async fn lead_waits_for_the_boot_canary_before_spending_or_escalating() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        o.teams.as_mut().expect("teams").manager.lead.enabled = true;
+        let id = o
+            .store()
+            .enqueue_lead_item(
+                &rhapsody_store::LeadTrigger::ImpossibleState {
+                    subject: "TEST-100".into(),
+                    kind: "in_review_no_pr".into(),
+                },
+                "2026-10-08",
+            )
+            .expect("item");
+        let item = o.store().load_lead_items().expect("items").remove(0);
+        let case = LeadCase {
+            item,
+            subject: crate::leadexec::LeadSubject {
+                open: true,
+                ..Default::default()
+            },
+            identities: vec!["alice".into()],
+            evidence: "case".into(),
+        };
+        o.lead_runtime = Some(Arc::new(LeadRuntime {
+            control: o.control(),
+            store: o.store.clone(),
+            projects: Vec::new(),
+            teams: o.teams.clone().expect("teams"),
+            prs: Arc::new(crate::ghsummons::GH::new("", None)),
+            comments: None,
+            room: None,
+            memory: None,
+            findings_dir: None,
+        }));
+        let mut run = manager_run();
+        run.lead_item = Some(id);
+        o.handle_lead_prepared(id, Ok(Some((case, run))));
+        assert!(dispatched.lock().expect("spawn").is_empty());
+        assert!(
+            o.lead_pending.is_empty(),
+            "a pending canary must not submit an escalation"
+        );
+        assert!(
+            o.store()
+                .load_lead_decisions()
+                .expect("decisions")
+                .is_empty()
+        );
+        assert_eq!(
+            o.store().load_lead_items().expect("items")[0].state,
+            "queued"
+        );
+    }
+
+    #[test]
+    fn lost_lead_owner_releases_the_case_and_claim() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        o.teams.as_mut().expect("teams").manager.lead.enabled = true;
+        let id = o
+            .store()
+            .enqueue_lead_item(
+                &rhapsody_store::LeadTrigger::ImpossibleState {
+                    subject: "TEST-100".into(),
+                    kind: "in_review_no_pr".into(),
+                },
+                "2026-10-08",
+            )
+            .expect("item");
+        o.store()
+            .set_lead_item_state(id, "running")
+            .expect("running");
+        let item = o.store().load_lead_items().expect("items").remove(0);
+        let mut run = manager_run();
+        run.lead_item = Some(id);
+        let key = run.key();
+        o.claimed.insert(key.clone());
+        o.lead_cases.insert(
+            key.clone(),
+            (
+                LeadCase {
+                    item,
+                    subject: crate::leadexec::LeadSubject::default(),
+                    identities: Vec::new(),
+                    evidence: "case".into(),
+                },
+                run,
+            ),
+        );
+        o.pump_lead_items();
+        assert!(
+            o.lead_cases.is_empty(),
+            "no case may hold the manager slot without a live owner"
+        );
+        assert!(!o.claimed.contains(&key));
+        assert_eq!(
+            o.store().load_lead_items().expect("items")[0].state,
+            "queued"
+        );
     }
 
     /// Mark the §4.7 self-test as passed on the installed version, so the launch gate opens.

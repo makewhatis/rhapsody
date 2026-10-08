@@ -459,6 +459,8 @@ mod tests {
         "rundiff.rs",
         "runautomerge.rs",
         "prconditional.rs",
+        // T2's RuntimeHost owns no Orchestrator; preparation/execution are spawned by managerrun.
+        "leadexec.rs",
     ];
 
     /// The control task's own modules, named so that widening [`OFF_LOOP_CALLERS`] to include one

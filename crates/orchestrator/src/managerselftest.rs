@@ -545,6 +545,23 @@ impl ManagerSelfTestState {
             .collect()
     }
 
+    /// A probeable entry awaits its first/version-change canary. This grants no availability;
+    /// lead work stays queued until the normal selection gate observes a matching PASS.
+    pub fn has_pending_canary(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .iter()
+            .any(|e| {
+                e.installed_version.as_ref().is_some_and(|installed| {
+                    e.record
+                        .as_ref()
+                        .is_none_or(|record| &record.cli_version != installed)
+                })
+            })
+    }
+
     pub fn set_credential_probe(&self, probe: std::sync::Arc<dyn EntryCredentialProbe>) {
         *self.probe.write().unwrap_or_else(|e| e.into_inner()) = probe;
     }

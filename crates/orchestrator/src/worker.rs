@@ -596,7 +596,9 @@ async fn run_manager_attempt(
     // the base instructions alone. STUDIO-1054: the base prompt and the decision contract come from
     // the ONE builder the M12 harness also uses, so the live run is told the block it must emit
     // instead of a `HANDOFF:` line.
-    let prompt = if mgr.key.starts_with("limit:") {
+    let prompt = if mgr.lead_item.is_some() {
+        crate::leadexec::lead_live_prompt(&mgr.case_packet)
+    } else if mgr.key.starts_with("limit:") {
         mgr.case_packet.clone()
     } else {
         crate::managerrun::manager_live_prompt(&mgr.case_packet)
@@ -4398,6 +4400,15 @@ fi
     // is never started (`last_manager_start` is `None`), or the cwd survives.
     #[tokio::test]
     async fn a_manager_attempt_provisions_an_empty_cwd_and_removes_it() {
+        isolated_manager_attempt(None).await;
+    }
+
+    #[tokio::test]
+    async fn a_lead_attempt_uses_the_live_lead_contract_and_manager_isolation() {
+        isolated_manager_attempt(Some(7)).await;
+    }
+
+    async fn isolated_manager_attempt(lead_item: Option<i64>) {
         let ag = fake_agent(vec![agentfake::TurnScript {
             result: TurnResult {
                 status: TURN_SUCCEEDED.to_string(),
@@ -4416,6 +4427,7 @@ fi
         );
         d.manager_root = root.path.clone();
         d.manager = Some(crate::managerrun::ManagerCheckout {
+            lead_item,
             key: "pr:o/r#1@manager".to_string(),
             run_timeout_ms: 1234,
             case_packet: String::new(),
@@ -4430,6 +4442,13 @@ fi
             run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
         assert!(err.is_none(), "manager attempt clean: {err:?}");
         assert!(!decl.declared_handoff);
+        let prompt = ag.last_prompt();
+        if lead_item.is_some() {
+            assert!(prompt.contains(crate::leaddecision::LEAD_DECISION_TAG));
+            assert!(!prompt.contains(crate::managerdecision::MANAGER_DECISION_TAG));
+        } else {
+            assert!(prompt.contains(crate::managerdecision::MANAGER_DECISION_TAG));
+        }
 
         let started = ag
             .last_manager_start()
@@ -4479,6 +4498,7 @@ fi
         let mut d = make_deps(ws, ag.clone(), tr, "ignored", 1);
         d.manager_root = root.path.clone();
         d.manager = Some(crate::managerrun::ManagerCheckout {
+            lead_item: None,
             key: "pr:o/r#1@manager".into(),
             ..Default::default()
         });
@@ -4529,6 +4549,7 @@ fi
         );
         d.manager_root = root.path.clone();
         d.manager = Some(crate::managerrun::ManagerCheckout {
+            lead_item: None,
             key: "pr:o/r#1@manager".to_string(),
             run_timeout_ms: 1234,
             case_packet: "CASE PACKET DATA".to_string(),

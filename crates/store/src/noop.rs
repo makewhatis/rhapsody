@@ -18,6 +18,30 @@ impl Store for Noop {
     fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
         Ok(Vec::new())
     }
+    fn load_lead_decisions(&self) -> Result<Vec<LeadDecisionRow>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn lead_digest_entries(&self, _since: &str) -> Result<Vec<LeadDecisionRow>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn lead_execution(&self, _item: i64) -> Result<Option<LeadExecution>, StoreError> {
+        Ok(None)
+    }
+    fn save_lead_execution(&self, _row: &LeadExecution) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn set_lead_item_state(&self, _item: i64, _state: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn reserve_lead_route_back(&self, _item: i64) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn save_lead_decision(&self, _row: &LeadDecisionRow) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+    fn reserve_lead_run(&self, _item: i64, _pr: &str, _max: i64) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn start_run(&self, _r: RunStart) -> Result<i64, StoreError> {
         Ok(0)
     }

@@ -575,6 +575,35 @@ impl crate::Tracker for Tracker {
             .filter(|d| !d.trim().is_empty()))
     }
 
+    async fn fetch_issue_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Result<Option<Issue>, TrackerError> {
+        let _guard = self.lock();
+        Ok(self
+            .load_locked()?
+            .issues
+            .iter()
+            .find(|j| j.identifier.eq_ignore_ascii_case(identifier))
+            .map(to_core_issue))
+    }
+
+    async fn update_issue_description(
+        &self,
+        id: &str,
+        description: &str,
+    ) -> Result<(), TrackerError> {
+        let _guard = self.lock();
+        let mut doc = self.load_locked()?;
+        let issue = doc
+            .issues
+            .iter_mut()
+            .find(|j| j.id == id)
+            .ok_or_else(|| issue_not_found_err(id))?;
+        issue.description = Some(description.into());
+        self.write_locked(&doc)
+    }
+
     /// Reloads the file and returns issues whose state matches the Backlog state TYPE (resolved via
     /// the file's `state_types` map, defaulting to "Backlog" when the section is absent — mirroring
     /// `move_issue_to_type`). `blocked_by` edges are populated by [`to_core_issue`]. INF-318.
