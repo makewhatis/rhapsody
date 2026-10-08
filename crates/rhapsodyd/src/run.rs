@@ -692,6 +692,7 @@ where
                 .as_ref()
                 .map(|r| r.clone() as Arc<dyn rhapsody_config::room::RoomLog>),
             memory: o.teams_memory.as_ref().map(|m| m.backend()),
+            operator_memory: o.teams_memory.as_ref().and_then(|m| m.operator_memory()),
             findings_dir: std::env::var_os("HOME")
                 .map(|h| std::path::PathBuf::from(h).join(".rhapsody/docs")),
         }));

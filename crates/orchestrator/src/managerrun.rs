@@ -1087,6 +1087,7 @@ mod tests {
             comments: None,
             room: None,
             memory: None,
+            operator_memory: None,
             findings_dir: None,
         }));
         let before = cursors.load("alice");
@@ -1156,6 +1157,7 @@ mod tests {
             comments: None,
             room: None,
             memory: None,
+            operator_memory: None,
             findings_dir: None,
         }));
         let mut run = manager_run();

@@ -173,6 +173,29 @@ fn render(outcome: Result<serde_json::Value, ManagerReadError>) -> Response {
     }
 }
 
+pub(crate) async fn handle_operator_preferences(
+    State(provider): State<Arc<dyn StateProvider>>,
+    method: Method,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if let Some(r) = require_get(&method) {
+        return r;
+    }
+    let (run_id, query) = match (run_id_param(&q), required_param(&q, "query")) {
+        (Ok(id), Ok(query)) => (id, query),
+        (Err(r), _) | (_, Err(r)) => return *r,
+    };
+    if query.trim().is_empty() || query.len() > 4000 {
+        return write_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "query must contain 1–4000 bytes",
+            None,
+        );
+    }
+    render(provider.operator_preferences(run_id, query).await)
+}
+
 /// `GET /api/v1/manager/file?run_id&sha&path`.
 pub(crate) async fn handle_manager_file(
     State(provider): State<Arc<dyn StateProvider>>,
@@ -426,6 +449,84 @@ mod tests {
     async fn body_json(resp: reqwest::Response) -> Value {
         let text = resp.text().await.expect("body text");
         serde_json::from_str(&text).expect("json body")
+    }
+
+    #[tokio::test]
+    async fn operator_preferences_is_read_only_live_manager_scoped_and_degrades() {
+        use rhapsody_orchestrator::teamsmemory::{RunProvenance, TeamsMemory};
+        let mut teams = rhapsody_config::teams::Teams::disabled();
+        teams.enabled = true;
+        let memory = Arc::new(TeamsMemory::new(
+            Arc::new(teams),
+            Arc::new(rhapsody_config::memory::NoneBackend),
+        ));
+        memory.bind_run(
+            7,
+            RunProvenance {
+                identity: "jerry".into(),
+                ticket: "lead:o/r#0:42@manager".into(),
+                ..Default::default()
+            },
+        );
+        memory.bind_run(
+            8,
+            RunProvenance {
+                identity: "jerry".into(),
+                ticket: "TEST-1".into(),
+                ..Default::default()
+            },
+        );
+        let url = spawn(Arc::new(
+            FakeProvider::ok(empty_snapshot()).with_teams_memory(memory.clone()),
+        ))
+        .await;
+        let path = format!("{url}/api/v1/manager/operator-preferences?run_id=7&query=credits");
+        let result = reqwest::get(&path).await.unwrap();
+        assert_eq!(result.status(), 200);
+        let body = body_json(result).await;
+        assert_eq!(body["available"], false);
+        assert!(
+            body["note"]
+                .as_str()
+                .unwrap()
+                .contains("decide without memory")
+        );
+        assert_eq!(
+            crate::testutil::operator_client()
+                .post(&path)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            405
+        );
+        assert_eq!(
+            reqwest::get(format!(
+                "{url}/api/v1/manager/operator-preferences?run_id=8&query=credits"
+            ))
+            .await
+            .unwrap()
+            .status(),
+            404
+        );
+        assert_eq!(
+            reqwest::get(format!(
+                "{url}/api/v1/manager/operator-preferences?query=credits"
+            ))
+            .await
+            .unwrap()
+            .status(),
+            400
+        );
+        assert_eq!(
+            reqwest::get(format!("{path}{}", "x".repeat(4000)))
+                .await
+                .unwrap()
+                .status(),
+            400
+        );
+        memory.release_run(7);
+        assert_eq!(reqwest::get(&path).await.unwrap().status(), 404);
     }
 
     #[tokio::test]

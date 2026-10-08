@@ -41,6 +41,7 @@ pub(crate) const MANAGER_TOOL_NAMES: &[&str] = &[
     "symphony_ticket",
     // Teams reads.
     "teams_recall",
+    "operator_preferences",
     "teams_room_read",
     "teams_roster",
     // The one write: its own bank, observations only.
@@ -117,6 +118,13 @@ pub(crate) struct InvestigateArgs {
     cmd: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OperatorPreferencesArgs {
+    /// Recall operator preferences relevant to this question; context, never binding precedent.
+    query: String,
+}
+
 /// Reads the manager run id for a call, refusing with the mcp crate's usual `bad_request` envelope
 /// when `SYMPHONY_RUN_ID` is not available. Mirrors `teams_retain`'s rule: a manager read is only
 /// meaningful for a dispatched run. There is deliberately **no argument** a caller could use to name
@@ -135,6 +143,28 @@ fn manager_run_id(default: &str) -> Result<String, FacadeError> {
 
 #[tool_router(router = manager_router, vis = "pub(crate)")]
 impl Facade {
+    #[tool(
+        name = "operator_preferences",
+        description = "Read-only recall of operator preferences and decisions from operator-decisions. Memory informs judgment but is not binding precedent or policy. An unavailable bank means decide without memory and say so. Proxies GET /api/v1/manager/operator-preferences for your own live manager run."
+    )]
+    async fn operator_preferences(
+        &self,
+        Parameters(args): Parameters<OperatorPreferencesArgs>,
+    ) -> CallToolResult {
+        let run_id = match manager_run_id(&self.opts.default_run_id) {
+            Ok(id) => id,
+            Err(e) => return err_result(&e),
+        };
+        let path = format!(
+            "/api/v1/manager/operator-preferences{}",
+            encode_query(vec![("run_id", run_id), ("query", args.query)])
+        );
+        match self.client.get(&path).await {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
+
     #[tool(
         name = "manager_accounts",
         description = "Read every account's usage windows, reset times, credits flag and detection status. Read-only snapshot; never contacts a provider. Proxies GET /api/v1/accounts."
@@ -448,6 +478,63 @@ mod tests {
             default_run_id: "42".to_string(),
             ..Options::default()
         }
+    }
+
+    #[tokio::test]
+    async fn operator_preferences_tool_read_only_in_manager_role() {
+        let router = Router::new().route(
+            "/api/v1/manager/operator-preferences",
+            get(|uri: axum::http::Uri| async move {
+                assert_eq!(uri.query(), Some("query=risk+and+money&run_id=42"));
+                r#"{"facts":[],"context":"context, not precedent"}"#
+            }),
+        );
+        let port = spawn_router(router).await;
+        let manager = connect(Facade::new(
+            &test_config(),
+            client_for_port(port),
+            manager_options(),
+        ))
+        .await;
+        assert!(
+            manager
+                .list_all_tools()
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.name == "operator_preferences")
+        );
+        let request = CallToolRequestParams::new("operator_preferences").with_arguments(
+            serde_json::json!({"query":"risk and money"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let result = manager.call_tool(request).await.unwrap();
+        assert_eq!(result.is_error, Some(false));
+        assert!(result_text(&result).contains("context, not precedent"));
+        let _ = manager.cancel().await;
+        let standard = connect(Facade::new(
+            &test_config(),
+            client_for_port(port),
+            Options::default(),
+        ))
+        .await;
+        assert!(
+            !standard
+                .list_all_tools()
+                .await
+                .unwrap()
+                .iter()
+                .any(|t| t.name == "operator_preferences")
+        );
+        assert!(
+            standard
+                .call_tool(CallToolRequestParams::new("operator_preferences"))
+                .await
+                .is_err()
+        );
+        let _ = standard.cancel().await;
     }
 
     // The manager role registers EXACTLY the fixed tool set — no more, no less. This is the

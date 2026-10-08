@@ -147,6 +147,7 @@ pub const MANAGER_MCP_TOOLS: &[&str] = &[
     "symphony_logs",
     "symphony_ticket",
     "teams_recall",
+    "operator_preferences",
     "teams_room_read",
     "teams_roster",
     // The one registered write: its own bank, observations only (§3.2, §4.4).
@@ -235,6 +236,29 @@ pub fn manager_allowed_tools() -> String {
         .map(|t| format!("mcp__{MANAGER_MCP_SERVER}__{t}"))
         .collect::<Vec<_>>()
         .join(",")
+}
+
+#[cfg(test)]
+#[test]
+fn operator_preferences_tool_read_only_in_manager_role() {
+    assert!(MANAGER_MCP_TOOLS.contains(&"operator_preferences"));
+    let args = manager_args(&Config::default(), "/private/manager-mcp.json");
+    assert!(
+        args.iter()
+            .any(|arg| arg.contains("mcp__symphony__operator_preferences"))
+    );
+    let config: serde_json::Value =
+        serde_json::from_str(&crate::opencode::manager::manager_config_content(
+            "openai/gpt-test",
+            "rhapsodyd",
+            "/workflow",
+            "/home",
+            "42",
+        ))
+        .unwrap();
+    assert_eq!(config["permission"]["symphony_*"], "allow");
+    assert_eq!(config["permission"]["*"], "deny");
+    assert_eq!(config["tools"]["bash"], false);
 }
 
 /// The comma-joined `--disallowedTools` value.
