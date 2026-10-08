@@ -356,6 +356,16 @@ impl Orchestrator {
         project: &str,
         run_id: i64,
     ) -> ResumePlan {
+        if self
+            .limit_policy
+            .pending_reassignments
+            .contains_key(issue_id)
+        {
+            return ResumePlan {
+                superseded: true,
+                ..Default::default()
+            };
+        }
         if self.running.contains_key(issue_id) {
             return ResumePlan {
                 live: true,

@@ -132,6 +132,7 @@ pub(crate) struct LimitPolicy {
     pub fed_budgets: BTreeMap<String, rhapsody_config::ProviderBudget>,
     pub manager_cases: HashMap<String, LimitItem>,
     pub limited_managers: HashMap<String, chrono::DateTime<chrono::Utc>>,
+    pub pending_reassignments: HashMap<String, chrono::DateTime<chrono::Utc>>,
     pub decisions: Vec<crate::managerlimits::LimitDecision>,
     pub credit_approvals: HashMap<String, (String, i64)>,
 }
@@ -1346,6 +1347,15 @@ impl Orchestrator {
     }
 
     pub(crate) fn request_limit_resume(&mut self, id: &str) -> bool {
+        // A handled refusal must retain the claim: Resume finalize otherwise releases it to
+        // ordinary dispatch while off-loop label writes are still changing the identity.
+        if self.limit_policy.pending_reassignments.contains_key(id) {
+            tracing::warn!(
+                issue_id = id,
+                "limit: Resume refused while reassignment is pending"
+            );
+            return true;
+        }
         let Some(s) = self.limit_policy.suspended.get(id) else {
             return false;
         };

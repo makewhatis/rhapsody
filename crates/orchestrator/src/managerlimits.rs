@@ -424,6 +424,9 @@ impl Orchestrator {
         let id = self.limit_policy.suspended.iter().find(|(_,s)| {
             s.run.issue.identifier == decision.ticket && matches!(&s.outcome,HandoffOutcome::ManagerItem(i) if i.account == decision.account)
         }).map(|(id,_)| id.clone()).ok_or("limit continuation is no longer pending")?;
+        if self.limit_policy.pending_reassignments.contains_key(&id) {
+            return Err("reassignment is still pending".into());
+        }
         if authority == rhapsody_config::teams::LimitAuthority::Advise {
             if let Some(item) = self
                 .limit_policy
@@ -560,6 +563,9 @@ impl Orchestrator {
             mode: gate.mode.into(),
             old,
         };
+        self.limit_policy
+            .pending_reassignments
+            .insert(plan.old.issue.id.clone(), plan.old.started_at);
         self.limit_manager_status(&decision.account, "reassign pending");
         if self.ctx.is_some() {
             let events = self.events.clone();
@@ -604,6 +610,9 @@ impl Orchestrator {
     }
 
     pub(crate) fn finish_limit_reassign(&mut self, result: LimitReassigned) -> Result<(), String> {
+        if self.limit_policy.pending_reassignments.get(&result.id) == Some(&result.started_at) {
+            self.limit_policy.pending_reassignments.remove(&result.id);
+        }
         let account = result.decision.account.clone();
         let finish = || -> Result<(crate::RunningEntry, rhapsody_core::Issue, String), String> {
             let s = self
@@ -1034,6 +1043,61 @@ mod tests {
         ] {
             assert!(parse_limit_decision(&bad).is_err());
         }
+    }
+
+    #[tokio::test]
+    async fn operator_resume_is_refused_while_reassignment_is_pending() {
+        let (mut o, _, _dir) = setup();
+        let (gate_tx, gate_rx) = tokio::sync::watch::channel(false);
+        let mut tracker = Fake::new();
+        tracker.candidates = vec![o.limit_policy.suspended["1"].run.issue.clone()];
+        tracker.add_label_gate = Some(gate_rx);
+        let tracker = Arc::new(tracker);
+        o.eff.as_mut().unwrap().tracker = tracker.clone();
+        let cancel = crate::control_loop::CancelSignal::new();
+        o.ctx = Some(cancel.wait());
+        o.apply_limit_decision(decision(LimitAction::Reassign("bob".into())))
+            .await
+            .unwrap();
+        // The old account has reset, so Resume would otherwise arm the old identity.
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(10121, 0).unwrap());
+        let before = o.limit_policy.suspended["1"].outcome.clone();
+        // Also cover a Resume admitted before the transaction and finalized after it began.
+        o.handle_resume_finalize("1", true);
+        assert_eq!(
+            o.limit_policy.suspended["1"].outcome, before,
+            "operator resume must not supersede tracker writes already in flight"
+        );
+        assert!(o.handle_resume("1", "MT-1", "", 0).superseded);
+        assert!(o.claimed.contains("1"));
+        assert_eq!(o.limit_policy.items[0].manager_status, "reassign pending");
+        assert!(
+            o.apply_limit_decision(decision(LimitAction::Wait))
+                .await
+                .is_err()
+        );
+        gate_tx.send(true).unwrap();
+        let mut rx = o.events_rx.lock().unwrap().take().unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let crate::control_loop::Event::LimitReassigned(result) = event else {
+            panic!("unexpected completion")
+        };
+        o.finish_limit_reassign(*result).unwrap();
+        assert_eq!(tracker.add_label_calls()[0].label_name, "rhapsody:@bob");
+        assert_eq!(
+            tracker.remove_label_calls()[0].label_name,
+            "rhapsody:@alice"
+        );
+        // Fake's candidate snapshot is static; the next fetch reflects the completed writes.
+        let mut after = Fake::new();
+        after.candidates = vec![o.limit_policy.suspended["1"].run.issue.clone()];
+        o.eff.as_mut().unwrap().tracker = Arc::new(after);
+        o.resume_due_limits().await;
+        assert_eq!(o.running["1"].identity, "bob");
+        cancel.cancel();
     }
 
     #[tokio::test]
