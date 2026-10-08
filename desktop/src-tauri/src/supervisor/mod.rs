@@ -425,6 +425,14 @@ impl Supervisor {
         run.done().await;
     }
 
+    /// Requests shutdown without waiting for the runtime to drive the drain. Test drop guards use
+    /// this before signaling the child directly, so a multi-thread runtime cannot restart it.
+    pub fn request_stop(&self) {
+        if let Some(run) = lock(&self.inner.state).run.clone() {
+            run.request_stop();
+        }
+    }
+
     /// Stops then starts the daemon. Mirrors Go `Restart(ctx)`.
     pub async fn restart<F>(&self, cancel: F) -> Result<(), StartError>
     where
@@ -574,7 +582,10 @@ impl Inner {
                 Ok(())
             });
         }
-        tokio::process::Command::from(std_cmd)
+        let mut cmd = tokio::process::Command::from(std_cmd);
+        // A cancelled supervise task (including test-runtime teardown) must not orphan its child.
+        cmd.kill_on_drop(true);
+        cmd
     }
 
     /// Launches the daemon once and returns when it becomes unhealthy/exits or its run is asked to

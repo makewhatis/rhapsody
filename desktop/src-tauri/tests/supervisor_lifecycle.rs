@@ -23,6 +23,9 @@ use rhapsody_credential_ipc::wire::{
 use rhapsody_desktop::credential_bootstrap::{ChannelObservations, CredentialOwnerLookup};
 use rhapsody_desktop::supervisor::{CredentialBootstrap, Options, StartError, State, Supervisor};
 
+mod support;
+use support::SupervisorGuard;
+
 /// Path to the compiled fakedaemon stand-in for rhapsodyd (Cargo builds it for us).
 fn fake_daemon() -> &'static str {
     env!("CARGO_BIN_EXE_fakedaemon")
@@ -53,6 +56,67 @@ fn cancel_after(dur: Duration) -> tokio::time::Sleep {
 
 fn env(kvs: &[&str]) -> Vec<String> {
     kvs.iter().map(|s| (*s).to_string()).collect()
+}
+
+/// A runtime torn down by a test failure must not orphan its supervised child.
+#[test]
+fn runtime_teardown_kills_the_supervised_child() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let sup = Supervisor::new(fast_options(fake_daemon(), &[]));
+    runtime
+        .block_on(async { sup.start(cancel_after(Duration::from_secs(10))).await })
+        .expect("start");
+    let pid = sup.status().pid;
+    assert!(pid > 0);
+    drop(runtime);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while unsafe { libc::kill(pid, 0) == 0 } && Instant::now() < deadline {
+        // The runtime's SIGCHLD reaper is gone; reap our own child if it has exited.
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let survived = unsafe { libc::kill(pid, 0) == 0 };
+    // Clean up even on the failing-first run; never leave the regression's own orphan behind.
+    if survived {
+        unsafe {
+            libc::kill(-pid, libc::SIGKILL);
+            libc::waitpid(pid, std::ptr::null_mut(), 0);
+        }
+    }
+    assert!(!survived, "runtime teardown orphaned fakedaemon pid {pid}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn assertion_unwind_kills_child_without_restarting_it() {
+    let sup = Supervisor::new(fast_options(fake_daemon(), &[]));
+    let test_sup = sup.clone();
+    let failed = tokio::spawn(async move {
+        let _guard = SupervisorGuard::new(&test_sup);
+        test_sup
+            .start(cancel_after(Duration::from_secs(10)))
+            .await
+            .expect("start");
+        panic!("simulated assertion failure after start");
+    });
+    assert!(
+        failed
+            .await
+            .expect_err("simulated assertion must fail")
+            .is_panic()
+    );
+    tokio::time::timeout(Duration::from_secs(5), sup.stop())
+        .await
+        .expect("guard must stop the supervisor");
+    assert_eq!(sup.status().state, State::Stopped);
+    assert_eq!(
+        sup.status().restarts,
+        0,
+        "failure cleanup must suppress restarts"
+    );
+    assert!(!sup.healthy().await, "failure cleanup left a live daemon");
 }
 
 /// A unique scratch directory removed on drop (STUDIO-1031), so a lifecycle run leaves no
@@ -106,6 +170,7 @@ impl Drop for TempDir {
 async fn start_becomes_healthy_then_stop() {
     let bin = fake_daemon();
     let sup = Supervisor::new(fast_options(bin, &env(&["FAKE_READY_DELAY_MS=120"])));
+    let _guard = SupervisorGuard::new(&sup);
 
     sup.start(cancel_after(Duration::from_secs(10)))
         .await
@@ -137,6 +202,7 @@ async fn restarts_on_crash() {
         bin,
         &env(&[&format!("FAKE_CRASH_MARKER={}", marker.display())]),
     ));
+    let _guard = SupervisorGuard::new(&sup);
 
     sup.start(cancel_after(Duration::from_secs(10)))
         .await
@@ -164,6 +230,7 @@ async fn start_timeout_when_never_healthy() {
     opts.startup_timeout = Duration::from_millis(250);
     opts.max_restarts = 1;
     let sup = Supervisor::new(opts);
+    let _guard = SupervisorGuard::new(&sup);
 
     let err = sup.start(cancel_after(Duration::from_secs(10))).await;
     assert!(
@@ -183,6 +250,7 @@ async fn start_timeout_when_never_healthy() {
 async fn start_stop_start_cycle() {
     let bin = fake_daemon();
     let sup = Supervisor::new(fast_options(bin, &[]));
+    let _guard = SupervisorGuard::new(&sup);
     for i in 0..3 {
         sup.start(cancel_after(Duration::from_secs(10)))
             .await
@@ -197,6 +265,7 @@ async fn start_stop_start_cycle() {
 async fn restart_method() {
     let bin = fake_daemon();
     let sup = Supervisor::new(fast_options(bin, &[]));
+    let _guard = SupervisorGuard::new(&sup);
     sup.start(cancel_after(Duration::from_secs(15)))
         .await
         .expect("start");
@@ -218,6 +287,7 @@ async fn restart_after_give_up() {
     opts.startup_timeout = Duration::from_millis(120);
     opts.max_restarts = 1;
     let sup = Supervisor::new(opts);
+    let _guard = SupervisorGuard::new(&sup);
 
     for i in 0..2 {
         let err = sup.start(cancel_after(Duration::from_secs(5))).await;
@@ -237,6 +307,7 @@ async fn restart_after_give_up() {
 async fn concurrent_start_stop_restart() {
     let bin = fake_daemon();
     let sup = Supervisor::new(fast_options(bin, &[]));
+    let _guard = SupervisorGuard::new(&sup);
     sup.start(cancel_after(Duration::from_secs(10)))
         .await
         .expect("initial start");
@@ -298,6 +369,7 @@ async fn concurrent_start_stop_restart() {
 async fn start_cancel_tears_down_run() {
     let bin = fake_daemon();
     let sup = Supervisor::new(fast_options(bin, &env(&["FAKE_READY_DELAY_MS=60000"])));
+    let _guard = SupervisorGuard::new(&sup);
 
     let err = sup.start(cancel_after(Duration::from_millis(80))).await;
     assert_eq!(err, Err(StartError::Cancelled), "want Cancelled");
@@ -333,6 +405,7 @@ async fn start_cancel_tears_down_run() {
 #[tokio::test]
 async fn start_fails_fast_when_binary_missing() {
     let sup = Supervisor::new(fast_options("", &[]));
+    let _guard = SupervisorGuard::new(&sup);
     let start = Instant::now();
     let err = sup.start(cancel_after(Duration::from_secs(2))).await;
     assert!(
@@ -370,6 +443,7 @@ async fn start_fails_fast_when_binary_not_executable() {
     std::fs::write(&p, b"not an executable").expect("write");
     std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).expect("chmod"); // no exec bit
     let sup = Supervisor::new(fast_options(p.to_str().unwrap(), &[]));
+    let _guard = SupervisorGuard::new(&sup);
 
     let err = sup.start(cancel_after(Duration::from_secs(2))).await;
     assert!(err.is_err(), "want an error for a non-executable binary");
@@ -387,6 +461,7 @@ async fn start_fails_fast_when_binary_not_executable() {
 async fn launched_daemon_leads_its_own_process_group() {
     let bin = fake_daemon();
     let sup = Supervisor::new(fast_options(bin, &[]));
+    let _guard = SupervisorGuard::new(&sup);
     sup.start(cancel_after(Duration::from_secs(10)))
         .await
         .expect("start");
@@ -614,6 +689,7 @@ async fn supervisor_serves_the_credential_channel_and_records_observed_revisions
         )
     };
     let sup = Supervisor::new(options);
+    let _guard = SupervisorGuard::new(&sup);
     sup.start(cancel_after(Duration::from_secs(10)))
         .await
         .expect("start");
@@ -687,6 +763,7 @@ async fn supervisor_serves_the_credential_channel_and_records_observed_revisions
 async fn url_reflects_chosen_port() {
     let bin = fake_daemon();
     let sup = Supervisor::new(fast_options(bin, &[]));
+    let _guard = SupervisorGuard::new(&sup);
     sup.start(cancel_after(Duration::from_secs(10)))
         .await
         .expect("start");
