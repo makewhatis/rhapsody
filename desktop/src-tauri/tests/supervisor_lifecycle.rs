@@ -412,9 +412,11 @@ struct ShortDir {
 
 impl ShortDir {
     fn new(prefix: &str) -> ShortDir {
-        let path = PathBuf::from("/tmp").join(format!("{prefix}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&path);
-        std::fs::create_dir_all(&path).expect("create short dir");
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        let path = PathBuf::from("/tmp").join(format!("{prefix}-{}-{seq}", std::process::id()));
+        std::fs::create_dir(&path).expect("create short dir");
         ShortDir { path }
     }
 }
@@ -430,6 +432,20 @@ impl Drop for ShortDir {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.path);
     }
+}
+
+#[test]
+fn short_dir_calls_with_the_same_prefix_are_independent() {
+    let first = ShortDir::new("rd-isolation");
+    let marker = first.join("marker");
+    std::fs::write(&marker, "first").expect("write marker");
+    let second = ShortDir::new("rd-isolation");
+    assert_ne!(first.path, second.path);
+    drop(second);
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("read marker"),
+        "first"
+    );
 }
 
 /// A read-only in-memory `CredentialOwner` double: one Present binding at a fixed revision. The

@@ -99,12 +99,14 @@ struct Scratch {
 
 impl Scratch {
     fn new(tag: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
         let base = std::env::temp_dir()
             .canonicalize()
             .unwrap_or_else(|_| std::env::temp_dir());
-        let dir = base.join(format!("rhapsody-e2e-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let dir = base.join(format!("rhapsody-e2e-{}-{tag}-{seq}", std::process::id()));
+        std::fs::create_dir(&dir).expect("scratch dir");
         Self { dir }
     }
 
@@ -119,6 +121,20 @@ impl Drop for Scratch {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
+}
+
+#[test]
+fn scratch_calls_with_the_same_tag_are_independent() {
+    let first = Scratch::new("isolation");
+    let marker = first.path().join("marker");
+    std::fs::write(&marker, "first").expect("write marker");
+    let second = Scratch::new("isolation");
+    assert_ne!(first.path(), second.path());
+    drop(second);
+    assert_eq!(
+        std::fs::read_to_string(marker).expect("read marker"),
+        "first"
+    );
 }
 
 fn write_executable(path: &Path, body: &str) {
