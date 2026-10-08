@@ -1020,7 +1020,7 @@ impl crate::ControlHandle {
             .manager_pr(run_id)
             .await
             .map_err(|_| InvestigateError::Unavailable("PR head could not be verified".into()))?;
-        if pr.get("headRefOid").and_then(|s| s.as_str()) != Some(head) {
+        if pr.get("head").and_then(|s| s.as_str()) != Some(head) {
             return Err(InvestigateError::InvalidRef);
         }
         let mgr = self
@@ -1087,6 +1087,103 @@ mod tests {
                 ..Default::default()
             })
         }
+    }
+
+    #[tokio::test]
+    async fn investigate_accepts_the_normalized_manager_pr_head() {
+        use rhapsody_store::{RunStart, Sqlite, Store, StorePath};
+
+        let root = crate::testsupport::TempDir::new();
+        let head = "a".repeat(40);
+        let gh_head = head.clone();
+        let gh = crate::ghsummons::GH::new(
+            "@symphony",
+            Some(Box::new(move |args| {
+                assert_eq!(&args[..6], &["pr", "view", "1", "--repo", "o/r", "--json"]);
+                Ok(serde_json::to_vec(&serde_json::json!({ "headRefOid": gh_head })).unwrap())
+            })),
+        );
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let id = store
+            .start_run(RunStart {
+                issue_identifier: "pr:o/r#1@manager".into(),
+                repo: "git@github.com:o/r.git".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mgr = Arc::new(
+            rhapsody_workspace::Manager::new(rhapsody_workspace::Config {
+                root: root.path.clone(),
+                hooks: Default::default(),
+                hook_timeout: Duration::from_secs(1),
+            })
+            .unwrap(),
+        );
+        let exec = Arc::new(Fake::default());
+        let runtime = Arc::new(Investigations {
+            exec: exec.clone(),
+            image: Ok("pinned".into()),
+            root: PathBuf::from(&root.path),
+            runs: Mutex::new(HashMap::new()),
+            warmups: tokio::sync::Mutex::new(HashMap::new()),
+        });
+        runtime.bind_run(id);
+        // An existing session lets the production tool path execute without Docker or a checkout.
+        let slot = runtime.runs.lock().unwrap().get(&id).unwrap().clone();
+        *slot.session.lock().await = Some(InvestigationSession {
+            container: Session::guard(exec.clone(), "verified-head".into()),
+            head: head.clone(),
+            _checkout: CheckoutGuard {
+                mgr: mgr.clone(),
+                repo: String::new(),
+                run_id: id,
+            },
+        });
+        let mut orchestrator = crate::Orchestrator::new("unused");
+        orchestrator.set_store(store);
+        let mut handle = orchestrator.control();
+        handle.manager_gh = Some(Arc::new(gh));
+        handle.investigate = Some(runtime.clone());
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        handle.events = tx;
+        tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let crate::Event::WorkspaceGc { reply } = event {
+                    let _ = reply.send(crate::workspace_gc::WorkspaceGcPlan {
+                        mgr: Some(mgr.clone()),
+                        keep: Default::default(),
+                    });
+                }
+            }
+        });
+
+        let pr = handle.manager_pr(id).await.unwrap();
+        assert_eq!(pr["head"], head);
+        assert!(pr.get("headRefOid").is_none());
+        let result = handle.investigate(id, &head, "exit 42").await;
+        assert!(result.is_ok(), "verified PR head rejected: {result:?}");
+        assert_eq!(result.unwrap().exit_code, 42);
+        assert!(
+            exec.calls
+                .lock()
+                .unwrap()
+                .contains(&exec_args("verified-head", "exit 42"))
+        );
+
+        exec.calls.lock().unwrap().clear();
+        assert_eq!(
+            handle
+                .investigate(id, &"b".repeat(40), "exit 43")
+                .await
+                .unwrap_err(),
+            InvestigateError::InvalidRef
+        );
+        assert!(
+            exec.calls.lock().unwrap().is_empty(),
+            "unverified head executed a command"
+        );
+        runtime.release_run(id);
+        tokio::task::yield_now().await;
     }
 
     #[test]
