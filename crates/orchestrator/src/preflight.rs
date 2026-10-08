@@ -921,6 +921,13 @@ mod tests {
     }
 
     async fn drive_tick(o: &mut Orchestrator) {
+        // These ticks share tracing callsites with the log-capture test. Serializing every tick
+        // keeps an unrelated runtime's empty subscriber from racing its interest-cache rebuild.
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        drive_tick_unlocked(o).await;
+    }
+
+    async fn drive_tick_unlocked(o: &mut Orchestrator) {
         o.on_tick().await;
         if let Some(t) = o.tick_timer.take() {
             t.abort(); // stop the poll timer on_tick re-arms
@@ -1099,10 +1106,10 @@ mod tests {
         tracing::callsite::rebuild_interest_cache();
         let (mut o, _, _dir) = mixed_accounts(true);
         for _ in 0..2 {
-            drive_tick(&mut o).await;
+            drive_tick_unlocked(&mut o).await;
             assert!(o.build_snapshot().review_divergence.is_empty());
         }
-        drive_tick(&mut o).await;
+        drive_tick_unlocked(&mut o).await;
         let report = o.build_snapshot().review_divergence;
         assert_eq!(report.len(), 1);
         assert!(report[0].reason.contains("claude-subscription"));
@@ -1128,7 +1135,7 @@ mod tests {
             kind: FakeKind::Healthy,
             calls: Arc::new(AtomicUsize::new(0)),
         }));
-        drive_tick(&mut o).await;
+        drive_tick_unlocked(&mut o).await;
         assert!(o.build_snapshot().review_divergence.is_empty());
     }
 

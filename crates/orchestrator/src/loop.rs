@@ -2974,6 +2974,7 @@ mod tests {
     /// login skips dispatch every tick until a human re-authenticates. See the sibling test above.
     #[tokio::test]
     async fn a_dead_credential_retires_the_published_count() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
         struct DeadProbe;
         #[async_trait::async_trait]
         impl crate::preflight::CredentialProbe for DeadProbe {
