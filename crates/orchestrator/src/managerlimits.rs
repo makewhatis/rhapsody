@@ -493,6 +493,9 @@ impl Orchestrator {
                 HandoffOutcome::Switch { engine: *engine }
             }
             LimitAction::SpendCredits => {
+                if decision.account == "chatgpt-subscription" && self.openai_budget_rejected(now) {
+                    return Err("credits cannot bypass the independent OpenAI budget wall".into());
+                }
                 if note.is_none() || reset <= now || !decision.account.ends_with("-subscription") {
                     return Err(
                         "credits require a subscription, handoff note and future reset".into(),
@@ -1177,6 +1180,59 @@ mod tests {
             );
             assert!(o.limit_policy.credit_approvals.is_empty());
         }
+    }
+
+    #[tokio::test]
+    async fn credits_cannot_override_the_independent_openai_budget_wall() {
+        let (mut o, _, _dir) = setup();
+        o.eff.as_mut().unwrap().cfg.limits.credits = "manager_urgent".into();
+        o.limit_policy.items[0].account = "chatgpt-subscription".into();
+        let item = o.limit_policy.items[0].clone();
+        let suspended = o.limit_policy.suspended.get_mut("1").unwrap();
+        suspended.run.harness = "opencode".into();
+        suspended.run.model = "openai/test".into();
+        suspended.run.model_override.model = "openai/test".into();
+        suspended.outcome = HandoffOutcome::ManagerItem(item.clone());
+        let observation = rhapsody_agent::ratelimit::LimitObs {
+            status: rhapsody_agent::ratelimit::LimitStatus::Allowed,
+            windows: vec![rhapsody_agent::ratelimit::WindowObs {
+                window: "primary".into(),
+                utilization: 0.96,
+                resets_at_s: 10000,
+            }],
+            using_credits: false,
+            source: "probe",
+            observed_at_s: 1000,
+        };
+        o.accounts
+            .observe("chatgpt-subscription", observation.clone());
+        let mut budget = observation;
+        budget.status = rhapsody_agent::ratelimit::LimitStatus::Rejected;
+        budget.source = "budget";
+        budget.windows[0].window = "daily".into();
+        budget.windows[0].utilization = 1.0;
+        budget.windows[0].resets_at_s = 2000;
+        o.accounts.observe("openai", budget);
+        let mut decision = decision(LimitAction::SpendCredits);
+        decision.account = "chatgpt-subscription".into();
+        let recovery_before = o.store().load_recovery().unwrap().retries;
+        let error = o.apply_limit_decision(decision.clone()).await.unwrap_err();
+        assert!(error.contains("OpenAI budget"), "{error}");
+        assert!(o.limit_policy.credit_approvals.is_empty());
+        assert_eq!(o.limit_policy.items, vec![item.clone()]);
+        assert_eq!(
+            o.limit_policy.suspended["1"].outcome,
+            HandoffOutcome::ManagerItem(item)
+        );
+        assert_eq!(o.store().load_recovery().unwrap().retries, recovery_before);
+        assert!(!o.retry_attempts.contains_key("limit:1"));
+        o.resume_due_limits().await;
+        assert!(!o.running.contains_key("1"));
+        // The budget reset releases only the backstop; named credit authorization still works.
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(2001, 0).unwrap());
+        o.apply_limit_decision(decision).await.unwrap();
+        assert!(o.credit_approved("1", "chatgpt-subscription"));
+        assert!(o.limit_policy.items.is_empty());
     }
 
     #[test]
