@@ -75,6 +75,14 @@ pub fn render(s: &Snapshot) -> Value {
     // The DETAIL and not just a flag, because the advisory on `/api/v1/projects` is a fixed string
     // and an operator's next question is always "which one". Clients read
     // `state.review_divergence?.length`.
+    if let Some(obj) = out.as_object_mut() {
+        if !s.limit_held.is_empty() {
+            obj.insert("limit_held".into(), json!(s.limit_held));
+        }
+        if !s.limit_items.is_empty() {
+            obj.insert("limit_items".into(), json!(s.limit_items));
+        }
+    }
     if !s.review_divergence.is_empty()
         && let Some(obj) = out.as_object_mut()
     {

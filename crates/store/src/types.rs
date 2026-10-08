@@ -88,6 +88,8 @@ pub const OUTCOME_RUNNING: &str = "running";
 pub const OUTCOME_CONTINUED: &str = "continued";
 /// agent-declared hand-off verified by state, or Done-type terminal
 pub const OUTCOME_COMPLETED: &str = "completed";
+/// An account limit ended this segment, independently of failure/review/loop budgets (L4).
+pub const OUTCOME_LIMIT: &str = "limit";
 /// Stop button, cancel-type terminal, or external wind-down
 pub const OUTCOME_STOPPED: &str = "stopped";
 /// error exit (incl. turn timeout) or stall (reason="stalled")

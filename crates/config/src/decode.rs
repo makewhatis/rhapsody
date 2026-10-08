@@ -53,6 +53,8 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     let bytes =
         serde_yaml_ng::to_string(&def.config).map_err(|e| ConfigError::Parse(e.to_string()))?;
     let r: Raw = serde_yaml_ng::from_str(&bytes).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let limits = r.limits.clone().unwrap_or_default();
+    limits.validate().map_err(ConfigError::Parse)?;
     for (model, price) in &r.prices {
         if !model
             .split_once('/')
@@ -344,6 +346,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         pr_label: or_str(r.pr_label, "rhapsody"),
         budgets,
         prices: r.prices.into_iter().collect(),
+        limits,
         notify,
         providers,
     })

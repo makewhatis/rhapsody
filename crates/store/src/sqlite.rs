@@ -1845,6 +1845,25 @@ impl Store for Sqlite {
         Ok(n)
     }
 
+    fn account_credit_spend(&self, account: &str, since: &str) -> Result<f64, StoreError> {
+        let conn = self.lock();
+        let (unknown, usd): (bool, f64) = conn.query_row(
+            "SELECT COALESCE(MAX(kind = 'limit.credit_cost_unknown'), 0),
+                    COALESCE(SUM(json_extract(text, '$.usd')), 0.0)
+               FROM events
+              WHERE kind IN ('limit.credit_cost', 'limit.credit_cost_unknown')
+                AND at >= ?1 AND json_extract(text, '$.account') = ?2",
+            params![since, account],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok(if unknown { f64::INFINITY } else { usd })
+    }
+
+    fn account_credit_notified(&self, account: &str, since: &str) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE kind = 'limit.credit_spend' AND at >= ?1 AND json_extract(text, '$.account') = ?2)", params![since, account], |row| row.get(0))?)
+    }
+
     fn ticket_spend_by_provider(
         &self,
         ticket: &str,

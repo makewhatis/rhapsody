@@ -61,6 +61,9 @@ pub fn encode(c: &Config) -> Result<Definition, ConfigError> {
 /// absent/false knob is pruned.
 fn raw_from_config(c: &Config) -> Raw {
     let mut r = Raw::default();
+    if c.limits != crate::Limits::default() {
+        r.limits = Some(c.limits.clone());
+    }
 
     r.tracker.kind = c.tracker.kind.clone();
     r.tracker.endpoint = c.tracker.endpoint.clone();

@@ -194,6 +194,10 @@ pub fn local_day_start() -> String {
     day_start(Local::now())
 }
 
+pub(crate) fn local_day_start_at(now: DateTime<Utc>) -> String {
+    day_start(now.with_timezone(&Local))
+}
+
 /// The local-day boundary for `now`, resolved through the ZONE's own transition rules rather than
 /// through `now`'s current offset.
 ///
@@ -739,18 +743,20 @@ impl crate::orchestrator::Orchestrator {
         iss: &rhapsody_core::Issue,
         project: &str,
     ) -> RunPricing {
-        let harness = self.review_harness_for(iss);
-        let mut mo = self
-            .route_teams(iss)
-            .map(|td| td.model_override)
-            .unwrap_or_default();
+        let projection = self.limit_projection(iss, project);
+        let harness = self.effective_harness(&projection.harness);
+        let mut mo = projection.model_override;
         if let Some(teams) = &self.teams
             && let rhapsody_config::teams::ReviewModelChoice::Use(model) =
                 teams.review_model_for(&harness, &self.configured_backend())
         {
             mo.model = model.into();
         }
-        self.run_pricing_for(&harness, &mo, project)
+        let mut pricing = self.run_pricing_for(&harness, &mo, project);
+        if !projection.pricing.account.is_empty() {
+            pricing.account = projection.pricing.account;
+        }
+        pricing
     }
 }
 

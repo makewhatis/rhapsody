@@ -418,6 +418,18 @@ impl ClaudeSession {
 
 #[async_trait]
 impl Session for ClaudeSession {
+    fn resume_from(&self, thread_id: &str) -> Result<(), AgentError> {
+        if thread_id.is_empty() {
+            return Err(AgentError::Other(
+                "parked Claude session has no thread id".into(),
+            ));
+        }
+        *self
+            .thread_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = thread_id.to_string();
+        Ok(())
+    }
     fn account_oauth(&self) -> Option<bool> {
         *self.account_oauth.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1169,6 +1181,26 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn restored_session_sends_resume_on_the_first_turn() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "PARK-1");
+        let (_script_guard, script) = write_fake_claude(
+            "#!/usr/bin/env bash\nprevious=\nfound=0\nfor arg in \"$@\"; do\n  if [[ $previous == --resume && $arg == saved-session ]]; then found=1; fi\n  previous=$arg\ndone\n[[ $found == 1 ]] || exit 9\nread -r prompt\nprintf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"saved-session\",\"apiKeySource\":\"none\"}' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"saved-session\",\"result\":\"continued\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
+        );
+        let session = new_runner(&script, &root.path())
+            .start_session(&ws, issue("1", "PARK-1"), None)
+            .await
+            .unwrap();
+        session.resume_from("saved-session").unwrap();
+        let (_, error) = session
+            .run_turn("Continue after the reset", None, None, &|_| {})
+            .await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(session.thread_id(), "saved-session");
     }
 
     #[tokio::test]

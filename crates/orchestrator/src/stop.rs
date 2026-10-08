@@ -388,6 +388,9 @@ impl Orchestrator {
     /// Runs ON the control task after the off-loop move-to-Todo. Mirrors Go `handleResumeFinalize`.
     pub(crate) fn handle_resume_finalize(&mut self, issue_id: &str, moved: bool) {
         if moved {
+            if self.request_limit_resume(issue_id) {
+                return;
+            }
             self.claimed.remove(issue_id);
         }
     }
@@ -475,7 +478,7 @@ impl ControlHandle {
                 });
             }
         };
-        if run.outcome != store::OUTCOME_STOPPED {
+        if run.outcome != store::OUTCOME_STOPPED && run.outcome != store::OUTCOME_LIMIT {
             return Ok(ResumeResult {
                 not_stopped: true,
                 identifier: run.issue_identifier,
