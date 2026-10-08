@@ -671,15 +671,70 @@ pub(crate) async fn provision_manager_config_dir(
 /// into the JSON filter in memory, never to a terminal, transcript, diagnostic or intermediate file.
 #[cfg(target_os = "macos")]
 async fn read_claude_keychain() -> Option<String> {
+    // Claude Code now keys its item by OS username. An older account-less item can coexist
+    // under the same service, and an unqualified lookup returns that stale item on this Mac.
+    let account = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tokio::process::Command::new("/usr/bin/id")
+            .arg("-un")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()
+    .and_then(Result::ok)
+    .filter(|output| output.status.success())
+    .and_then(|output| String::from_utf8(output.stdout).ok());
+    read_claude_keychain_from(
+        std::path::Path::new("/usr/bin/security"),
+        account.as_deref().map(str::trim).filter(|s| !s.is_empty()),
+        chrono::Utc::now().timestamp_millis(),
+    )
+    .await
+}
+
+#[cfg(target_os = "macos")]
+async fn read_claude_keychain_from(
+    command: &std::path::Path,
+    account: Option<&str>,
+    now_ms: i64,
+) -> Option<String> {
+    let mut latest_expired = None;
+    for account in account.map(Some).into_iter().chain(std::iter::once(None)) {
+        let Some(raw) = read_claude_keychain_item(command, account).await else {
+            continue;
+        };
+        let Some(expires) = credential_expiry(&raw) else {
+            continue;
+        };
+        if expires > now_ms {
+            return Some(raw);
+        }
+        if latest_expired
+            .as_ref()
+            .is_none_or(|(last, _)| expires > *last)
+        {
+            latest_expired = Some((expires, raw));
+        }
+    }
+    latest_expired.map(|(_, raw)| raw)
+}
+
+#[cfg(target_os = "macos")]
+async fn read_claude_keychain_item(
+    command: &std::path::Path,
+    account: Option<&str>,
+) -> Option<String> {
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(["find-generic-password", "-s", "Claude Code-credentials"]);
+    if let Some(account) = account {
+        cmd.args(["-a", account]);
+    }
     let output = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new("/usr/bin/security")
-            .args([
-                "find-generic-password",
-                "-s",
-                "Claude Code-credentials",
-                "-w",
-            ])
+        std::time::Duration::from_secs(4),
+        cmd.arg("-w")
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .kill_on_drop(true)
@@ -1526,6 +1581,88 @@ mod tests {
 
     use super::*;
     use crate::testsupport::{TempDir, issue, recording_subscriber};
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn manager_keychain_prefers_current_daemon_user_over_expired_accountless_item() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let security = dir.child("security");
+        std::fs::write(&security, r#"#!/bin/sh
+if [ "$1" != find-generic-password ] || [ "$2" != -s ] || [ "$3" != Claude\ Code-credentials ]; then exit 1; fi
+if [ "$4" = -a ] && [ "$5" = daemon-user ] && [ "$6" = -w ]; then
+  printf '%s' '{"claudeAiOauth":{"accessToken":"current-user-access","refreshToken":"never-copy","expiresAt":3000}}'
+else
+  printf '%s' '{"claudeAiOauth":{"accessToken":"expired-accountless-access","expiresAt":1000}}'
+fi
+"#).expect("fake security");
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700))
+            .expect("executable fake security");
+        let raw =
+            read_claude_keychain_from(std::path::Path::new(&security), Some("daemon-user"), 2000)
+                .await
+                .expect("Keychain item");
+        let token = provision_manager_credential_from_sources(
+            std::path::Path::new(&dir.path),
+            None,
+            || Some(raw),
+            2000,
+        )
+        .expect("fresh daemon-user login must win over expired accountless item");
+        assert_eq!(token, "current-user-access");
+        let copied =
+            std::fs::read_to_string(dir.child(".credentials.json")).expect("private credential");
+        assert!(!copied.contains("refreshToken"));
+        assert!(!copied.contains("never-copy"));
+        assert!(!copied.contains("expired-accountless-access"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn manager_keychain_keeps_current_legacy_fallback_and_latest_expired_detail() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new();
+        let security = dir.child("security");
+        std::fs::write(
+            &security,
+            r#"#!/bin/sh
+if [ "$4" = -a ]; then
+  if [ "$5" = absent-user ]; then exit 44; fi
+  printf '%s' '{"claudeAiOauth":{"accessToken":"expired-user-access","expiresAt":1000}}'
+else
+  printf '%s' '{"claudeAiOauth":{"accessToken":"legacy-access","expiresAt":3000}}'
+fi
+"#,
+        )
+        .expect("fake security");
+        std::fs::set_permissions(&security, std::fs::Permissions::from_mode(0o700))
+            .expect("executable fake security");
+        for user in ["absent-user", "expired-user"] {
+            let raw = read_claude_keychain_from(std::path::Path::new(&security), Some(user), 2000)
+                .await
+                .expect("legacy fallback");
+            assert_eq!(credential_expiry(&raw), Some(3000));
+            assert_eq!(
+                rhapsody_agent::manager::model_credential_from_config_json(&raw).as_deref(),
+                Some("legacy-access")
+            );
+        }
+        let raw =
+            read_claude_keychain_from(std::path::Path::new(&security), Some("expired-user"), 4000)
+                .await
+                .expect("latest expired item retained for typed detail");
+        let error = provision_manager_credential_from_sources(
+            std::path::Path::new(&dir.path),
+            None,
+            || Some(raw),
+            4000,
+        )
+        .expect_err("both expired");
+        assert_eq!(
+            error.to_string(),
+            "Claude login expired at 1970-01-01 00:00:03 UTC; run claude once as the daemon's user"
+        );
+    }
 
     #[test]
     fn expired_manager_file_falls_back_to_keychain_without_copying_refresh_token() {

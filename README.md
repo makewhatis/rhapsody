@@ -70,7 +70,8 @@ then every 15 minutes; CLI version changes still trigger a fresh test, and passi
 periodically retested. Shutdown cancels in-flight canaries.
 
 Claude manager credentials use an unexpired file login first, falling back on macOS to the
-`Claude Code-credentials` Keychain service. Private manager files carry only the access token and
+`Claude Code-credentials` Keychain service, preferring the daemon user's account item over a stale
+account-less legacy item. Private manager files carry only the access token and
 expiry, never a refresh token or unrelated MCP login. Missing/expired logins refuse before launch
 with actionable detail; both harnesses report bounded, secret-stripped canary turn errors. These
 are Teams-only behaviors with no frozen Go counterpart; existing API/golden shapes are unchanged.
