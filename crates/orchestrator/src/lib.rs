@@ -62,6 +62,7 @@ pub mod liveness;
 pub mod managerapply;
 pub mod managerapproval;
 pub mod managerdecision;
+pub mod managerdocs;
 pub mod managerexchange;
 pub mod managerintervention;
 pub mod managerlimits;

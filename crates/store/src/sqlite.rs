@@ -1239,6 +1239,22 @@ impl Store for Sqlite {
         Ok(id)
     }
 
+    fn retire_resolved_lead_missing_pr(&self, item: i64) -> Result<bool, StoreError> {
+        // The old item/decision/execution remains intact. Only its unique dedupe key is retired,
+        // so repeated observations within an incident stay bounded and later incidents do not
+        // inherit an exhausted execution or overwrite the paper trail. Recheck under the lock.
+        Ok(self.lock().execute(
+            "UPDATE rhapsody_lead_items SET question = question || ':resolved:' || id \
+             WHERE id = ?1 AND trigger = 'impossible_state' AND detail = 'in_review_no_pr' \
+             AND question = 'in_review_no_pr' AND state = 'done' \
+             AND EXISTS(SELECT 1 FROM rhapsody_lead_decisions d \
+             WHERE d.id = (SELECT MAX(id) FROM rhapsody_lead_decisions WHERE item = ?1) \
+             AND d.decision LIKE 'done:%' \
+             AND json_extract(CASE WHEN json_valid(d.actions) THEN d.actions ELSE '[]' END, '$[0].action') = 'resolve')",
+            params![item],
+        )? == 1)
+    }
+
     fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
@@ -10149,6 +10165,132 @@ mod tests {
         drop(store);
         let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
         assert_eq!(store.load_lead_items().expect("items"), before);
+    }
+
+    #[test]
+    fn resolved_missing_pr_retirement_preserves_history_and_survives_restart() {
+        let dir = scratch_dir();
+        let path = StorePath::Disk(dir.join("lead-recurrence.db"));
+        let store = Sqlite::open(path.clone()).unwrap();
+        let trigger = LeadTrigger::ImpossibleState {
+            subject: "STUDIO-598".into(),
+            kind: "in_review_no_pr".into(),
+        };
+        let first = store
+            .enqueue_lead_item(&trigger, "2026-10-08T00:00:00Z")
+            .unwrap();
+        let execution = LeadExecution {
+            item: first,
+            run_attempts: 3,
+            findings: "first occurrence".into(),
+            ..Default::default()
+        };
+        store.save_lead_execution(&execution).unwrap();
+        store
+            .save_lead_decision(&LeadDecisionRow {
+                item: first,
+                decision: "done: document-only review".into(),
+                actions: r#"[{"action":"resolve","reason":"published"}]"#.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store.set_lead_item_state(first, "done").unwrap();
+        let history = store.load_lead_decisions().unwrap();
+        let items = store.load_lead_items().unwrap();
+        assert_eq!(
+            store
+                .enqueue_lead_item(&trigger, "2026-10-08T01:00:00Z")
+                .unwrap(),
+            first
+        );
+        assert!(store.retire_resolved_lead_missing_pr(first).unwrap());
+        assert!(!store.retire_resolved_lead_missing_pr(first).unwrap());
+        assert_eq!(store.load_lead_items().unwrap(), items);
+        drop(store);
+        let store = Sqlite::open(path).unwrap();
+        assert_eq!(store.load_lead_decisions().unwrap(), history);
+        assert_eq!(store.lead_execution(first).unwrap(), Some(execution));
+        let second = store
+            .enqueue_lead_item(&trigger, "2026-10-08T02:00:00Z")
+            .unwrap();
+        assert_ne!(second, first);
+        assert_eq!(
+            store
+                .enqueue_lead_item(&trigger, "2026-10-08T03:00:00Z")
+                .unwrap(),
+            second
+        );
+        let items = store.load_lead_items().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].state, "done");
+        assert_eq!(items[1].state, "queued");
+        assert_eq!(items[1].attempts_on_question, 0);
+        assert!(store.lead_execution(second).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolved_missing_pr_retirement_refuses_unresolved_or_escalated_items() {
+        for (kind, state, decision, actions) in [
+            (
+                "in_review_no_pr",
+                "running",
+                "done: resolved",
+                r#"[{"action":"resolve"}]"#,
+            ),
+            (
+                "in_review_no_pr",
+                "parked",
+                "done: resolved",
+                r#"[{"action":"resolve"}]"#,
+            ),
+            (
+                "in_review_no_pr",
+                "done",
+                "escalate: needs human",
+                r#"[{"action":"escalate"}]"#,
+            ),
+            (
+                "in_review_no_pr",
+                "done",
+                "proposed: resolved",
+                r#"[{"action":"resolve"}]"#,
+            ),
+            (
+                "in_review_no_pr",
+                "done",
+                "done: requeued",
+                r#"[{"action":"requeue"}]"#,
+            ),
+            ("in_review_no_pr", "done", "done: malformed", "not JSON"),
+            (
+                "zero_verdict_escalation",
+                "done",
+                "done: resolved",
+                r#"[{"action":"resolve"}]"#,
+            ),
+        ] {
+            let store = open_mem();
+            let trigger = LeadTrigger::ImpossibleState {
+                subject: "STUDIO-598".into(),
+                kind: kind.into(),
+            };
+            let id = store.enqueue_lead_item(&trigger, "at").unwrap();
+            store
+                .save_lead_decision(&LeadDecisionRow {
+                    item: id,
+                    decision: decision.into(),
+                    actions: actions.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            store.set_lead_item_state(id, state).unwrap();
+            assert!(
+                !store.retire_resolved_lead_missing_pr(id).unwrap(),
+                "{kind}/{state}/{decision}"
+            );
+            assert_eq!(store.enqueue_lead_item(&trigger, "later").unwrap(), id);
+        }
+        assert!(!Noop.retire_resolved_lead_missing_pr(1).unwrap());
     }
 
     #[test]

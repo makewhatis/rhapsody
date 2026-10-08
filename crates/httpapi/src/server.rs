@@ -45,9 +45,11 @@ use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
 use crate::handlers_manager::handle_investigate;
 use crate::handlers_manager::{
-    handle_manager_diff, handle_manager_file, handle_manager_findings, handle_manager_grep,
-    handle_manager_interdiff, handle_manager_ls, handle_manager_patch_id, handle_manager_pr,
-    handle_manager_pr_activity, handle_manager_pr_commits, handle_operator_preferences,
+    handle_docs_list, handle_docs_read, handle_manager_diff, handle_manager_file,
+    handle_manager_findings, handle_manager_grep, handle_manager_interdiff, handle_manager_ls,
+    handle_manager_patch_id, handle_manager_pr, handle_manager_pr_activity,
+    handle_manager_pr_commits, handle_manager_ticket, handle_operator_preferences,
+    handle_tracker_documents,
 };
 use crate::handlers_message::{handle_run_message, handle_run_messages};
 use crate::handlers_projects::handle_projects;
@@ -583,6 +585,28 @@ pub trait StateProvider: Send + Sync {
         Err(ManagerReadError::Unavailable("operator memory unavailable"))
     }
 
+    async fn docs_read(&self, _run_id: i64, _path: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable("document reads unavailable"))
+    }
+    async fn docs_list(&self, _run_id: i64, _glob: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable("document reads unavailable"))
+    }
+    async fn tracker_documents(
+        &self,
+        _run_id: i64,
+        _project: String,
+        _issue: String,
+        _query: String,
+        _excerpt: bool,
+    ) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable(
+            "tracker documents unavailable",
+        ))
+    }
+    async fn manager_ticket(&self, _run_id: i64, _identifier: String) -> ManagerReadOutcome {
+        Err(ManagerReadError::Unavailable("tracker ticket unavailable"))
+    }
+
     /// `GET /api/v1/manager/file?run_id&sha&path` — one blob at a commit sha, from git objects.
     async fn manager_file(&self, _run_id: i64, _sha: String, _path: String) -> ManagerReadOutcome {
         Err(ManagerReadError::Unavailable(
@@ -877,6 +901,16 @@ where
         // the run's own `run_id`. `/api/v1/manager/pr/activity` and `/pr/commits` are more specific
         // than `/pr`; axum's matchit dispatches them regardless of order.
         .route("/api/v1/manager/file", any(handle_manager_file))
+        .route("/api/v1/manager/docs/read", operator_read(handle_docs_read))
+        .route("/api/v1/manager/docs/list", operator_read(handle_docs_list))
+        .route(
+            "/api/v1/manager/tracker/documents",
+            operator_read(handle_tracker_documents),
+        )
+        .route(
+            "/api/v1/manager/tracker/ticket",
+            operator_read(handle_manager_ticket),
+        )
         .route(
             "/api/v1/manager/operator-preferences",
             any(handle_operator_preferences),
@@ -1020,6 +1054,17 @@ where
     T: 'static,
 {
     any(handler).layer(axum::middleware::from_fn(require_operator_write))
+}
+
+/// New sensitive evidence GETs share the browser-origin proof, without enabling any mutation.
+fn operator_read<H, T>(handler: H) -> MethodRouter<ApiState>
+where
+    H: Handler<T, ApiState>,
+    T: 'static,
+{
+    any(handler).layer(axum::middleware::from_fn(
+        crate::operator_guard::require_operator_read,
+    ))
 }
 
 /// The router state: the read [`StateProvider`] + the optional process-log [`LogSource`]. Mirrors Go's

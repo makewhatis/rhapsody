@@ -148,6 +148,9 @@ pub const MANAGER_MCP_TOOLS: &[&str] = &[
     "symphony_ticket",
     "teams_recall",
     "operator_preferences",
+    "docs_read",
+    "docs_list",
+    "tracker_documents",
     "teams_room_read",
     "teams_roster",
     // The one registered write: its own bank, observations only (§3.2, §4.4).

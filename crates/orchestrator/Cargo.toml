@@ -68,6 +68,8 @@ reqwest = { version = "0.12", default-features = false, features = ["default-tls
 sha2 = "0.10"
 # T4: parse Cargo target paths for a credential-free, metadata-only warm-up tree.
 toml = "0.8"
+# STUDIO-1146: descriptor-relative, no-follow document opens. Already in Cargo.lock.
+libc = "0.2"
 # rhapsody-provider-broker (PB4, STUDIO-999): the daemon injects the cloneable registration handle
 # into the orchestrator before `o.control()` (design §11.1). `default-features = false` so the
 # orchestrator carries only the protocol-neutral PB1 handle — never the loopback HTTP stack, which

@@ -136,7 +136,7 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, FacadeError> {
-        self.do_request_timeout(method, path, body, HTTP_TIMEOUT)
+        self.do_request_timeout(method, path, body, HTTP_TIMEOUT, false)
             .await
     }
 
@@ -146,6 +146,7 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
         timeout: Duration,
+        operator_read: bool,
     ) -> Result<Vec<u8>, FacadeError> {
         let base = self.base.as_deref().ok_or_else(|| {
             unreachable(
@@ -161,10 +162,12 @@ impl Client {
 
         let url = format!("{base}{path}");
         let mut req = http.request(method.clone(), &url).timeout(timeout);
+        if method != reqwest::Method::GET || operator_read {
+            req = req.header(OPERATOR_HEADER, OPERATOR_HEADER_VALUE);
+        }
         let body = if method == reqwest::Method::GET {
             body
         } else {
-            req = req.header(OPERATOR_HEADER, OPERATOR_HEADER_VALUE);
             Some(body.unwrap_or_else(|| EMPTY_JSON_BODY.to_vec()))
         };
         if let Some(b) = body {
@@ -208,6 +211,13 @@ impl Client {
         self.do_request(reqwest::Method::GET, path, None).await
     }
 
+    /// Sensitive manager evidence GETs prove browser-origin safety using the operator header.
+    /// No body or mutation is sent. Ordinary GETs retain the Go facade's header contract.
+    pub(crate) async fn get_operator(&self, path: &str) -> Result<Vec<u8>, FacadeError> {
+        self.do_request_timeout(reqwest::Method::GET, path, None, HTTP_TIMEOUT, true)
+            .await
+    }
+
     /// POSTs an already-encoded JSON `payload` to `path`, returning the raw 2xx body. The generic
     /// form behind the Rhapsody Teams write tools (STUDIO-645), whose bodies vary per tool; the
     /// Go-parity `post_message` / `post_action` keep their own named helpers.
@@ -232,6 +242,7 @@ impl Client {
             path,
             Some(payload),
             Duration::from_secs(1320),
+            false,
         )
         .await
     }

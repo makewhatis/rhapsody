@@ -567,6 +567,20 @@ impl TeamsMemory {
         self.operator_memory.clone()
     }
 
+    /// Host-bound live role check shared by the read-only manager evidence tools.
+    pub fn require_live_manager(
+        &self,
+        run_id: i64,
+    ) -> Result<(), crate::managerread::ManagerReadError> {
+        use crate::managerread::ManagerReadError;
+        let runs = self.read_runs();
+        let prov = runs.get(&run_id).ok_or(ManagerReadError::NoSuchRun)?;
+        if !self.enabled() || !crate::managerrun::is_manager_key(&prov.ticket) {
+            return Err(ManagerReadError::NotAManagerRun);
+        }
+        Ok(())
+    }
+
     /// Read-only and off-loop. A worker's binding cannot be used to access the manager tool.
     pub async fn operator_preferences(
         &self,
