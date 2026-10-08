@@ -122,10 +122,9 @@ mod tests {
         signal.cancel();
         let result = tokio::time::timeout(StdDuration::from_secs(2), &mut task).await;
         task.abort();
-        assert!(
-            result.is_ok(),
-            "cancellation must interrupt pending worktree GC"
-        );
+        result
+            .expect("cancellation must interrupt pending worktree GC")
+            .expect("prune scheduler must exit without panicking");
     }
 
     // Mirrors Go `TestPruneScheduleRunsOnceOnFreshDB`: the scheduler's startup prune runs without
