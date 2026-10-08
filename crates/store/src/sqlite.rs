@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 32;
+const SCHEMA_VERSION: i64 = 33;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -685,6 +685,26 @@ CREATE TABLE rhapsody_lead_reporting (
   count INTEGER NOT NULL DEFAULT 0
 );
 "#,
+    // v32 -> v33: the operator's shared notification centre and read state (STUDIO-1145).
+    // Additive Rhapsody-only objects; all Go tables and their golden remain unchanged.
+    r#"
+CREATE TABLE rhapsody_notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  notice_group TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  summary TEXT NOT NULL,
+  href TEXT NOT NULL,
+  at TEXT NOT NULL,
+  read_at TEXT,
+  active INTEGER NOT NULL DEFAULT 1,
+  transient INTEGER NOT NULL DEFAULT 0
+);
+CREATE UNIQUE INDEX rhapsody_notifications_active_source
+  ON rhapsody_notifications(source) WHERE active = 1;
+CREATE TABLE rhapsody_notifications_snapshot (id INTEGER PRIMARY KEY CHECK(id = 1), at TEXT NOT NULL);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1212,6 +1232,85 @@ impl Sqlite {
 }
 
 impl Store for Sqlite {
+    fn notices_enabled(&self) -> bool {
+        true
+    }
+    fn observe_notices(&self, rows: &[Notice], at: &str) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let latest: Option<String> = tx
+            .query_row(
+                "SELECT at FROM rhapsody_notifications_snapshot WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest
+            .as_deref()
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .zip(chrono::DateTime::parse_from_rfc3339(at).ok())
+            .is_some_and(|(latest, incoming)| latest > incoming)
+        {
+            return Ok(());
+        }
+        tx.execute("INSERT INTO rhapsody_notifications_snapshot(id, at) VALUES (1, ?1) ON CONFLICT(id) DO UPDATE SET at = excluded.at", [at])?;
+        let existing = {
+            let mut stmt = tx.prepare(
+                "SELECT id, source FROM rhapsody_notifications WHERE active = 1 AND transient = 1",
+            )?;
+            stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, source) in existing {
+            if !rows.iter().any(|row| row.source == source) {
+                tx.execute("UPDATE rhapsody_notifications SET active = 0, read_at = COALESCE(read_at, ?2) WHERE id = ?1", params![id, at])?;
+            }
+        }
+        for row in rows {
+            tx.execute(
+                "INSERT INTO rhapsody_notifications (source, kind, notice_group, subject, summary, href, at, transient)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                 ON CONFLICT(source) WHERE active = 1 DO UPDATE SET
+                 kind = excluded.kind, notice_group = excluded.notice_group,
+                 subject = excluded.subject, summary = excluded.summary, href = excluded.href",
+                params![row.source, row.kind, row.group, row.subject, row.summary, row.href, row.at, row.transient],
+            )?;
+        }
+        // Keep live/durable-source read state plus the newest 200 resolved read episodes.
+        // Active source dedupe must survive retention, or an old event could page again.
+        tx.execute("DELETE FROM rhapsody_notifications WHERE read_at IS NOT NULL AND id NOT IN (SELECT id FROM rhapsody_notifications WHERE read_at IS NOT NULL ORDER BY id DESC LIMIT 200) AND active = 0", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn notices(&self) -> Result<Vec<Notice>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id, source, kind, notice_group, subject, summary, href, at, read_at, active, transient FROM rhapsody_notifications ORDER BY at DESC, id DESC")?;
+        Ok(stmt
+            .query_map([], |row| {
+                Ok(Notice {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    kind: row.get(2)?,
+                    group: row.get(3)?,
+                    subject: row.get(4)?,
+                    summary: row.get(5)?,
+                    href: row.get(6)?,
+                    at: row.get(7)?,
+                    read_at: row.get(8)?,
+                    active: row.get(9)?,
+                    transient: row.get(10)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+    fn read_notice(&self, id: i64, at: &str) -> Result<bool, StoreError> {
+        Ok(self.lock().execute(
+            "UPDATE rhapsody_notifications SET read_at = COALESCE(read_at, ?2) WHERE id = ?1",
+            params![id, at],
+        )? > 0)
+    }
     fn enqueue_lead_item(&self, trigger: &LeadTrigger, at: &str) -> Result<i64, StoreError> {
         let (kind, question, detail) = trigger.queue_parts();
         let kinds = match trigger {
@@ -4498,6 +4597,72 @@ mod tests {
             scratch_dir_name(4242, 0, 222),
             "a reused pid at the same counter must not reuse a scratch directory"
         );
+    }
+
+    #[test]
+    fn notification_reads_survive_restart_and_a_new_hold_episode_is_unread() {
+        let dir = scratch_dir();
+        let path = dir.join("notices.db");
+        let store = Sqlite::open(StorePath::Disk(path.clone())).unwrap();
+        let row = Notice {
+            source: "hold:TEST-1".into(),
+            kind: "human_hold".into(),
+            group: "needs_you".into(),
+            subject: "TEST-1".into(),
+            summary: "human step".into(),
+            href: "#job/TEST-1".into(),
+            at: "2026-10-08T10:00:00Z".into(),
+            transient: true,
+            active: true,
+            ..Default::default()
+        };
+        store
+            .observe_notices(std::slice::from_ref(&row), &row.at)
+            .unwrap();
+        let id = store.notices().unwrap()[0].id;
+        assert!(store.read_notice(id, "2026-10-08T10:01:00Z").unwrap());
+        drop(store);
+        let store = Sqlite::open(StorePath::Disk(path)).unwrap();
+        store
+            .observe_notices(std::slice::from_ref(&row), "2026-10-08T10:02:00Z")
+            .unwrap();
+        assert_eq!(
+            store.notices().unwrap()[0].read_at.as_deref(),
+            Some("2026-10-08T10:01:00Z")
+        );
+        store.observe_notices(&[], "2026-10-08T10:03:00Z").unwrap();
+        assert!(!store.notices().unwrap()[0].active);
+        store
+            .observe_notices(&[row], "2026-10-08T10:04:00Z")
+            .unwrap();
+        let rows = store.notices().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_ne!(rows[0].id, id);
+        assert!(rows[0].read_at.is_none());
+        assert!(rows[1].read_at.is_some());
+    }
+
+    #[test]
+    fn older_notification_snapshot_cannot_clear_or_reopen_a_newer_episode() {
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        let row = Notice {
+            source: "hold:TEST-1".into(),
+            transient: true,
+            ..Default::default()
+        };
+        store
+            .observe_notices(std::slice::from_ref(&row), "2026-10-08T10:02:00Z")
+            .unwrap();
+        store.observe_notices(&[], "2026-10-08T10:01:00Z").unwrap();
+        assert!(store.notices().unwrap()[0].active);
+        store.observe_notices(&[], "2026-10-08T10:03:00Z").unwrap();
+        store
+            .observe_notices(&[row], "2026-10-08T10:02:30Z")
+            .unwrap();
+        let rows = store.notices().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].active);
+        assert!(rows[0].read_at.is_some());
     }
 
     // Creating a scratch directory over a stale one must START EMPTY, so a leftover `symphony.db`
@@ -8394,6 +8559,9 @@ mod tests {
                 "rhapsody_lead_decisions_at".to_string(),
                 "rhapsody_lead_execution".to_string(),
                 "rhapsody_lead_reporting".to_string(),
+                "rhapsody_notifications".to_string(),
+                "rhapsody_notifications_active_source".to_string(),
+                "rhapsody_notifications_snapshot".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

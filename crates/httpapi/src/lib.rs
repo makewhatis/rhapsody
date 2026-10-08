@@ -55,6 +55,7 @@ mod handlers_linear;
 mod handlers_logs;
 mod handlers_manager;
 mod handlers_message;
+mod handlers_notifications;
 mod handlers_projects;
 mod handlers_provider_config;
 mod handlers_providers;

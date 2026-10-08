@@ -641,6 +641,38 @@ impl ManagerSelfTestState {
             .map(|e| e.credential_notice.clone())
             .collect()
     }
+    /// Non-secret cached health for the operator centre. No credential I/O and no
+    /// selection side effects: pending startup canaries are not failing checks.
+    pub fn cached_failures(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let reason = if entry.auth_blocked.is_some() {
+                    "authentication failed; log in as the daemon's user".to_string()
+                } else if let Some(SelfTestRecord {
+                    verdict: SelfTestVerdict::Failed(reason),
+                    ..
+                }) = &entry.record
+                {
+                    reason.detail.clone()
+                } else {
+                    entry.unavailable.clone()
+                };
+                (!reason.is_empty()).then(|| {
+                    format!(
+                        "Manager entry {} ({}): {}",
+                        index + 1,
+                        entry.entry.harness,
+                        reason
+                    )
+                })
+            })
+            .collect()
+    }
     pub fn select(
         &self,
         now_ms: i64,
@@ -817,6 +849,12 @@ impl ManagerSelfTestState {
             SelfTestVerdict::Passed => Ok(()),
             SelfTestVerdict::Failed(reason) => Err(reason.clone()),
         }
+    }
+}
+
+impl crate::ControlHandle {
+    pub fn manager_health_notices(&self) -> Vec<String> {
+        self.manager_selftest.cached_failures()
     }
 }
 
@@ -1819,6 +1857,33 @@ mod tests {
             ReviewAuthority::Advise,
             "a pass must leave the authority exactly as it was"
         );
+    }
+
+    #[test]
+    fn cached_health_omits_pending_checks_reports_failure_and_recovers_without_probing() {
+        let state = ManagerSelfTestState::new(entries());
+        assert!(state.cached_failures().is_empty());
+        state.record_entry(
+            0,
+            SelfTestRecord {
+                cli_version: "1".into(),
+                verdict: SelfTestVerdict::Failed(ManagerUnavailable {
+                    cli_version: "1".into(),
+                    detail: "Login expired; refresh login".into(),
+                }),
+            },
+        );
+        assert!(state.cached_failures()[0].contains("Login expired"));
+        state.record_entry(
+            0,
+            SelfTestRecord {
+                cli_version: "1".into(),
+                verdict: SelfTestVerdict::Passed,
+            },
+        );
+        assert!(state.cached_failures().is_empty());
+        state.mark_auth_blocked(0, None);
+        assert!(state.cached_failures()[0].contains("authentication failed"));
     }
 
     struct FakeCanary(Vec<CanaryObservation>);

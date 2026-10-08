@@ -349,6 +349,7 @@ mod router_tests {
     /// Every mutating route. A route added to `build_router` with a POST side must be added here
     /// and wrapped in `operator_write`, or `every_route_refuses_an_unguarded_unsafe_request` fails.
     const MUTATING: &[&str] = &[
+        "/api/v1/notifications/7/read",
         "/api/v1/lead/decisions/7/overrule",
         "/api/v1/manager/investigate",
         "/api/v1/refresh",

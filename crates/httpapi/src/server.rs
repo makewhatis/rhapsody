@@ -86,6 +86,14 @@ use crate::web::{WebDist, serve_web};
 /// Every handler tests against a fake, exactly as Go's `server_test.go` uses `fakeProvider`.
 #[async_trait]
 pub trait StateProvider: Send + Sync {
+    /// Notification persistence only (STUDIO-1145). The history surface remains read-only.
+    fn notification_store(&self) -> Option<Arc<dyn rhapsody_store::Store + Send + Sync>> {
+        None
+    }
+    /// Cached manager health; never perform credential probes from an HTTP read.
+    fn manager_notices(&self) -> Vec<String> {
+        Vec::new()
+    }
     fn lead_reports(&self) -> Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>> {
         None
     }
@@ -801,6 +809,14 @@ where
         // state-free — `/state` is golden-pinned to the Go daemon's payload and cannot carry it.
         .route("/api/v1/version", any(handle_version))
         .route("/api/v1/accounts", any(handle_accounts))
+        .route(
+            "/api/v1/notifications",
+            any(crate::handlers_notifications::handle_notifications),
+        )
+        .route(
+            "/api/v1/notifications/{id}/read",
+            operator_write(crate::handlers_notifications::handle_read),
+        )
         // Coalesced poll+reconcile trigger (H3): POST-only, 202. Registered method-agnostically so a
         // GET yields a 405 envelope rather than the SPA fallback.
         .route("/api/v1/refresh", operator_write(handle_refresh))

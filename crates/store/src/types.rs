@@ -1409,3 +1409,19 @@ pub enum ManagerActivationOutcome {
     /// No row, or a terminal one: nothing was changed.
     Absent,
 }
+/// Compact daemon notices (STUDIO-1145); no Go counterpart. `source` deduplicates a
+/// durable event or one live episode. Resolved episodes stay in the centre as read history.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Notice {
+    pub id: i64,
+    pub source: String,
+    pub kind: String,
+    pub group: String,
+    pub subject: String,
+    pub summary: String,
+    pub href: String,
+    pub at: String,
+    pub read_at: Option<String>,
+    pub active: bool,
+    pub transient: bool,
+}
