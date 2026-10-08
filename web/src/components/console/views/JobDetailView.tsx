@@ -132,6 +132,7 @@ import type {
   TeamsRoomMessage,
 } from "@/lib/api";
 import "@/theme/console-trace.css";
+import { JobLimitChips } from "./LimitChips";
 
 // Job detail — the "Trace" run detail (STUDIO-742), the three zones of the design record
 // `~/.rhapsody/docs/console-run-detail-design.md` §3, rebuilt over STUDIO-683's summary strip and
@@ -253,6 +254,7 @@ export function JobDetailView({
         </a>{" "}
         · {issue}
       </div>
+      <JobLimitChips ticket={issue} latestRunId={runs[0]?.id ?? 0} identity={runs[0] ? (identities.get(runs[0].id) ?? "") : ""} />
 
       {run === undefined ? (
         <>
