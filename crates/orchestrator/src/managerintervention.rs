@@ -70,7 +70,7 @@ pub fn stall_kind_for(kind: DivergenceKind) -> Option<&'static str> {
         // and routing it to the manager would page a human a second time for work they reserved.
         | DivergenceKind::HeldForHuman
         | DivergenceKind::ManagerDeferred
-        | DivergenceKind::ReviewInfrastructure => None,
+        | DivergenceKind::ReviewInfrastructure | DivergenceKind::CredentialInfrastructure => None,
     }
 }
 
@@ -978,7 +978,8 @@ impl Orchestrator {
             .eff
             .as_ref()
             .is_some_and(|e| e.cfg.budgets.values().any(|b| b.daily_usd > 0.0))
-            || !self.accounts.snapshot((self.now)().timestamp()).is_empty();
+            || !self.accounts.snapshot((self.now)().timestamp()).is_empty()
+            || !self.probe_cache.is_empty();
         let usd_held = self.manager_run_for(pr).is_some_and(|run| {
             if !usd_configured {
                 self.release_budget_hold(&run.key());
@@ -1010,7 +1011,24 @@ impl Orchestrator {
             hold_active,
             provider_budget_exhausted: usd_held
                 || (!ticket.is_empty() && self.budget_hold_for(pr, &ticket).is_some()),
-            credential_healthy: !self.credential_probe_dead(),
+            credential_healthy: !self.manager_run_for(pr).is_some_and(|run| {
+                let Some(route) = self.review_route(&run.repo_url) else {
+                    return false;
+                };
+                match self.select_manager_entry(&run) {
+                    Ok(selected) => self
+                        .manager_credential_probe_reason(&selected.entry.harness, &route.slug)
+                        .is_some(),
+                    Err(_) => self.teams.as_ref().is_some_and(|teams| {
+                        let entries = teams.manager.effective_harnesses();
+                        !entries.is_empty()
+                            && entries.iter().all(|entry| {
+                                self.manager_credential_probe_reason(&entry.harness, &route.slug)
+                                    .is_some()
+                            })
+                    }),
+                }
+            }),
             selftest_permitted: self.manager_launch_permitted().is_ok(),
             at_capacity: false,
         }
@@ -4323,11 +4341,7 @@ mod tests {
         let (mut o, _) = orch(ReviewAuthority::Act);
         pass_self_test(&o);
         prime_holds(&o);
-        o.probe_cache = Some(crate::preflight::ProbeCache {
-            checked_at: Utc::now(),
-            healthy: false,
-            last_logged_dead_at: None,
-        });
+        o.seed_dead_probe("claude", "rhapsody");
         let found = vec![divergence(DivergenceKind::ReviewEscalated, PR_DISPLAY)];
         let routing = o.route_stalls_to_manager(&found);
         assert!(routing.adopted.is_empty());
@@ -4341,6 +4355,57 @@ mod tests {
     }
 
     // --- every gate at every relaunch (B4) -----------------------------------------------------
+
+    #[test]
+    fn a_held_claude_probe_allows_the_opencode_manager_fallback() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        let entries = vec![
+            rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "claude".into(),
+                model: "opus".into(),
+                effort: "high".into(),
+            },
+            rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "opencode".into(),
+                model: "openai/gpt-test".into(),
+                effort: "high".into(),
+            },
+        ];
+        o.teams.as_mut().unwrap().manager.harnesses = entries.clone();
+        o.manager_selftest.configure(entries);
+        o.manager_selftest
+            .set_credential_probe(Arc::new(LoginProbe));
+        for index in 0..2 {
+            o.manager_selftest.record_entry(
+                index,
+                SelfTestRecord {
+                    cli_version: test_cli_version(),
+                    verdict: SelfTestVerdict::Passed,
+                },
+            );
+        }
+        o.eff.as_mut().unwrap().projects[0].mcfg.opencode.command = test_cli_command();
+        o.seed_dead_probe("claude", "rhapsody");
+        // Worker API auth is a different credential; the manager still uses native OAuth.
+        o.eff.as_mut().unwrap().projects[0]
+            .mcfg
+            .claude
+            .billing_guard = Some(false);
+        assert!(!o.credential_probe_held("claude", "rhapsody"));
+        assert!(
+            o.manager_credential_probe_reason("claude", "rhapsody")
+                .is_some()
+        );
+        prime_holds(&o);
+        let routing =
+            o.route_stalls_to_manager(&[divergence(DivergenceKind::ReviewEscalated, PR_KEY)]);
+        assert_eq!(routing.adopted.len(), 1, "{:?}", routing.surfaced);
+        o.pump_manager_interventions();
+        let runs = dispatched.lock().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].harness, "opencode");
+        assert_eq!(o.manager_attempts[&runs[0].issue.id].selected.index, 1);
+    }
 
     // Every §10.2 gate is honoured when RELAUNCHING a `failed_attempt` — not just on the first
     // launch. MUTATION: return `Proceed` for `failed_attempt` (gate only the pre-launch states) and
@@ -4401,14 +4466,10 @@ mod tests {
         o.store()
             .set_manager_intervention_state(&id, MANAGER_INTERVENTION_FAILED_ATTEMPT)
             .expect("failed attempt");
-        o.probe_cache = Some(crate::preflight::ProbeCache {
-            checked_at: Utc::now(),
-            healthy: false,
-            last_logged_dead_at: None,
-        });
+        o.seed_dead_probe("claude", "rhapsody");
         o.pump_manager_interventions();
         assert_eq!(state_of(&o, &id), MANAGER_INTERVENTION_DEFERRED);
-        o.probe_cache = None;
+        o.probe_cache.clear();
 
         assert_eq!(
             o.store()

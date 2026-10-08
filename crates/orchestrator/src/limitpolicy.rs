@@ -253,7 +253,9 @@ impl Orchestrator {
             },
             project,
         );
-        self.account_usable(&pricing.account) && self.usd_budget_hold(&pricing).is_none()
+        !self.credential_probe_held(&spec.harness, project)
+            && self.account_usable(&pricing.account)
+            && self.usd_budget_hold(&pricing).is_none()
     }
 
     /// Resolve the engine without composing the persona or advancing the room cursor. A refused
@@ -325,9 +327,11 @@ impl Orchestrator {
 
     pub(crate) fn limit_dispatch_ready(&self, issue: &rhapsody_core::Issue, project: &str) -> bool {
         let now = (self.now)().timestamp();
-        if !self.accounts.snapshot(now).iter().any(|a| {
-            level(&self.accounts, &a.account, &self.limits_config(), now) >= Level::StopNew
-        }) {
+        if !self.has_credential_holds()
+            && !self.accounts.snapshot(now).iter().any(|a| {
+                level(&self.accounts, &a.account, &self.limits_config(), now) >= Level::StopNew
+            })
+        {
             return true;
         }
         let run = self.limit_projection(issue, project);
@@ -337,7 +341,7 @@ impl Orchestrator {
         } else {
             &run.pricing.account
         };
-        if self.account_usable(account) {
+        if !self.credential_probe_held(&run.harness, project) && self.account_usable(account) {
             return true;
         }
         let (harness, model) =
@@ -366,7 +370,12 @@ impl Orchestrator {
             title: issue.title.clone(),
             project: project.into(),
             provider: account.clone(),
-            reason: format!("waiting: {account} limit, resets {reset}"),
+            reason: self
+                .credential_probe_reason(&run.harness, project)
+                .map_or_else(
+                    || format!("waiting: {account} limit, resets {reset}"),
+                    |reason| format!("waiting: {account} credential — {reason}"),
+                ),
             ..Default::default()
         });
         false
@@ -430,12 +439,17 @@ impl Orchestrator {
             self.note_usd_budget_hold(held);
             return false;
         }
-        if self.account_usable(account) || self.credit_approved(&re.issue.id, account) {
+        if self.run_credential_probe_reason(re).is_none()
+            && (self.account_usable(account) || self.credit_approved(&re.issue.id, account))
+        {
             self.limit_policy.holds.remove(&re.issue.identifier);
             if self
                 .budget_ledger
                 .get(&re.issue.identifier, self.budget_hold_ttl())
-                .is_some_and(|h| h.reason.starts_with("waiting:") && h.reason.contains(" limit"))
+                .is_some_and(|h| {
+                    h.reason.starts_with("waiting:")
+                        && (h.reason.contains(" limit") || h.reason.contains(" credential"))
+                })
             {
                 self.release_budget_hold(&re.issue.identifier);
             }
@@ -483,7 +497,10 @@ impl Orchestrator {
             .accounts
             .tightest(account, (self.now)().timestamp())
             .map_or(0, |w| w.resets_at_s);
-        let reason = format!("waiting: {account} limit, resets {reset}");
+        let reason = self.run_credential_probe_reason(re).map_or_else(
+            || format!("waiting: {account} limit, resets {reset}"),
+            |reason| format!("waiting: {account} credential — {reason}"),
+        );
         if self
             .limit_policy
             .holds

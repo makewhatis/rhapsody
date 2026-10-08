@@ -519,7 +519,9 @@ impl Orchestrator {
         }
         self.feed_budget_windows();
         let pricing = self.review_projected_pricing(&iss, &route.slug);
-        if !self.account_usable(&pricing.account) {
+        if self.credential_probe_held(&self.review_harness_for(&iss), &route.slug)
+            || !self.account_usable(&pricing.account)
+        {
             return ReviewDispatchOutcome::BudgetHeld;
         }
 

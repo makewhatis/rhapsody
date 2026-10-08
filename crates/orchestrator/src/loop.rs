@@ -1106,11 +1106,11 @@ impl Orchestrator {
         if let Err(e) = self.validate() {
             tracing::error!(err = %e, "dispatch preflight validation failed; skipping dispatch");
             self.refresh_gated_chatgpt_queue().await;
-            // This early return and the credential preflight just below both skip dispatch
+            // This early return and the drain gate just below both skip dispatch
             // entirely, so the reset at the top of `dispatch_decisions` never runs and the last
             // successful pass's tally would stand.
             // Retire it here instead (STUDIO-805): unlike the tracker outage that reset covers,
-            // NEITHER of these clears up on its own — a bad config or a dead agent credential skips
+            // NEITHER of these clears up on its own — a bad config or an armed drain skips
             // dispatch every tick until a human intervenes — so a survivor would render "N queued"
             // indefinitely against a teammate who is neither queued nor running. This count exists
             // to tell "queued" apart from "broken"; on these paths the honest answer is "broken".
@@ -1118,7 +1118,7 @@ impl Orchestrator {
             self.schedule_tick(poll);
             return;
         }
-        // STUDIO-880: the drain gate. Same seam, same property as the credential preflight below —
+        // STUDIO-880: the drain gate. Like validation above, it must
         // skip ALL dispatch WITHOUT claiming anything, before dispatch's candidate fetch — a drain
         // that claimed a ticket and then declined to run it would leave the abandoned claim that the
         // "nothing is claimed" invariant exists to prevent. Deliberately ONE gate rather than a
@@ -1133,17 +1133,9 @@ impl Orchestrator {
             self.schedule_tick(poll);
             return;
         }
-        // BO-59: agent credential-liveness preflight. A dead backend credential (e.g. an expired Claude
-        // OAuth login) skips ALL dispatch WITHOUT claiming anything, so an infrastructure fault fails
-        // fast instead of claim→dispatch→die every ~5 min. Runs BEFORE dispatch's candidate fetch
-        // (nothing is claimed); cached per TTL; logs the transition + rate-limits the steady-state
-        // repeat itself, so this call site stays quiet rather than error-logging every 30s forever.
-        if !self.credential_preflight().await {
-            self.refresh_gated_chatgpt_queue().await;
-            self.set_held_for_capacity(HashMap::new()); // see the retirement note above
-            self.schedule_tick(poll);
-            return;
-        }
+        // BO-59/STUDIO-1144: refresh per-context verdicts before selection; only a definite failure
+        // holds that credential's work. Timeouts are unknown and never skip the whole tick.
+        self.credential_preflight().await;
         // symphony.poll wraps this tick's candidate fetch + dispatch decisions (a short control-loop
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
@@ -3021,6 +3013,7 @@ mod tests {
     /// login skips dispatch every tick until a human re-authenticates. See the sibling test above.
     #[tokio::test]
     async fn a_dead_credential_retires_the_published_count() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
         struct DeadProbe;
         #[async_trait::async_trait]
         impl crate::preflight::CredentialProbe for DeadProbe {

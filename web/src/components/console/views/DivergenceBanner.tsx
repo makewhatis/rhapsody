@@ -35,18 +35,19 @@ export function DivergenceBanner() {
   const state = useStateQuery();
   const rows = state.data?.review_divergence ?? [];
   const limits = state.data?.limit_items ?? [];
+  const hasCredentialReport = rows.some((d) => d.kind === "credential_infrastructure");
   if (rows.length === 0 && limits.length === 0) return null;
   return (
     <div role="status" className="setuperr">
       {rows.length > 0 ? <Note variant="warn">
-        {rows.length === 1
+        {hasCredentialReport ? "Infrastructure and work needing attention:" : rows.length === 1
           ? "1 pull request needs attention:"
           : `${rows.length} pull requests need attention:`}{" "}
         {rows.map((d) => (
           <span key={`${d.pr}:${d.reviewer}`} style={{ display: "block" }}>
             {d.pr}
             {d.ticket ? ` (${d.ticket})` : ""} —{" "}
-            {(d.kind === "manager_deferred" || d.kind === "review_infrastructure") && d.reason ? d.reason : d.detail},{" "}
+            {(d.kind === "manager_deferred" || d.kind === "review_infrastructure" || d.kind === "credential_infrastructure") && d.reason ? d.reason : d.detail},{" "}
             {humanStale(d.stale_secs)}.
             {d.capacity_held
               ? ` It is held for capacity: ${d.capacity_held.holders} run(s) hold the ${d.capacity_held.budget} budget, so no reviewer run can start yet.`

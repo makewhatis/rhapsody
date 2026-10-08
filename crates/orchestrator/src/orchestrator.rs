@@ -9,7 +9,7 @@
 //! this state land in later P5 tickets (O2–O7), each extending this struct and the entry types with
 //! the fields its behavior needs.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex, RwLock};
@@ -1022,12 +1022,11 @@ pub struct Orchestrator {
     /// via [`set_credential_probe`](Orchestrator::set_credential_probe).
     pub(crate) cred_probe: Option<Arc<dyn crate::preflight::CredentialProbe>>,
     /// The cached credential-probe verdict for the dispatch preflight. Mutated only by on_tick's
-    /// `credential_preflight` on the single control task, so it needs no lock. `None` until the first
-    /// probe.
-    pub(crate) probe_cache: Option<crate::preflight::ProbeCache>,
-    /// The per-probe timeout bound: a probe that does not answer within this is treated as "cannot
-    /// verify → skip dispatch" (fail closed), well under the poll interval so a hang never wedges the
-    /// tick. A field (not a const) so tests can shrink it; defaulted to
+    /// `credential_preflight` on the single control task, so it needs no lock. Keyed by credential
+    /// context; an empty map means no probe verdicts yet.
+    pub(crate) probe_cache: BTreeMap<crate::preflight::ProbeKey, crate::preflight::CachedProbe>,
+    /// The per-probe timeout bound: no answer is unknown, permits dispatch and retries next tick.
+    /// A field (not a const) so tests can shrink it; defaulted to
     /// [`PROBE_TIMEOUT`](crate::preflight::PROBE_TIMEOUT).
     pub(crate) probe_timeout: std::time::Duration,
 
@@ -1252,7 +1251,7 @@ impl Orchestrator {
             // BO-59: no credential probe by default → the preflight is a no-op and dispatch is
             // byte-identical to the pre-feature behavior. The daemon installs the real probe at startup.
             cred_probe: None,
-            probe_cache: None,
+            probe_cache: BTreeMap::new(),
             probe_timeout: crate::preflight::PROBE_TIMEOUT,
             // STUDIO-880: never draining by default → the gate and the turn-boundary check are both
             // inert, i.e. byte-identical to a daemon built before the feature.

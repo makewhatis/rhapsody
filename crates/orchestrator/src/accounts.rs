@@ -44,6 +44,20 @@ pub struct AccountView {
     pub today_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost_kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe_reason: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub credential_probes: Vec<CredentialView>,
+}
+
+/// Separate from usage windows: an auth hold must never fabricate quota rejection or stop live runs.
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
+pub struct CredentialView {
+    pub account: String,
+    pub harness: String,
+    pub held: bool,
+    pub reason: String,
+    pub checked_at_s: i64,
 }
 
 #[derive(Default)]
@@ -55,6 +69,7 @@ pub struct AccountLedger {
 struct LedgerState {
     accounts: BTreeMap<String, AccountState>,
     runs: BTreeMap<String, String>,
+    credential_probes: Vec<CredentialView>,
 }
 
 #[derive(Default)]
@@ -85,6 +100,17 @@ fn severity(status: LimitStatus) -> u8 {
 }
 
 impl AccountLedger {
+    pub(crate) fn replace_credential_probes(&self, probes: Vec<CredentialView>) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for probe in &probes {
+            state.accounts.entry(probe.account.clone()).or_default();
+        }
+        state.credential_probes = probes;
+    }
+
     pub fn observe(&self, account: &str, obs: LimitObs) {
         if account.is_empty() {
             return;
@@ -208,6 +234,13 @@ impl AccountLedger {
                     })
                     .collect();
                 AccountView {
+                    probe_reason: None,
+                    credential_probes: state
+                        .credential_probes
+                        .iter()
+                        .filter(|p| &p.account == name)
+                        .cloned()
+                        .collect(),
                     level: None,
                     today_usd: None,
                     cost_kind: None,
@@ -525,6 +558,15 @@ impl crate::ControlHandle {
                     ))
                     .into(),
                 );
+                if let Some(probe) = view.credential_probes.iter().find(|p| p.held) {
+                    view.level = Some("stop_new".into());
+                    view.status = "credential_held".into();
+                    view.probe_reason = Some(probe.reason.clone());
+                } else if let Some(probe) =
+                    view.credential_probes.iter().find(|p| !p.reason.is_empty())
+                {
+                    view.probe_reason = Some(probe.reason.clone());
+                }
                 view.cost_kind = Some(
                     if matches!(
                         view.account.as_str(),
@@ -689,6 +731,7 @@ mod tests {
         use rhapsody_tracker::fake::Fake;
         use std::sync::Arc;
 
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
         struct DeadCredential;
         #[async_trait::async_trait]
         impl crate::preflight::CredentialProbe for DeadCredential {
@@ -724,7 +767,7 @@ mod tests {
                     }
                     _ => o.set_credential_probe(Arc::new(DeadCredential)),
                 }
-                // Work arrives after boot while the dispatch gate remains closed.
+                // Work arrives after boot while validation/drain is closed or Claude is held.
                 for (queued, failed) in
                     [(false, false), (true, false), (false, true), (false, false)]
                 {
@@ -757,7 +800,15 @@ mod tests {
                     assert!(o.claimed.is_empty());
                     assert!(o.retry_attempts.is_empty());
                     assert!(o.preparing.is_empty());
-                    assert!(!o.human_holds.labelled_and_primed().1);
+                    assert_eq!(
+                        o.human_holds.labelled_and_primed().1,
+                        gate == "credential",
+                        "a scoped Claude hold must still allow the normal board pass; validation/drain observation must not prime it"
+                    );
+                    if gate == "credential" {
+                        assert!(o.credential_probe_held("claude", ""));
+                        assert!(!o.credential_probe_held("opencode", ""));
+                    }
                 }
             }
         }
