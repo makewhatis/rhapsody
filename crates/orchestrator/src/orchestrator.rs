@@ -634,6 +634,8 @@ pub struct Orchestrator {
     /// gate (off the control task) writes it and [`Orchestrator::manager_launch_permitted`] reads it.
     /// A version change invalidates it; see [`crate::managerselftest::ManagerSelfTestState`].
     pub(crate) manager_selftest: std::sync::Arc<crate::managerselftest::ManagerSelfTestState>,
+    /// T4: Docker work runs off-loop; control only binds/releases live manager run ids.
+    pub investigate: Option<Arc<crate::investigate::Investigations>>,
     /// The off-loop manager APPLIER's inbox (STUDIO-1016, design §7.6): the control task hands it
     /// [`ManagerApplyRequest`](crate::managerapply::ManagerApplyRequest)s and folds the results back
     /// in through [`Orchestrator::handle_manager_effect`]. `None` in tests and whenever the manager
@@ -1193,6 +1195,7 @@ impl Orchestrator {
             lead_pending: HashSet::new(),
             lead_cursor: 0,
             lead_cases: HashMap::new(),
+            investigate: None,
             manager_apply_submitted: std::collections::HashSet::new(),
             review_rounds: HashMap::new(),
             review_attempts: HashMap::new(),

@@ -91,6 +91,8 @@ struct EntryState {
     unavailable: String,
     warned_at_ms: Option<i64>,
     credential_notice: String,
+    retry_at: Option<tokio::time::Instant>,
+    boot_retry_at: tokio::time::Instant,
 }
 
 /// The canary's working directory is empty except for this project-settings directory; a project
@@ -351,8 +353,8 @@ fn parse_canary_init(raw: &str) -> Option<CanaryInitPosture> {
 /// Its absence from the CLI's init `tools` array is the structural proof it cannot be called.
 pub const CANARY_UNREGISTERED_MCP_TOOL: &str = "mcp__symphony__symphony_stop";
 
-/// The canary turn's wall-clock ceiling. The canary runs before the daemon serves (and before the
-/// manager is enabled), so a hung CLI must not hold boot open: 5 minutes is a backstop far above a
+/// The canary turn's wall-clock ceiling. The canary runs off-loop after the daemon serves, before
+/// the manager is enabled: 5 minutes is a backstop far above a
 /// real canary turn (measured ~6 s on the installed CLI) and far below the 1-hour default turn
 /// timeout a manager session would otherwise inherit.
 pub const CANARY_RUN_TIMEOUT_MS: u64 = 300_000;
@@ -527,6 +529,8 @@ impl ManagerSelfTestState {
                 unavailable: String::new(),
                 warned_at_ms: None,
                 credential_notice: String::new(),
+                retry_at: None,
+                boot_retry_at: tokio::time::Instant::now() + MANAGER_SELFTEST_BOOT_RETRY,
             })
             .collect();
     }
@@ -541,6 +545,23 @@ impl ManagerSelfTestState {
             .collect()
     }
 
+    /// A probeable entry awaits its first/version-change canary. This grants no availability;
+    /// lead work stays queued until the normal selection gate observes a matching PASS.
+    pub fn has_pending_canary(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .iter()
+            .any(|e| {
+                e.installed_version.as_ref().is_some_and(|installed| {
+                    e.record
+                        .as_ref()
+                        .is_none_or(|record| &record.cli_version != installed)
+                })
+            })
+    }
+
     pub fn set_credential_probe(&self, probe: std::sync::Arc<dyn EntryCredentialProbe>) {
         *self.probe.write().unwrap_or_else(|e| e.into_inner()) = probe;
     }
@@ -551,6 +572,14 @@ impl ManagerSelfTestState {
     pub fn record_entry(&self, index: usize, record: SelfTestRecord) {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(state) = inner.entries.get_mut(index) {
+            state.retry_at = match record.verdict {
+                SelfTestVerdict::Passed => None,
+                SelfTestVerdict::Failed(_) => Some(if state.record.is_none() {
+                    state.boot_retry_at
+                } else {
+                    tokio::time::Instant::now() + MANAGER_SELFTEST_RETRY_INTERVAL
+                }),
+            };
             state.installed_version = Some(record.cli_version.clone());
             state.record = Some(record.clone());
         }
@@ -820,8 +849,8 @@ impl crate::orchestrator::Orchestrator {
     }
 }
 
-/// Boot and the watcher share this per-entry version reconciliation. A failed verdict is not
-/// retried until the harness version changes; absence of a factory arm fails closed with detail.
+/// Boot and the watcher share this per-entry reconciliation. Version changes run immediately;
+/// same-version failures retry on a bounded cadence, and passing entries do not spend another turn.
 pub async fn run_entry_self_tests(factory: &dyn CanaryRunnerFactory, state: &ManagerSelfTestState) {
     for (index, entry) in state.entries().iter().enumerate() {
         let probed = factory.probe_version(entry);
@@ -833,9 +862,12 @@ pub async fn run_entry_self_tests(factory: &dyn CanaryRunnerFactory, state: &Man
             .unwrap_or_else(|e| e.into_inner())
             .entries
             .get(index)
-            .and_then(|e| e.record.as_ref())
-            .is_some_and(|r| r.cli_version == version);
-        if unchanged && probed.is_ok() {
+            .is_some_and(|e| {
+                e.record.as_ref().is_some_and(|r| r.cli_version == version)
+                    && e.retry_at
+                        .is_none_or(|due| tokio::time::Instant::now() < due)
+            });
+        if unchanged {
             continue;
         }
         let verdict = match probed {
@@ -968,12 +1000,14 @@ pub async fn reconcile_probed_version(
 /// that an in-place CLI update is noticed promptly; the launch gate re-probes regardless, so this
 /// bound only decides how quickly the manager is re-enabled after a version change.
 pub const MANAGER_SELFTEST_WATCH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+pub const MANAGER_SELFTEST_BOOT_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+pub const MANAGER_SELFTEST_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
 
 /// The off-loop self-test watcher (STUDIO-1049, §4.7): while the manager may act, re-probe the
-/// installed CLI version on a fixed cadence and, whenever it differs from the recorded verdict's,
-/// run the canary afresh and record it — which re-enables the manager only if the new CLI still
-/// honours the contract. Runs until `ctx` is cancelled. This is what makes "whenever the CLI version
-/// changes" true for a long-lived daemon rather than only at boot.
+/// installed CLI version on a fixed cadence. Version changes and due failed-entry retries run the
+/// canary afresh, re-enabling an entry only after a passing verdict. Runs until cancellation,
+/// including cancellation during a canary turn.
 pub async fn run_selftest_watch_task(
     mut ctx: crate::CancelWait,
     factory: std::sync::Arc<dyn CanaryRunnerFactory>,
@@ -984,7 +1018,10 @@ pub async fn run_selftest_watch_task(
             _ = ctx.cancelled() => return,
             _ = tokio::time::sleep(MANAGER_SELFTEST_WATCH_INTERVAL) => {}
         }
-        run_entry_self_tests(factory.as_ref(), &state).await;
+        tokio::select! {
+            _ = ctx.cancelled() => return,
+            _ = run_entry_self_tests(factory.as_ref(), &state) => {}
+        }
         let _ = state.select(
             chrono::Utc::now().timestamp_millis(),
             state.credential_probe().as_ref(),
@@ -1056,6 +1093,61 @@ impl CliCanaryRunner {
     }
 }
 
+/// A canary failure is operator-visible. Strip the exact credential(s) supplied to the child and
+/// common credential forms before bounding/flattening the diagnostic. Never render a raw payload.
+pub(crate) fn safe_canary_detail(text: &str, secrets: &[String]) -> String {
+    let mut text = text.to_string();
+    let mut secrets: Vec<_> = secrets.iter().filter(|s| !s.is_empty()).collect();
+    secrets.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    for secret in secrets {
+        text = text.replace(secret.as_str(), "[redacted]");
+    }
+    let Ok(pattern) = regex::Regex::new(
+        r#"(?i)sk-[a-z0-9_-]+|lin_api_[a-z0-9_-]+|Bearer\s+[^\s\"',;]+|eyJ[a-z0-9_-]+\.[a-z0-9_-]+\.[a-z0-9_-]+|(?:accessToken|refreshToken|api[_-]?key|password|secret|token)\s*[\"']?\s*[:=]\s*[\"']?[^\s\"',;}]+"#,
+    ) else {
+        return "canary diagnostic unavailable".into();
+    };
+    pattern
+        .replace_all(&text, "[redacted]")
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .take(2000)
+        .collect()
+}
+
+/// Extract credential values from a source document for exact redaction; never expose the document
+/// itself in an error. Refresh credentials stay here, never in the child's provisioned file.
+pub(crate) fn canary_credential_secrets(raw: &str) -> Vec<String> {
+    fn collect(value: &serde_json::Value, secrets: &mut Vec<String>) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                for (key, value) in fields {
+                    let key = key.to_ascii_lowercase();
+                    if ["token", "secret", "password", "access", "refresh", "key"]
+                        .iter()
+                        .any(|name| key.contains(name))
+                        && let Some(secret) = value.as_str()
+                    {
+                        secrets.push(secret.to_string());
+                    }
+                    collect(value, secrets);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, secrets);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut secrets = Vec::new();
+    if let Ok(value) = serde_json::from_str(raw) {
+        collect(&value, &mut secrets);
+    }
+    secrets
+}
+
 #[async_trait::async_trait]
 impl CanaryRunner for CliCanaryRunner {
     async fn run_canary(&self, cli_version: &str) -> Vec<CanaryObservation> {
@@ -1083,6 +1175,16 @@ impl CliCanaryRunner {
         cli_version: &str,
         entry: Option<&ManagerHarnessEntry>,
     ) -> Vec<CanaryObservation> {
+        self.run_for_entry_with_credential(cli_version, entry, None)
+            .await
+    }
+
+    async fn run_for_entry_with_credential(
+        &self,
+        cli_version: &str,
+        entry: Option<&ManagerHarnessEntry>,
+        credential: Option<String>,
+    ) -> Vec<CanaryObservation> {
         // A daemon-owned per-run canary directory under the workspace root. Removed on every exit
         // path below via a drop guard so neither the trap file nor the cwd outlives the self-test.
         let dir = std::path::Path::new(&self.workspace_root)
@@ -1104,7 +1206,14 @@ impl CliCanaryRunner {
         // real launch does — the attempts are refused BEFORE authentication matters when the posture
         // is enforced, but a relocated config root cannot authenticate without it, so its absence
         // would make a boundary failure indistinguishable from a login failure.
-        let model_credential = crate::worker::provision_manager_config_dir(&config_dir);
+        let model_credential = match credential {
+            Some(token) => Some(token),
+            None => match crate::worker::provision_manager_config_dir(&config_dir).await {
+                Ok(token) => Some(token),
+                Err(error) => return self.failed(error.to_string()),
+            },
+        };
+        let secrets: Vec<String> = model_credential.iter().cloned().collect();
 
         let cfg = rhapsody_agent::claude::Config {
             command: self.command.clone(),
@@ -1130,9 +1239,10 @@ impl CliCanaryRunner {
         // The session tees the raw stream-json to this buffer, so the CLI's OWN `system/init` line
         // (its tools, MCP servers and permission mode) is available for the init-contract check.
         let raw = SharedTranscriptBuf::new();
+        let stderr = SharedTranscriptBuf::new();
         let transcript = rhapsody_agent::Transcript {
             stdout: Some(Box::new(raw.clone())),
-            stderr: None,
+            stderr: Some(Box::new(stderr.clone())),
         };
         let session = match rhapsody_agent::harness::Harness::start_manager_session(
             &runner,
@@ -1159,7 +1269,25 @@ impl CliCanaryRunner {
         // `evaluate` turns into a disable (alice's review B5: reading the verdict from the init
         // posture alone let a dead canary pass, the exact B1 failure mode treated as a pass).
         if let Some(e) = err {
-            return self.failed(format!("the canary turn did not complete: {e}"));
+            let mut detail = result.result_text;
+            for line in raw.string().lines() {
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
+                    && value["type"] == "result"
+                    && let Some(errors) = value["errors"].as_array()
+                {
+                    for error in errors.iter().filter_map(|error| error.as_str()) {
+                        detail.push(' ');
+                        detail.push_str(error);
+                    }
+                }
+            }
+            if detail.trim().is_empty() {
+                detail = stderr.string();
+            }
+            return self.failed(safe_canary_detail(
+                &format!("the canary turn did not complete: {e}: {detail}"),
+                &secrets,
+            ));
         }
         let report = parse_canary_report(&result.result_text);
         let trap_fired = dir.join(CANARY_TRAP_FILE).exists();
@@ -1460,6 +1588,66 @@ mod tests {
             calls: Default::default(),
         }
     }
+    #[tokio::test(start_paused = true)]
+    async fn failed_entry_is_retried_and_recovers_without_a_cli_version_change() {
+        struct RecoveringFactory(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl CanaryRunnerFactory for RecoveringFactory {
+            fn probe_version(&self, _: &ManagerHarnessEntry) -> Result<String, String> {
+                Ok("1".into())
+            }
+            fn runner(&self, _: &ManagerHarnessEntry) -> Option<Box<dyn CanaryRunner>> {
+                let n = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(Box::new(FakeCanary(if n < 2 {
+                    vec![]
+                } else {
+                    all_refused()
+                })))
+            }
+        }
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let factory = std::sync::Arc::new(RecoveringFactory(calls.clone()));
+        let state = std::sync::Arc::new(ManagerSelfTestState::new(vec![entries()[1].clone()]));
+        run_entry_self_tests(factory.as_ref(), &state).await;
+        assert!(state.permitted().is_err());
+        let cancel = crate::CancelSignal::new();
+        let task = tokio::spawn(run_selftest_watch_task(
+            cancel.wait(),
+            factory,
+            state.clone(),
+        ));
+        tokio::task::yield_now().await;
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no 30s model retry"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "first failed retry at 60s"
+        );
+        assert!(state.permitted().is_err());
+        tokio::time::advance(std::time::Duration::from_secs(870)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "15min backoff"
+        );
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            state.permitted().is_ok(),
+            "cause cleared; the same CLI must recover"
+        );
+        cancel.cancel();
+        task.await.expect("watcher join");
+    }
     #[tokio::test]
     async fn factory_without_runner_marks_entry_unavailable() {
         let state = ManagerSelfTestState::new(entries());
@@ -1478,12 +1666,17 @@ mod tests {
         let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
         let (events, subscriber) = crate::testsupport::recording_subscriber();
         let _guard = tracing::subscriber::set_default(subscriber);
+        // Register both verdict callsites before rebuilding their global Interest cache. Their
+        // first hits can race sibling tests with no subscriber (TRA-243); the throwaway state keeps
+        // the captured pass below a genuine boot, with neither verdict nor retry deadline reused.
+        run_entry_self_tests(&factory(), &ManagerSelfTestState::new(entries())).await;
         tracing::callsite::rebuild_interest_cache();
+        events.lock().expect("logs").clear();
         run_entry_self_tests(&f, &state).await;
         assert_eq!(*f.calls.lock().expect("lock"), vec!["opencode", "claude"]);
+        let events = events.lock().expect("logs");
+        assert_eq!(events.len(), 2, "one log per entry: {events:?}");
         let logs = events
-            .lock()
-            .expect("logs")
             .iter()
             .map(|e| format!("{} {} {:?}", e.level, e.message, e.fields))
             .collect::<Vec<_>>()
@@ -1497,7 +1690,6 @@ mod tests {
                 && logs.contains("unknown tool exposed"),
             "{logs}"
         );
-        println!("{logs}");
     }
     #[tokio::test]
     async fn version_change_reruns_only_that_entry() {
@@ -1521,6 +1713,28 @@ mod tests {
 
     fn all_refused() -> Vec<CanaryObservation> {
         REQUIRED_ATTEMPTS.iter().copied().map(refused).collect()
+    }
+
+    #[test]
+    fn canary_diagnostics_redact_exact_credentials_before_truncation() {
+        let raw = r#"{"openai":{"access":"opaque-access","refresh":"opaque-refresh"}}"#;
+        let secrets = canary_credential_secrets(raw);
+        let diagnostic = safe_canary_detail(
+            "401 rejected opaque-access opaque-refresh Bearer opaque-bearer refreshToken=other-secret eyJheader.payload.signature\nmore",
+            &secrets,
+        );
+        assert!(diagnostic.contains("401 rejected"));
+        for secret in [
+            "opaque-access",
+            "opaque-refresh",
+            "opaque-bearer",
+            "other-secret",
+            "eyJheader.payload.signature",
+        ] {
+            assert!(!diagnostic.contains(secret), "must redact {secret}");
+        }
+        let detail = safe_canary_detail(&"é".repeat(3000), &[]);
+        assert_eq!(detail.chars().count(), 2000);
     }
 
     #[test]
@@ -1798,7 +2012,7 @@ mod tests {
             // A CLEAN init posture: only manager MCP tools, only the daemon's server, default mode.
             "printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\",\"tools\":[\"mcp__symphony__manager_pr\"],\"mcp_servers\":[{\"name\":\"symphony\"}],\"permissionMode\":\"default\"}'\n",
             // …then die, as an auth/quota/crash/timeout would: a terminal ERROR result.
-            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"session_id\":\"s\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
+            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"login rejected fake-canary-access sk-ant-oat01-secret\",\"session_id\":\"s\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}'\n",
         );
         std::fs::write(&script, body).expect("write fake claude");
         let root = crate::testsupport::TempDir::new();
@@ -1808,7 +2022,18 @@ mod tests {
             daemon_bin: String::new(),
             workflow_path: String::new(),
         };
-        let observations = runner.run_canary("0.0.0").await;
+        let observations = runner
+            .run_for_entry_with_credential("0.0.0", None, Some("fake-canary-access".into()))
+            .await;
+        assert!(
+            observations[0].detail.contains("login rejected"),
+            "real turn error: {:?}",
+            observations[0]
+        );
+        assert!(
+            !observations[0].detail.contains("fake-canary-access")
+                && !observations[0].detail.contains("sk-ant-oat01-secret")
+        );
         assert!(
             observations.iter().all(|o| !o.refused),
             "a canary whose turn errored must observe NO refusal: {observations:?}"

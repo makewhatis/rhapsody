@@ -85,6 +85,21 @@ findings from `~/.rhapsody/docs/<ticket>-findings.md`. Preference recall, sandbo
 digest delivery, immediate pages and overrule UI belong to subsequent slices. With the lead disabled,
 existing payloads, schema goldens and dispatch behavior remain unchanged.
 
+### Manager boot self-tests and recovery (STUDIO-1139)
+
+The Teams manager's boundary canaries run off-loop only after the API listener is started and
+`runtime.json` names this daemon's port/PID. Configured review authority stays intact while the
+existing verdict gate refuses pending/failed entries. A failed entry retries after about 60 seconds,
+then every 15 minutes; CLI version changes still trigger a fresh test, and passing entries are not
+periodically retested. Shutdown cancels in-flight canaries.
+
+Claude manager credentials use an unexpired file login first, falling back on macOS to the
+`Claude Code-credentials` Keychain service, preferring the daemon user's account item over a stale
+account-less legacy item. Private manager files carry only the access token and
+expiry, never a refresh token or unrelated MCP login. Missing/expired logins refuse before launch
+with actionable detail; both harnesses report bounded, secret-stripped canary turn errors. These
+are Teams-only behaviors with no frozen Go counterpart; existing API/golden shapes are unchanged.
+
 ### Account-limit reporting (STUDIO-1128)
 
 The default-on ledger and policy now report account state transitions (including reset and
@@ -1517,6 +1532,26 @@ tools the manager run calls (`manager_*`, role `manager`) are the only callers, 
 facade registers none of them — the manager surface is opt-in via `rhapsodyd mcp --role manager`.
 The `rhapsody_` prefix keeps the evidence table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` pins the thirteenth name.
+
+### A disposable investigation shell for the manager (STUDIO-1135)
+
+The tech lead design's T-D3 deliberately extends the manager with `investigate(ref, cmd)`:
+repository code can run only in a disposable Docker container, through the host, while the
+manager harness still has no built-in shell, edit or web tools. This has no Go counterpart.
+The manager-only MCP tool proxies the additive, operator-guarded
+`POST /api/v1/manager/investigate?run_id=...`; ordinary workers do not register the tool.
+
+The host verifies the live run's own PR head, exports it with Git's built-in tar archive from
+cached mirror objects (no host checkout, content filters or hooks), mounts the unpacked export and
+a dependency cache read-only, and provides writable scratch
+tmpfs. Network, operator credentials, home mounts, capabilities and privilege escalation are
+absent. Limits are 2 CPUs, 4 GiB RAM, 512 processes, ten minutes per command, thirty per session
+and 64 KiB combined output. A separate networked, credential-free warm-up sees dependency metadata
+only and disables npm lifecycle scripts. Boot probes fail closed for this tool alone: the manager
+continues with a typed unavailable reason and a WARN when Docker/image/isolation is unavailable.
+Build instructions, cache/build usage and the explicit real-container acceptance tests are in
+[`docker/investigate/README.md`](docker/investigate/README.md). Existing ported endpoints, schemas,
+goldens and ordinary-worker tool sets are unchanged.
 
 ### The manager intervention lifecycle — one active per PR, leased runs, atomic budgets (STUDIO-1015)
 
