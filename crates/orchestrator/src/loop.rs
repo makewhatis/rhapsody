@@ -596,6 +596,8 @@ fn worker_deps_for(
         // every existing provisioning path exactly as it was.
         manager: None,
         manager_root: String::new(),
+        #[cfg(test)]
+        manager_test_credential: None,
         // Review-only (STUDIO-959): `spawn_worker` stamps the `gh` reads a delta round needs, and
         // `None` keeps every non-review run — and every delta-less review — byte-identical.
         review_delta: None,
@@ -2132,6 +2134,16 @@ impl ControlHandle {
         // watch's lock across the (allocating) `Snapshot` clone.
         let latest = self.snapshot_pub.borrow().clone();
         latest.map(|s| (*s).clone())
+    }
+
+    /// Wait for the first control-loop publication before a boot canary calls `/state`.
+    /// Merely binding the HTTP socket leaves that endpoint at `snapshot_unavailable`.
+    pub async fn wait_for_snapshot(&self) -> bool {
+        self.snapshot_pub
+            .clone()
+            .wait_for(|snapshot| snapshot.is_some())
+            .await
+            .is_ok()
     }
 
     /// Requests the race-free workspace-GC plan, built on the control task (Go `evWorkspaceGC`). Backs

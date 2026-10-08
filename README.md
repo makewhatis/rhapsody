@@ -61,6 +61,20 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Manager boot self-tests and recovery (STUDIO-1139)
+
+The Teams manager's boundary canaries run off-loop only after the API listener is started and
+`runtime.json` names this daemon's port/PID. Configured review authority stays intact while the
+existing verdict gate refuses pending/failed entries. A failed entry retries after about 60 seconds,
+then every 15 minutes; CLI version changes still trigger a fresh test, and passing entries are not
+periodically retested. Shutdown cancels in-flight canaries.
+
+Claude manager credentials use an unexpired file login first, falling back on macOS to the
+`Claude Code-credentials` Keychain service. Private manager files carry only the access token and
+expiry, never a refresh token or unrelated MCP login. Missing/expired logins refuse before launch
+with actionable detail; both harnesses report bounded, secret-stripped canary turn errors. These
+are Teams-only behaviors with no frozen Go counterpart; existing API/golden shapes are unchanged.
+
 ### Account limit observations and API (STUDIO-1123)
 
 Rhapsody observes account limits by default and adds a read-only

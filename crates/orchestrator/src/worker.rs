@@ -286,6 +286,9 @@ pub struct WorkerDeps {
     /// The resolved workspace root, under which a manager run's per-run cwd is created (only read
     /// when [`Self::manager`] is `Some`). Empty on every construction that skips the stamp.
     pub manager_root: String,
+    /// Synthetic access token for fake-harness provisioning tests; never compiled into a daemon.
+    #[cfg(test)]
+    pub(crate) manager_test_credential: Option<String>,
     /// The `gh` reads a DELTA review round needs (STUDIO-959): whether the commit the reviewer last
     /// read is an ancestor of the head, and the findings already on the pull request. `None` on
     /// every non-review run, and on a review daemon that could not build the seam — in which case
@@ -515,7 +518,26 @@ async fn run_manager_attempt(
     // the token is injected as `CLAUDE_CODE_OAUTH_TOKEN` because a relocated config root cannot
     // authenticate from the file on macOS (§4.5).
     let model_credential = if deps.agent.id() == agent::HarnessId::Claude {
-        provision_manager_config_dir(&config_dir)
+        #[cfg(test)]
+        let injected = deps.manager_test_credential.clone();
+        #[cfg(not(test))]
+        let injected: Option<String> = None;
+        let credential = match injected {
+            Some(token) => Ok(token),
+            None => provision_manager_config_dir(&config_dir).await,
+        };
+        match credential {
+            Ok(token) => Some(token),
+            Err(error) => {
+                return (
+                    issue.state.clone(),
+                    WorkerDeclaration::default(),
+                    Some(WorkerError::Agent(agent::AgentError::Other(
+                        error.to_string(),
+                    ))),
+                );
+            }
+        }
     } else {
         // OpenCode provisions only its refresh-blank OpenAI credential in its private XDG tree.
         None
@@ -610,54 +632,124 @@ impl Drop for ManagerDirGuard {
 ///
 /// The source is the operator's own Claude config root (`CLAUDE_CONFIG_DIR`, else `$HOME/.claude`).
 /// The document it reads is `.credentials.json`; what is WRITTEN into `config_dir` is a FILTERED
-/// document carrying only `claudeAiOauth` — the operator file's unrelated `mcpOAuth` tokens (Linear,
-/// Cloudflare, …) are never copied.
+/// document carrying only the OAuth access token and expiry — refresh and unrelated MCP tokens
+/// are never copied. An expired or missing file falls back to Claude Code's macOS Keychain item.
 ///
 /// The token is returned because a relocated config root cannot authenticate from the file alone on
 /// macOS, where the CLI reads its OAuth credential from the login Keychain keyed by the config root
 /// (measured on `claude` 2.1.281: `loggedIn: false` with the file present). The adapter therefore
 /// injects the same token as `CLAUDE_CODE_OAUTH_TOKEN`, which the relocated CLI DOES honour.
 ///
-/// Best-effort: an absent or credential-free source is logged and the run proceeds — the child then
-/// fails to authenticate, which is a runtime failure rather than a boundary hole (no operator hook,
-/// plugin, MCP server or permission rule is ever copied).
-pub(crate) fn provision_manager_config_dir(config_dir: &std::path::Path) -> Option<String> {
-    if let Err(e) = std::fs::create_dir_all(config_dir) {
-        tracing::warn!(dir = %config_dir.display(), err = %e, "manager: could not create the config dir");
-        return None;
-    }
+/// Missing/expired credentials refuse BEFORE spawning the CLI, with a typed actionable error.
+pub(crate) async fn provision_manager_config_dir(
+    config_dir: &std::path::Path,
+) -> Result<String, ManagerCredentialError> {
     let source = std::env::var_os("CLAUDE_CONFIG_DIR")
         .map(std::path::PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".claude")));
-    let source = source?;
-    let cred = source.join(".credentials.json");
-    let raw = match std::fs::read_to_string(&cred) {
-        Ok(raw) => raw,
-        Err(e) => {
-            tracing::warn!(
-                source = %cred.display(),
-                err = %e,
-                "manager: no model credential found to provision; the manager run will fail to \
-                 authenticate"
-            );
-            return None;
-        }
+    let raw = source.and_then(|p| std::fs::read_to_string(p.join(".credentials.json")).ok());
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let keychain = if raw
+        .as_deref()
+        .and_then(credential_expiry)
+        .is_some_and(|expires| expires > now_ms)
+    {
+        None
+    } else {
+        read_claude_keychain().await
     };
-    // Write the filtered document (only `claudeAiOauth`) when the source has a usable OAuth token.
-    // Written 0600: it is a live OAuth access token, and the operator's own copy is mode 0600.
-    match rhapsody_agent::manager::manager_credential_document(&raw) {
-        Some(doc) => {
-            if let Err(e) = write_secret_file(&config_dir.join(".credentials.json"), &doc) {
-                tracing::warn!(err = %e, "manager: could not write the filtered model credential");
-            }
-        }
-        None => tracing::warn!(
-            source = %cred.display(),
-            "manager: the operator credential holds no OAuth access token; the manager run will \
-             fail to authenticate"
-        ),
+    provision_manager_credential_from_sources(config_dir, raw.as_deref(), || keychain, now_ms)
+}
+
+/// The only native Claude credential source beyond the file. The password's stdout goes directly
+/// into the JSON filter in memory, never to a terminal, transcript, diagnostic or intermediate file.
+#[cfg(target_os = "macos")]
+async fn read_claude_keychain() -> Option<String> {
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new("/usr/bin/security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    rhapsody_agent::manager::model_credential_from_config_json(&raw)
+    let raw = String::from_utf8(output.stdout).ok()?;
+    rhapsody_agent::manager::manager_credential_document(&raw)
+}
+
+#[cfg(not(target_os = "macos"))]
+async fn read_claude_keychain() -> Option<String> {
+    None
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub(crate) enum ManagerCredentialError {
+    #[error("Claude login expired at {expired_at}; run claude once as the daemon's user")]
+    LoginExpired {
+        expired_at: chrono::DateTime<chrono::Utc>,
+    },
+    #[error("Claude login unavailable; run claude once as the daemon's user")]
+    LoginUnavailable,
+    #[error("manager credential provisioning failed: {0}")]
+    Provision(String),
+}
+
+fn credential_expiry(raw: &str) -> Option<i64> {
+    rhapsody_agent::manager::model_credential_from_config_json(raw)?;
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    value["claudeAiOauth"]["expiresAt"].as_i64()
+}
+
+fn provision_manager_credential_from_sources(
+    config_dir: &std::path::Path,
+    file: Option<&str>,
+    keychain: impl FnOnce() -> Option<String>,
+    now_ms: i64,
+) -> Result<String, ManagerCredentialError> {
+    let file_expiry = file.and_then(credential_expiry);
+    let fallback = if file_expiry.is_some_and(|expires| expires > now_ms) {
+        None
+    } else {
+        keychain()
+    };
+    let raw = if file_expiry.is_some_and(|expires| expires > now_ms) {
+        file
+    } else {
+        fallback
+            .as_deref()
+            .filter(|raw| credential_expiry(raw).is_some_and(|expires| expires > now_ms))
+    };
+    let raw = raw.ok_or_else(|| {
+        file_expiry
+            .into_iter()
+            .chain(fallback.as_deref().and_then(credential_expiry))
+            .max()
+            .and_then(chrono::DateTime::from_timestamp_millis)
+            .map_or(ManagerCredentialError::LoginUnavailable, |expired_at| {
+                ManagerCredentialError::LoginExpired { expired_at }
+            })
+    })?;
+    let token = rhapsody_agent::manager::model_credential_from_config_json(raw)
+        .ok_or(ManagerCredentialError::LoginUnavailable)?;
+    let doc = rhapsody_agent::manager::manager_credential_document(raw)
+        .ok_or(ManagerCredentialError::LoginUnavailable)?;
+    std::fs::create_dir_all(config_dir)
+        .map_err(|e| ManagerCredentialError::Provision(e.to_string()))?;
+    write_secret_file(&config_dir.join(".credentials.json"), &doc)
+        .map_err(|e| ManagerCredentialError::Provision(e.to_string()))?;
+    Ok(token)
 }
 
 /// Writes a secret-bearing file with owner-only permissions (0600), so a copied credential never
@@ -1415,6 +1507,96 @@ mod tests {
     use super::*;
     use crate::testsupport::{TempDir, issue, recording_subscriber};
 
+    #[test]
+    fn expired_manager_file_falls_back_to_keychain_without_copying_refresh_token() {
+        let dir = TempDir::new();
+        let file = r#"{"claudeAiOauth":{"accessToken":"stale-access","refreshToken":"stale-refresh","expiresAt":1000}}"#;
+        let keychain = r#"{"claudeAiOauth":{"accessToken":"current-access","refreshToken":"current-refresh","expiresAt":3000},"mcpOAuth":{"accessToken":"unrelated"}}"#;
+        let called = std::cell::Cell::new(false);
+        let token = provision_manager_credential_from_sources(
+            std::path::Path::new(&dir.path),
+            Some(file),
+            || {
+                called.set(true);
+                Some(keychain.into())
+            },
+            2000,
+        )
+        .expect("current login");
+        assert!(called.get(), "expired file must consult Keychain reader");
+        assert_eq!(token, "current-access");
+        let doc =
+            std::fs::read_to_string(dir.child(".credentials.json")).expect("provisioned file");
+        assert!(doc.contains("current-access"));
+        for forbidden in [
+            "refreshToken",
+            "current-refresh",
+            "stale-access",
+            "mcpOAuth",
+            "unrelated",
+        ] {
+            assert!(!doc.contains(forbidden), "must not copy {forbidden}");
+        }
+    }
+
+    #[test]
+    fn absent_manager_login_gives_typed_actionable_detail() {
+        let dir = TempDir::new();
+        let error = provision_manager_credential_from_sources(
+            std::path::Path::new(&dir.path),
+            None,
+            || None,
+            2000,
+        )
+        .expect_err("missing login");
+        assert!(matches!(error, ManagerCredentialError::LoginUnavailable));
+        assert_eq!(
+            error.to_string(),
+            "Claude login unavailable; run claude once as the daemon's user"
+        );
+        assert!(!std::path::Path::new(&dir.child(".credentials.json")).exists());
+    }
+
+    #[test]
+    fn manager_login_sources_require_future_expiry_and_report_the_last_expiry() {
+        let dir = TempDir::new();
+        let path = std::path::Path::new(&dir.path);
+        let expired = r#"{"claudeAiOauth":{"accessToken":"old","expiresAt":1000}}"#;
+        let error = provision_manager_credential_from_sources(path, Some(expired), || None, 1000)
+            .expect_err("expiry boundary");
+        assert!(matches!(error, ManagerCredentialError::LoginExpired { .. }));
+        assert_eq!(
+            error.to_string(),
+            "Claude login expired at 1970-01-01 00:00:01 UTC; run claude once as the daemon's user"
+        );
+        for file in [
+            None,
+            Some("not json"),
+            Some(r#"{"claudeAiOauth":{"accessToken":"unknown-expiry"}}"#),
+            Some(r#"{"mcpOAuth":{}}"#),
+        ] {
+            let token = provision_manager_credential_from_sources(
+                path,
+                file,
+                || Some(r#"{"claudeAiOauth":{"accessToken":"current","expiresAt":3000}}"#.into()),
+                2000,
+            )
+            .expect("Keychain fallback");
+            assert_eq!(token, "current");
+        }
+        let valid = r#"{"claudeAiOauth":{"accessToken":"file-current","expiresAt":3000}}"#;
+        assert_eq!(
+            provision_manager_credential_from_sources(
+                path,
+                Some(valid),
+                || panic!("valid file must not open Keychain"),
+                2000
+            )
+            .expect("valid file"),
+            "file-current"
+        );
+    }
+
     fn test_workspace(hooks: HookScripts) -> (Arc<Manager>, TempDir) {
         let root = TempDir::new();
         let m = Manager::new(workspace::Config {
@@ -1463,6 +1645,7 @@ mod tests {
             review_delta: None,
             manager: None,
             manager_root: String::new(),
+            manager_test_credential: Some("fake-manager-access".into()),
             run_id: 0,
             drain: crate::drain::DrainSignal::new(),
             // STUDIO-978: a fully-capable fake, MCP injection on, no pre-decided refusal — the
