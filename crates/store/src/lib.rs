@@ -712,6 +712,18 @@ pub trait Store {
     /// `0` for an identifier with no runs.
     fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError>;
 
+    /// Estimated overage dollars recorded by L4 as cost-delta events, including live runs.
+    /// `usd_accounting_available` gates disabled stores; an unreadable active ledger is an error,
+    /// so `daily_cap` cannot silently refund itself on restart.
+    /// An unknown cost returns infinity for the local day, keeping unmetered turns fail-closed.
+    fn account_credit_spend(&self, _account: &str, _since: &str) -> Result<f64, StoreError> {
+        Ok(0.0)
+    }
+
+    fn account_credit_notified(&self, _account: &str, _since: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+
     /// A ticket's lifetime token spend per provider, covering BOTH its author runs
     /// (`runs.issue_identifier = ticket`) AND the review runs on its pull request
     /// (`pr:<owner>/<repo>#<number>@*`), joined through `rhapsody_run_provenance.provider`

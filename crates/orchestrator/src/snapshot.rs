@@ -154,6 +154,8 @@ pub struct Snapshot {
     /// a daemon with no configured budget (the default) serves a `/api/v1/state` payload
     /// byte-identical to the Go daemon's — which is what `harness/fixtures/api/state.json` pins.
     pub budget_held: Vec<crate::budget::BudgetHeld>,
+    pub limit_held: Vec<String>,
+    pub limit_items: Vec<crate::limitpolicy::LimitItem>,
     /// Pending desktop notifications for the runaway-loop breaker (STUDIO-1026), oldest first.
     ///
     /// Empty is the load-bearing half, exactly as [`Snapshot::budget_held`]'s is:
@@ -278,6 +280,8 @@ impl Orchestrator {
             // STUDIO-957: the current per-provider budget refusals; empty on a daemon with no
             // configured budget, which keeps the wire payload — and the golden — unchanged.
             budget_held: self.budget_ledger.held(self.budget_hold_ttl()),
+            limit_held: self.limit_holds(),
+            limit_items: self.limit_policy.items.clone(),
             // STUDIO-1026: the pending desktop notifications; empty on a daemon with no macOS
             // channel, which keeps the wire payload — and the golden — unchanged.
             notifications: self.notifications.pending(),

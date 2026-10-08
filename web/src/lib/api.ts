@@ -52,6 +52,20 @@ export interface BlockedEntry {
   mode?: string; // graphite|dag — which threshold applies (never "disabled")
 }
 
+export interface LimitDecisionItem {
+  account: string;
+  windows: { window: string; utilization: number; resets_at_s: number }[];
+  credits_policy: string;
+  tickets: {
+    ticket: string;
+    identity: string;
+    mid_review: boolean;
+    fallback: { harness: string; model: string; effort: string }[];
+    healthy: boolean[];
+    handoff_note?: string;
+  }[];
+}
+
 export interface StateResponse {
   status: "ok" | "degraded";
   poll_interval_ms: number;
@@ -76,6 +90,8 @@ export interface StateResponse {
   // daemon's golden. Read it as `state.review_divergence?.length` — an absent key and an empty array
   // mean the same thing.
   review_divergence?: ReviewDivergence[];
+  // L4 decisions the rules could not resolve; human-owned until manager limit actions land.
+  limit_items?: LimitDecisionItem[];
   // Tickets the dispatcher is holding because they wear `rhapsody:human` (STUDIO-949), or ABSENT
   // when it holds none. Optional for `drain`'s reason: emitted only while the hold set is non-empty
   // so a Go-identical delta is absent. Read it as `state.held_for_human?.length`.

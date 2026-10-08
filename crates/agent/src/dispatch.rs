@@ -542,6 +542,17 @@ impl fmt::Debug for BrokeredSession {
 
 #[async_trait]
 impl Session for BrokeredSession {
+    fn account_oauth(&self) -> Option<bool> {
+        self.inner.account_oauth()
+    }
+
+    fn resume_from(&self, thread_id: &str) -> Result<(), AgentError> {
+        self.inner.resume_from(thread_id)
+    }
+
+    fn retain_for_limit(&self) {
+        self.inner.retain_for_limit();
+    }
     fn id(&self) -> String {
         self.inner.id()
     }

@@ -34,10 +34,11 @@ import { useStateQuery } from "@/hooks/useStateQuery";
 export function DivergenceBanner() {
   const state = useStateQuery();
   const rows = state.data?.review_divergence ?? [];
-  if (rows.length === 0) return null;
+  const limits = state.data?.limit_items ?? [];
+  if (rows.length === 0 && limits.length === 0) return null;
   return (
     <div role="status" className="setuperr">
-      <Note variant="warn">
+      {rows.length > 0 ? <Note variant="warn">
         {rows.length === 1
           ? "1 pull request needs attention:"
           : `${rows.length} pull requests need attention:`}{" "}
@@ -72,7 +73,21 @@ export function DivergenceBanner() {
           </span>
         ))}
         Nothing has been changed on your behalf — this is a report.
-      </Note>
+      </Note> : null}
+      {limits.map((item) => (
+        <Note variant="warn" key={item.account}>
+          {item.account} limit needs a human decision.
+          {item.tickets.map((ticket) => (
+            <span key={ticket.ticket} style={{ display: "block" }}>
+              {ticket.ticket} ({ticket.identity || "unassigned"}) is paused
+              {ticket.mid_review ? " mid-review" : ""}.
+              {ticket.handoff_note ? ` Read the handoff note at ${ticket.handoff_note}.`
+                : " The daemon could not write a handoff note; check the run's progress file and transcript."}
+            </span>
+          ))}
+          Credits policy: {item.credits_policy}. No automatic switch is available.
+        </Note>
+      ))}
     </div>
   );
 }

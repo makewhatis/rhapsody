@@ -634,6 +634,7 @@ fn worker_deps_for(
         // Test seam only; production always builds the dispatch runner from the prepared knobs.
         prepared_harness: None,
         engine: None,
+        resume_session: String::new(),
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -1006,6 +1007,8 @@ impl Orchestrator {
         // drain or a dead credential is exactly one whose kept opencode sessions would otherwise
         // never be bounded, because the per-issue retention check only fires on a redispatch.
         self.sweep_retained_opencode_sessions();
+        self.enforce_limits();
+        self.resume_due_limits().await;
         self.reconcile().await;
         // STUDIO-898: the review reconciliation sweep — compare each watched pull request's board
         // state against its activity and REPORT any that disagree. Local reads only (the watch set
@@ -1920,6 +1923,11 @@ impl Orchestrator {
         // place, so a dispatch that routed to nobody is byte-identical to today.
         deps.model_override = model_override;
         deps.engine = engine;
+        deps.resume_session = self
+            .running
+            .get(&iss.id)
+            .map(|r| r.resume_session.clone())
+            .unwrap_or_default();
         // ⚠️ The routed teammate's HARNESS (STUDIO-902): swap in that backend's already-built
         // runner. Empty — every profile that names none — leaves `deps.agent` exactly as
         // `worker_deps_for` set it, which is what keeps every existing dispatch byte-identical.
