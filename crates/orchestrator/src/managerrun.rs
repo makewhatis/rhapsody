@@ -984,6 +984,45 @@ mod tests {
     }
 
     #[test]
+    fn pr_manager_pump_preserves_the_live_limit_manager_attempt() {
+        let (mut o, _) = orch(ReviewAuthority::Act);
+        pass_self_test(&o, &test_cli_version());
+        let limit = ManagerRun {
+            limit_account: "claude-subscription".into(),
+            repo_url: REPO_URL.into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            o.dispatch_manager(limit.clone()),
+            ManagerDispatchOutcome::Dispatched
+        );
+        o.pump_manager_interventions();
+        assert!(
+            o.manager_attempts.contains_key(&limit.key()),
+            "PR-row pruning must preserve the limit manager entry cursor for exit/fallback"
+        );
+        let run = o.running[&limit.key()].clone();
+        o.on_worker_exit(crate::retry::EvWorkerExit {
+            issue_id: limit.key(),
+            started_at: run.started_at,
+            failed: true,
+            err_msg: "turn_failed".into(),
+            last_state: String::new(),
+            auth_needed: false,
+            refused: false,
+            declared_handoff: false,
+            review_verdict: None,
+            manager_text: None,
+        });
+        o.pump_manager_interventions();
+        assert_eq!(
+            o.manager_attempts[&limit.key()].next_index,
+            1,
+            "a failed limit manager must advance, not restart its primary entry"
+        );
+    }
+
+    #[test]
     fn manager_usd_budget_refuses_before_staging() {
         for listed in [false, true] {
             for priced in [false, true] {

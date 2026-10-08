@@ -730,10 +730,13 @@ impl Orchestrator {
                 return;
             }
         };
-        self.manager_attempts.retain(|_, attempt| {
-            all.iter().any(|row| {
-                row.id == attempt.intervention_id && !manager_intervention_is_terminal(&row.state)
-            })
+        self.manager_attempts.retain(|key, attempt| {
+            // Limit cases have no PR intervention row; their episode owns cursor cleanup.
+            key.starts_with("limit:")
+                || all.iter().any(|row| {
+                    row.id == attempt.intervention_id
+                        && !manager_intervention_is_terminal(&row.state)
+                })
         });
         let mut slots = self.manager_available_slots(&all, None);
 
