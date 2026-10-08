@@ -220,6 +220,10 @@ pub fn classify(line: &[u8]) -> Classified {
             }
         }
         "error" => {
+            let limit = serde_json::from_slice(line)
+                .ok()
+                .as_ref()
+                .and_then(crate::ratelimit::parse_opencode_limit);
             let e = r.error.unwrap_or_default();
             let failure = Failure {
                 name: e.name,
@@ -232,6 +236,7 @@ pub fn classify(line: &[u8]) -> Classified {
                     event_type: EVENT_TURN_FAILED.to_string(),
                     timestamp: now,
                     message: failure.summary(),
+                    limit,
                     ..Default::default()
                 },
                 session_id: r.session_id,
@@ -312,6 +317,18 @@ mod tests {
     }
     use super::*;
     use crate::{EVENT_NOTIFICATION, EVENT_TURN_FAILED};
+
+    #[test]
+    fn limit_error_keeps_the_original_failure_and_observation() {
+        let c = classify(br#"{"type":"error","error":{"name":"APIError","data":{"statusCode":429,"isRetryable":true,"responseBody":"{\"error\":{\"code\":\"usage_limit_reached\",\"resets_at\":1791312600}}"}}}"#);
+        assert_eq!(c.event.event_type, EVENT_TURN_FAILED);
+        assert!(c.failure.unwrap().retryable);
+        assert!(!c.terminal);
+        assert_eq!(c.event.limit.unwrap().windows[0].resets_at_s, 1791312600);
+        let auth = classify(br#"{"type":"error","error":{"data":{"statusCode":401}}}"#);
+        assert!(auth.event.limit.is_none());
+        assert!(auth.failure.unwrap().is_auth());
+    }
 
     // STUDIO-1118: the credential-rejection shapes — a bare 401, and the two OAuth messages a
     // provider reports — and nothing else (a 429 or a 500 is an ordinary, retryable failure).

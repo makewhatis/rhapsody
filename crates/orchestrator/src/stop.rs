@@ -168,6 +168,10 @@ pub struct ControlHandle {
     /// operator asked — which on the updater's path is exactly when it matters. It is a lock-free
     /// atomic, so it is not a sixth state seam.
     pub(crate) drain: crate::drain::DrainSignal,
+
+    /// The shared account ledger's off-loop read handle (STUDIO-1123).
+    pub(crate) accounts: std::sync::Arc<crate::accounts::AccountLedger>,
+
     /// The `gh` seams the console's merge action drives (STUDIO-767), snapshotted from
     /// [`Orchestrator::merge_deps`](crate::orchestrator::Orchestrator). It lives on the handle
     /// rather than being reached through [`Self::events`] because every call it makes BLOCKS
@@ -215,6 +219,7 @@ impl crate::orchestrator::Orchestrator {
             quorum: self.quorum_tx.clone(),
             review_intro: self.review_intro_tx.clone(),
             drain: self.drain.clone(),
+            accounts: std::sync::Arc::clone(&self.accounts),
             lifecycle: std::sync::Arc::clone(&self.lifecycle),
             merge: self.merge_deps.as_ref().map(std::sync::Arc::clone),
             diff: self.diff_deps.as_ref().map(std::sync::Arc::clone),

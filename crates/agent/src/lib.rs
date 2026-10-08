@@ -26,6 +26,7 @@ pub mod humanize;
 pub mod manager;
 pub mod opencode;
 pub mod proctree;
+pub mod ratelimit;
 
 pub use dispatch::{
     DispatchRefusal, DispatchRunner, LaunchContext, PreparedHarnessSpec, PreparedProvider,
@@ -68,6 +69,10 @@ pub const EVENT_STARTUP_FAILED: &str = "startup_failed";
 /// records the delivery ([`Event::message`] = the operator's text, [`Event::turn`] = the turn it was
 /// folded into) so the orchestrator can mark the stored row delivered.
 pub const EVENT_OPERATOR_MESSAGE: &str = "operator_message";
+/// An additive account-limit observation (STUDIO-1123); never carries token usage.
+pub const EVENT_LIMIT_OBSERVED: &str = "limit_observed";
+/// Internal, nonsecret session authentication classification; consumed by the worker bridge.
+pub const EVENT_ACCOUNT_AUTH: &str = "account_auth";
 
 // --- TurnStatus -------------------------------------------------------------------------------
 // The outcome of a single turn. Go models these as `type TurnStatus string`.
@@ -86,7 +91,7 @@ pub const TURN_TIMED_OUT: &str = "timed_out";
 /// cache-creation + cache-read; the cache portion is (`total_tokens` − `input_tokens` −
 /// `output_tokens`). This doc contract is carried over verbatim from Go — downstream billing math
 /// depends on it.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Usage {
     pub input_tokens: i64,
     pub output_tokens: i64,
@@ -102,7 +107,7 @@ pub struct Usage {
 /// `Option<DateTime<Utc>>` so a zero-value `Event` is `Default`-constructible (`None` = unset); the
 /// stream-json parser (A2) and runner (A3) fill it. `usage` is Go's `*Usage` pointer — present only
 /// on usage-bearing events.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize)]
 pub struct Event {
     pub event_type: String,
     pub timestamp: Option<DateTime<Utc>>,
@@ -114,11 +119,26 @@ pub struct Event {
     pub usage: Option<Usage>,
     /// Dollars reported by the harness, cumulative within this turn (STUDIO-1124).
     /// None is absent; subscription OpenCode commonly reports Some(0), not a free API price.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub cost_usd: Option<f64>,
     /// `turn` is the 1-based turn number the event belongs to; set on `EVENT_OPERATOR_MESSAGE` so
     /// the orchestrator can record which turn an operator message was delivered into (INF-250).
     /// Zero on events that don't carry a turn.
     pub turn: i64,
+    /// Rhapsody-only payload; absent on every existing event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub limit: Option<ratelimit::LimitObs>,
+}
+
+impl Event {
+    pub fn limit_observed(obs: ratelimit::LimitObs) -> Self {
+        Self {
+            event_type: EVENT_LIMIT_OBSERVED.into(),
+            timestamp: chrono::DateTime::from_timestamp(obs.observed_at_s, 0),
+            limit: Some(obs),
+            ..Default::default()
+        }
+    }
 }
 
 /// `TurnResult` summarizes a completed turn.
@@ -187,6 +207,12 @@ impl ModelOverride {
 /// points and share it between tasks.
 #[async_trait]
 pub trait Session: Send + Sync {
+    /// Authentication actually observed by this session. None means unknown, never inferred
+    /// from the model. Read in the worker's event callback; contains no credential or I/O.
+    fn account_oauth(&self) -> Option<bool> {
+        None
+    }
+
     /// Returns `"<thread_id>-<turn_id>"` for the most recent turn (upstream §10.2).
     fn id(&self) -> String;
 
@@ -371,6 +397,36 @@ pub(crate) static ENV_GUARD: tokio::sync::RwLock<()> = tokio::sync::RwLock::cons
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_existing_event_serializes_without_an_additive_limit_key() {
+        for kind in [
+            EVENT_SESSION_STARTED,
+            EVENT_TURN_COMPLETED,
+            EVENT_TURN_FAILED,
+            EVENT_NOTIFICATION,
+            EVENT_STARTUP_FAILED,
+            EVENT_OPERATOR_MESSAGE,
+        ] {
+            let event = Event {
+                event_type: kind.into(),
+                timestamp: chrono::DateTime::from_timestamp(1000, 0),
+                pid: 42,
+                message: "payload".into(),
+                usage: Some(Usage {
+                    input_tokens: 7,
+                    total_tokens: 7,
+                    ..Default::default()
+                }),
+                turn: 1,
+                ..Default::default()
+            };
+            let expected = format!(
+                r#"{{"event_type":"{kind}","timestamp":"1970-01-01T00:16:40Z","pid":42,"message":"payload","usage":{{"input_tokens":7,"output_tokens":0,"cache_creation_tokens":0,"cache_read_tokens":0,"total_tokens":7}},"turn":1}}"#
+            );
+            assert_eq!(serde_json::to_string(&event).unwrap(), expected);
+        }
+    }
 
     // Mirrors Go `agent.TestEnumsAndZeroValues` (agent_test.go). Go asserts the constants are
     // non-empty; we assert their exact string VALUES (the "same string values" contract) for all

@@ -243,6 +243,18 @@ pub enum Event {
     ReviewMissingPr(crate::reviewintro::ReviewIntroRequest),
     /// One agent event folded into the running entry (Go `evAgentUpdate`).
     AgentUpdate(AgentUpdate),
+    /// Nonsecret auth classification, frozen against the dispatch-time engine and run generation.
+    RunAccount {
+        issue_id: String,
+        started_at: DateTime<Utc>,
+        account: String,
+    },
+    /// A limit observation from that same generation; probes do not count as agent liveness.
+    RunLimit {
+        issue_id: String,
+        started_at: DateTime<Utc>,
+        obs: agent::ratelimit::LimitObs,
+    },
     /// The concrete per-run transcript path the worker opened (Go `evTranscriptOpened`).
     TranscriptOpened { issue_id: String, path: String },
     /// A fired retry timer (Go `evRetry`).
@@ -748,6 +760,16 @@ impl Orchestrator {
                 usage,
             } => self.on_broker_usage(&issue_id, run_id, &usage),
             Event::AgentUpdate(e) => self.on_agent_update(e),
+            Event::RunAccount {
+                issue_id,
+                started_at,
+                account,
+            } => self.bind_account(&issue_id, started_at, &account),
+            Event::RunLimit {
+                issue_id,
+                started_at,
+                obs,
+            } => self.observe_account(&issue_id, started_at, obs),
             Event::TranscriptOpened { issue_id, path } => {
                 self.on_transcript_opened(&issue_id, &path)
             }
@@ -1780,6 +1802,8 @@ impl Orchestrator {
     async fn shutdown(&mut self, rx: &mut UnboundedReceiver<Event>) {
         for re in self.running.values() {
             re.cancel.cancel();
+            self.accounts
+                .release_run(&crate::accounts::run_key(&re.issue.id, re.started_at));
         }
         // STUDIO-988: an in-flight preparation is work this daemon is abandoning; cancel it so its
         // resolver task stops waiting and a late completion is stale.
@@ -1847,6 +1871,10 @@ impl Orchestrator {
             deps.lead_progress_dir = std::env::var_os("HOME")
                 .map(|home| std::path::PathBuf::from(home).join(".rhapsody/docs"));
         }
+        // Resolve once, before the task exists. A later reload never reattributes this run.
+        let (mut account_harness, mut account_model) =
+            self.resolved_harness_model(&harness, &model_override, &project_slug);
+        let mut provider_account = None;
         // The auto-park's terminal guard's gate (STUDIO-1007): the merge→Done transition is "on"
         // only when the loaded teams config names one. Read from the SAME `self.teams` the handoff's
         // terminal/merged guard reads, so the two guards that protect the same transition can never
@@ -1931,6 +1959,9 @@ impl Orchestrator {
         // — but if it did, the run is refused rather than silently run on another harness.
         if let Some(spec) = prepared {
             let name = spec.harness.name();
+            account_harness = name.to_string();
+            account_model = spec.model.clone().unwrap_or_default();
+            provider_account = spec.provider.as_ref().map(|p| p.stable_id().to_string());
             let pool = eff
                 .project_by_slug(&project_slug)
                 .map_or(&eff.agents, |rp| &rp.agents);
@@ -1973,6 +2004,31 @@ impl Orchestrator {
         tokio::spawn(async move {
             let _guard = guard; // held for the worker's lifetime (Go `o.wg.Add(1)` + `defer Done`)
             let on_event = move |e: agent::Event| {
+                if e.event_type == agent::EVENT_ACCOUNT_AUTH {
+                    let account = provider_account.clone().unwrap_or_else(|| {
+                        crate::accounts::account_for(
+                            &account_harness,
+                            &account_model,
+                            e.message == "oauth",
+                        )
+                    });
+                    let _ = events_ev.send(Event::RunAccount {
+                        issue_id: issue_id_ev.clone(),
+                        started_at,
+                        account,
+                    });
+                    return;
+                }
+                if let Some(obs) = e.limit.clone() {
+                    let _ = events_ev.send(Event::RunLimit {
+                        issue_id: issue_id_ev.clone(),
+                        started_at,
+                        obs,
+                    });
+                    if e.event_type == agent::EVENT_LIMIT_OBSERVED {
+                        return;
+                    }
+                }
                 let _ = events_ev.send(Event::AgentUpdate(AgentUpdate {
                     issue_id: issue_id_ev.clone(),
                     ev: e,
@@ -2353,6 +2409,22 @@ impl Orchestrator {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn shutdown_releases_account_activity_with_store_off() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let at = chrono::DateTime::from_timestamp(1000, 0).unwrap();
+        let mut re = crate::orchestrator::RunningEntry::empty(rhapsody_core::Issue {
+            id: "shutdown".into(),
+            ..Default::default()
+        });
+        re.started_at = at;
+        o.running.insert("shutdown".into(), re);
+        o.bind_account("shutdown", at, "claude-subscription");
+        assert!(!o.accounts.snapshot(5000)[0].stale);
+        let mut rx = o.take_events_rx().unwrap();
+        o.shutdown(&mut rx).await;
+        assert!(o.accounts.snapshot(5000)[0].stale);
+    }
     use super::*;
 
     /// STUDIO-898: `on_tick` still runs the review reconciliation sweep, and runs it ABOVE the three

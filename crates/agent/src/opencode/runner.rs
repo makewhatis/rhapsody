@@ -91,6 +91,7 @@ investigation and recorded findings, act on them now.]";
 /// Builds opencode sessions.
 pub struct Runner {
     cfg: Config,
+    limits: std::sync::Arc<super::limits::UsageProbe>,
     force_fresh: bool,
 }
 
@@ -115,6 +116,7 @@ impl Runner {
         }
         Runner {
             cfg,
+            limits: super::limits::shared_probe(),
             force_fresh: false,
         }
     }
@@ -252,6 +254,8 @@ impl Runner {
             last_turn_failed: AtomicBool::new(false),
             auth_failed: AtomicBool::new(false),
             manager: None,
+            account_oauth: std::sync::OnceLock::new(),
+            limits: std::sync::Arc::clone(&self.limits),
         }))
     }
 }
@@ -473,6 +477,8 @@ impl Runner {
                 home,
                 xdg,
             }),
+            account_oauth: std::sync::OnceLock::new(),
+            limits: std::sync::Arc::clone(&self.limits),
         }))
     }
 }
@@ -530,6 +536,7 @@ impl crate::Runner for Runner {
         let fresh = Runner {
             cfg: self.cfg.clone(),
             force_fresh: true,
+            limits: std::sync::Arc::clone(&self.limits),
         };
         fresh.start_session(workspace_path, issue, transcript).await
     }
@@ -627,6 +634,8 @@ impl crate::Runner for Runner {
             last_turn_failed: AtomicBool::new(false),
             auth_failed: AtomicBool::new(false),
             manager: None,
+            account_oauth: std::sync::OnceLock::new(),
+            limits: std::sync::Arc::clone(&self.limits),
         }))
     }
 }
@@ -673,6 +682,9 @@ struct OpencodeSession {
     auth_failed: AtomicBool,
     /// Manager-only environment and private dirs; never participates in legacy retry/resume.
     manager: Option<ManagerParams>,
+    /// Kind read from this session's selected-provider login once, before its first turn.
+    account_oauth: std::sync::OnceLock<Option<bool>>,
+    limits: std::sync::Arc<super::limits::UsageProbe>,
 }
 
 struct ManagerParams {
@@ -840,6 +852,9 @@ impl Drop for OpencodeSession {
 
 #[async_trait]
 impl Session for OpencodeSession {
+    fn account_oauth(&self) -> Option<bool> {
+        self.account_oauth.get().copied().flatten()
+    }
     fn id(&self) -> String {
         format!(
             "{}-{}",
@@ -1050,6 +1065,31 @@ impl OpencodeSession {
         resume_note: bool,
     ) -> (TurnResult, Option<AgentError>) {
         self.auth_failed.store(false, Ordering::SeqCst);
+        let cfg_for_auth = self.turn_cfg();
+        let provider = cfg_for_auth
+            .model
+            .split_once('/')
+            .map(|(p, _)| p)
+            .unwrap_or("");
+        let login_path = self.manager.as_ref().map_or_else(
+            || self.state.xdg_data_home().join("opencode/auth.json"),
+            |m| m.xdg.join("data/opencode/auth.json"),
+        );
+        self.account_oauth.get_or_init(|| {
+            if self.brokered.is_some() {
+                Some(false)
+            } else {
+                super::limits::auth_kind(&login_path, provider)
+            }
+        });
+        // Classification is known before exec; a silent child must still bind its live account.
+        if let Some(oauth) = self.account_oauth() {
+            on_event(Event {
+                event_type: crate::EVENT_ACCOUNT_AUTH.into(),
+                message: if oauth { "oauth" } else { "api" }.into(),
+                ..Default::default()
+            });
+        }
         // The same containment invariant the claude runner enforces before every exec (§9.5): the
         // workspace must be inside the root and equal to the cwd.
         if let Err(e) = rhapsody_workspace::validate_launch(
@@ -1379,6 +1419,23 @@ impl OpencodeSession {
         let deadline = tokio::time::sleep_until(Instant::now() + cfg.turn_timeout);
         tokio::pin!(deadline);
 
+        // Passive GETs exist only for the lifetime of an active OAuth OpenAI turn. The module's
+        // shared gate bounds all runners (including managers/reviews) to one attempt per 10 min.
+        let probe_active =
+            self.brokered.is_none() && provider == "openai" && self.account_oauth() == Some(true);
+        let probe = async {
+            if !probe_active {
+                std::future::pending::<()>().await;
+            }
+            loop {
+                if let Some(obs) = self.limits.observe(&login_path).await {
+                    on_event(Event::limit_observed(obs));
+                }
+                tokio::time::sleep(Duration::from_secs(600)).await;
+            }
+        };
+        tokio::pin!(probe);
+
         // Extracted so it can run both on every stdout chunk AND once more after the redactor's
         // `finish()` flushes its retained prefix on EOF. A macro (not a closure) so it can mutate
         // the captured turn accumulators directly.
@@ -1436,6 +1493,9 @@ impl OpencodeSession {
                         ev.cost_usd = cost_usd;
                     }
                     ev.pid = pid as i64;
+                    if let Some(obs) = ev.limit.take() {
+                        on_event(Event::limit_observed(obs));
+                    }
                     // ⚠️ A usage-bearing NOTIFICATION must carry the RUNNING TURN TOTAL, not this
                     // step's own figures. The orchestrator's live estimate is LAST-WINS, not
                     // additive (`agentupdate.rs`: "the assistant message.usage is
@@ -1479,6 +1539,7 @@ impl OpencodeSession {
 
         'outer: loop {
             tokio::select! {
+                _ = &mut probe => {},
                 _ = &mut deadline => {
                     kill_tree(pid);
                     timed_out = true;
@@ -2375,6 +2436,143 @@ exit 0
         seen.lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    #[tokio::test]
+    async fn limit_error_emits_observation_but_remains_a_failed_turn() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let script = write_script(
+            &scripts,
+            "limit.sh",
+            r#"printf '%s\n' '{"type":"error","error":{"name":"APIError","data":{"message":"usage limit","statusCode":429,"isRetryable":true,"responseBody":"{\"error\":{\"code\":\"usage_limit_reached\",\"resets_at\":1791312600}}"}}}'
+exit 1"#,
+        );
+        let auth = seeded_auth(&scripts);
+        let root = TempDir::new();
+        let state = TempDir::new();
+        let mut runner = runner_for(&script, &root, &auth, &state.path().to_string_lossy());
+        runner.cfg.model = "fireworks-ai/test".into();
+        let sess = runner
+            .start_session(&make_ws(&root, "limit"), issue("LIMIT-1"), None)
+            .await
+            .unwrap();
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_some());
+        assert_eq!(tr.status, TURN_FAILED);
+        assert_eq!(sess.account_oauth(), Some(false));
+        let events = events_of(&seen);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == crate::EVENT_LIMIT_OBSERVED)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == EVENT_TURN_FAILED)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find_map(|e| e.limit.as_ref())
+                .unwrap()
+                .windows[0]
+                .resets_at_s,
+            1791312600
+        );
+        // This test intentionally failed; remove the retained synthetic session too.
+        sess.stop().await.unwrap();
+        std::fs::remove_dir_all(state.path()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn active_oauth_turns_probe_once_and_emit_measured_usage() {
+        let _env = ENV_GUARD.read().await;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let scripts = TempDir::new();
+        let ready = scripts.path().join("probe-replied");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}/usage", listener.local_addr().unwrap());
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+                assert!(request.starts_with("get /usage http/1.1"));
+                assert!(request.contains("authorization: bearer test-access"));
+                assert!(!request.contains("refresh"));
+                count.fetch_add(1, Ordering::SeqCst);
+                let body = include_str!("../../testdata/limits/chatgpt-usage.json");
+                stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).as_bytes()).await.unwrap();
+            }
+        });
+        let script = write_script(
+            &scripts,
+            "probe.sh",
+            &format!(
+                "while ! test -f '{}'; do sleep 0.01; done\nprintf '%s\\n' '{{\"type\":\"step_finish\",\"sessionID\":\"s\",\"part\":{{\"reason\":\"stop\"}}}}'\n",
+                ready.display()
+            ),
+        );
+        let auth = scripts.path().join("auth.json");
+        std::fs::write(&auth, br#"{"openai":{"type":"oauth","access":"test-access","refresh":"","expires":4102444800000}}"#).unwrap();
+        let state = TempDir::new();
+        let root = TempDir::new();
+        let mut runner = runner_for(
+            &script,
+            &root,
+            &auth.to_string_lossy(),
+            &state.path().to_string_lossy(),
+        );
+        runner.cfg.model = "openai/test".into();
+        runner.cfg.turn_timeout = Duration::from_secs(5);
+        runner.limits = Arc::new(super::super::limits::UsageProbe::for_test(endpoint));
+        let a = runner
+            .start_session(&make_ws(&root, "a"), issue("PROBE-A"), None)
+            .await
+            .unwrap();
+        let b = runner
+            .start_session(&make_ws(&root, "b"), issue("PROBE-B"), None)
+            .await
+            .unwrap();
+        let (seen, collect) = collector();
+        let on_event = |e: Event| {
+            let limit = e.limit.is_some();
+            collect(e);
+            if limit {
+                std::fs::write(&ready, b"observed").unwrap();
+            }
+        };
+        let (ra, rb) = tokio::join!(
+            a.run_turn("p", None, None, &on_event),
+            b.run_turn("p", None, None, &on_event)
+        );
+        server.abort();
+        let _ = server.await;
+        assert!(ra.1.is_none() && rb.1.is_none());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let evs = events_of(&seen);
+        let obs: Vec<_> = evs.iter().filter_map(|e| e.limit.as_ref()).collect();
+        assert_eq!(obs.len(), 1);
+        assert_eq!(obs[0].source, "probe");
+        assert_eq!(obs[0].windows[0].utilization, 0.31);
+        assert_eq!(a.account_oauth(), Some(true));
+        assert_eq!(b.account_oauth(), Some(true));
+        a.stop().await.unwrap();
+        b.stop().await.unwrap();
     }
 
     // ⚠️⚠️ THE ACCEPTANCE TEST. "Two concurrent opencode runs lose no turns. Assert on the event

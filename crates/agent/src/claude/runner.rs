@@ -138,6 +138,7 @@ impl crate::Runner for Runner {
             model_override: Mutex::new(crate::ModelOverride::default()),
             manager_config_dir: None,
             manager_credential: None,
+            account_oauth: Mutex::new(None),
         }))
     }
 }
@@ -237,6 +238,7 @@ impl Harness for Runner {
             model_override: Mutex::new(crate::ModelOverride::default()),
             manager_config_dir: Some(req.config_dir),
             manager_credential: req.model_credential,
+            account_oauth: Mutex::new(None),
         }))
     }
 }
@@ -291,9 +293,19 @@ struct ClaudeSession {
     /// the relocated credential file). `None` on every non-manager run — and on a manager run whose
     /// operator store had no usable token — leaving that run's env byte-identical.
     manager_credential: Option<String>,
+    /// Nonsecret auth observed from the first system/init; frozen for this run.
+    account_oauth: Mutex<Option<bool>>,
 }
 
 impl ClaudeSession {
+    /// A subscription-limit signal can precede system/init on an early CLI refusal.
+    /// It is itself positive subscription evidence; never overwrite an observed API source.
+    fn note_limit_auth(&self) {
+        let mut auth = self.account_oauth.lock().unwrap_or_else(|e| e.into_inner());
+        if auth.is_none() {
+            *auth = Some(true);
+        }
+    }
     /// Locks `thread_id`, recovering the guard on poison (a panic while holding it, which this code
     /// never does) so the accessor stays panic-free under `-D warnings`.
     fn locked_thread_id(&self) -> std::sync::MutexGuard<'_, String> {
@@ -406,6 +418,9 @@ impl ClaudeSession {
 
 #[async_trait]
 impl Session for ClaudeSession {
+    fn account_oauth(&self) -> Option<bool> {
+        *self.account_oauth.lock().unwrap_or_else(|e| e.into_inner())
+    }
     fn id(&self) -> String {
         format!(
             "{}-{}",
@@ -654,6 +669,10 @@ impl Session for ClaudeSession {
                                 if !c.ok {
                                     continue;
                                 }
+                                if c.event.event_type == EVENT_SESSION_STARTED && !c.api_key_source.is_empty() {
+                                    let mut auth = self.account_oauth.lock().unwrap_or_else(|e| e.into_inner());
+                                    if auth.is_none() { *auth = Some(c.api_key_source == "none"); }
+                                }
                                 // Billing guard on the first system/init of THIS turn: apiKeySource
                                 // must be "none". Otherwise kill the tree and abort.
                                 if guard_on
@@ -672,6 +691,11 @@ impl Session for ClaudeSession {
                                 // Only the terminal result carries the AUTHORITATIVE per-turn total.
                                 if c.terminal && let Some(u) = ev.usage {
                                     usage = u;
+                                }
+                                if ev.limit.is_some() { self.note_limit_auth(); }
+                                if c.terminal && c.result.status == TURN_FAILED && let Some(obs) = crate::ratelimit::parse_claude_limit_error(&c.result.result_text) {
+                                    self.note_limit_auth();
+                                    on_event(Event::limit_observed(obs));
                                 }
                                 on_event(ev);
                                 if c.terminal {
@@ -818,6 +842,13 @@ impl Session for ClaudeSession {
         // No terminal result observed.
         let exit_bad = matches!(&wait_res, Ok(s) if !s.success()) || wait_res.is_err();
         if exit_bad {
+            for line in String::from_utf8_lossy(stderr_buf.bytes()).lines() {
+                if let Some(obs) = crate::ratelimit::parse_claude_limit_error(line) {
+                    self.note_limit_auth();
+                    on_event(Event::limit_observed(obs));
+                    break;
+                }
+            }
             let mut msg = truncate_stderr(stderr_buf.bytes());
             if stderr_buf.truncated {
                 msg.push_str(" (stderr capped)");
@@ -1102,6 +1133,70 @@ mod tests {
         assert_eq!(v["type"], "user", "line not a user message: {line}");
         assert_eq!(v["message"]["role"], "user", "line role not user: {line}");
         v["message"]["content"].as_str().unwrap().to_string()
+    }
+
+    #[tokio::test]
+    async fn limit_rejection_does_not_replace_terminal_usage_or_auth() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "LIMIT-1");
+        let (_s, script) = write_fake_claude(
+            "#!/usr/bin/env bash\nhead -n 1 >/dev/null\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}'\necho '{\"type\":\"result\",\"is_error\":true,\"result\":\"You\\u0027ve hit your limit\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}'\n",
+        );
+        let sess = new_runner(&script, &root.path())
+            .start_session(&ws, issue("1", "LIMIT-1"), None)
+            .await
+            .unwrap();
+        let events = Mutex::new(Vec::new());
+        let (tr, err) = sess
+            .run_turn("p", None, None, &|e| events.lock().unwrap().push(e))
+            .await;
+        assert!(err.is_some());
+        assert_eq!(tr.usage.total_tokens, 10);
+        assert_eq!(sess.account_oauth(), Some(true));
+        let events = events.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == crate::EVENT_LIMIT_OBSERVED)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.event_type == EVENT_TURN_FAILED)
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn stderr_limit_rejection_without_init_is_observed() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "LIMIT-STDERR");
+        let (_s, script) = write_fake_claude(
+            "#!/usr/bin/env bash\nhead -n 1 >/dev/null\nprintf '%s\\n' \"You've hit your weekly limit\" >&2\nexit 1\n",
+        );
+        let sess = new_runner(&script, &root.path())
+            .start_session(&ws, issue("1", "LIMIT-STDERR"), None)
+            .await
+            .unwrap();
+        let events = Mutex::new(Vec::new());
+        let (_, err) = sess
+            .run_turn("p", None, None, &|e| events.lock().unwrap().push(e))
+            .await;
+        assert!(err.is_some());
+        assert_eq!(
+            sess.account_oauth(),
+            Some(true),
+            "the subscription rejection itself classifies an early refusal"
+        );
+        let events = events.lock().unwrap();
+        let obs = events.iter().find_map(|e| e.limit.as_ref()).unwrap();
+        assert_eq!(obs.windows[0].window, "seven_day");
+        assert_eq!(obs.status, crate::ratelimit::LimitStatus::Rejected);
     }
 
     // Mirrors Go `claude.TestRunTurnSuccessStreamsEventsAndUsage`.
