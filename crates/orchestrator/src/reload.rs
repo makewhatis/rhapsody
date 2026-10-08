@@ -187,6 +187,10 @@ impl Orchestrator {
             self.review_capacity_held.clear();
         }
         self.set_reads_target(Arc::clone(&tracker), cfg.tracker.api_key.clone());
+        self.reads
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .limits = cfg.limits.clone();
         // The roster identities a review dispatch would be refused for (STUDIO-978), resolved HERE
         // on the control task — the live harness question needs `eff` (just set above) and the
         // roster's profiles, neither of which the off-loop manager room reader holds. Published

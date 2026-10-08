@@ -825,6 +825,7 @@ impl Orchestrator {
         if let Some(td) = &teams_dispatch {
             self.record_route_event(&mut re, td);
         }
+        self.report_identity_limit_handoff(&mut re);
         // Bind the run to its identity for the off-loop `teams_retain` (STUDIO-645, T4): the tool
         // takes `content` and nothing else, so the host must already know who this run is before
         // the agent can ask to record anything. Two map writes, no I/O, and skipped entirely for a

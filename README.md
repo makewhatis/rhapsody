@@ -93,6 +93,29 @@ advances to another healthy entry, rather than restoring a deleted private sessi
 creating recursive manager work. Existing Go-owned tables, config/state goldens and fixture
 normalization are unchanged.
 
+### Account-limit reporting (STUDIO-1128)
+
+The default-on ledger and policy now report account state transitions (including reset and
+staleness), rather than pushing for each run. `notify.macos` and `notify.ntfy` use the existing
+transports, with affected-run counts and projected park/switch/wait dispositions. L4's
+once-per-account/local-day credit-spend event also produces a push under every credits policy.
+Notification delivery is best-effort and time-bounded, off the control task; deduplication is
+decided before delivery, so a refused channel is logged rather than retried per tick.
+
+Each completed limit handoff produces a room post and a tokenless tracker comment (a PR
+comment for a synthetic review/manager run), naming the engine, disposition, resume time or
+condition, and note path. The existing events ledger records `limit.handoff` for the job page.
+If the next successful dispatch after a limit stop changes identity, that dispatch records
+and posts the old/new identity, new engine, resume time and recorded note path. A relabel
+alone is not announced as a completed handoff. Later ordinary assignments do not inherit
+an older limit episode.
+The additive Accounts endpoint gains policy `level`, `cost_kind` and known `today_usd`;
+unknown costs are omitted rather than reported as zero. Raw policy snapshots are unchanged.
+The console's Accounts route and job chips share the daemon/browser and desktop build.
+`/state` adds `limit_jobs` only while a limit disposition exists, leaving Go-owned payloads,
+tables and committed goldens untouched. State-transition dedupe is process-local; credit-spend
+dedupe retains L4's durable daily event history.
+
 ### Default-on account limit policy (STUDIO-1126)
 
 `limits:` adds an intentional scheduling divergence from Go: an absent block still uses
@@ -1502,6 +1525,26 @@ tools the manager run calls (`manager_*`, role `manager`) are the only callers, 
 facade registers none of them — the manager surface is opt-in via `rhapsodyd mcp --role manager`.
 The `rhapsody_` prefix keeps the evidence table out of the Go-recaptured schema golden;
 `divergent_objects_are_gated_by_name_only` pins the thirteenth name.
+
+### A disposable investigation shell for the manager (STUDIO-1135)
+
+The tech lead design's T-D3 deliberately extends the manager with `investigate(ref, cmd)`:
+repository code can run only in a disposable Docker container, through the host, while the
+manager harness still has no built-in shell, edit or web tools. This has no Go counterpart.
+The manager-only MCP tool proxies the additive, operator-guarded
+`POST /api/v1/manager/investigate?run_id=...`; ordinary workers do not register the tool.
+
+The host verifies the live run's own PR head, exports it with Git's built-in tar archive from
+cached mirror objects (no host checkout, content filters or hooks), mounts the unpacked export and
+a dependency cache read-only, and provides writable scratch
+tmpfs. Network, operator credentials, home mounts, capabilities and privilege escalation are
+absent. Limits are 2 CPUs, 4 GiB RAM, 512 processes, ten minutes per command, thirty per session
+and 64 KiB combined output. A separate networked, credential-free warm-up sees dependency metadata
+only and disables npm lifecycle scripts. Boot probes fail closed for this tool alone: the manager
+continues with a typed unavailable reason and a WARN when Docker/image/isolation is unavailable.
+Build instructions, cache/build usage and the explicit real-container acceptance tests are in
+[`docker/investigate/README.md`](docker/investigate/README.md). Existing ported endpoints, schemas,
+goldens and ordinary-worker tool sets are unchanged.
 
 ### The manager intervention lifecycle — one active per PR, leased runs, atomic budgets (STUDIO-1015)
 

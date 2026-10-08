@@ -137,6 +137,12 @@ the `Orchestrator` struct itself. Concretely:
     auto-promote pass writes those with a partial (Backlog-only) view, and letting it mark the set
     "known" would reopen the silent hole.
 
+  - `investigate.rs`'s `Investigations` (STUDIO-1135) — control only binds/releases live manager
+    ids through `bind_teams_run`/`release_teams_run`. Request tasks own Docker, cached PR-head
+    archive exports, per-session async locks and the warm-up lock. The registry mutex never spans an
+    await. Run release cancels investigation work and schedules cleanup; deadlines also remove
+    idle containers. Failed sandbox self-tests disable this tool only, leaving authority intact.
+
   - `managerselftest.rs`'s `ManagerSelfTestState` — the boot gate and off-loop watcher write
     version-bound verdicts per manager-run entry; the control task reads them at launch and marks
     a rejected login auth-blocked against its dispatch-time fingerprint (STUDIO-1119). Entry
@@ -148,7 +154,7 @@ the `Orchestrator` struct itself. Concretely:
 
   - `breaker.rs`'s `NotificationsState` (`Orchestrator::notifications: Arc<NotificationsState>`,
     STUDIO-1026) — a `Mutex`-guarded bounded queue of pending desktop notifications. The off-loop
-    breaker task's `MacosChannel` is the only writer; the control task's `build_snapshot` is its only
+    breaker and account-report tasks' `MacosChannel` is the writer; the control task's `build_snapshot` is its only
     reader (for the conditional `notifications` key on `/api/v1/state`). A ninth seam of the
     `BudgetLedger` shape: both sides genuinely touch it, neither can wait for the other, and the
     lock is never held across an `.await`. The breaker's other two pieces are NOT seams — `breaker_tx`
