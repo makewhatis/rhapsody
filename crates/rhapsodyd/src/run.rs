@@ -59,6 +59,7 @@ struct BootSeams {
     home: Option<PathBuf>,
     /// Overrides [`RUNTIME_HEAL_INTERVAL`] so a test can observe the self-heal without waiting 30s.
     heal_interval: Option<Duration>,
+    manager_canary: Option<Arc<dyn rhapsody_orchestrator::managerselftest::CanaryRunnerFactory>>,
 }
 
 /// Starts the Rhapsody daemon for the workflow selected by `args`, running until `ctx` is cancelled.
@@ -110,6 +111,7 @@ where
         provider: provider_seam,
         home,
         heal_interval,
+        manager_canary,
     } = seams;
     let heal_interval = heal_interval.unwrap_or(RUNTIME_HEAL_INTERVAL);
     // `rhapsodyd mcp [WORKFLOW.md]` runs the local MCP facade over stdio instead of the daemon
@@ -399,8 +401,8 @@ where
     // every appender: the dispatch-path catch-up, the HTTP post surface, triage, the quorum and the
     // manager's replies. See the sharing note where the off-loop tasks take their clones.
     let mut teams_room: Option<Arc<rhapsody_config::room::LocalRoom>> = None;
-    // The off-loop self-test watcher wiring (STUDIO-1049, §4.7): `Some` only when
-    // `manager.review_authority` is not `off` after the boot self-test, so a default install spawns
+    // The off-loop self-test watcher wiring: `Some` only when
+    // `manager.review_authority` is configured, so a default install spawns
     // no task and has no delta. Carried out of the Teams block for `teams_prefetch`'s reason — the
     // watcher is spawned beside the prune scheduler, by which point `o` has moved into the control
     // task.
@@ -424,29 +426,26 @@ where
         // BEFORE the config is injected/cloned anywhere, so every consumer sees the effective
         // authority and the Noop store can never accept `act`.
         enforce_manager_storage_requirement(&mut teams_cfg, durable_store);
-        // STUDIO-1049 (§4.7/§10.2): before any authority other than `off` takes effect, verify the
-        // installed `claude` CLI honours the manager tool contract with a canary launch. Fail closed:
-        // any successful attempt, an unexercised attempt, or a canary that cannot run forces the
-        // authority back to `off` and records the typed reason. The recorded verdict is what
-        // `manager_launch_permitted()` (and M8's launch gate) reads.
-        apply_manager_self_test(
-            &mut teams_cfg,
-            o.manager_selftest_state(),
-            resolved.as_ref(),
-            &flags.path.to_string_lossy(),
-        )
-        .await;
-        // When the manager may act, keep the §4.7 verdict fresh across a CLI version change: the
-        // watcher re-probes the installed version and re-runs the canary whenever it changed. The
-        // launch gate re-probes too, so nothing acts on a stale verdict in the meantime.
+        // Configure now, but do not launch until the API is serving and runtime.json names THIS
+        // daemon. Preserve even legacy authority: the verdict gate fails closed while pending or
+        // failed, and a background pass can then recover without changing the operator's config.
         if teams_cfg.manager.review_authority != rhapsody_config::teams::ReviewAuthority::Off {
+            o.manager_selftest_state()
+                .configure(teams_cfg.manager.effective_harnesses());
+            o.manager_selftest_state().set_credential_probe(Arc::new(
+                ManagerEntryCredentialProbe {
+                    operator_auth: rhapsody_agent::opencode::manager::operator_auth_path(),
+                },
+            ));
             manager_selftest_watch = Some((
                 o.manager_selftest_handle(),
-                manager_canary_factory(
-                    resolved.as_ref(),
-                    &flags.path.to_string_lossy(),
-                    teams_cfg.manager.harnesses.is_empty(),
-                ),
+                manager_canary.unwrap_or_else(|| {
+                    manager_canary_factory(
+                        resolved.as_ref(),
+                        &flags.path.to_string_lossy(),
+                        teams_cfg.manager.harnesses.is_empty(),
+                    )
+                }),
             ));
         }
         o.teams = Some(teams_cfg.clone());
@@ -711,6 +710,7 @@ where
     let mut dashboard_url = String::new();
     let mut server_task = None;
     let mut runtime_heal_task = None;
+    let mut manager_api_port = None;
     if let (eff_port, true) = resolve_server_port(flags.port, &flags.path) {
         // The enable flow (STUDIO-652) reads and writes the SAME `teams.yaml` the boot load above
         // resolved, so `GET/POST /api/v1/teams/config` and the daemon can never disagree about
@@ -772,6 +772,7 @@ where
                 tracing::info!(%addr, "observability server listening");
                 dashboard_url = format!("http://{addr}");
                 let bound_port = i32::from(addr.port());
+                manager_api_port = Some(bound_port);
                 // Publish the ACTUAL bound loopback port so `rhapsodyd mcp` reaches a daemon launched
                 // on a dynamic/ephemeral --port (best-effort; removed on clean shutdown). The write is
                 // GUARDED (STUDIO-1041): a runtime file naming another LIVE daemon is left untouched.
@@ -874,13 +875,27 @@ where
 
     // --- manager self-test watcher (STUDIO-1049, §4.7) ---
     //
-    // Spawned only when the manager may act. It re-probes the installed `claude` version on a fixed
-    // cadence and re-runs the canary whenever it changed, so a CLI that auto-updates in place is
-    // re-verified without a daemon restart. It holds no `Orchestrator`: its whole contact is the
+    // Spawned for configured authority, even while every entry is failing. Boot waits for a usable
+    // API; subsequent version changes and bounded failed-entry retries can recover without restart.
+    // It holds no `Orchestrator`: its whole contact is the
     // shared `ManagerSelfTestState` handle and the resolved command/paths.
     let manager_watch_task = manager_selftest_watch.map(|(state, factory)| {
-        let ctx = shutdown.wait();
+        let mut ctx = shutdown.wait();
+        let handle = handle.clone();
+        let factory = Arc::new(ListeningManagerCanaryFactory {
+            inner: factory,
+            home: runtime_home.clone(),
+            port: manager_api_port,
+        });
         tokio::spawn(async move {
+            tokio::select! {
+                _ = ctx.cancelled() => return,
+                ready = handle.wait_for_snapshot() => if !ready { return; }
+            }
+            tokio::select! {
+                _ = ctx.cancelled() => return,
+                _ = rhapsody_orchestrator::managerselftest::run_entry_self_tests(factory.as_ref(), &state) => {}
+            }
             rhapsody_orchestrator::managerselftest::run_selftest_watch_task(ctx, factory, state)
                 .await;
         })
@@ -2268,41 +2283,36 @@ fn enforce_manager_storage_requirement(
     teams.manager.review_authority = effective;
 }
 
-/// STUDIO-1049 (§4.7/§10.2): before `manager.review_authority` other than `off` takes effect, run the
-/// startup self-test against the installed `claude` CLI. Fail closed — any successful attempt, an
-/// attempt not exercised, or a canary that cannot run (including an unprobeable CLI version) forces
-/// the authority back to `off` and records the typed reason, which items go to the human feed with.
-///
-/// `off` is skipped entirely, so a default installation boots without a model launch and is
-/// byte-identical.
-async fn apply_manager_self_test(
-    teams: &mut rhapsody_config::teams::Teams,
-    selftest: &rhapsody_orchestrator::managerselftest::ManagerSelfTestState,
-    resolved: Option<&rhapsody_config::Config>,
-    workflow_path: &str,
-) {
-    use rhapsody_config::teams::ReviewAuthority;
-    if teams.manager.review_authority == ReviewAuthority::Off {
-        return;
+/// Never test against a previous/peer daemon's publication. Rechecked by the background watcher,
+/// so a publication failure can recover after runtime.json self-heals without restarting.
+struct ListeningManagerCanaryFactory {
+    inner: Arc<dyn rhapsody_orchestrator::managerselftest::CanaryRunnerFactory>,
+    home: Option<PathBuf>,
+    port: Option<i32>,
+}
+impl rhapsody_orchestrator::managerselftest::CanaryRunnerFactory for ListeningManagerCanaryFactory {
+    fn probe_version(
+        &self,
+        entry: &rhapsody_config::teams::ManagerHarnessEntry,
+    ) -> Result<String, String> {
+        let published = self
+            .home
+            .as_deref()
+            .and_then(|h| runtimeport::read_in(h).ok());
+        if !published
+            .is_some_and(|p| Some(p.port) == self.port && p.pid == std::process::id() as i32)
+        {
+            return Err(
+                "manager API is not listening with this daemon's runtime.json publication".into(),
+            );
+        }
+        self.inner.probe_version(entry)
     }
-    selftest.configure(teams.manager.effective_harnesses());
-    selftest.set_credential_probe(Arc::new(ManagerEntryCredentialProbe {
-        operator_auth: rhapsody_agent::opencode::manager::operator_auth_path(),
-    }));
-    let factory =
-        manager_canary_factory(resolved, workflow_path, teams.manager.harnesses.is_empty());
-    rhapsody_orchestrator::managerselftest::run_entry_self_tests(factory.as_ref(), selftest).await;
-    if selftest
-        .select(
-            chrono::Utc::now().timestamp_millis(),
-            selftest.credential_probe().as_ref(),
-        )
-        .is_err()
-        && teams.manager.harnesses.is_empty()
-    {
-        // Legacy installs retain today's boot-time off transition. Explicit lists retain the
-        // configured authority, gated by selection, so a version change can re-enable an entry.
-        teams.manager.review_authority = ReviewAuthority::Off;
+    fn runner(
+        &self,
+        entry: &rhapsody_config::teams::ManagerHarnessEntry,
+    ) -> Option<Box<dyn rhapsody_orchestrator::managerselftest::CanaryRunner>> {
+        self.inner.runner(entry)
     }
 }
 
@@ -2877,6 +2887,113 @@ mod tests {
         let code = run_with_seam(signal.wait(), &argv, buf.clone(), false, false, seams).await;
         drop(home);
         code
+    }
+
+    // STUDIO-1139: the boot canary observes publication and an actual successful API response.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn manager_canary_starts_only_after_runtime_publication_and_live_listener() {
+        use rhapsody_orchestrator::managerselftest::{
+            CanaryObservation, CanaryRunner, CanaryRunnerFactory, REQUIRED_ATTEMPTS,
+        };
+        struct ListenerCanary {
+            home: PathBuf,
+            observed: Arc<tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<bool>>>>,
+        }
+        #[async_trait::async_trait]
+        impl CanaryRunner for ListenerCanary {
+            async fn run_canary(&self, _: &str) -> Vec<CanaryObservation> {
+                use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                let ready = async {
+                    let info = runtimeport::read_in(&self.home).ok()?;
+                    if info.pid != std::process::id() as i32 {
+                        return None;
+                    }
+                    let mut stream =
+                        tokio::net::TcpStream::connect(("127.0.0.1", info.port as u16))
+                            .await
+                            .ok()?;
+                    stream.write_all(b"GET /api/v1/state HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").await.ok()?;
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).await.ok()?;
+                    let body = response.split_once("\r\n\r\n")?.1;
+                    let state: serde_json::Value = serde_json::from_str(body).ok()?;
+                    Some(response.starts_with("HTTP/1.1 200") && state["status"] == "ok")
+                };
+                let ready = tokio::time::timeout(Duration::from_secs(3), ready)
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or(false);
+                if let Some(tx) = self.observed.lock().await.take() {
+                    let _ = tx.send(ready);
+                }
+                REQUIRED_ATTEMPTS
+                    .iter()
+                    .map(|&attempt| CanaryObservation {
+                        attempt,
+                        refused: ready,
+                        detail: "listener readiness".into(),
+                    })
+                    .collect()
+            }
+        }
+        impl CanaryRunnerFactory for ListenerCanary {
+            fn probe_version(
+                &self,
+                _: &rhapsody_config::teams::ManagerHarnessEntry,
+            ) -> Result<String, String> {
+                Ok("test".into())
+            }
+            fn runner(
+                &self,
+                _: &rhapsody_config::teams::ManagerHarnessEntry,
+            ) -> Option<Box<dyn CanaryRunner>> {
+                Some(Box::new(Self {
+                    home: self.home.clone(),
+                    observed: self.observed.clone(),
+                }))
+            }
+        }
+        let dir = TempDir::new();
+        let db = dir.path.join("rhapsody.db");
+        let wf = write_wf(
+            &dir,
+            &format!("storage:\n  path: {}\n", db.display()),
+            "server:\n  port: 0\n",
+        );
+        std::fs::write(
+            dir.path.join("teams.yaml"),
+            "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  review_authority: advise\n",
+        )
+        .expect("teams config");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let seams = BootSeams {
+            home: Some(dir.path.clone()),
+            manager_canary: Some(Arc::new(ListenerCanary {
+                home: dir.path.clone(),
+                observed: Arc::new(tokio::sync::Mutex::new(Some(tx))),
+            })),
+            ..Default::default()
+        };
+        let signal = CancelSignal::new();
+        let ctx = signal.wait();
+        let argv = vec![wf.to_string_lossy().into_owned()];
+        let buf = SharedBuf::new();
+        let run_buf = buf.clone();
+        let task =
+            tokio::spawn(
+                async move { run_with_seam(ctx, &argv, run_buf, false, false, seams).await },
+            );
+        let ready = tokio::time::timeout(Duration::from_secs(15), rx).await;
+        signal.cancel();
+        assert_eq!(task.await.expect("daemon join"), 0, "{}", buf.contents());
+        let ready = ready
+            .unwrap_or_else(|_| panic!("canary ran: {}", buf.contents()))
+            .expect("canary observation");
+        assert!(
+            ready,
+            "the canary must find this daemon's runtime.json and receive a successful state response on its listener"
+        );
     }
 
     // Mirrors Go `TestRunStartsDaemonAndStopsCleanly` (storage forced off to stay hermetic — the
