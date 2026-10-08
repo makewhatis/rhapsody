@@ -15,8 +15,8 @@
 //!
 //! ⚠️ Round crossings count COMPLETED REVIEW RUNS read from the `runs` ledger
 //! (`pr:<owner>/<repo>#<n>@*`), never the review watcher's own dispatch counter
-//! (`rhapsody_review_bound.dispatches`). An operator `clear` resets the latter, and a dispatched
-//! round that never ran spent nothing: the breaker bounds spend that really HAPPENED.
+//! (`rhapsody_review_bound.dispatches`). An operator `clear` resets both counters (STUDIO-1134),
+//! but a dispatched round that never ran spent nothing: only completed runs since clear count.
 //! [`crate::reviewwatch`]'s in-memory round count is the same story — it does not survive a restart.
 //!
 //! Spend crossings sum the ticket's author runs PLUS the review runs on its pull request, split by
@@ -712,7 +712,7 @@ impl Orchestrator {
         if !self.breaker_limits_configured() || !self.review_ticketless_enabled() {
             return;
         }
-        if self.breaker_tx.is_none() {
+        if self.breaker_tx.is_none() && !self.lead_enabled() {
             return;
         }
         // Fail closed while the hold ledger is un-primed, for the reconciliation sweep's reason
@@ -767,6 +767,26 @@ impl Orchestrator {
         }
         for (ticket, owner, repo, number) in seen {
             if let Some(plan) = self.plan_crossing(&ticket, &owner, &repo, number, &persisted) {
+                if self.lead_enabled()
+                    && crate::leaditems::enqueue(
+                        self.store(),
+                        rhapsody_store::LeadTrigger::BreakerHold {
+                            ticket: plan.plan.ticket.clone(),
+                            pr: plan.plan.pr(),
+                            kinds: plan
+                                .plan
+                                .kinds
+                                .iter()
+                                .map(|k| k.as_str().to_string())
+                                .collect(),
+                        },
+                    ) > 0
+                {
+                    // Detection only: T2 owns the lead's convergence judgment and release/hold.
+                    // A durable item replaces the operator hold and page; enqueue failure falls
+                    // through to the existing crossing so it never hides the operator's report.
+                    continue;
+                }
                 // Persist BEFORE handing off, so a restart in the gap still counts the crossing.
                 let row = rhapsody_store::BreakerCrossingRow {
                     ticket: plan.plan.ticket.clone(),
@@ -1144,6 +1164,10 @@ mod tests {
 
         let rows = store.load_breaker_crossings().expect("crossings");
         assert_eq!(rows.len(), 1, "one persisted crossing");
+        assert!(
+            store.load_lead_items().expect("items").is_empty(),
+            "disabled lead keeps the old plan"
+        );
         assert_eq!(rows[0].ticket, "STUDIO-988");
         assert_eq!(rows[0].notified_rounds, 5);
         let plan = rx.try_recv().expect("one plan was sent");
@@ -1157,6 +1181,169 @@ mod tests {
         assert!(
             plan.spend.iter().any(|s| s.provider == "anthropic"),
             "the plan reports the spend by provider"
+        );
+    }
+
+    #[test]
+    fn breaker_hold_becomes_lead_item_instead_of_human_plan() {
+        let store = store();
+        seed_watch(&store, "STUDIO-1123");
+        for _ in 0..5 {
+            seed_run(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                OUTCOME_COMPLETED,
+                10,
+                "",
+            );
+        }
+        let mut o = orch(store.clone(), 5, &[]);
+        o.teams.as_mut().expect("teams").manager.lead.enabled = true;
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        let items = store.load_lead_items().expect("items");
+        assert_eq!(items.len(), 1, "the production crossing queues lead work");
+        assert_eq!(items[0].subject, "STUDIO-1123");
+        assert_eq!(
+            items[0].trigger,
+            rhapsody_store::LeadTrigger::BreakerHold {
+                ticket: "STUDIO-1123".into(),
+                pr: "makewhatis/rhapsody#12".into(),
+                kinds: vec!["review rounds".into()],
+            }
+        );
+        assert!(rx.try_recv().is_err(), "no human hold/notification plan");
+        o.reconcile_breaker();
+        let mut restarted = orch(store.clone(), 5, &[]);
+        restarted
+            .teams
+            .as_mut()
+            .expect("teams")
+            .manager
+            .lead
+            .enabled = true;
+        restarted.reconcile_breaker();
+        assert_eq!(store.load_lead_items().expect("items"), items);
+    }
+
+    #[test]
+    fn lead_breaker_queues_all_crossed_kinds_without_a_notification_task() {
+        let store = store();
+        seed_watch(&store, "STUDIO-1123");
+        for _ in 0..5 {
+            seed_run(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                OUTCOME_COMPLETED,
+                10,
+                "anthropic",
+            );
+        }
+        let mut o = orch(store.clone(), 5, &[("anthropic", 40)]);
+        o.teams.as_mut().expect("teams").manager.lead.enabled = true;
+        o.reconcile_breaker();
+        assert_eq!(
+            store.load_lead_items().expect("items")[0].trigger,
+            rhapsody_store::LeadTrigger::BreakerHold {
+                ticket: "STUDIO-1123".into(),
+                pr: "makewhatis/rhapsody#12".into(),
+                kinds: vec!["review rounds".into(), "per-ticket spend".into()],
+            }
+        );
+    }
+
+    #[test]
+    fn review_clear_resets_breaker_rounds_and_counts_only_later_completions() {
+        let store = store();
+        seed_watch(&store, "STUDIO-1123");
+        for _ in 0..7 {
+            seed_run(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                OUTCOME_COMPLETED,
+                10,
+                "",
+            );
+        }
+        let in_flight = store
+            .start_run(RunStart {
+                issue_identifier: "pr:makewhatis/rhapsody#12@bob".into(),
+                ..Default::default()
+            })
+            .expect("in flight");
+        let mut o = orch(store.clone(), 5, &[]);
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        assert_eq!(rx.try_recv().expect("first hold").rounds, 7);
+        let pr = crate::prstate::PrCoord::new("MakeWhatIs", "Rhapsody", 12);
+        assert_eq!(
+            o.handle_review_clear(&pr),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            store
+                .count_completed_review_runs("makewhatis", "rhapsody", 12)
+                .expect("rounds"),
+            0
+        );
+        assert_eq!(
+            store.load_breaker_crossings().expect("crossings")[0].notified_rounds,
+            0
+        );
+        // A fresh control task proves the reset is durable, not an in-memory refund.
+        let mut o = orch(store.clone(), 5, &[]);
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        assert!(rx.try_recv().is_err());
+        store
+            .end_run(
+                in_flight,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("complete after clear");
+        for _ in 0..3 {
+            seed_run(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                OUTCOME_COMPLETED,
+                10,
+                "",
+            );
+        }
+        // Lifetime count is 11 here: the former next lifetime multiple must NOT hold.
+        o.reconcile_breaker();
+        assert!(
+            rx.try_recv().is_err(),
+            "four post-clear completions stay below five"
+        );
+        seed_run(&store, "pr:makewhatis/rhapsody#12@alice", "failed", 10, "");
+        o.reconcile_breaker();
+        assert!(rx.try_recv().is_err(), "failed reviews are not rounds");
+        seed_run(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            OUTCOME_COMPLETED,
+            10,
+            "",
+        );
+        o.reconcile_breaker();
+        assert_eq!(rx.try_recv().expect("new threshold").rounds, 5);
+        assert_eq!(
+            store.load_breaker_crossings().expect("crossings")[0].notified_rounds,
+            5
+        );
+        assert_eq!(
+            o.handle_review_clear(&pr),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(
+            store
+                .count_completed_review_runs("makewhatis", "rhapsody", 12)
+                .expect("rounds"),
+            0
         );
     }
 
