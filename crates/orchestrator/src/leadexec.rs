@@ -174,6 +174,7 @@ impl LeadRuntime {
                 .and_then(crate::managerintervention::parse_pr_key)
                 .map_or(0, |p| p.number);
             let run = crate::managerrun::ManagerRun {
+                limit_account: String::new(),
                 lead_item: Some(item.id),
                 owner,
                 repo,

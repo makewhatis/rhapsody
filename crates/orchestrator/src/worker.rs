@@ -598,6 +598,8 @@ async fn run_manager_attempt(
     // instead of a `HANDOFF:` line.
     let prompt = if mgr.lead_item.is_some() {
         crate::leadexec::lead_live_prompt(&mgr.case_packet)
+    } else if mgr.key.starts_with("limit:") {
+        mgr.case_packet.clone()
     } else {
         crate::managerrun::manager_live_prompt(&mgr.case_packet)
     };

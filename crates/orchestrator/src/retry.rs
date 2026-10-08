@@ -374,10 +374,7 @@ impl Orchestrator {
         }
         if prepared.is_none()
             && engine.is_none()
-            // A lead was admitted against its selected manager entry. A teammate/default
-            // projection here would test the wrong account; the final actual-account gate below
-            // still runs after the manager override is installed.
-            && !self.pending_manager.get(&iss.id).is_some_and(|m| m.lead_item.is_some())
+            && !self.pending_manager.contains_key(&iss.id)
             && !self.limit_dispatch_ready(&iss, route.as_ref().map_or("", |r| r.slug.as_str()))
         {
             if let Some(attempt) = attempt {
@@ -1040,6 +1037,9 @@ impl Orchestrator {
             .get(&e.issue_id)
             .is_some_and(|re| re.started_at == e.started_at);
         if !live {
+            if self.limit_policy.limited_managers.get(&e.issue_id) == Some(&e.started_at) {
+                self.limit_policy.limited_managers.remove(&e.issue_id);
+            }
             if let Some(suspended) = self.limit_policy.suspended.get_mut(&e.issue_id)
                 && suspended.run.started_at == e.started_at
             {
@@ -1062,6 +1062,7 @@ impl Orchestrator {
             return;
         };
         self.limit_policy.deadlines.remove(&e.issue_id);
+        self.limit_policy.credit_approvals.remove(&e.issue_id);
         self.limit_policy
             .cost_baselines
             .retain(|(run, _), _| *run != re.run_id);
