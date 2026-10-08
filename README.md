@@ -61,6 +61,32 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Manager findings and tracker documents (STUDIO-1146)
+
+The isolated manager role adds `docs_read(path)`, `docs_list(glob)` and
+`tracker_documents(project|issue, query, excerpt)` via GET-only `/api/v1/manager/docs/{read,list}`
+and `/api/v1/manager/tracker/documents`. A live host-bound manager role is required. Claude's
+explicit MCP allowlist and OpenCode's server-prefixed permissions allow these reads without
+enabling any built-in file, shell or web tool. The daemon keeps the tracker key; no document-write
+tool is added. Manager `symphony_ticket` augments its existing run/review history with the scoped
+ticket and attached documents using `/api/v1/manager/tracker/ticket`; ordinary facade history and
+Go-owned payloads remain byte-identical.
+
+Local reads are confined to the canonical `~/.rhapsody/docs` tree, including symlink/parent
+resolution, and descriptor-relative no-follow opens refuse path replacement escapes. Only regular
+UTF-8 files of at most 128 KiB are served. Listing accepts basename globs (`*` and `?`), scans at
+most 4096 entries, returns at most 200 files and reports truncation. Tracker reads use only enabled
+project clients for the manager run's repository, with project/issue membership checks; document
+queries return up to 200 results with bounded metadata and optional 2048-byte excerpts. Every
+response marks content as untrusted data, and the manager instructions forbid obeying it.
+
+The lead decision block gains `resolve {reason}`, used alone to close a lead item when current
+evidence confirms no work is needed, without mutating a ticket. This lets a confirmed document-only
+review finish without an escalation or spurious requeue. Shared-team recall still uses the configured
+bank verbatim (without the personal prefix); failures now identify that bank and a safe backend
+failure reason in the lead packet/log, while decisions continue from current evidence. No frozen
+Go behavior, schema or golden is changed.
+
 ### Tech-lead reporting, daily budgets and operator overrules (STUDIO-1138)
 
 The opt-in lead adds `GET /api/v1/lead/decisions?since=` (RFC3339) and the

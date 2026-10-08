@@ -125,20 +125,24 @@ impl LeadHost for RecordingHost {
 }
 
 fn setup(question: &str) -> (Arc<Sqlite>, RecordingHost, LeadCase) {
+    setup_subject(
+        "TEST-100",
+        LeadTrigger::BlockedHandoff {
+            ticket: "TEST-100".into(),
+            question: question.into(),
+        },
+    )
+}
+
+fn setup_subject(identifier: &str, trigger: LeadTrigger) -> (Arc<Sqlite>, RecordingHost, LeadCase) {
     let store = Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
     let id = store
-        .enqueue_lead_item(
-            &LeadTrigger::BlockedHandoff {
-                ticket: "TEST-100".into(),
-                question: question.into(),
-            },
-            "2026-10-07T12:00:00Z",
-        )
+        .enqueue_lead_item(&trigger, "2026-10-07T12:00:00Z")
         .expect("enqueue");
     let subject = LeadSubject {
         ticket: Issue {
             id: "uuid-100".into(),
-            identifier: "TEST-100".into(),
+            identifier: identifier.into(),
             team_id: "team".into(),
             state: "In Review".into(),
             labels: Some(vec!["rhapsody:@jerry".into()]),
@@ -1277,6 +1281,7 @@ async fn pr_only_decision_writes_subject_paper_trail() {
 }
 
 struct OperatorStub {
+    endpoint: String,
     memory: Arc<rhapsody_config::hindsight::OperatorMemory>,
     requests: Arc<Mutex<Vec<String>>>,
     task: tokio::task::JoinHandle<()>,
@@ -1289,11 +1294,16 @@ impl Drop for OperatorStub {
 }
 
 async fn operator_stub(status: u16) -> OperatorStub {
+    memory_stub(status, "scratch-lead").await
+}
+
+async fn memory_stub(status: u16, bank: &str) -> OperatorStub {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let sink = requests.clone();
+    let bank = bank.to_string();
     let task = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let mut bytes = Vec::new();
@@ -1318,7 +1328,7 @@ async fn operator_stub(status: u16) -> OperatorStub {
                 }
             }
             let request = String::from_utf8(bytes).unwrap();
-            assert!(request.contains("/banks/scratch-lead"), "{request}");
+            assert!(request.contains(&format!("/banks/{bank}")), "{request}");
             sink.lock().unwrap().push(request);
             let body = r#"{"results":[{"id":"pref-1","text":"Prefer diagnosis before spending credits.","metadata":{"by":"David"}}]}"#;
             let response = format!(
@@ -1329,12 +1339,40 @@ async fn operator_stub(status: u16) -> OperatorStub {
         }
     });
     OperatorStub {
+        endpoint: url.clone(),
         memory: Arc::new(
             rhapsody_config::hindsight::OperatorMemory::for_bank(&url, "", "scratch-lead").unwrap(),
         ),
         requests,
         task,
     }
+}
+
+#[tokio::test]
+async fn lead_and_t3_team_recall_use_the_same_hindsight_team_bank_without_prefix() {
+    use rhapsody_config::hindsight::HindsightBackend;
+    let stub = memory_stub(200, "team").await;
+    let (store, _, _) = setup("document publication");
+    let mut runtime = memory_runtime(store, None);
+    runtime.teams.enabled = true;
+    runtime.teams.memory.team_bank = "team".into();
+    let backend = Arc::new(HindsightBackend::new(&stub.endpoint, "agent-", "").unwrap());
+    runtime.memory = Some(backend.clone());
+    let text = runtime
+        .prefetch_memory("STUDIO-598", "document publication")
+        .await;
+    assert!(text.contains("Prefer diagnosis before spending credits"));
+    assert!(!text.contains("Team memory unavailable"));
+    let t3 = crate::teamsmemory::TeamsMemory::new(Arc::new(runtime.teams.clone()), backend);
+    let recalled = t3.recall_team("STUDIO-598", "").await.unwrap();
+    assert_eq!(recalled.identity, "team");
+    assert_eq!(recalled.facts.len(), 1);
+    for request in stub.requests.lock().unwrap().iter() {
+        assert!(request.starts_with("POST /v1/default/banks/team/memories/recall "));
+        assert!(request.contains("experience") && request.contains("world"));
+        assert!(!request.contains("/banks/agent-team"));
+    }
+    assert_eq!(stub.requests.lock().unwrap().len(), 2);
 }
 
 fn memory_runtime(
@@ -1472,4 +1510,154 @@ fn recalled_memory_cannot_forge_host_structure_and_reports_omissions() {
         ..Default::default()
     });
     assert!(render_memory(&recalled).contains("Showing 1 of 2 recalled facts"));
+}
+
+#[tokio::test]
+async fn lead_can_resolve_a_confirmed_document_only_review_without_effects() {
+    let (store, host, case) = setup("design-only review has no PR");
+    let result = replay(store.as_ref(), &host, &case, serde_json::json!([{"action":"resolve","reason":"Findings read; published project document confirmed."}])).await;
+    assert!(result.escalation.is_none(), "{:?}", result.escalation);
+    assert_eq!(result.state, "done");
+    assert!(
+        host.calls
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|c| c.starts_with("ticket_line:")
+                || c.starts_with("room:")
+                || c.starts_with("retain:"))
+    );
+}
+
+#[tokio::test]
+async fn resolve_is_standalone_and_stale_evidence_cannot_close_an_item() {
+    for stale in [false, true] {
+        let (store, host, case) = setup("document-only review");
+        let actions = if stale {
+            host.subject.lock().unwrap().ticket.state = "Todo".into();
+            serde_json::json!([{"action":"resolve","reason":"document confirmed"}])
+        } else {
+            serde_json::json!([{"action":"resolve","reason":"document confirmed"},{"action":"requeue","ticket":"TEST-100"}])
+        };
+        let result = replay(store.as_ref(), &host, &case, actions).await;
+        if stale {
+            assert_eq!(result.state, "queued");
+        } else {
+            assert!(
+                result
+                    .escalation
+                    .as_deref()
+                    .unwrap()
+                    .contains("resolve must be the only action")
+            );
+        }
+        assert!(
+            host.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| !c.starts_with("todo:"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn replay_studio_598_and_1142_reads_findings_confirms_publication_and_resolves() {
+    let dir = crate::testsupport::TempDir::new();
+    // The diagnosis' consequential findings, including the one publication check it could not do.
+    std::fs::write(dir.child("STUDIO-1142-findings.md"), "STUDIO-598 is a valid document-only review. No unmet acceptance criterion found. Confirm the design document exists on the Rhapsody project in Linear.").unwrap();
+    for identifier in ["STUDIO-598", "STUDIO-1142"] {
+        let (store, host, mut case) = setup_subject(
+            identifier,
+            LeadTrigger::ImpossibleState {
+                subject: identifier.into(),
+                kind: "in_review_no_pr".into(),
+            },
+        );
+        case.subject.pr = None;
+        *host.subject.lock().unwrap() = case.subject.clone();
+        let mut tracker = rhapsody_tracker::fake::Fake::new();
+        tracker.candidates.push(case.subject.ticket.clone());
+        tracker.documents.insert(
+            "".into(),
+            rhapsody_tracker::Documents {
+                documents: vec![rhapsody_tracker::Document {
+                    title: "STUDIO-598 — hot-loadable plugins".into(),
+                    url: "https://linear.app/document/rhapsody-plugins".into(),
+                    updated_at: "2026-08-29T00:00:00Z".into(),
+                    excerpt: Some("Accepted, design only; slices P1–P9.".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        );
+        let (handle, id, _) =
+            crate::testsupport::manager_evidence_handle(store.clone(), Arc::new(tracker));
+        let listing =
+            crate::managerdocs::list(std::path::Path::new(&dir.path), "STUDIO-1142-*.md").unwrap();
+        let file = listing["files"][0]["path"].as_str().unwrap();
+        let findings = crate::managerdocs::read(std::path::Path::new(&dir.path), file).unwrap();
+        let published = handle
+            .tracker_documents(id, "rhapsody", "", "STUDIO-598", true)
+            .await
+            .unwrap();
+        let ticket = handle.manager_ticket(id, identifier).await.unwrap();
+        assert_eq!(ticket["issue"]["identifier"], identifier);
+        case.evidence = format!(
+            "docs_list: {listing}\ndocs_read: {findings}\ntracker_documents: {published}\nsymphony_ticket: {ticket}"
+        );
+        // Scripted lead chooses from tool evidence. It refuses resolution when either half is absent.
+        let confirmed = findings["content"]
+            .as_str()
+            .unwrap()
+            .contains("valid document-only review")
+            && published["documents"][0]["url"] == "https://linear.app/document/rhapsody-plugins"
+            && published["documents"][0]["updated_at"] == "2026-08-29T00:00:00Z";
+        let actions = if confirmed {
+            serde_json::json!([{"action":"resolve","reason":"Findings read; STUDIO-598 design publication confirmed on the configured project. No work needed."}])
+        } else {
+            serde_json::json!([{"action":"escalate","need":"artifact could not be confirmed"}])
+        };
+        let expected_decision = format!("done: {actions}");
+        let result = replay(store.as_ref(), &host, &case, actions).await;
+        assert!(
+            result.escalation.is_none(),
+            "{identifier}: {:?}",
+            result.escalation
+        );
+        assert_eq!(store.load_lead_items().unwrap()[0].state, "done");
+        assert_eq!(store.load_lead_items().unwrap()[0].subject, identifier);
+        assert_eq!(
+            store.load_lead_decisions().unwrap()[0].decision,
+            expected_decision
+        );
+        assert!(
+            host.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|c| c.starts_with("ticket_line:")
+                    || c.starts_with("room:")
+                    || c.starts_with("retain:"))
+        );
+    }
+}
+
+#[tokio::test]
+async fn team_memory_unavailability_identifies_the_bank_and_failure() {
+    let (store, _, _) = setup("find design document");
+    let mut runtime = memory_runtime(store, None);
+    runtime.teams.memory.team_bank = "team".into();
+    runtime.memory = Some(Arc::new(
+        rhapsody_config::hindsight::HindsightBackend::new("http://127.0.0.1:1", "agent-", "")
+            .unwrap(),
+    ));
+    let text = runtime
+        .prefetch_memory("STUDIO-598", "find design document")
+        .await;
+    assert!(text.contains("Team memory unavailable"));
+    assert!(
+        text.contains("bank=team") && text.contains("backend request failed"),
+        "{text}"
+    );
 }
