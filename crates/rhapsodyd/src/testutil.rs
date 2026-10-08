@@ -11,6 +11,12 @@ use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::fmt::MakeWriter;
 
+pub async fn http_listener() -> (tokio::net::TcpListener, String) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    (listener, url)
+}
+
 /// A shared in-memory writer capturing the daemon's stderr fan (Go's tests pass a `bytes.Buffer`).
 /// Implements both [`Write`] (for the banner + fatal-error lines the boot writes directly) and
 /// [`MakeWriter`] (for `telemetry::init`'s fmt layer), the two ways `run` consumes `stderr`. It is

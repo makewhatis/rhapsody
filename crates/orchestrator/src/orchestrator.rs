@@ -1038,6 +1038,7 @@ pub struct Orchestrator {
     pub(crate) drain: crate::drain::DrainSignal,
     /// Account observations written on the control task and read off-loop by HTTP.
     pub(crate) accounts: Arc<crate::accounts::AccountLedger>,
+    pub(crate) chatgpt_queued: bool,
     pub(crate) limit_policy: crate::limitpolicy::LimitPolicy,
     /// What the last tick observed about the armed drain, for the gate's logging. `Some` exactly
     /// when the previous tick found the drain armed, which is what makes the cancel transition
@@ -1256,6 +1257,7 @@ impl Orchestrator {
             // inert, i.e. byte-identical to a daemon built before the feature.
             drain: crate::drain::DrainSignal::new(),
             accounts: Arc::new(crate::accounts::AccountLedger::default()),
+            chatgpt_queued: false,
             limit_policy: crate::limitpolicy::LimitPolicy::default(),
             drain_gate: None,
             // STUDIO-988: no resolver, no reservations, an empty gate → preparation is inert by
