@@ -199,6 +199,8 @@ pub struct ControlHandle {
 
     /// Boot-loaded lead reporting service; HTTP reads/overrules stay off the control task.
     pub(crate) lead_reports: Option<std::sync::Arc<crate::leadreport::LeadReports>>,
+    /// Cached manager health shared with HTTP (STUDIO-1145); no new state lock.
+    pub(crate) manager_selftest: std::sync::Arc<crate::managerselftest::ManagerSelfTestState>,
 
     /// Wake the off-loop reporter as soon as an escalation decision is durable.
     pub(crate) lead_report_tx: Option<tokio::sync::mpsc::UnboundedSender<()>>,
@@ -236,6 +238,7 @@ impl crate::orchestrator::Orchestrator {
             manager_gh: self.manager_gh_deps.as_ref().map(std::sync::Arc::clone),
             investigate: self.investigate.clone(),
             lead_reports: self.lead_reports.clone(),
+            manager_selftest: self.manager_selftest.clone(),
             lead_report_tx: self.lead_report_tx.clone(),
         }
     }

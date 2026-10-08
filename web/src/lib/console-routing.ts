@@ -9,7 +9,7 @@
 // `hooks/useConsoleRoute.ts`, which keeps the redirect and highlight rules testable
 // without a DOM.
 
-/** Every route the console serves (§2.3). `job` is the only one that carries a key. */
+/** Every route the console serves (§2.3). `job` and Lead decision links carry keys. */
 export const CONSOLE_ROUTES = [
   "jobs",
   "accounts",
@@ -31,7 +31,7 @@ export type ConsoleRouteName = (typeof CONSOLE_ROUTES)[number];
 
 export interface ConsoleRoute {
   name: ConsoleRouteName;
-  /** The ticket key for `job/:key`; "" for every other route. */
+  /** Ticket key for `job/:key`, entry id for `lead/:key`; "" otherwise. */
   key: string;
 }
 
@@ -96,12 +96,12 @@ export function parseConsoleRoute(hash: string): ConsoleRoute {
 
   const [head, ...rest] = path.split("/");
   if (!isRouteName(head)) return DEFAULT_CONSOLE_ROUTE;
-  if (head !== "job") return { name: head, key: "" };
+  if (head !== "job" && head !== "lead") return { name: head, key: "" };
 
   // `job` without a key is not a view — there is no ticket to render — so it lands on Jobs.
   const raw = rest.join("/");
-  if (raw === "") return DEFAULT_CONSOLE_ROUTE;
-  return { name: "job", key: safeDecode(raw) };
+  if (raw === "") return head === "lead" ? { name: "lead", key: "" } : DEFAULT_CONSOLE_ROUTE;
+  return { name: head, key: safeDecode(raw) };
 }
 
 // A hand-typed key can carry a stray `%`, which decodeURIComponent throws on. The key is
@@ -117,8 +117,8 @@ function safeDecode(raw: string): string {
 
 /** The hash a route navigates to — the inverse of `parseConsoleRoute`. */
 export function consoleRouteHash(route: ConsoleRoute): string {
-  if (route.name === "job" && route.key !== "") {
-    return `#job/${encodeURIComponent(route.key)}`;
+  if ((route.name === "job" || route.name === "lead") && route.key !== "") {
+    return `#${route.name}/${encodeURIComponent(route.key)}`;
   }
   return `#${route.name}`;
 }

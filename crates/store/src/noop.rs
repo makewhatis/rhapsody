@@ -12,6 +12,18 @@ use crate::*;
 pub struct Noop;
 
 impl Store for Noop {
+    fn notices_enabled(&self) -> bool {
+        false
+    }
+    fn observe_notices(&self, _rows: &[Notice], _at: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn notices(&self) -> Result<Vec<Notice>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn read_notice(&self, _id: i64, _at: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn reserve_lead_run_daily(
         &self,
         _item: i64,

@@ -126,6 +126,21 @@ impl From<rusqlite::Error> for StoreError {
 /// err)` triple for a single lookup becomes `Result<Option<_>, _>`, and Go pointer fields map to
 /// [`Option`].
 pub trait Store {
+    fn notices_enabled(&self) -> bool {
+        false
+    }
+    /// Observe a complete, successful notice snapshot, resolving absent transient episodes.
+    /// Existing observations never reset read state. Off stores retain the no-op contract.
+    fn observe_notices(&self, _rows: &[Notice], _at: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn notices(&self) -> Result<Vec<Notice>, StoreError> {
+        Ok(Vec::new())
+    }
+    /// Idempotent acknowledgement; false means the id does not exist.
+    fn read_notice(&self, _id: i64, _at: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Atomically deduplicates tech-lead work on (subject, question). Zero means storage is off.
     fn enqueue_lead_item(&self, _trigger: &LeadTrigger, _at: &str) -> Result<i64, StoreError> {
         Ok(0)

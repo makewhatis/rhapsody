@@ -691,6 +691,19 @@ export interface LeadDecisionsResponse {
   decisions: LeadDecision[];
   queued: { id: number; subject: string; state: string; trigger: string }[];
 }
+export type NoticeGroup = "needs_you" | "decisions" | "system" | "activity";
+export interface DaemonNotice {
+  id: number; kind: string; group: NoticeGroup; subject: string; summary: string;
+  href: string; at: string; read_at: string | null; active: boolean;
+}
+export interface NotificationsResponse { notifications: DaemonNotice[] }
+export function fetchNotifications(): Promise<NotificationsResponse> {
+  return getJSON("/api/v1/notifications");
+}
+export async function readNotification(id: number): Promise<void> {
+  const response = await operatorPost(`/api/v1/notifications/${id}/read`, {});
+  if (!response.ok) throw new Error(await daemonErrorMessage(response, "Notification could not be marked read"));
+}
 export function fetchLeadDecisions(since = ""): Promise<LeadDecisionsResponse> {
   return getJSON(`/api/v1/lead/decisions${since ? `?since=${encodeURIComponent(since)}` : ""}`);
 }

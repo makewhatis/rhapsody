@@ -130,6 +130,7 @@ pub struct DaemonState {
     /// The read-only history view, narrowed once from the handle's shared store (stable for the
     /// daemon's lifetime — the store is injected before `Run`).
     history: Arc<dyn HistoryStore>,
+    notifications: Option<Arc<dyn Store + Send + Sync>>,
     /// Where this daemon reads `teams.yaml`, for the enable flow's `GET`/`POST
     /// /api/v1/teams/config` (STUDIO-652). Empty ⇒ no on-disk runtime home, so there is no
     /// `teams.yaml` to read or write and the endpoint says so.
@@ -151,9 +152,22 @@ impl DaemonState {
     /// `o.control()`) BEFORE the orchestrator moves into the control-loop task.
     pub fn new(handle: ControlHandle) -> Self {
         let history: Arc<dyn HistoryStore> = Arc::new(HistoryView(handle.store()));
+        let store = handle.store();
+        let notifications = if store.notices_enabled() {
+            Some(store)
+        } else {
+            match rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory) {
+                Ok(store) => Some(Arc::new(store) as Arc<dyn Store + Send + Sync>),
+                Err(error) => {
+                    tracing::warn!(%error, "notification state unavailable");
+                    None
+                }
+            }
+        };
         Self {
             handle,
             history,
+            notifications,
             teams_config_path: String::new(),
             provider: None,
             account_now_s: None,
@@ -187,6 +201,12 @@ impl DaemonState {
 
 #[async_trait]
 impl StateProvider for DaemonState {
+    fn notification_store(&self) -> Option<Arc<dyn Store + Send + Sync>> {
+        self.notifications.clone()
+    }
+    fn manager_notices(&self) -> Vec<String> {
+        self.handle.manager_health_notices()
+    }
     fn lead_reports(&self) -> Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>> {
         self.handle.lead_reports()
     }
@@ -746,6 +766,33 @@ mod tests {
             .list_runs(RunFilter::default())
             .expect("list runs");
         assert!(runs.is_empty(), "fresh store must have no runs");
+    }
+
+    #[test]
+    fn a_no_history_daemon_still_shares_notification_read_state_in_memory() {
+        let o = Orchestrator::new("WORKFLOW.md");
+        let state = DaemonState::new(o.control());
+        let browser = state.notification_store().unwrap();
+        browser
+            .observe_notices(
+                &[rhapsody_store::Notice {
+                    source: "test".into(),
+                    ..Default::default()
+                }],
+                "2026-10-08T10:00:00Z",
+            )
+            .unwrap();
+        let id = browser.notices().unwrap()[0].id;
+        let desktop = state.notification_store().unwrap();
+        desktop.read_notice(id, "2026-10-08T10:01:00Z").unwrap();
+        assert!(browser.notices().unwrap()[0].read_at.is_some());
+        assert!(
+            state
+                .history()
+                .list_runs(RunFilter::default())
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // run_transcript for an absent run id → None (Go `found == false`).

@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/utils";
 import { InfoIcon, WarnIcon } from "./icons";
 
-export type NoteVariant = "warn" | "info";
+export type NoteVariant = "warn" | "info" | "operator";
 
 export interface NoteProps {
   variant?: NoteVariant;

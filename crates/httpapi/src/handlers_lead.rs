@@ -121,6 +121,22 @@ mod tests {
     use crate::testutil::{FakeProvider, empty_snapshot, spawn_router};
     use rhapsody_store::{LeadDecisionRow, LeadTrigger, Sqlite, Store, StorePath};
     #[tokio::test]
+    async fn notification_api_exists_independently_of_lead_capability() {
+        let url = spawn_router(crate::new_handler(
+            Arc::new(FakeProvider::ok(empty_snapshot())),
+            None,
+        ))
+        .await;
+        let response = reqwest::get(format!("{url}/api/v1/notifications"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["notifications"],
+            serde_json::json!([])
+        );
+    }
+    #[tokio::test]
     async fn version_exposes_effective_lead_capability() {
         for enabled in [false, true] {
             let provider = FakeProvider::ok(empty_snapshot());

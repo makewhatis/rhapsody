@@ -162,3 +162,8 @@ describe("the Settings tab routes (STUDIO-691)", () => {
     }
   });
 });
+it("round-trips a Lead notification's exact decision entry", () => {
+  const route = parseConsoleRoute("#lead/decision-17");
+  expect(route).toEqual({ name: "lead", key: "decision-17" });
+  expect(consoleRouteHash(route)).toBe("#lead/decision-17");
+});

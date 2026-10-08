@@ -133,6 +133,20 @@ Investigation settings can tighten its existing hard ceilings (2 CPUs, 4g, 10-mi
 Advise decisions become terminal proposals in the human feed, without work mutations. Explicit
 escalations still page with the stated need. The console's Lead page lists the paper trail and
 offers Overrule in both the browser dashboard and desktop window.
+The shared browser/desktop notification centre groups Needs you, Decisions, System and Activity
+(STUDIO-1145). `GET /api/v1/notifications` observes local snapshots, durable lead decisions/activity
+events and structured auto-merge success logs; migration **33** stores deduplicated compact notices
+and read state in `rhapsody_notifications`, with `rhapsody_notifications_active_source` dedupe
+and the `rhapsody_notifications_snapshot` admission watermark. Operator-guarded
+`POST /api/v1/notifications/{id}/read` is idempotent. Dismissals
+synchronize between clients; resolved live conditions become read history and a new episode is
+unread. Decisions are informational; only unread Needs-you notices use the operator tone and
+appear in the expandable slim strip and the Jobs tile count. The PR-attention banner is removed.
+System notices also feed Accounts status and the health dot. With history disabled, notice state
+uses process-local SQLite without creating a disk file; it lasts for that daemon's lifetime.
+Lead runs stay out of Jobs
+ticket lanes, nav counts and whole-store ticket tallies; the Lead page shows running/queued
+work under its real ticket or PR subject, without displaying the synthetic `#0` coordinate.
 The additive `/api/v1/version` capability `lead_enabled: true` is present only when the reporting
 service is installed (lead enabled and durable storage available); otherwise it is omitted.
 The console omits Lead and redirects its deep link when that capability is unavailable.

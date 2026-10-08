@@ -8,6 +8,7 @@ export type PillVariant =
   | "queued"
   | "done"
   | "blocked"
+  | "operator"
   | "parked";
 
 /**
@@ -26,6 +27,7 @@ export const PILL_COLORS: Record<PillVariant, string> = {
   queued: "var(--ink-3)",
   done: "var(--info)",
   blocked: "var(--bad)",
+  operator: "var(--operator)",
   // `parked` (STUDIO-966) — a ticket outside its project's `active_states`, which no agent will
   // pick up: a deliberate hold, not a failure. Its own hue because `queued`'s grey would read as
   // "an agent is coming" and `blocked`'s red as a fault, and neither is true.

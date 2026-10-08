@@ -49,6 +49,7 @@ import { useJobsViewMode } from "@/hooks/useJobsViewMode";
 import { useBoardLaneWidth } from "@/hooks/useBoardLaneWidth";
 import { useBoardCardFields } from "@/hooks/useBoardCardFields";
 import { BoardView } from "./BoardView";
+import { useNotificationCentre } from "./NotificationCentre";
 
 const ALL_PROJECTS = "";
 
@@ -144,6 +145,7 @@ export function JobsView({
   // `payload.held_for_human` itself, by identity, which is the only way to avoid counting a hold
   // that already ran twice. See `consoleStoreCounts`.
   const counts = consoleStoreCounts(issueCounts.data, state.data?.blocked);
+  const notifications = useNotificationCentre();
   const mates = mateStates(overview.data);
   const roster = mates.map((m) => m.name);
   // In Board mode the lanes ARE the status axis (STUDIO-932), so the status filter does not apply:
@@ -207,20 +209,11 @@ export function JobsView({
           <Stat value={counts?.running ?? "—"} label="running" />
           <Stat value={counts?.queued ?? "—"} label="queued" />
           <Stat value={counts?.blocked ?? "—"} label="blocked" tone="bad" />
-          {/* The operator's own queue (STUDIO-743, design record §6), and the strip's ONLY
-              human-attention flag. §3 originally painted an "in review" stat here too; David's
-              2026-09-03 decision dropped it, because the two reported the same set two pills
-              apart — a duplicate in a different colour rather than a second fact. "Needs you"
-              IS the in-review-that-needs-you, widened by the failed runs that also want a
-              person, so it cuts across the three above rather than partitioning with them (see
-              `needsOperator`). The in-review rows themselves are still one click away on the Seg
-              below, which is where a count of them belongs if one is ever wanted again.
-
-              Unlike the three it can also be UNANSWERABLE even once the tally has landed: when the
-              daemon resolved no ticket lifecycle at all, it says "—" rather than a number — see
-              `ConsoleJobCounts`. All four say "—" before the first tally arrives, because a zero
-              there would be a claim that the store is empty. */}
-          <Stat value={counts?.needsYou ?? "—"} label="needs you" tone="op" />
+          {/* One operator queue/count, shared with the centre (STUDIO-1145). Ticket
+              lifecycle tallies are not notifications and must not inflate this tile. */}
+          <button className="needs-tile" onClick={() => notifications.show("needs_you")} aria-label={`Needs you, ${notifications.needsYou ?? "unknown"} unread`}>
+            <Stat value={notifications.needsYou ?? "—"} label="needs you" tone="op" />
+          </button>
         </NowStats>
       </NowStrip>
 
