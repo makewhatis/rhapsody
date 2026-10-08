@@ -715,6 +715,7 @@ pub trait Store {
     /// Estimated overage dollars recorded by L4 as cost-delta events, including live runs.
     /// `usd_accounting_available` gates disabled stores; an unreadable active ledger is an error,
     /// so `daily_cap` cannot silently refund itself on restart.
+    /// An unknown cost returns infinity for the local day, keeping unmetered turns fail-closed.
     fn account_credit_spend(&self, _account: &str, _since: &str) -> Result<f64, StoreError> {
         Ok(0.0)
     }

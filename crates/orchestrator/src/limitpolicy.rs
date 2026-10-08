@@ -59,14 +59,14 @@ pub fn level(ledger: &AccountLedger, account: &str, cfg: &Limits, now_s: i64) ->
     if cfg.credits == "always" && t.warn == 100.0 && t.stop_new == 100.0 && t.handoff == 100.0 {
         return Level::Ok;
     }
+    if view.status == "rejected" {
+        return Level::Wall;
+    }
     if view.using_credits {
         return match cfg.credits.as_str() {
             "always" | "daily_cap" => Level::Ok,
             _ => Level::Wall,
         };
-    }
-    if view.status == "rejected" {
-        return Level::Wall;
     }
     let percent = ledger
         .tightest(account, now_s)
@@ -123,7 +123,7 @@ pub(crate) struct LimitPolicy {
 pub(crate) struct Suspended {
     pub run: RunningEntry,
     pub outcome: HandoffOutcome,
-    pub note: PathBuf,
+    pub note: Option<PathBuf>,
     pub worker_finished: bool,
     pub account: Option<crate::accounts::AccountView>,
 }
@@ -146,7 +146,7 @@ struct ResumeRecord {
     stack_context: String,
     review: Option<crate::review::ReviewRun>,
     outcome: HandoffOutcome,
-    note: PathBuf,
+    note: Option<PathBuf>,
     account: Option<crate::accounts::AccountView>,
 }
 
@@ -340,6 +340,19 @@ impl Orchestrator {
                     .and_then(|dir| rhapsody_config::profiles::resolve(dir, &i.profile).ok())
             });
         let harness = self.effective_harness(profile.as_ref().map_or("", |p| p.harness.as_str()));
+        // Explicit providers are stable account ids, even when the model names another provider.
+        // The preparation path selects profile > global; without a registry it stays native.
+        if self.config_defines_any_provider() {
+            let provider = profile.as_ref().map_or("", |p| p.provider.as_str());
+            if !provider.is_empty() {
+                return provider.into();
+            }
+            if let Some(eff) = &self.eff
+                && !eff.cfg.agent.provider.is_empty()
+            {
+                return eff.cfg.agent.provider.clone();
+            }
+        }
         let mut model = rhapsody_agent::ModelOverride {
             model: profile.map(|p| p.model).unwrap_or_default(),
             ..Default::default()
@@ -604,7 +617,6 @@ impl Orchestrator {
             rhapsody_store::OUTCOME_LIMIT,
             &format!("{account} limit"),
         );
-        self.persist_complete(&re.issue.identifier);
         self.persist_totals();
         self.claimed.insert(re.issue.id.clone());
         self.completed.remove(&re.issue.id);
@@ -655,17 +667,16 @@ impl Orchestrator {
         // directory is deliberately removed on exit. L5 owns their ordered engine fallback; a
         // limited manager therefore goes to the human feed rather than pretending it can park.
         let note = match self.write_limit_note(&re, account) {
-            Ok(path) => path,
+            Ok(path) => Some(path),
             Err(error) => {
                 tracing::warn!(%error, ticket = %re.issue.identifier, "limit: note could not be written; holding for a human");
-                self.queue_limit_item(item);
-                return;
+                None
             }
         };
         for ticket in &mut item.tickets {
-            ticket.handoff_note = Some(note.clone());
+            ticket.handoff_note = note.clone();
         }
-        let outcome = if crate::managerrun::is_manager_key(&re.issue.id) {
+        let outcome = if note.is_none() || crate::managerrun::is_manager_key(&re.issue.id) {
             HandoffOutcome::ManagerItem(item.clone())
         } else {
             decide(&self.accounts, item.clone(), &cfg, now, next)
@@ -886,7 +897,7 @@ impl Orchestrator {
         let engine = crate::dispatch::DispatchEngine {
             index,
             spec,
-            handoff_note: Some(suspended.note.clone()),
+            handoff_note: suspended.note.clone(),
         };
         self.limit_policy.resume_sessions.insert(id.into(), resume);
         if old.brokered && matches!(suspended.outcome, HandoffOutcome::Park { .. }) {
@@ -1182,6 +1193,19 @@ impl Orchestrator {
                     .any(|v| v.account == account && v.using_credits)
             {
                 tracing::warn!(%account, "limit: the harness omitted overage cost; daily_cap cannot be enforced, refusing credits");
+                if let Some(re) = self.running.get_mut(id) {
+                    re.event_seq += 1;
+                    let row = rhapsody_store::EventRow {
+                        seq: re.event_seq,
+                        at: crate::persist::rfc3339((self.now)()),
+                        kind: "limit.credit_cost_unknown".into(),
+                        tool: String::new(),
+                        text: serde_json::json!({"account":account}).to_string(),
+                    };
+                    if let Err(error) = self.store.append_events(re.run_id, &[row]) {
+                        tracing::warn!(%error, "limit: unknown credit cost could not be recorded");
+                    }
+                }
                 self.limit_policy
                     .credit_spent
                     .insert((account, day(now)), f64::INFINITY);
@@ -1431,6 +1455,196 @@ mod tests {
             tickets: vec![],
             credits_policy: "never".into(),
         }
+    }
+
+    #[test]
+    fn review_b1_credits_do_not_mask_a_rejected_window() {
+        for policy in ["daily_cap", "always"] {
+            let (mut o, _, _, _dir) = setup(false);
+            dispatch(&mut o);
+            o.eff.as_mut().unwrap().cfg.limits.credits = policy.into();
+            o.eff.as_mut().unwrap().cfg.limits.credits_daily_usd = 10.0;
+            let mut credits = observation(1.0, 1200);
+            credits.using_credits = true;
+            o.accounts.observe("claude-subscription", credits);
+            let mut rejected = observation(0.99, 9000);
+            rejected.windows[0].window = "seven_day".into();
+            rejected.status = LimitStatus::Rejected;
+            o.accounts.observe("claude-subscription", rejected);
+            assert_eq!(
+                level(&o.accounts, "claude-subscription", &o.limits_config(), 1000),
+                Level::Wall,
+                "{policy} cannot bypass a rejected window"
+            );
+            assert!(!o.account_usable("claude-subscription"));
+            o.enforce_limits();
+            assert!(o.running.is_empty());
+        }
+    }
+
+    #[test]
+    fn review_b2_reviewer_routes_by_explicit_provider_not_model_prefix() {
+        let (mut o, st, _, dir) = setup(false);
+        std::fs::write(
+            dir.child("worker.md"),
+            "---\nharness: opencode\nprovider: paid\nmodel: openai/model\n---\nReviewer\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.child("bob.md"),
+            "---\nharness: opencode\nprovider: healthy\nmodel: openai/model\n---\nReviewer\n",
+        )
+        .unwrap();
+        for id in ["paid", "healthy"] {
+            o.eff.as_mut().unwrap().cfg.providers.insert(
+                id.into(),
+                rhapsody_config::ProviderDefinition {
+                    id: id.into(),
+                    protocol: "openai-compatible".into(),
+                    base_url: "https://example.test/v1".into(),
+                    ..Default::default()
+                },
+            );
+        }
+        o.teams
+            .as_mut()
+            .unwrap()
+            .roster
+            .push(rhapsody_config::teams::Identity {
+                name: "bob".into(),
+                profile: "bob".into(),
+                ..Default::default()
+            });
+        o.teams.as_mut().unwrap().quorum.reviewers = 1;
+        o.accounts.observe("paid", observation(0.91, 5000));
+        let teams = o.teams.as_ref().unwrap();
+        assert_eq!(o.reviewer_limit_account(teams, "alice"), "paid");
+        assert_eq!(
+            crate::quorum::select_reviewers(
+                teams,
+                "author",
+                &HashMap::new(),
+                &o.reviewer_exclusions(teams)
+            ),
+            vec!["bob"]
+        );
+        let review = crate::review::ReviewRun {
+            owner: "owner".into(),
+            repo: "repo".into(),
+            number: 1,
+            reviewer: "alice".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            o.review_projected_pricing(&review.synthetic_issue(), "")
+                .account,
+            "paid"
+        );
+        // A model prefix that happens to be limited must not exclude the healthy explicit account.
+        o.accounts.observe("openai", observation(0.99, 5000));
+        o.accounts
+            .observe("chatgpt-subscription", observation(0.99, 5000));
+        assert!(!o.reviewer_exclusions(teams).excludes("bob"));
+        let watch = review.watch_key();
+        let iss = review.synthetic_issue();
+        assert!(!o.finish_review_dispatch_prepared(
+            review,
+            crate::retry::DispatchRoute {
+                slug: String::new(),
+                group: String::new(),
+                repo: String::new(),
+                model: String::new(),
+                workspace_mode: String::new(),
+            },
+            iss,
+            None,
+        ));
+        assert!(st.get_review_watch(&watch).unwrap().is_none());
+        assert!(o.running.is_empty());
+    }
+
+    #[test]
+    fn review_b3_note_write_failure_keeps_a_durable_human_suspension() {
+        let (mut o, _, _, dir) = setup(false);
+        let db = StorePath::Disk(dir.child("limit.db").into());
+        let st: Arc<dyn Store + Send + Sync> = Arc::new(Sqlite::open(db.clone()).unwrap());
+        o.set_store(st.clone());
+        dispatch(&mut o);
+        std::fs::write(dir.child("not-a-directory"), "blocked").unwrap();
+        o.limit_policy.docs_dir = Some(dir.child("not-a-directory").into());
+        o.accounts
+            .observe("claude-subscription", observation(1.0, 1200));
+        o.enforce_limits();
+        assert!(o.running.is_empty());
+        assert!(
+            st.load_recovery()
+                .unwrap()
+                .retries
+                .iter()
+                .any(|r| r.identifier == "MT-1" && r.error.starts_with(RETRY_LIMIT_PREFIX))
+        );
+        drop(o);
+        drop(st);
+        let (mut recovered, _, clock, _dir) = setup(false);
+        recovered.set_store(Arc::new(Sqlite::open(db).unwrap()));
+        recovered.boot_recovery();
+        let suspended = &recovered.limit_policy.suspended["1"];
+        assert!(matches!(suspended.outcome, HandoffOutcome::ManagerItem(_)));
+        assert_eq!(suspended.run.thread_id, "session-before-limit");
+        assert_eq!(suspended.run.retry_attempt, 2);
+        assert!(recovered.claimed.contains("1"));
+        assert!(recovered.retry_attempts.is_empty());
+        assert_eq!(
+            recovered.limit_policy.items[0].tickets[0].handoff_note,
+            None
+        );
+        clock.store(1320, Ordering::SeqCst);
+        let mut iss = issue("1", "MT-1", "Todo");
+        iss.labels = Some(vec!["rhapsody:@alice".into()]);
+        assert!(recovered.select_dispatch(vec![iss]).is_empty());
+    }
+
+    #[test]
+    fn review_b4_unknown_credit_cost_survives_reopen_for_the_local_day() {
+        let (mut o, _, _, dir) = setup(false);
+        let db = StorePath::Disk(dir.child("limit.db").into());
+        o.set_store(Arc::new(Sqlite::open(db.clone()).unwrap()));
+        dispatch(&mut o);
+        o.eff.as_mut().unwrap().cfg.limits.credits = "daily_cap".into();
+        o.eff.as_mut().unwrap().cfg.limits.credits_daily_usd = 10.0;
+        let mut credits = observation(1.0, 1200);
+        credits.using_credits = true;
+        o.accounts.observe("claude-subscription", credits);
+        o.on_agent_update(crate::AgentUpdate {
+            issue_id: "1".into(),
+            ev: rhapsody_agent::Event {
+                event_type: rhapsody_agent::EVENT_TURN_COMPLETED.into(),
+                usage: Some(Default::default()),
+                ..Default::default()
+            },
+        });
+        assert!(o.running.is_empty());
+        drop(o);
+        let (mut recovered, _, clock, _dir) = setup(false);
+        recovered.eff.as_mut().unwrap().cfg.limits.credits = "daily_cap".into();
+        recovered.eff.as_mut().unwrap().cfg.limits.credits_daily_usd = 10.0;
+        recovered.set_store(Arc::new(Sqlite::open(db).unwrap()));
+        recovered.boot_recovery();
+        // Even after the plan window reset, the day's unknown bill must still refuse credits.
+        clock.store(1320, Ordering::SeqCst);
+        let mut credits = observation(1.0, 5000);
+        credits.observed_at_s = 1320;
+        credits.using_credits = true;
+        recovered.accounts.observe("claude-subscription", credits);
+        assert!(!recovered.account_usable("claude-subscription"));
+        assert!(
+            recovered
+                .credit_spent("claude-subscription", 1320)
+                .is_infinite()
+        );
+        assert_eq!(recovered.credit_spent("other-account", 1320), 0.0);
+        let tomorrow = day(1320) + 86400;
+        assert_eq!(recovered.credit_spent("claude-subscription", tomorrow), 0.0);
     }
 
     #[tokio::test]
@@ -1786,7 +2000,8 @@ mod tests {
             st.issue_history("MT-1", "", 10).unwrap()[0].outcome,
             "limit"
         );
-        let text = std::fs::read_to_string(&o.limit_policy.suspended["1"].note).unwrap();
+        let text =
+            std::fs::read_to_string(o.limit_policy.suspended["1"].note.as_ref().unwrap()).unwrap();
         assert!(text.contains("Committed work") && text.contains("next: finish tests"));
     }
 
@@ -1799,7 +2014,13 @@ mod tests {
         o.accounts.observe("claude-subscription", wall);
         o.enforce_limits();
         assert!(o.running.is_empty());
-        assert!(o.limit_policy.suspended["1"].note.exists());
+        assert!(
+            o.limit_policy.suspended["1"]
+                .note
+                .as_ref()
+                .unwrap()
+                .exists()
+        );
     }
 
     #[tokio::test]

@@ -88,14 +88,18 @@ parked conversation; their ordered engine fallback is owned by manager integrati
 Resume metadata uses the existing retry queue and
 restores known holds at boot without changing the Go schema. `limit` is a distinct run
 outcome and charges no failure/review verdict budget or completed-review breaker round.
+If the handoff note cannot be written, a note-absent human decision item and suspension
+still persist; a restart does not silently release the ticket.
 
 Under `never`, observed overage stops immediately and the account remains rejected until
 reset. `manager_urgent` is likewise fail-closed until manager authorization lands.
 `daily_cap` meters positive reported-cost deltas while credits are in use; estimates and
 once-per-account/local-day credit-spend events persist in the existing event ledger. An
-unreadable ledger or an omitted terminal cost refuses further credits. Subscription
-API-equivalent dollars do not become provider budget windows. Pay-per-token budgets feed
-daily windows, and changing/removing an operator cap replaces only its budget observation,
+unreadable ledger or an omitted terminal cost refuses further credits.
+An omitted overage cost is recorded as unknown and refuses credits for the rest of the
+local day across restarts. Credit permission never bypasses a rejected account window.
+Subscription API-equivalent dollars do not become provider budget windows. Pay-per-token
+budgets feed daily windows, and changing/removing an operator cap replaces only its budget observation,
 never an external stream/probe observation.
 
 Actual Claude session resumption after a five-hour gap remains unverified; fake-harness
