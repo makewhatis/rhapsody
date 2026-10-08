@@ -1634,6 +1634,67 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn identity_limit_handoff_reports_the_new_teammate_once() {
+        use rhapsody_config::room::{Cursor, LocalRoom};
+        let (mut o, store, _, dir) = setup(false);
+        let tracker = Arc::new(Fake::new());
+        o.eff.as_mut().unwrap().tracker = tracker.clone();
+        let mut rx = o.open_limit_report_channel();
+        dispatch(&mut o);
+        o.accounts
+            .observe("claude-subscription", observation(1.0, 9000));
+        o.enforce_limits();
+        while rx.try_recv().is_ok() {}
+        // The policy executor has reassigned the ticket and seeded the note; dispatch reports
+        // the actual next owner rather than announcing an uncommitted label decision.
+        o.limit_policy.suspended.remove("1");
+        std::fs::write(
+            dir.child("bob.md"),
+            "---\nharness: opencode\nmodel: fireworks-ai/model\n---\nWorker\n",
+        )
+        .unwrap();
+        o.teams
+            .as_mut()
+            .unwrap()
+            .roster
+            .push(rhapsody_config::teams::Identity {
+                name: "bob".into(),
+                profile: "bob".into(),
+                ..Default::default()
+            });
+        let mut next = issue("1", "MT-1", "Todo");
+        next.labels = Some(vec!["rhapsody:@bob".into()]);
+        o.dispatch_issue(next, Some(2), None, String::new());
+        assert_eq!(o.running["1"].identity, "bob");
+        let report = rx.try_recv().expect("the identity handoff must report");
+        let room = LocalRoom::new(dir.child("room"));
+        crate::limitreport::perform_report(report, Some(&room), &[], None).await;
+        let posts = room.read_since("bob", &Cursor::default(), 20).unwrap();
+        assert_eq!(posts.messages.len(), 1);
+        for word in [
+            "MT-1",
+            "alice",
+            "bob",
+            "fireworks-ai/model",
+            "resumes",
+            "MT-1-limit-handoff.md",
+        ] {
+            assert!(posts.messages[0].body.contains(word));
+        }
+        assert_eq!(tracker.create_comment_calls().len(), 1);
+        let text = &tracker.create_comment_calls()[0].body;
+        assert!(!text.contains('@'));
+        let events = store.run_events(o.running["1"].run_id).unwrap();
+        let handoff = events.iter().find(|e| e.kind == "limit.handoff").unwrap();
+        assert!(handoff.text.contains("handed_off"));
+        o.enforce_limits();
+        assert!(
+            !std::iter::from_fn(|| rx.try_recv().ok())
+                .any(|r| matches!(r, crate::limitreport::Report::Handoff { .. }))
+        );
+    }
+
     #[test]
     fn account_reporting_uses_configured_levels_and_unknown_costs() {
         let (mut o, store, _, _dir) = setup(false);

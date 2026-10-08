@@ -10,16 +10,16 @@ use rhapsody_tracker::Tracker;
 use serde::Serialize;
 use std::sync::Arc;
 
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, serde::Deserialize)]
 pub struct LimitJobReport {
     pub ticket: String,
     pub account: String,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub resume_at_s: Option<i64>,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub model: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub identity: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<std::path::PathBuf>,
@@ -39,6 +39,18 @@ pub(crate) fn level_label(level: Level) -> &'static str {
         Level::Handoff => "handoff",
         Level::Wall => "wall",
     }
+}
+
+fn tokenless(mut body: String, token: &str) -> String {
+    body = body.replace('@', "");
+    if !token.is_empty() {
+        // Strip after mentions too: `f@oo` must not become a custom `foo` summons. Repeat
+        // to remove tokens formed by joining the remaining data.
+        while body.contains(token) {
+            body = body.replace(token, "");
+        }
+    }
+    body
 }
 
 pub enum Report {
@@ -214,7 +226,7 @@ impl Orchestrator {
         };
         // A model, identity or note path is data, and may itself carry a summon. Removing every
         // mention introducer keeps both brand aliases and a custom configured token inert.
-        let mut body = format!(
+        let body = format!(
             "{}: {} limit; {} on {} / {} → {action}. Handoff note: {}.",
             run.issue.identifier,
             account,
@@ -226,16 +238,10 @@ impl Orchestrator {
                 |p| p.display().to_string()
             )
         );
-        body = body.replace('@', "");
-        if let Some(eff) = &self.eff
-            && !eff.summon_token.is_empty()
-        {
-            // Remove after mention stripping too: data such as `f@oo` must not become the
-            // custom token `foo`. Repeating closes tokens formed by joining the remaining data.
-            while body.contains(&eff.summon_token) {
-                body = body.replace(&eff.summon_token, "");
-            }
-        }
+        let body = tokenless(
+            body,
+            self.eff.as_ref().map_or("", |e| e.summon_token.as_str()),
+        );
         let tracker = self.eff.as_ref().map(|eff| {
             eff.project_by_slug(&run.project_slug)
                 .map_or_else(|| eff.tracker.clone(), |p| p.tracker.clone())
@@ -379,6 +385,113 @@ impl Orchestrator {
         }
         reports.sort_by(|a, b| a.ticket.cmp(&b.ticket));
         reports
+    }
+
+    /// A manager's relabel is only an intention. Report an identity handoff when the shared
+    /// dispatch funnel actually starts its next run, and only immediately after a limit stop.
+    pub(crate) fn report_identity_limit_handoff(&self, run: &mut crate::RunningEntry) {
+        if run.run_id == 0
+            || run.identity.is_empty()
+            || run.review.is_some()
+            || crate::managerrun::is_manager_key(&run.issue.id)
+        {
+            return;
+        }
+        let rows = match self
+            .store
+            .issue_history(&run.issue.identifier, &run.project_slug, 2)
+        {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "limit: previous run could not be read for identity reporting");
+                return;
+            }
+        };
+        let Some(previous) = rows.iter().find(|r| r.id != run.run_id) else {
+            return;
+        };
+        if previous.outcome != rhapsody_store::OUTCOME_LIMIT {
+            return;
+        }
+        let hits = match self.store.search_events(rhapsody_store::EventQuery {
+            issue: run.issue.identifier.clone(),
+            kind: "limit.handoff".into(),
+            limit: 1,
+            ..Default::default()
+        }) {
+            Ok(hits) => hits,
+            Err(error) => {
+                tracing::warn!(%error, "limit: previous handoff could not be read");
+                return;
+            }
+        };
+        let Some(hit) = hits.first().filter(|h| h.run_id == previous.id) else {
+            return;
+        };
+        let mut job: LimitJobReport = match serde_json::from_str(&hit.text) {
+            Ok(job) => job,
+            Err(error) => {
+                tracing::warn!(%error, "limit: previous handoff report is unreadable");
+                return;
+            }
+        };
+        if job.identity.is_empty() || job.identity == run.identity {
+            return;
+        }
+        let old_identity = job.identity.clone();
+        job.identity = run.identity.clone();
+        job.state = "handed_off".into();
+        job.resume_at_s = Some((self.now)().timestamp());
+        job.model = run.model.clone();
+        let text = match serde_json::to_string(&job) {
+            Ok(text) => text,
+            Err(error) => {
+                tracing::warn!(%error, "limit: identity handoff could not be serialized");
+                return;
+            }
+        };
+        run.event_seq += 1;
+        if let Err(error) = self.store.append_events(
+            run.run_id,
+            &[rhapsody_store::EventRow {
+                seq: run.event_seq,
+                at: crate::persist::rfc3339((self.now)()),
+                kind: "limit.handoff".into(),
+                text,
+                ..Default::default()
+            }],
+        ) {
+            tracing::warn!(%error, "limit: identity handoff could not be recorded");
+        }
+        let body = format!(
+            "{}: {} limit handoff; handed from {} to {} on {} / {}; resumes as run {} at {}. Handoff note: {}.",
+            run.issue.identifier,
+            job.account,
+            old_identity,
+            run.identity,
+            self.effective_harness(&run.harness),
+            run.model,
+            run.run_id,
+            local_time((self.now)().timestamp()),
+            job.note
+                .as_ref()
+                .map_or_else(|| "unavailable".into(), |p| p.display().to_string())
+        );
+        let tracker = self.eff.as_ref().map(|eff| {
+            eff.project_by_slug(&run.project_slug)
+                .map_or_else(|| eff.tracker.clone(), |p| p.tracker.clone())
+        });
+        self.send_limit_report(Report::Handoff {
+            ticket: run.issue.identifier.clone(),
+            issue_id: run.issue.id.clone(),
+            body: tokenless(
+                body,
+                self.eff.as_ref().map_or("", |e| e.summon_token.as_str()),
+            ),
+            at: (self.now)(),
+            tracker,
+            pr: None,
+        });
     }
 }
 

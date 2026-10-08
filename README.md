@@ -73,6 +73,10 @@ decided before delivery, so a refused channel is logged rather than retried per 
 Each completed limit handoff produces a room post and a tokenless tracker comment (a PR
 comment for a synthetic review/manager run), naming the engine, disposition, resume time or
 condition, and note path. The existing events ledger records `limit.handoff` for the job page.
+If the next successful dispatch after a limit stop changes identity, that dispatch records
+and posts the old/new identity, new engine, resume time and recorded note path. A relabel
+alone is not announced as a completed handoff. Later ordinary assignments do not inherit
+an older limit episode.
 The additive Accounts endpoint gains policy `level`, `cost_kind` and known `today_usd`;
 unknown costs are omitted rather than reported as zero. Raw policy snapshots are unchanged.
 The console's Accounts route and job chips share the daemon/browser and desktop build.

@@ -254,7 +254,7 @@ export function JobDetailView({
         </a>{" "}
         · {issue}
       </div>
-      <JobLimitChips ticket={issue} latestRunId={runs[0]?.id ?? 0} identity={runs[0] ? (identities.get(runs[0].id) ?? "") : ""} />
+      <JobLimitChips ticket={issue} latestRunId={runs[0]?.id ?? 0} previousRunId={runs[1]?.id ?? 0} identity={runs[0] ? (identities.get(runs[0].id) ?? "") : ""} />
 
       {run === undefined ? (
         <>
