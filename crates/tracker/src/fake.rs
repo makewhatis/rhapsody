@@ -109,6 +109,9 @@ type Clock = Box<dyn Fn() -> DateTime<Utc> + Send + Sync>;
 /// A programmable in-memory tracker. Programmable inputs are set directly by tests.
 #[derive(Default)]
 pub struct Fake {
+    /// Read-only documents by scoped issue identifier, or empty key for the configured project.
+    pub documents: HashMap<String, crate::Documents>,
+    pub documents_err: Option<TrackerError>,
     pub candidates: Vec<Issue>,
     /// Normalized-lowercase state -> issues.
     pub by_state: HashMap<String, Vec<Issue>>,
@@ -360,6 +363,37 @@ impl Fake {
 
 #[async_trait]
 impl Tracker for Fake {
+    async fn fetch_documents(
+        &self,
+        issue: Option<&str>,
+        query: &str,
+        excerpt: bool,
+    ) -> Result<crate::Documents, TrackerError> {
+        if let Some(error) = &self.documents_err {
+            return Err(error.clone());
+        }
+        if let Some(identifier) = issue
+            && self.fetch_issue_by_identifier(identifier).await?.is_none()
+        {
+            return Err(TrackerError::Other(
+                "document issue outside configured project".into(),
+            ));
+        }
+        let mut value = self
+            .documents
+            .get(issue.unwrap_or(""))
+            .cloned()
+            .unwrap_or_default();
+        value
+            .documents
+            .retain(|d| d.title.to_lowercase().contains(&query.to_lowercase()));
+        if !excerpt {
+            for doc in &mut value.documents {
+                doc.excerpt = None;
+            }
+        }
+        Ok(value)
+    }
     async fn fetch_issue_by_identifier(
         &self,
         identifier: &str,

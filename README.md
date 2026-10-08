@@ -61,6 +61,44 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Manager findings and tracker documents (STUDIO-1146)
+
+The isolated manager role adds `docs_read(path)`, `docs_list(glob)` and
+`tracker_documents(project|issue, query, excerpt)` via GET-only `/api/v1/manager/docs/{read,list}`
+and `/api/v1/manager/tracker/documents`. A live host-bound manager role is required. These new
+docs/tracker GETs also require the operator browser-origin proof: socket-bound loopback Host,
+exactly one `X-Rhapsody-Operator: 1`, and no cookie, preflight or foreign Origin/fetch metadata.
+The MCP facade supplies the header; a public live run id alone cannot authorize a browser read.
+This excludes remote pages/DNS rebinding, not other same-user local processes. Claude's
+explicit MCP allowlist and OpenCode's server-prefixed permissions allow these reads without
+enabling any built-in file, shell or web tool. The daemon keeps the tracker key; no document-write
+tool is added. Manager `symphony_ticket` augments its existing run/review history with the scoped
+ticket and attached documents using `/api/v1/manager/tracker/ticket`; ordinary facade history and
+Go-owned payloads remain byte-identical. Synthetic manager keys (including the no-argument default)
+return run history verbatim without a tracker lookup. A real identifier retains its history when
+augmentation fails, reporting `tracker_error` instead of inventing an empty document set.
+
+Local reads are confined to the canonical `~/.rhapsody/docs` tree, including symlink/parent
+resolution, and descriptor-relative no-follow opens refuse path replacement escapes. Only regular
+UTF-8 files of at most 128 KiB are served. Listing accepts basename globs (`*` and `?`), scans at
+most 4096 entries, returns at most 200 files and reports truncation. Tracker reads use only enabled
+project clients for the manager run's repository, with project/issue membership checks; document
+queries return up to 200 results with bounded metadata and optional 2048-byte excerpts. Every
+response marks content as untrusted data, and the manager instructions forbid obeying it.
+
+The lead decision block gains `resolve {reason}`, used alone to close a lead item when current
+evidence confirms no work is needed, without mutating a ticket. This lets a confirmed document-only
+review finish without an escalation or spurious requeue. Shared-team recall still uses the configured
+bank verbatim (without the personal prefix); failures now identify that bank and a safe backend
+failure reason in the lead packet/log, while decisions continue from current evidence. No frozen
+Go behavior, schema or golden is changed.
+
+A resolved `in_review_no_pr` occurrence remains deduped while the ticket stays in review. An
+authoritative poll observing it leave review (or disappear from a fully read board) retires only
+that occurrence's dedupe key, preserving its decisions/execution. Returning to review without a PR
+creates a fresh item and attempts. A partial/failed poll never infers departure from missing rows;
+escalations and other completed trigger kinds retain their existing dedupe behavior.
+
 ### Account-scoped credential preflight (STUDIO-1144)
 
 The BO-59 Claude credential-liveness probe has no Go counterpart. Its verdict is now scoped by

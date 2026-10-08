@@ -513,6 +513,28 @@ impl StateProvider for DaemonState {
         self.handle.manager_file(run_id, &sha, &path).await
     }
 
+    async fn docs_read(&self, run_id: i64, path: String) -> ManagerReadOutcome {
+        self.handle.docs_read(run_id, &path).await
+    }
+    async fn docs_list(&self, run_id: i64, glob: String) -> ManagerReadOutcome {
+        self.handle.docs_list(run_id, &glob).await
+    }
+    async fn tracker_documents(
+        &self,
+        run_id: i64,
+        project: String,
+        issue: String,
+        query: String,
+        excerpt: bool,
+    ) -> ManagerReadOutcome {
+        self.handle
+            .tracker_documents(run_id, &project, &issue, &query, excerpt)
+            .await
+    }
+    async fn manager_ticket(&self, run_id: i64, identifier: String) -> ManagerReadOutcome {
+        self.handle.manager_ticket(run_id, &identifier).await
+    }
+
     async fn operator_preferences(&self, run_id: i64, query: String) -> ManagerReadOutcome {
         match self.handle.teams_memory() {
             Some(memory) => memory.operator_preferences(run_id, &query).await,

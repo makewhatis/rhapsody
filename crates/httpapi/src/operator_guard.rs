@@ -26,6 +26,10 @@
 //! other method reaches the handler unchanged: reads keep their wire contract, and a wrong method
 //! still gets the handler's own 405. Every denial is the same bounded 403 envelope. The specific
 //! reason is logged with the method and route path, but no header value is echoed back or logged.
+//!
+//! STUDIO-1146 also applies this browser-origin boundary to sensitive manager evidence GETs.
+//! Their public run id supplies role/scope, not requester authentication. Ordinary reads retain
+//! their existing contract; same-user local processes remain outside this boundary.
 
 use std::net::SocketAddr;
 
@@ -52,6 +56,9 @@ pub(crate) const DENIED_CODE: &str = "operator_write_forbidden";
 /// The message of the single denial envelope. It is fixed, so no client-supplied value is ever
 /// reflected back.
 pub(crate) const DENIED_MESSAGE: &str = "mutating requests need Host 127.0.0.1:<port>, exactly one X-Rhapsody-Operator: 1 header, a same-origin Origin, and no cookies";
+
+const READ_DENIED_CODE: &str = "operator_read_forbidden";
+const READ_DENIED_MESSAGE: &str = "manager evidence reads need Host 127.0.0.1:<port>, exactly one X-Rhapsody-Operator: 1 header, a same-origin Origin, and no cookies";
 
 /// The local address of the socket a request arrived on, captured once per accepted connection.
 /// This is the "server state" the guard compares `Host` against. `None` means the address could
@@ -117,6 +124,32 @@ pub(crate) async fn require_operator_write(req: Request, next: Next) -> Response
                 "refused a loopback write that did not come from an operator client"
             );
             denied()
+        }
+    }
+}
+
+/// Sensitive GETs need the same browser-origin proof as writes, before extraction or host I/O.
+/// Wrong methods still reach the handler's 405; preflights fail closed without CORS grants.
+pub(crate) async fn require_operator_read(req: Request, next: Next) -> Response {
+    let method = req.method().clone();
+    if method != Method::GET && method != Method::OPTIONS {
+        return next.run(req).await;
+    }
+    let port = req
+        .extensions()
+        .get::<ConnectInfo<BoundAddr>>()
+        .and_then(|ConnectInfo(BoundAddr(addr))| addr.map(|a| a.port()));
+    match check(&method, req.headers(), port) {
+        Ok(()) => next.run(req).await,
+        Err(denial) => {
+            tracing::warn!(reason = denial.as_str(), method = %method, path = req.uri().path(),
+                "refused a manager evidence read that did not come from an operator client");
+            write_error(
+                StatusCode::FORBIDDEN,
+                READ_DENIED_CODE,
+                READ_DENIED_MESSAGE,
+                None,
+            )
         }
     }
 }
@@ -377,6 +410,13 @@ mod router_tests {
         "/api/v1/providers/config",
     ];
 
+    const SENSITIVE_READS: &[&str] = &[
+        "/api/v1/manager/docs/read",
+        "/api/v1/manager/docs/list",
+        "/api/v1/manager/tracker/documents",
+        "/api/v1/manager/tracker/ticket",
+    ];
+
     /// Every path `build_router` registers, read from its source so a new route cannot be missed
     /// by forgetting to list it. `{id}` becomes `7`.
     fn registered_paths() -> Vec<String> {
@@ -453,7 +493,18 @@ mod router_tests {
                 match status {
                     405 => {}
                     403 => {
-                        assert_denied(resp, &format!("{method} {path}")).await;
+                        if SENSITIVE_READS.contains(&path.as_str()) {
+                            let body: Value = resp.json().await.unwrap();
+                            assert_eq!(
+                                body,
+                                serde_json::json!({"error": {
+                                    "code": super::READ_DENIED_CODE,
+                                    "message": super::READ_DENIED_MESSAGE
+                                }})
+                            );
+                        } else {
+                            assert_denied(resp, &format!("{method} {path}")).await;
+                        }
                         if method == reqwest::Method::POST {
                             guarded.push(path.clone());
                         }
@@ -692,13 +743,16 @@ mod router_tests {
         }
     }
 
-    /// Reads keep their wire contract: a GET is never refused by the guard, even with a hostile
-    /// origin and no operator header.
+    /// Ordinary reads keep their wire contract, even with a hostile origin and no operator header.
+    /// The new sensitive evidence reads have their own denial/admission matrix in handlers_manager.
     #[tokio::test]
     async fn reads_are_not_guarded() {
         let f = serve().await;
         let client = reqwest::Client::new();
         for path in registered_paths() {
+            if SENSITIVE_READS.contains(&path.as_str()) {
+                continue;
+            }
             if path == "/api/v1/logs/stream" {
                 continue; // an infinite SSE stream; its GET contract is pinned in handlers_logs
             }

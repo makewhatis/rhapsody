@@ -272,6 +272,66 @@ impl Orchestrator {
         self.lead_impossible(ticket, "in_review_no_pr")
     }
 
+    /// A no-work resolution settles one occurrence, not all future incidents for this ticket.
+    /// Reuse the poll's project-scoped board snapshot: explicit departures are authoritative;
+    /// absence is authoritative only when every configured project answered. No tracker I/O here.
+    pub(crate) fn observe_lead_review_departures<'a>(
+        &mut self,
+        candidates: impl Iterator<Item = (&'a rhapsody_core::Issue, Option<usize>)>,
+        read_the_board: bool,
+    ) {
+        if !self.lead_enabled() {
+            return;
+        }
+        let Some(eff) = self.eff.as_ref() else {
+            return;
+        };
+        let reviewing: std::collections::HashMap<&str, bool> = candidates
+            .map(|(issue, proj)| {
+                let (review, active) = match proj.and_then(|i| eff.projects.get(i)) {
+                    Some(p) => (&p.review_states, &p.active_states),
+                    None => (&eff.review_states, &eff.active_states),
+                };
+                let state = rhapsody_core::normalize_state(&issue.state);
+                // An unknown state cannot establish that the condition went away.
+                (
+                    issue.identifier.as_str(),
+                    state.is_empty() || (review.contains(&state) && !active.contains(&state)),
+                )
+            })
+            .collect();
+        let rows = match self.store().load_lead_items() {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(%error, "lead: resolved incidents unreadable; preserving dedupe keys");
+                return;
+            }
+        };
+        for row in rows {
+            if row.state != "done"
+                || !matches!(&row.trigger,
+                LeadTrigger::ImpossibleState { kind, .. } if kind == "in_review_no_pr")
+            {
+                continue;
+            }
+            let departed = match reviewing.get(row.subject.as_str()) {
+                Some(in_review) => !in_review,
+                None => read_the_board,
+            };
+            if !departed {
+                continue;
+            }
+            match self.store().retire_resolved_lead_missing_pr(row.id) {
+                Ok(true) => {
+                    self.review_adopt_probed.remove(&row.subject);
+                }
+                Ok(false) => {}
+                Err(error) => tracing::warn!(item = row.id, %error,
+                    "lead: could not retire resolved incident; preserving its dedupe key"),
+            }
+        }
+    }
+
     pub(crate) fn lead_draft_exhausted(&self, pr: &str) -> bool {
         self.lead_impossible(pr, "draft_pokes_exhausted")
     }
@@ -550,6 +610,48 @@ mod tests {
                 kind: "in_review_no_pr".into()
             }
         );
+    }
+
+    #[test]
+    fn resolved_missing_pr_departure_requires_an_authoritative_project_observation() {
+        for (state, complete, retire) in [
+            (Some("In Review"), true, false),
+            (Some(""), true, false),
+            (None, false, false), // partial/failed board read, not departure
+            (None, true, true),   // terminal/disappeared on a fully read board
+            (Some("Todo"), false, true), // explicit away observation, even on a partial poll
+        ] {
+            let mut o = orch(true);
+            let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+            let mut eff = crate::testsupport::empty_effective(tracker.clone());
+            eff.review_states = crate::testsupport::set_of(&["todo"]); // must use owning project's set
+            let mut project = crate::testsupport::empty_resolved_project("rhapsody", tracker);
+            project.review_states = crate::testsupport::set_of(&["in review"]);
+            eff.projects.push(project);
+            o.eff = Some(eff);
+            o.lead_missing_pr("STUDIO-598");
+            let id = o.store().load_lead_items().unwrap()[0].id;
+            o.store()
+                .save_lead_decision(&rhapsody_store::LeadDecisionRow {
+                    item: id,
+                    decision: "done: resolved".into(),
+                    actions: r#"[{"action":"resolve"}]"#.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            o.store().set_lead_item_state(id, "done").unwrap();
+            let issues: Vec<_> = state
+                .map(|s| crate::testsupport::issue("598", "STUDIO-598", s))
+                .into_iter()
+                .collect();
+            o.observe_lead_review_departures(issues.iter().map(|i| (i, Some(0))), complete);
+            o.lead_missing_pr("STUDIO-598");
+            assert_eq!(
+                o.store().load_lead_items().unwrap().len(),
+                if retire { 2 } else { 1 },
+                "{state:?}/{complete}"
+            );
+        }
     }
 
     #[test]

@@ -145,6 +145,11 @@ pub trait Store {
     fn enqueue_lead_item(&self, _trigger: &LeadTrigger, _at: &str) -> Result<i64, StoreError> {
         Ok(0)
     }
+    /// Retire only a resolved missing-PR incident's dedupe key after an authoritative departure
+    /// from review. History stays done; a later occurrence receives a fresh item and run budget.
+    fn retire_resolved_lead_missing_pr(&self, _item: i64) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Durable lead queue, oldest first, including parked/completed items.
     fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
         Ok(Vec::new())

@@ -30,6 +30,56 @@ use crate::effective::{DEFAULT_CLAIM_SETTLE_DELAY, DEFAULT_CLAIM_TTL, Effective,
 
 use crate::liveness::{self, Sampler};
 use crate::obslog::Store as TranscriptStore;
+
+/// A live manager evidence reader over the same project/role bindings production publishes.
+pub(crate) fn manager_evidence_handle(
+    store: Arc<dyn Store + Send + Sync>,
+    tracker: Arc<dyn Tracker>,
+) -> (
+    crate::ControlHandle,
+    i64,
+    Arc<crate::teamsmemory::TeamsMemory>,
+) {
+    let mut o = Orchestrator::new("WORKFLOW.md");
+    o.set_store(store.clone());
+    o.set_reads_target(tracker.clone(), "never-exposed");
+    o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+        trackers: vec![crate::reads::ProjectTracker {
+            slug: "rhapsody".into(),
+            tracker,
+        }],
+        facts: vec![crate::reads::ProjectFacts {
+            pr_owner: "o".into(),
+            pr_repo: "r".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    });
+    let mut teams = Teams::disabled();
+    teams.enabled = true;
+    let memory = Arc::new(crate::teamsmemory::TeamsMemory::new(
+        Arc::new(teams),
+        Arc::new(rhapsody_config::memory::NoneBackend),
+    ));
+    let run_id = store
+        .start_run(RunStart {
+            issue_id: "lead:o/r#0:1@manager".into(),
+            issue_identifier: "lead:o/r#0:1@manager".into(),
+            repo: "https://github.com/o/r.git".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    memory.bind_run(
+        run_id,
+        crate::teamsmemory::RunProvenance {
+            identity: "jerry".into(),
+            ticket: "lead:o/r#0:1@manager".into(),
+            ..Default::default()
+        },
+    );
+    o.teams_memory = Some(memory.clone());
+    (o.control(), run_id, memory)
+}
 use crate::orchestrator::{Orchestrator, RetryEntry, RunningEntry};
 
 /// A preparation resolver that never answers, for tests that only need asynchronous preparation to

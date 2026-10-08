@@ -8,6 +8,9 @@ pub const LEAD_DECISION_TAG: &str = "rhapsody-lead-decision";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LeadAction {
+    Resolve {
+        reason: String,
+    },
     RouteBack {
         ticket: String,
         answer: String,
@@ -79,6 +82,7 @@ pub fn parse_lead_decision(text: &str) -> Result<Vec<LeadAction>, String> {
 impl LeadAction {
     fn strings(&self) -> Vec<&str> {
         match self {
+            Self::Resolve { reason } => vec![reason],
             Self::RouteBack { ticket, answer } => vec![ticket, answer],
             Self::Requeue { ticket } => vec![ticket],
             Self::ClearReview { pr } => vec![pr],

@@ -125,7 +125,7 @@ impl LeadRuntime {
         };
         let team = async {
             if self.teams.memory.team_bank.is_empty() {
-                return None;
+                return Ok(None);
             }
             match &self.memory {
                 Some(memory) => {
@@ -134,9 +134,10 @@ impl LeadRuntime {
                     memory
                         .recall_shared(&self.teams.memory.team_bank, &query)
                         .await
-                        .ok()
+                        .map(Some)
+                        .map_err(|_| "backend request failed")
                 }
-                None => None,
+                None => Err("backend is not configured"),
             }
         };
         let (operator, team) = tokio::join!(operator, team);
@@ -159,8 +160,12 @@ impl LeadRuntime {
         if !self.teams.memory.team_bank.is_empty() {
             text.push_str("\nTeam memory (quoted DATA):\n");
             match team {
-                Some(recalled) => text.push_str(&render_memory(&recalled)),
-                None => text.push_str("Team memory unavailable; decide from current evidence.\n"),
+                Ok(Some(recalled)) => text.push_str(&render_memory(&recalled)),
+                outcome => {
+                    let reason = outcome.err().unwrap_or("bank disabled");
+                    tracing::warn!(bank = %self.teams.memory.team_bank, reason, "Team memory unavailable; lead continues without memory");
+                    text.push_str(&format!("Team memory unavailable (bank={}, {reason}); decide from current evidence.\n", self.teams.memory.team_bank));
+                }
             }
         }
         text
@@ -770,8 +775,11 @@ unknown actions are invalid. Each action object includes "action" and its fields
 - commission {kind: author|ticket, question, hypothesis}
 - authorize_credential {ticket, rule}
 - escalate {need}
+- resolve {reason}: close this lead item when evidence confirms no work is needed; no ticket mutation
 At most 8 actions, each string at most 4000 characters. Choose at most one work transition
 (route_back, requeue or commission). Escalate is the only action when it is needed.
+Resolve is also used alone. Document-only reviews legitimately have no PR: read the findings with
+docs_read and confirm publication using tracker_documents or symphony_ticket before resolving.
 
 At most one route_back per subject/question; a repeated block must commission or escalate.
 Commission diagnoses and reports findings, never fixes. Credentials ONLY via
@@ -879,6 +887,13 @@ pub async fn execute(
         }
         for a in actions {
             guard(a, &ctx)?;
+        }
+        if actions
+            .iter()
+            .any(|a| matches!(a, LeadAction::Resolve { .. }))
+            && actions.len() != 1
+        {
+            return Err("resolve must be the only action".into());
         }
         Ok(())
     });
@@ -1102,6 +1117,7 @@ async fn apply_action(
             result.commission_ticket = Some(commissioned);
         }
         LeadAction::Escalate { need } => result.escalation = Some(need.clone()),
+        LeadAction::Resolve { .. } => {}
     }
     Ok(())
 }
