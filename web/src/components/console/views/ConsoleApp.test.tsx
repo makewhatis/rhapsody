@@ -188,7 +188,7 @@ describe("the rail is capability-gated on /api/v1/version (§2.2)", () => {
   it("renders Jobs, Teams, Memory and Settings when teams is on", async () => {
     h.fetchVersion.mockResolvedValue(version(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
   });
 
   // Box 2.2 — the load-bearing one: ABSENT, not greyed.
@@ -430,7 +430,7 @@ describe("first run routes to onboarding (§8.1, audit G2)", () => {
     h.fetchVersion.mockResolvedValue(version(true));
     h.getStatus.mockResolvedValue(status(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
     expect(screen.queryByRole("progressbar", { name: "Onboarding progress" })).toBeNull();
   });
 
@@ -458,7 +458,7 @@ describe("first run routes to onboarding (§8.1, audit G2)", () => {
     // The wizard's success path calls back into the shell, which re-reads status; the poll would
     // reach the same place a beat later.
     h.getStatus.mockResolvedValue(status(true));
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]), {
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]), {
       timeout: 4000,
     });
     expect(screen.queryByRole("progressbar", { name: "Onboarding progress" })).toBeNull();
@@ -484,7 +484,7 @@ describe("a partial first-run write survives the swap into the console", () => {
     fireEvent.click(screen.getByRole("button", { name: "Start playing" }));
 
     // The shell swaps to the console...
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]), {
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]), {
       timeout: 4000,
     });
     // ...and the failure came with it.
@@ -527,7 +527,7 @@ describe("the desktop bridge survives the flip", () => {
   it("routes the tray's Settings… item to Settings and Dashboard back to Jobs", async () => {
     h.fetchVersion.mockResolvedValue(version(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
 
     act(() => h.emitNavigate("settings"));
     await waitFor(() => expect(activeNavs()).toEqual(["settings"]));
@@ -549,7 +549,7 @@ describe("the desktop bridge survives the flip", () => {
   it("shows the shutdown overlay when the app begins quitting", async () => {
     h.fetchVersion.mockResolvedValue(version(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
     expect(screen.queryByText("Shutting down…")).toBeNull();
 
     act(() => h.emitShuttingDown());
@@ -571,7 +571,7 @@ describe("desktop window chrome (STUDIO-701)", () => {
     h.fetchVersion.mockResolvedValue(version(true));
     h.getStatus.mockResolvedValue(status(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
     expect(document.querySelector(".app.rh-console.overlay-titlebar")).not.toBeNull();
     const drag = document.querySelector(".rail")?.firstElementChild;
     expect(drag?.className).toBe("drag");
@@ -596,7 +596,7 @@ describe("desktop window chrome (STUDIO-701)", () => {
     h.fetchVersion.mockResolvedValue(version(true));
     h.getStatus.mockResolvedValue(status(true));
     mount();
-    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "teams", "memory", "settings"]));
+    await waitFor(() => expect(railItems()).toEqual(["jobs", "accounts", "lead", "teams", "memory", "settings"]));
     expect(document.querySelector(".overlay-titlebar")).toBeNull();
     expect(document.querySelector("[data-tauri-drag-region]")).toBeNull();
     expect(document.querySelector(".rail")?.firstElementChild?.classList.contains("logo")).toBe(true);

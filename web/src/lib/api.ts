@@ -681,6 +681,27 @@ export async function fetchAccounts(): Promise<AccountView[]> {
   return response.accounts ?? [];
 }
 
+export interface LeadDecision {
+  id: number; subject: string; trigger: string; at: string; decision: string;
+  reasoning: string; evidence: string; actions: string; harness: string; model: string;
+  overruled_at?: string | null; overrule_note?: string | null;
+}
+export interface LeadDecisionsResponse {
+  decisions: LeadDecision[];
+  queued: { id: number; subject: string; state: string; trigger: string }[];
+}
+export function fetchLeadDecisions(since = ""): Promise<LeadDecisionsResponse> {
+  return getJSON(`/api/v1/lead/decisions${since ? `?since=${encodeURIComponent(since)}` : ""}`);
+}
+export async function overruleLeadDecision(id: number, note: string): Promise<{ item: number; memory_retained: boolean }> {
+  const response = await operatorPost(`/api/v1/lead/decisions/${id}/overrule`, { note });
+  if (!response.ok) {
+    const body = await response.json() as ApiError;
+    throw new Error(body.error?.message ?? `Overrule failed: ${response.status}`);
+  }
+  return response.json();
+}
+
 // fetchRunDetail fetches one run's unified detail by run id (GET /api/v1/runs/{id}). It
 // serves a running run (live snapshot) and a finished run (history store) identically — the
 // caller polls while outcome === "running" and goes static once it terminates.

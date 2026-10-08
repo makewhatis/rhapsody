@@ -13,6 +13,7 @@
 export const CONSOLE_ROUTES = [
   "jobs",
   "accounts",
+  "lead",
   "job",
   "teams",
   "memory",
@@ -47,6 +48,7 @@ export const DEFAULT_CONSOLE_ROUTE: ConsoleRoute = { name: "jobs", key: "" };
  * a surface the daemon cannot serve.
  */
 export const TEAMS_ONLY_ROUTES = [
+  "lead",
   "teams",
   "memory",
   "manage",
