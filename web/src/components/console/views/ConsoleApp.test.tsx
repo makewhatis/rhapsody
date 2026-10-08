@@ -2,9 +2,9 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import type { DaemonVersion } from "@/lib/api";
+import type { DaemonVersion, NotificationsResponse } from "@/lib/api";
 import type { StatusDTO } from "@/lib/bindings";
 
 // STUDIO-681 §10, sub-ticket 2 — the app shell's acceptance boxes 2.1-2.5 and 2.12.
@@ -23,6 +23,7 @@ const h = vi.hoisted(() => {
   return {
     fetchVersion: vi.fn(),
     fetchLeadDecisions: vi.fn(),
+    fetchNotifications: vi.fn(async (): Promise<NotificationsResponse> => ({ notifications: [] })),
     fetchIssueRuns: vi.fn(),
     getStatus: vi.fn(),
     hasOverlayTitlebar: vi.fn(() => false),
@@ -68,6 +69,7 @@ vi.mock("@/lib/api", async (orig) => {
     ...actual,
     fetchVersion: h.fetchVersion,
     fetchLeadDecisions: h.fetchLeadDecisions,
+    fetchNotifications: h.fetchNotifications,
     fetchAccounts: vi.fn(async () => []),
     fetchLimitHandoffs: vi.fn(async () => []),
     fetchState: vi.fn(async () => ({
@@ -115,6 +117,36 @@ vi.mock("@/lib/api", async (orig) => {
 });
 
 const { ConsoleApp } = await import("./ConsoleApp");
+
+it("shares the unread Needs-you count and filtered panel with the Jobs tile, including a real stuck PR", async () => {
+  h.fetchVersion.mockResolvedValue(version(true));
+  h.getStatus.mockResolvedValue(null);
+  h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
+  const notice = { id: 1, kind: "stuck_pr", group: "needs_you" as const, subject: "makewhatis/rhapsody#164",
+    summary: "Approved, held for a human", href: "https://github.com/makewhatis/rhapsody/pull/164",
+    at: "2026-10-08T10:00:00Z", read_at: null, active: true };
+  h.fetchNotifications.mockResolvedValueOnce({ notifications: [notice,
+    { ...notice, id: 2, kind: "lead_decision", group: "decisions", subject: "TEST-2" },
+    { ...notice, id: 3, kind: "login_check", group: "system", subject: "Manager" },
+    { ...notice, id: 4, read_at: "2026-10-08T11:00:00Z" },
+  ] });
+  const view = mount("#jobs");
+  const tile = await screen.findByRole("button", { name: "Needs you, 1 unread" });
+  const trigger = screen.getByRole("button", { name: "Notifications, 3 unread" });
+  expect(tile.querySelector(".n")?.textContent).toBe("1");
+  fireEvent.click(tile);
+  let panel = screen.getByRole("dialog", { name: "Notifications" });
+  expect(within(panel).getByRole("heading", { name: "Needs you · 1" })).toBeTruthy();
+  expect(within(panel).queryByRole("heading", { name: "Decisions" })).toBeNull();
+  expect(within(panel).getAllByRole("listitem")).toHaveLength(2);
+  expect(within(panel).getAllByRole("link")[0].getAttribute("href")).toBe(notice.href);
+  fireEvent.click(within(panel).getByRole("button", { name: "Close" }));
+  fireEvent.click(trigger);
+  panel = screen.getByRole("dialog", { name: "Notifications" });
+  expect(within(panel).getByRole("heading", { name: "Needs you · 1" })).toBeTruthy();
+  expect(within(panel).getByRole("heading", { name: "Decisions" })).toBeTruthy();
+  expect(view.container.textContent).not.toMatch(/pull requests? needs? attention|#0/);
+});
 
 function version(teams_enabled: boolean): DaemonVersion {
   return { version: "v0.4.0", commit: "abc", built_at: "2026-09-01T00:00:00Z", teams_enabled };

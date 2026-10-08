@@ -21,7 +21,6 @@ import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
 import { consoleNavFor, type ConsoleRoute, type ConsoleRouteName } from "@/lib/console-routing";
 import { viewForStatus } from "@/lib/daemon-status";
 import { DrainBanner } from "./DrainBanner";
-import { DivergenceBanner } from "./DivergenceBanner";
 import { FirstRunView, OnboardErrorBanner } from "./FirstRunView";
 import { JobDetailView } from "./JobDetailView";
 import { JobsView } from "./JobsView";
@@ -33,7 +32,7 @@ import { LogsView, ProvidersView, ToolsView, UpdatesView } from "./SettingsTabVi
 import { WorkflowView } from "./WorkflowView";
 import { AccountsPage } from "./AccountsPanel";
 import { LeadRoute } from "./LeadPage";
-import { LeadNotifications } from "./LeadNotifications";
+import { NotificationCentre, NotificationProvider, useNotificationCentre } from "./NotificationCentre";
 import { isLeadRun } from "@/lib/lead";
 
 // The Rhapsody Console shell — STUDIO-681 §2, built by STUDIO-683. The persistent rail on every
@@ -145,7 +144,7 @@ export function ConsoleApp() {
 
   return (
     <>
-      <AppShell
+      <NotificationProvider><AppShell
         items={items}
         active={consoleNavFor(route)}
         onNavigate={(id) => go(id as ConsoleRouteName)}
@@ -154,8 +153,7 @@ export function ConsoleApp() {
       >
         <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
         <DrainBanner />
-        <DivergenceBanner />
-        {leadEnabled === true ? <LeadNotifications /> : null}
+        <NotificationCentre />
         <ConsoleBody
           route={route}
           teamsEnabled={teamsEnabled}
@@ -165,7 +163,7 @@ export function ConsoleApp() {
           jobsLimit={jobsLimit}
           onLoadMoreJobs={() => setJobsLimit((n) => n + JOBS_PAGE_SIZE)}
         />
-      </AppShell>
+      </AppShell></NotificationProvider>
       {overlay}
     </>
   );
@@ -228,7 +226,7 @@ function ConsoleBody({
 
   switch (route.name) {
     case "lead":
-      return leadEnabled === true ? <LeadRoute /> : null;
+      return leadEnabled === true ? <LeadRoute entry={route.key} /> : null;
     case "accounts":
       return <AccountsPage />;
     case "job":
@@ -287,11 +285,12 @@ function ConsoleBody({
 /** The rail's foot: the daemon's live state, its build, and the capability flags (§2.1). */
 function RailFoot({ version, teamsEnabled }: { version: string; teamsEnabled: boolean }) {
   const state = useStateQuery();
+  const system = useNotificationCentre().notices.filter((n) => n.group === "system" && n.active);
   const port = typeof window === "undefined" ? "" : window.location.port;
   const live = state.data?.status === "ok";
   return (
     <>
-      <span className={live ? "live" : undefined}>{live ? "● live" : "○ offline"}</span>
+      <span className={system.length > 0 ? "health-warning" : live ? "live" : undefined} title={system.map((n) => n.summary).join("; ")}>{system.length > 0 ? "● needs attention" : live ? "● live" : "○ offline"}</span>
       {port === "" ? "" : ` · port ${port}`}
       <br />
       {version === "" ? "version unknown" : version}

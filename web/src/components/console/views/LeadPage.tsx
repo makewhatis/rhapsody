@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Button, Card, Note, Pill } from "@/components/console";
 import { overruleLeadDecision, type LeadDecision, type LeadDecisionsResponse } from "@/lib/api";
@@ -33,7 +33,7 @@ function Decision({ decision, onOverrule }: { decision: LeadDecision; onOverrule
     catch (err) { setError(err instanceof Error ? err.message : "Overrule could not be recorded."); }
     finally { setBusy(false); }
   };
-  return <article aria-label={`Decision ${decision.id}`} style={{ padding: 18, borderBottom: "1px solid var(--line)" }}>
+  return <article id={`decision-${decision.id}`} aria-label={`Decision ${decision.id}`} style={{ padding: 18, borderBottom: "1px solid var(--line)" }}>
     <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
       <b>{decision.subject}</b><Pill variant={overruled ? "queued" : escalation ? "operator" : "done"}>{overruled ? "Overruled" : escalation ? "Needs you" : proposal ? "Proposal" : "Decided"}</Pill>
       <span className="sub">#{decision.id} · {new Date(decision.at).toLocaleString()} · {decision.trigger.replaceAll("_", " ")}</span>
@@ -53,10 +53,11 @@ function Decision({ decision, onOverrule }: { decision: LeadDecision; onOverrule
   </article>;
 }
 
-export function LeadRoute() {
+export function LeadRoute({ entry = "" }: { entry?: string }) {
   const client = useQueryClient();
   const [warning, setWarning] = useState("");
   const query = useLeadDecisions();
+  useEffect(() => { if (entry) document.getElementById(entry)?.scrollIntoView?.({ block: "start" }); }, [entry, query.data]);
   if (query.isPending) return <div className="empty">Loading lead decisions…</div>;
   if (query.isError) return <div role="alert">{query.error.message}</div>;
   return <>{warning ? <Note variant="warn">{warning}</Note> : null}<LeadPage decisions={query.data.decisions} work={query.data.queued} onOverrule={async (id, note) => {

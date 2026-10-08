@@ -4,7 +4,7 @@ import { useVersionQuery } from "@/hooks/useTeams";
 
 export const LEAD_DECISIONS_QUERY_KEY = ["lead-decisions"] as const;
 
-// One capability-gated cache for the centre, Needs you and the full paper trail.
+// Capability-gated full paper trail. Compact notices/read state have their own daemon API.
 export function useLeadDecisions() {
   const version = useVersionQuery().data;
   const enabled = version?.teams_enabled === true && version.lead_enabled === true;

@@ -11,12 +11,14 @@ import type {
   IssueRun,
   IssueStatusBucket,
   LeadDecisionsResponse,
+  NotificationsResponse,
   StateResponse,
   TicketCostRow,
 } from "@/lib/api";
 import { phaseGlyph } from "@/lib/console-trace-view";
 import { LIVE_GLYPH, SPARK_KINDS } from "@/lib/console-trace-spark";
 import { JOBS_PAGE_SIZE } from "@/lib/console-jobs";
+import { NotificationProvider } from "./NotificationCentre";
 
 // STUDIO-681 §10, sub-ticket 2 — the Jobs worklist's acceptance boxes 2.6, 2.7 and 2.8,
 // driven through the real view against the endpoints §9 has: /api/v1/state for the live
@@ -28,6 +30,7 @@ const h = vi.hoisted(() => ({
   fetchIssueCounts: vi.fn(),
   fetchHistoryCosts: vi.fn(async (): Promise<{ costs: TicketCostRow[] }> => ({ costs: [] })),
   fetchTeamsOverview: vi.fn(),
+  fetchNotifications: vi.fn(async (): Promise<NotificationsResponse> => ({ notifications: [] })),
   fetchLeadDecisions: vi.fn(async (): Promise<LeadDecisionsResponse> => ({ decisions: [], queued: [] })),
   leadEnabled: false,
   fetchRunTranscript: vi.fn(),
@@ -45,6 +48,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchIssueCounts: h.fetchIssueCounts,
     fetchHistoryCosts: h.fetchHistoryCosts,
     fetchTeamsOverview: h.fetchTeamsOverview,
+    fetchNotifications: h.fetchNotifications,
     fetchLeadDecisions: h.fetchLeadDecisions,
     fetchRunTranscript: h.fetchRunTranscript,
     fetchTypedConfig: h.fetchTypedConfig,
@@ -180,7 +184,7 @@ function Paged({ onOpenJob }: { onOpenJob: (issue: string) => void }) {
 function mount(onOpenJob = vi.fn(), qc = new QueryClient({ defaultOptions: { queries: { retry: false } } })) {
   render(
     <QueryClientProvider client={qc}>
-      <Paged onOpenJob={onOpenJob} />
+      <NotificationProvider><Paged onOpenJob={onOpenJob} /></NotificationProvider>
     </QueryClientProvider>,
   );
   return onOpenJob;
@@ -244,7 +248,7 @@ describe("lead work is not a ticket job (STUDIO-1145)", () => {
     expect(document.body.textContent).not.toContain(`${key} title`);
   });
 
-  it("adds escalations, but no routine lead decisions, to Needs you", async () => {
+  it("uses the daemon notice count, not routine lead decisions or the ticket tally, for Needs you", async () => {
     h.leadEnabled = true;
     h.fetchLeadDecisions.mockResolvedValue({ decisions: [
       { id: 2, subject: "STUDIO-598", decision: "proposed: diagnosis" },
@@ -255,6 +259,12 @@ describe("lead work is not a ticket job (STUDIO-1145)", () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
     h.fetchIssueCounts.mockResolvedValue({ issues: 0, buckets: [] });
     h.fetchTeamsOverview.mockResolvedValue({ roster: [] });
+    const notice = { id: 1, kind: "lead_escalation", group: "needs_you" as const, subject: "STUDIO-1142", summary: "Needs access",
+      href: "#lead/decision-3", at: "2026-10-08T10:00:00Z", read_at: null, active: true };
+    h.fetchNotifications.mockResolvedValueOnce({ notifications: [notice,
+      { ...notice, id: 2, kind: "lead_decision", group: "decisions" },
+      { ...notice, id: 3, read_at: "2026-10-08T11:00:00Z" },
+    ] });
     mount();
     await waitFor(() => expect(stat("needs you")).toBe("1"));
   });
@@ -322,8 +332,8 @@ describe("the Now strip (§3)", () => {
     // The strip's shape itself, pinned: FOUR stats, and exactly one of them is the human-attention
     // flag. This reds if a second pill reporting the same set is ever put back beside it.
     expect(statLabels()).toEqual(["running", "queued", "blocked", "needs you"]);
-    // B, C — a clean run hands its ticket to review — plus F, whose failure needs a decision.
-    expect(stat("needs you")).toBe("3");
+    // A ticket state/outcome alone does not mint a notice (STUDIO-1145).
+    expect(stat("needs you")).toBe("0"); // Ticket lifecycle counts no longer mint notices.
     // And the in-review rows are still one click away, which is why the pill is not missed.
     fireEvent.click(screen.getByRole("button", { name: "In review" }));
     await waitFor(() => expect(rowKeys().sort()).toEqual(["B", "C"]));
@@ -375,11 +385,10 @@ describe("the ticket lifecycle (STUDIO-702)", () => {
   // The bug: two of these four tickets are terminal and used to be counted as awaiting review, for
   // as long as the store kept their runs. The claim outlived the pill that carried it — STUDIO-743
   // dropped the in-review stat — so it is asserted on the one the operator now reads.
-  it("counts only work actually awaiting a reviewer", async () => {
+  it("does not count routine reviewer waits as operator notices", async () => {
     await mountLifecycleJobs();
-    // REVIEW, plus LEGACY, which the daemon could not resolve and which falls back as before.
-    // MERGED and DROPPED are terminal and must not be billed to anybody.
-    expect(stat("needs you")).toBe("2");
+    // Routine reviewer waits, legacy outcomes and terminal tickets leave the notice count alone.
+    expect(stat("needs you")).toBe("0");
   });
 
   // The Done tab was permanently empty: `done` was unreachable from run outcomes alone.
@@ -661,7 +670,7 @@ describe("reviewing vs in review (§3)", () => {
 // STUDIO-743 (design record §6) — the additive Jobs-home touch: the operator's own count on the
 // Now strip, and a per-row preview of each run's shape in the run detail's phase glyphs.
 describe("the Needs you count (§6)", () => {
-  it("counts the tickets whose next move is the operator's, not the daemon's", async () => {
+  it("does not derive notices from lifecycle/outcome counts", async () => {
     h.fetchState.mockResolvedValue({
       ...EMPTY_STATE,
       blocked: [
@@ -698,21 +707,18 @@ describe("the Needs you count (§6)", () => {
     });
     mount();
 
-    // REVIEW is parked for a reviewer and FAILED needs a decision. MERGED is finished, IDLE is
-    // the daemon's to redispatch, and the two HELD rows wait on REVIEW rather than on the operator.
-    await waitFor(() => expect(stat("needs you")).toBe("2"));
-    // It is a count of a different set from every pill still beside it, and the fixture keeps the
-    // numbers apart so a coincidence cannot pass for agreement: three rows read "blocked" and only
-    // one of them wants a human, while the in-review row wants one without reading blocked at all.
+    // Only the notification feed knows which review waits/failures need a human.
+    // This fixture has no notices, independent of all three ticket tallies.
+    await waitFor(() => expect(stat("needs you")).toBe("0"));
+    // Ticket tallies still describe the ticket set independently.
     expect(stat("blocked")).toBe("3");
     expect(stat("running")).toBe("0");
     expect(stat("queued")).toBe("1");
   });
 
   // The OTHER side of the same distinction, and the one a careless `||` would silently break: a
-  // real, earned zero. The tracker answered and every ticket it named is finished, so nothing is
-  // waiting on the operator — and saying "0" there is a fact the strip should report, not a shrug.
-  it("says 0, not —, when the tracker answered and nothing is waiting", async () => {
+  // real, earned zero from a successful empty notification response.
+  it("says 0, not —, when the notice feed answered and nothing is waiting", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
     serveStore([
       run({ issue_identifier: "ONE", outcome: "completed", lifecycle: "done" }),
@@ -731,15 +737,9 @@ describe("the Needs you count (§6)", () => {
     expect(stat("needs you")).toBe("0");
   });
 
-  // THE OUTAGE SHAPE, END TO END. `issue_lifecycles` answers per request off a TTL cache and the
-  // tracker, so a cold cache or a failed Linear round-trip serves exactly this: the runs, none of
-  // them decorated. Every `completed` outcome is then inferred into "in review", so each row below
-  // reads in-review without one word from the tracker — and any count taken over those rows would
-  // be a number the console invented. It refuses instead: "—" says "I cannot tell", where both the
-  // numbers on offer would be claims. (Counting the inferred rows gives 2; the earlier shape that
-  // discounted an undecorated row gave 0 — "nothing is waiting on you", which is the one thing the
-  // console cannot know at that moment. The assertion reds on either.)
-  it("says — rather than a number when the tracker answered nothing for the page", async () => {
+  // A tracker outage still decorates no rows. The notice count is independent of those
+  // missing lifecycles, and remains answerable from its own successful API response.
+  it("keeps the notice count answerable when the tracker answered nothing for the page", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
     serveStore([
       run({ issue_identifier: "ONE", outcome: "completed" }),
@@ -759,7 +759,7 @@ describe("the Needs you count (§6)", () => {
     fireEvent.click(screen.getByRole("button", { name: "In review" }));
     await waitFor(() => expect(rowKeys().sort()).toEqual(["ONE", "TWO"]));
 
-    expect(stat("needs you")).toBe("—");
+    expect(stat("needs you")).toBe("0"); // Notices remain answerable without tracker lifecycles.
   });
 });
 
@@ -1226,14 +1226,14 @@ describe("the Now strip counts the STORE (STUDIO-828)", () => {
     return tr === undefined ? "<no row>" : (tr.querySelectorAll("td")[2]?.getAttribute("title") ?? "");
   }
 
-  /** `n` finished tickets the tracker has parked for review — each one is a "needs you". */
+  /** `n` queued tickets; queued remains a whole-store tally after Needs you moved to notices. */
   function store(n: number): IssueRun[] {
     return Array.from({ length: n }, (_, i) =>
       run({
         issue_identifier: `T-${i}`,
-        outcome: "completed",
-        lifecycle: "in_review",
-        tracker_state: "In Review",
+        outcome: "stopped",
+        lifecycle: "open",
+        tracker_state: "Todo",
       }),
     );
   }
@@ -1242,7 +1242,7 @@ describe("the Now strip counts the STORE (STUDIO-828)", () => {
   // the same store, and the numbers are equal. A test that renders one window and asserts a number
   // passes on the defective code too, so the two widths are the test.
   //
-  // 57 issues, so the default page genuinely truncates. The old fold answered "50 needs you" here
+  // 57 issues, so the default page genuinely truncates. A page-only fold answers "50 queued" here
   // and "57" after one click — a figure that moved because the operator scrolled.
   it("does not move when the operator loads more rows", async () => {
     h.fetchState.mockResolvedValue(EMPTY_STATE);
@@ -1258,7 +1258,7 @@ describe("the Now strip counts the STORE (STUDIO-828)", () => {
     });
     // 57, not 50: the number the operator reads is a count of the STORE, and the table beside it is
     // showing 50 of those rows. That gap is the fix, not a discrepancy.
-    expect(strip()).toEqual({ needsYou: "57", running: "0", queued: "0", blocked: "0" });
+    expect(strip()).toEqual({ needsYou: "0", running: "0", queued: "57", blocked: "0" });
     const narrow = strip();
 
     fireEvent.click(screen.getByRole("button", { name: /load 50 more/i }));
@@ -1281,7 +1281,7 @@ describe("the Now strip counts the STORE (STUDIO-828)", () => {
     serveStore(store(3));
     mount();
 
-    await waitFor(() => expect(stat("needs you")).toBe("3"));
+    await waitFor(() => expect(stat("queued")).toBe("3"));
 
     // The maintainer merges one. The daemon reports the new tracker state and nothing else changes.
     serveStore([
@@ -1297,7 +1297,7 @@ describe("the Now strip counts the STORE (STUDIO-828)", () => {
       await vi.advanceTimersByTimeAsync(LIVE_POLL_MS + 500);
     });
 
-    expect(stat("needs you")).toBe("2");
+    expect(stat("queued")).toBe("2");
     vi.useRealTimers();
   });
 
@@ -1310,7 +1310,7 @@ describe("the Now strip counts the STORE (STUDIO-828)", () => {
     serveStore(store(3));
     mount();
 
-    await waitFor(() => expect(stat("needs you")).toBe("3"));
+    await waitFor(() => expect(stat("queued")).toBe("3"));
 
     serveStore([
       ...store(2),
@@ -1318,7 +1318,7 @@ describe("the Now strip counts the STORE (STUDIO-828)", () => {
     ]);
     fireEvent.click(screen.getByRole("button", { name: /Refresh/ }));
 
-    await waitFor(() => expect(stat("needs you")).toBe("2"));
+    await waitFor(() => expect(stat("queued")).toBe("2"));
   });
 
   // The other half of defect B, and the one STUDIO-792 deliberately left open: a WIDENED window came
@@ -1335,7 +1335,7 @@ describe("the Now strip counts the STORE (STUDIO-828)", () => {
     await waitFor(() => expect(rowKeys()).toHaveLength(JOBS_PAGE_SIZE));
     fireEvent.click(screen.getByRole("button", { name: /load 50 more/i }));
     await waitFor(() => expect(rowKeys()).toHaveLength(57));
-    expect(trackerStateOf("T-0")).toBe("In Review");
+    expect(trackerStateOf("T-0")).toBe("Todo");
 
     serveStore([
       run({ issue_identifier: "T-0", outcome: "completed", lifecycle: "done", tracker_state: "Done" }),
@@ -1691,10 +1691,9 @@ describe("a Jobs list left open (STUDIO-791)", () => {
 
     // Both halves, together — which is the ticket's second acceptance clause. Since STUDIO-828 they
     // are no longer one fetch: the row comes from the listing and the count from the whole-store
-    // tally, two queries on the same cadence. That makes asserting both worth more than it was, not
-    // less — it is now possible for one to move without the other, and this says they do not.
+    // tally. The notification count is independent of this routine reviewer wait.
     expect(rowStatus("B-2")).toContain("in review");
-    expect(stat("needs you")).toBe("1");
+    expect(stat("needs you")).toBe("0");
   });
 });
 

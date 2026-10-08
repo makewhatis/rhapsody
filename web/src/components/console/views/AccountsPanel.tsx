@@ -2,6 +2,7 @@ import type { AccountView } from "@/lib/api";
 import { Card, Chip, Pill, PILL_COLORS, type PillVariant } from "@/components/console";
 import { useAccounts } from "@/hooks/useAccounts";
 import { useEffect, useState } from "react";
+import { useNotificationCentre } from "./NotificationCentre";
 
 const variants: Record<string, PillVariant> = { ok: "run", warn: "review", "stop-new": "review", handoff: "blocked", wall: "blocked", stale: "queued" };
 
@@ -47,10 +48,12 @@ export function AccountsPanel({ accounts, nowS }: { accounts: AccountView[]; now
 
 export function AccountsPage() {
   const query = useAccounts();
+  const system = useNotificationCentre().notices.filter((n) => n.group === "system" && n.active);
   const [nowS, setNowS] = useState(() => Math.floor(Date.now() / 1000));
   useEffect(() => { const timer = window.setInterval(() => setNowS(Math.floor(Date.now() / 1000)), 1000); return () => window.clearInterval(timer); }, []);
   return <section>
     <h1>Accounts</h1>
+    {system.length > 0 ? <Card title="System status">{system.map((n) => <p key={n.id}><Pill variant="review">{n.subject}</Pill> {n.summary}</p>)}</Card> : null}
     {query.isPending ? <div className="empty">Loading accounts…</div> : query.isError ? <div role="alert">Account usage could not be read.</div> : <AccountsPanel accounts={query.data ?? []} nowS={nowS} />}
   </section>;
 }
