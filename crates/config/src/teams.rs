@@ -86,6 +86,15 @@ pub enum ReviewAuthority {
     Act,
 }
 
+/// Authority over account-limit judgment calls, independent of review exchanges (STUDIO-1127).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LimitAuthority {
+    Advise,
+    #[default]
+    Act,
+}
+
 /// Serde is hand-written rather than derived so an unrecognised or misspelled value reads as `off`
 /// rather than failing the whole `teams.yaml` (which would silently disable Teams). M6 adds the
 /// validation that refuses a bad value loudly; until then "treat it as off" is the safe direction,
@@ -332,6 +341,8 @@ pub struct Manager {
     /// [`Teams::manager_review_authority`], never raw — the accessor folds in the ticketless gate.
     #[serde(default)]
     pub review_authority: ReviewAuthority,
+    #[serde(default)]
+    pub limit_authority: LimitAuthority,
     /// `manager.max_interventions` (STUDIO-1013, §7.3/§12): the post-threshold ceiling on
     /// interventions for one pull request in one generation. Parsed and carried here; the M7/M8
     /// activation transaction is what enforces it.
@@ -374,6 +385,7 @@ impl Default for Manager {
             max_tokens: DEFAULT_MAX_TOKENS,
             timeout_ms: DEFAULT_TIMEOUT_MS,
             review_authority: ReviewAuthority::Off,
+            limit_authority: LimitAuthority::Act,
             max_interventions: DEFAULT_MAX_INTERVENTIONS,
             max_runs_per_generation: DEFAULT_MAX_RUNS_PER_GENERATION,
             max_concurrent: DEFAULT_MAX_CONCURRENT,
@@ -1927,6 +1939,20 @@ impl Teams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn limit_authority_default_act() {
+        for manager in [
+            Manager::default(),
+            serde_yaml_ng::from_str::<Manager>("{}").unwrap(),
+        ] {
+            assert_eq!(
+                serde_json::to_value(manager).unwrap()["limit_authority"],
+                "act"
+            );
+        }
+        assert!(serde_yaml_ng::from_str::<Manager>("limit_authority: typo").is_err());
+    }
 
     /// §2.4 row 1, the inertness claim's first line: an absent `teams.yaml` is
     /// the off state AND stays absent. This is the deliberate divergence from
@@ -3761,6 +3787,7 @@ mod tests {
                 // below; `other` carries the `Act` spelling).
                 review_authority: ReviewAuthority::Off,
                 max_interventions: 4,
+                limit_authority: LimitAuthority::Advise,
                 max_runs_per_generation: 13,
                 max_concurrent: 2,
                 effort: "medium".to_string(),

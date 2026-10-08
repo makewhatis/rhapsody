@@ -46,6 +46,7 @@ pub(crate) const MANAGER_TOOL_NAMES: &[&str] = &[
     // The one write: its own bank, observations only.
     "teams_retain",
     // Host-served reads (§4.4).
+    "manager_accounts",
     "manager_pr",
     "manager_pr_activity",
     "manager_pr_commits",
@@ -122,6 +123,17 @@ fn manager_run_id(default: &str) -> Result<String, FacadeError> {
 
 #[tool_router(router = manager_router, vis = "pub(crate)")]
 impl Facade {
+    #[tool(
+        name = "manager_accounts",
+        description = "Read every account's usage windows, reset times, credits flag and detection status. Read-only snapshot; never contacts a provider. Proxies GET /api/v1/accounts."
+    )]
+    async fn manager_accounts(&self) -> CallToolResult {
+        match self.client.get("/api/v1/accounts").await {
+            Ok(body) => text_result(&body),
+            Err(e) => err_result(&e),
+        }
+    }
+
     #[tool(
         name = "manager_pr",
         description = "The pull request a manager run is adjudicating: head, base, state, draft, mergeable, and the checks at head. Served by the host's own off-loop gh. Proxies GET /api/v1/manager/pr. Defaults to your own run via SYMPHONY_RUN_ID."
@@ -357,6 +369,27 @@ mod tests {
     use rmcp::model::{CallToolRequestParams, CallToolResult};
     use rmcp::service::RunningService;
 
+    #[tokio::test]
+    async fn manager_accounts_tool_registered_read_only() {
+        let router = Router::new().route(
+            "/api/v1/accounts",
+            get(|| async { r#"{"accounts":[{"account":"claude-subscription"}]}"# }),
+        );
+        let port = spawn_router(router).await;
+        let facade = Facade::new(&test_config(), client_for_port(port), manager_options());
+        let client = connect(facade).await;
+        let tools = client.list_all_tools().await.unwrap();
+        assert!(tools.iter().any(|t| t.name == "manager_accounts"));
+        let res = client
+            .call_tool(CallToolRequestParams::new("manager_accounts"))
+            .await
+            .unwrap();
+        assert_eq!(
+            result_text(&res),
+            r#"{"accounts":[{"account":"claude-subscription"}]}"#
+        );
+        let _ = client.cancel().await;
+    }
     async fn connect(facade: Facade) -> RunningService<rmcp::RoleClient, ()> {
         let (client_t, server_t) = tokio::io::duplex(1 << 16);
         tokio::spawn(async move {
