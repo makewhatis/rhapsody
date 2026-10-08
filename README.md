@@ -1364,8 +1364,14 @@ rejections, crashes and timeouts advance to the next available entry through the
 reservation. Malformed decisions retain the existing same-entry failed-attempt handling. Every
 launched attempt counts against the generation budget. The host records `decided_by` beside a
 validated decision, and its explanation names the model, harness and fallback reason. OpenCode
-entries remain unavailable until their isolated manager session and self-test adapters are installed
-by the subsequent MH2/MH3 slices.
+entries use an isolated HOME/XDG tree and an OpenAI-only credential copy with an empty refresh
+field. Their self-test (STUDIO-1121) checks `debug agent build` without a model call, then runs a
+low-effort trap canary: no built-ins or unregistered writes, no project/plugin/instruction traps,
+and a successful `symphony_state` read. Both layers fail closed. The resolved permission tail may
+allow OpenCode's own truncated-output directory only inside that run's private XDG data tree.
+Before either launch, sessions and canaries copy the public model catalogue from
+`~/.cache/opencode/models.json` into their own private cache. A missing catalogue refuses the
+entry with `no OpenCode model catalogue; run opencode once as the daemon's user`.
 
 The manager adjudicates a stalled review loop, and the security boundary is that its agent run gets
 **no filesystem, no shell, no network and no repository checkout**: the daemon serves every read.

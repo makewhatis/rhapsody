@@ -61,6 +61,7 @@ pub mod managerprep;
 pub mod managerread;
 pub mod managerrun;
 pub mod managerselftest;
+pub mod managerselftest_opencode;
 pub mod managerwake;
 pub mod mergeconsole;
 pub mod message;

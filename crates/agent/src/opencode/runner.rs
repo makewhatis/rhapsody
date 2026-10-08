@@ -33,7 +33,7 @@
 //! value, exactly as for claude (design §15.5): withholding the Linear key from the agent is not a
 //! billing decision.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
@@ -393,33 +393,15 @@ pub(crate) const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
     stdin: StdinPolicy::ClosedAtStart,
 };
 
-impl Harness for Runner {
-    fn id(&self) -> HarnessId {
-        HarnessId::Opencode
-    }
-
-    fn capabilities(&self) -> &HarnessCapabilities {
-        &CAPABILITIES
-    }
-
-    /// The manager uses the ordinary stream runner with a separate, daemon-controlled posture.
-    /// Its credential can never refresh, retry from a copy, or survive the run for resume.
-    fn start_manager_session(
+impl Runner {
+    fn start_manager_session_in(
         &self,
         req: crate::manager::ManagerSessionStart,
         issue: Issue,
         transcript: Option<Transcript>,
+        real_home: String,
     ) -> Result<Box<dyn Session>, AgentError> {
         use std::os::unix::fs::DirBuilderExt;
-        let real_home = std::env::var("HOME")
-            .ok()
-            .filter(|h| !h.is_empty())
-            .ok_or_else(|| {
-                AgentError::Other(
-                    "manager_home_missing: daemon HOME is required for the manager MCP server"
-                        .to_string(),
-                )
-            })?;
         if req.model.is_empty() {
             return Err(AgentError::Other(
                 "manager_model_missing: OpenCode requires an explicit model".to_string(),
@@ -462,6 +444,7 @@ impl Harness for Runner {
                 .create(dir)
                 .map_err(|e| AgentError::Other(format!("manager_private_dir_failed: {e}")))?;
         }
+        manager::seed_manager_catalogue(Path::new(&real_home), &xdg.join("cache"))?;
         manager::seed_manager_credential(&operator_auth, &xdg.join("data"))?;
         let mut cfg = self.cfg.clone();
         cfg.model = req.model;
@@ -497,6 +480,36 @@ impl Harness for Runner {
             account_oauth: std::sync::OnceLock::new(),
             limits: std::sync::Arc::clone(&self.limits),
         }))
+    }
+}
+
+impl Harness for Runner {
+    fn id(&self) -> HarnessId {
+        HarnessId::Opencode
+    }
+
+    fn capabilities(&self) -> &HarnessCapabilities {
+        &CAPABILITIES
+    }
+
+    /// The manager uses the ordinary stream runner with a separate, daemon-controlled posture.
+    /// Its credential can never refresh, retry from a copy, or survive the run for resume.
+    fn start_manager_session(
+        &self,
+        req: crate::manager::ManagerSessionStart,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        let real_home = std::env::var("HOME")
+            .ok()
+            .filter(|h| !h.is_empty())
+            .ok_or_else(|| {
+                AgentError::Other(
+                    "manager_home_missing: daemon HOME is required for the manager MCP server"
+                        .to_string(),
+                )
+            })?;
+        self.start_manager_session_in(req, issue, transcript, real_home)
     }
 
     /// The brokered materialization (PB7, STUDIO-1002): provision a credential-FREE run state and a
@@ -1899,6 +1912,13 @@ printf '%s\n' '{"type":"step_finish","sessionID":"ses_manager","part":{"reason":
             std::fs::create_dir(&cwd).unwrap();
             std::fs::create_dir(&config).unwrap();
             let auth = root.path().join("operator-auth.json");
+            let cache = root.path().join("operator-home/.cache/opencode");
+            std::fs::create_dir_all(&cache).unwrap();
+            std::fs::write(
+                cache.join("models.json"),
+                r#"{"openai":{"models":{"gpt-6.1-sol":{}}}}"#,
+            )
+            .unwrap();
             std::fs::write(&auth, json!({"openai":{"type":"oauth","access":"test-only-access","refresh":"test-only-refresh","expires":4102444800000_i64},"other":{"key":"test-only-other"}}).to_string()).unwrap();
             let script = root.path().join("fake.sh");
             std::fs::write(
@@ -1914,6 +1934,7 @@ printf '%s\n' "$@" > "$capture/$label/argv"
 printf '%s' "$OPENCODE_CONFIG_CONTENT" > "$capture/$label/config"
 if test -z "$(ls -A .)"; then printf 'empty' > "$capture/$label/cwd-empty"; fi
 test -f "$XDG_DATA_HOME/opencode/auth.json"
+if test -f "$XDG_CACHE_HOME/opencode/models.json"; then cp "$XDG_CACHE_HOME/opencode/models.json" "$capture/$label/models.json"; fi
 # Reproduce shared-state failure rather than hiding it behind an always-successful fake.
 mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
 {}
@@ -1956,8 +1977,37 @@ mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
 
         fn start(&self) -> Box<dyn Session> {
             self.runner
-                .start_manager_session(self.req.clone(), Issue::default(), None)
+                .start_manager_session_in(
+                    self.req.clone(),
+                    Issue::default(),
+                    None,
+                    self.real_home(),
+                )
                 .unwrap()
+        }
+
+        fn real_home(&self) -> String {
+            self.root
+                .path()
+                .join("operator-home")
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        // Caller holds ENV_GUARD.write(); restore HOME before any assertion or await.
+        fn start_public(&self) -> Result<Box<dyn Session>, AgentError> {
+            let saved = std::env::var_os("HOME");
+            unsafe { std::env::set_var("HOME", self.real_home()) };
+            let result =
+                self.runner
+                    .start_manager_session(self.req.clone(), Issue::default(), None);
+            unsafe {
+                match saved {
+                    Some(home) => std::env::set_var("HOME", home),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            result
         }
 
         fn env(&self, label: &str) -> BTreeMap<String, String> {
@@ -2037,7 +2087,7 @@ mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
                 &s.req.model,
                 "/bin/rhapsodyd",
                 "/repo/WORKFLOW.md",
-                &std::env::var("HOME").unwrap(),
+                &s.real_home(),
                 "42"
             ))
             .unwrap()
@@ -2060,6 +2110,45 @@ mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
         assert_eq!(cred.as_object().unwrap().len(), 1);
         assert_eq!(cred["openai"]["refresh"], "");
         session.stop().await.unwrap();
+        s.assert_state_gone();
+    }
+
+    #[tokio::test]
+    async fn manager_cache_seeded_with_models_catalogue() {
+        let _env = crate::ENV_GUARD.write().await;
+        let s = Setup::new(SUCCESS);
+        let source = Path::new(&s.real_home()).join(".cache/opencode/models.json");
+        let before = std::fs::read(&source).unwrap();
+        let mtime = std::fs::metadata(&source).unwrap().modified().unwrap();
+        let session = s.start_public().unwrap();
+        let (_, err) = session.run_turn("catalogue", None, None, &|_| {}).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(
+            std::fs::read(s.root.path().join("catalogue/models.json")).unwrap(),
+            before
+        );
+        let env = s.env("catalogue");
+        assert!(Path::new(&env["XDG_CACHE_HOME"]).starts_with(s.state.path()));
+        assert_eq!(std::fs::read(&source).unwrap(), before);
+        assert_eq!(
+            std::fs::metadata(&source).unwrap().modified().unwrap(),
+            mtime
+        );
+        session.stop().await.unwrap();
+        s.assert_state_gone();
+    }
+
+    #[tokio::test]
+    async fn missing_catalogue_is_a_typed_reason() {
+        let _env = crate::ENV_GUARD.write().await;
+        let s = Setup::new(SUCCESS);
+        std::fs::remove_file(Path::new(&s.real_home()).join(".cache/opencode/models.json"))
+            .unwrap();
+        let result = s.start_public();
+        assert!(
+            matches!(result, Err(AgentError::Other(ref reason)) if reason == "no OpenCode model catalogue; run opencode once as the daemon's user")
+        );
+        assert!(!s.root.path().join("catalogue").exists());
         s.assert_state_gone();
     }
 
@@ -2128,7 +2217,7 @@ mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
         std::fs::write(&s.runner.cfg.auth_source, "malformed-test-only").unwrap();
         assert!(
             s.runner
-                .start_manager_session(s.req.clone(), Issue::default(), None)
+                .start_manager_session_in(s.req.clone(), Issue::default(), None, s.real_home())
                 .is_err()
         );
         s.assert_state_gone();
@@ -2163,7 +2252,7 @@ mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
         std::fs::create_dir(&second.config_dir).unwrap();
         let b = s
             .runner
-            .start_manager_session(second.clone(), Issue::default(), None)
+            .start_manager_session_in(second.clone(), Issue::default(), None, s.real_home())
             .unwrap();
         let (ra, rb) = tokio::join!(
             a.run_turn("a", None, None, &|_| {}),
