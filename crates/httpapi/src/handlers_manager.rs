@@ -24,6 +24,80 @@ use crate::handlers::require_get;
 use crate::responses::{write_error, write_json};
 use crate::server::StateProvider;
 
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InvestigateRequest {
+    #[serde(rename = "ref")]
+    head: String,
+    cmd: String,
+}
+
+/// POST-only, operator-guarded; command text belongs in a bounded body, never a URL or log line.
+pub(crate) async fn handle_investigate(
+    State(provider): State<Arc<dyn StateProvider>>,
+    method: Method,
+    Query(q): Query<HashMap<String, String>>,
+    request: axum::extract::Request,
+) -> Response {
+    if method != Method::POST {
+        return write_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "use POST",
+            None,
+        );
+    }
+    let run_id = match run_id_param(&q) {
+        Ok(id) => id,
+        Err(r) => return *r,
+    };
+    let body = match axum::body::to_bytes(request.into_body(), 16 * 1024).await {
+        Ok(body) => body,
+        Err(_) => {
+            return write_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too_large",
+                "investigate body exceeds 16 KB",
+                None,
+            );
+        }
+    };
+    let args: InvestigateRequest = match serde_json::from_slice(&body) {
+        Ok(args) => args,
+        Err(_) => {
+            return write_error(
+                StatusCode::BAD_REQUEST,
+                "bad_request",
+                "expected ref and cmd",
+                None,
+            );
+        }
+    };
+    if args.cmd.is_empty() || args.cmd.len() > 8 * 1024 {
+        return write_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "cmd must contain 1–8192 bytes",
+            None,
+        );
+    }
+    match provider.investigate(run_id, args.head, args.cmd).await {
+        Ok(output) => write_json(StatusCode::OK, &output),
+        Err(error) => {
+            use rhapsody_orchestrator::investigate::InvestigateError;
+            let status = match error {
+                InvestigateError::InvalidRef => StatusCode::BAD_REQUEST,
+                InvestigateError::SessionEnded | InvestigateError::SessionLost => {
+                    StatusCode::CONFLICT
+                }
+                InvestigateError::CommandTimeout => StatusCode::REQUEST_TIMEOUT,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            write_error(status, error.code(), error.to_string(), None)
+        }
+    }
+}
+
 /// Extracts a positive `run_id` query parameter, or a 400 envelope.
 fn run_id_param(q: &HashMap<String, String>) -> Result<i64, Box<Response>> {
     match q
@@ -312,6 +386,38 @@ mod tests {
     use super::*;
     use crate::server::new_handler;
     use crate::testutil::{FakeProvider, empty_snapshot, spawn_router};
+
+    #[tokio::test]
+    async fn investigate_is_post_only_bounded_and_typed_unavailable() {
+        let provider = Arc::new(crate::testutil::FakeProvider::ok(
+            crate::testutil::empty_snapshot(),
+        ));
+        let base = crate::testutil::spawn_router(crate::new_handler(provider, None)).await;
+        let path = format!("{base}/api/v1/manager/investigate?run_id=7");
+        assert_eq!(reqwest::get(&path).await.unwrap().status(), 405);
+        let client = crate::testutil::operator_client();
+        let body = serde_json::json!({"ref":"a".repeat(40), "cmd":"cargo --version"});
+        let response = client.post(&path).json(&body).send().await.unwrap();
+        assert_eq!(response.status(), 503);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["error"]["code"],
+            "investigate_unavailable"
+        );
+        let response = client
+            .post(&path)
+            .body("x".repeat(20 * 1024))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 413);
+        let response = client
+            .post(&path)
+            .json(&serde_json::json!({"ref":"a", "cmd":"true", "repo":"foreign"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 400);
+    }
 
     async fn spawn(provider: Arc<FakeProvider>) -> String {
         spawn_router(new_handler(provider, None)).await

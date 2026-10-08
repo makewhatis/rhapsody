@@ -43,6 +43,7 @@ use crate::handlers_history::{
 };
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
+use crate::handlers_manager::handle_investigate;
 use crate::handlers_manager::{
     handle_manager_diff, handle_manager_file, handle_manager_findings, handle_manager_grep,
     handle_manager_interdiff, handle_manager_ls, handle_manager_patch_id, handle_manager_pr,
@@ -582,6 +583,22 @@ pub trait StateProvider: Send + Sync {
         ))
     }
 
+    async fn investigate(
+        &self,
+        _run_id: i64,
+        _head: String,
+        _cmd: String,
+    ) -> Result<
+        rhapsody_orchestrator::investigate::CommandOutput,
+        rhapsody_orchestrator::investigate::InvestigateError,
+    > {
+        Err(
+            rhapsody_orchestrator::investigate::InvestigateError::Unavailable(
+                "investigate is disabled on this daemon".into(),
+            ),
+        )
+    }
+
     /// `GET /api/v1/manager/ls?run_id&sha&path` — a tree listing at a commit sha.
     async fn manager_ls(&self, _run_id: i64, _sha: String, _path: String) -> ManagerReadOutcome {
         Err(ManagerReadError::Unavailable(
@@ -853,6 +870,10 @@ where
         // the run's own `run_id`. `/api/v1/manager/pr/activity` and `/pr/commits` are more specific
         // than `/pr`; axum's matchit dispatches them regardless of order.
         .route("/api/v1/manager/file", any(handle_manager_file))
+        .route(
+            "/api/v1/manager/investigate",
+            operator_write(handle_investigate),
+        )
         .route("/api/v1/manager/ls", any(handle_manager_ls))
         .route("/api/v1/manager/grep", any(handle_manager_grep))
         .route("/api/v1/manager/diff", any(handle_manager_diff))
