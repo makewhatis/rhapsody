@@ -1562,7 +1562,7 @@ impl Orchestrator {
     /// own re-engaged run under the origin ticket does. `claimed` is deliberately not consulted — it
     /// holds opaque issue IDs, which cannot be matched against an identifier without a second lookup
     /// this path does not need; a claim that becomes a run is seen here on the next tick.
-    fn ticket_run_live(&self, identifier: &str) -> bool {
+    pub(crate) fn ticket_run_live(&self, identifier: &str) -> bool {
         self.running
             .values()
             .any(|entry| entry.issue.identifier == identifier)
@@ -1660,12 +1660,16 @@ impl Orchestrator {
             let since = *state.unanswered_since.get_or_insert(now);
             if now.signed_duration_since(since) >= crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED {
                 state.escalated = true;
+                let pokes = state.pokes;
+                if self.lead_draft_exhausted(&pr.to_string()) {
+                    return;
+                }
                 report.nudges.push(crate::draftpoke::DraftNudge::Escalate(
                     crate::draftpoke::DraftEscalation {
                         pr: pr.clone(),
                         identifier: identifier.to_string(),
                         author,
-                        pokes: state.pokes,
+                        pokes,
                     },
                 ));
             }
@@ -1673,12 +1677,16 @@ impl Orchestrator {
         }
         if state.pokes >= crate::draftpoke::MAX_DRAFT_POKES {
             state.escalated = true;
+            let pokes = state.pokes;
+            if self.lead_draft_exhausted(&pr.to_string()) {
+                return;
+            }
             report.nudges.push(crate::draftpoke::DraftNudge::Escalate(
                 crate::draftpoke::DraftEscalation {
                     pr: pr.clone(),
                     identifier: identifier.to_string(),
                     author,
-                    pokes: state.pokes,
+                    pokes,
                 },
             ));
             return;
@@ -1928,6 +1936,13 @@ impl Orchestrator {
                 counters += 1;
             }
             if row.dispatches == 0 && row.adjudication.is_some() {
+                if row
+                    .adjudication
+                    .as_ref()
+                    .is_some_and(|a| a.decision == rhapsody_store::REVIEW_ADJUDICATION_ESCALATE)
+                {
+                    self.lead_impossible(&row.pr, "zero_verdict_escalation");
+                }
                 if let Err(e) = self.store().clear_review_adjudication(&row.pr) {
                     tracing::warn!(pr = %row.pr, err = %e, "recovery: clearing an adjudication with no recorded verdict rounds failed");
                 }
@@ -6785,6 +6800,43 @@ mod tests {
                 sweep_at(&mut o, much_later, &[draft_at(12, HEAD_A)])
                     .nudges
                     .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn lead_draft_exhaustion_queues_on_both_bounds() {
+        for moving in [false, true] {
+            let mut teams = ticketless(&["alice", "bob"]);
+            teams.manager.lead.enabled = true;
+            let (mut o, _d) = orch(teams);
+            introduce(&o, row(12, "bob"));
+            let base = draft_clock();
+            sweep_at(&mut o, base, &[draft_at(12, HEAD_A)]);
+            let report = if moving {
+                sweep_at(&mut o, base, &[draft_at(12, HEAD_B)]);
+                sweep_at(&mut o, base, &[draft_at(12, HEAD_A)]);
+                sweep_at(&mut o, base, &[draft_at(12, HEAD_B)])
+            } else {
+                sweep_at(
+                    &mut o,
+                    base + crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED,
+                    &[draft_at(12, HEAD_A)],
+                )
+            };
+            assert!(
+                report.nudges.is_empty(),
+                "no human escalation: {:?}",
+                report.nudges
+            );
+            let items = o.store().load_lead_items().expect("items");
+            assert_eq!(items.len(), 1);
+            assert_eq!(
+                items[0].trigger,
+                rhapsody_store::LeadTrigger::ImpossibleState {
+                    subject: coord(12).to_string(),
+                    kind: "draft_pokes_exhausted".into()
+                }
             );
         }
     }

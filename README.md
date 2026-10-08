@@ -61,6 +61,23 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Tech-lead trigger queue (STUDIO-1134)
+
+`manager.lead.enabled` in the boot-loaded Teams configuration opts into a durable
+`rhapsody_lead_items` queue (schema migration **29**). Blocked ticket endings asking for a
+decision, review escalations, and impossible states (zero verdicts at the escalated head,
+In Review with an authoritative empty PR lookup, exhausted draft pokes, and exhausted review
+or manager attempts) queue lead work instead of reaching the existing human feed or escalation
+audit. The queue deduplicates on `(subject, question)` across restarts; detecting the same
+condition again does not charge a decision attempt. The usage-limit judgment seam queues an
+account item only; its policy producer belongs to the limits program.
+
+This slice detects and queues; the isolated lead runs and decision executors are subsequent
+slices. It grants no new manager tools or action authority. A failed/disabled store keeps the
+existing human report. With the lead disabled (the default), existing feed, audit and config
+serialization bytes are unchanged. Go has no lead queue, and the `rhapsody_` schema-name rule
+keeps the ported tables and golden fixtures byte-strict.
+
 ### Runtime paths → `~/.rhapsody` + `rhapsody.db` (TRA-238)
 
 Rhapsody gets its own runtime home. The daemon's filesystem paths and the history DB filename are

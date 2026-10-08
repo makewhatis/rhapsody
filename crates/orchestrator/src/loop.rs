@@ -233,6 +233,14 @@ pub enum Event {
     Refresh,
     /// A worker task's terminal report (Go `evWorkerExit`).
     WorkerExit(EvWorkerExit),
+    /// Ticket worker's blocked ending; sent before its exit and checked against its dispatch time.
+    LeadBlockedHandoff {
+        issue_id: String,
+        started_at: chrono::DateTime<chrono::Utc>,
+        question: String,
+    },
+    /// The adoption task positively found no open PR for a ticket parked in review.
+    ReviewMissingPr(crate::reviewintro::ReviewIntroRequest),
     /// One agent event folded into the running entry (Go `evAgentUpdate`).
     AgentUpdate(AgentUpdate),
     /// The concrete per-run transcript path the worker opened (Go `evTranscriptOpened`).
@@ -557,6 +565,8 @@ fn worker_deps_for(
         Some(Arc::clone(&eff.transcripts))
     };
     let mut deps = WorkerDeps {
+        lead_enabled: false,
+        lead_progress_dir: None,
         workspace: Arc::clone(&eff.workspace),
         agent: Arc::clone(&eff.agent),
         tracker: Arc::clone(&eff.tracker),
@@ -726,6 +736,12 @@ impl Orchestrator {
                 self.on_tick().await;
             }
             Event::WorkerExit(e) => self.on_worker_exit(e),
+            Event::LeadBlockedHandoff {
+                issue_id,
+                started_at,
+                question,
+            } => self.handle_lead_blocked(&issue_id, started_at, question),
+            Event::ReviewMissingPr(req) => self.handle_lead_missing_pr(&req),
             Event::BrokerUsage {
                 issue_id,
                 run_id,
@@ -1826,6 +1842,11 @@ impl Orchestrator {
             return; // no effective config → nothing to run (defensive; production always has one)
         };
         let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug), &self.drain);
+        deps.lead_enabled = self.lead_enabled();
+        if deps.lead_enabled {
+            deps.lead_progress_dir = std::env::var_os("HOME")
+                .map(|home| std::path::PathBuf::from(home).join(".rhapsody/docs"));
+        }
         // The auto-park's terminal guard's gate (STUDIO-1007): the merge→Done transition is "on"
         // only when the loaded teams config names one. Read from the SAME `self.teams` the handoff's
         // terminal/merged guard reads, so the two guards that protect the same transition can never
@@ -2008,6 +2029,13 @@ impl Orchestrator {
                     "agent login rejected, but the ticket could not be labelled for a human; it is \
                      still held in memory — apply the label by hand"
                 );
+            }
+            if let Some(question) = declared.blocked_question {
+                let _ = events_exit.send(Event::LeadBlockedHandoff {
+                    issue_id: issue_id.clone(),
+                    started_at,
+                    question,
+                });
             }
             let exit = EvWorkerExit {
                 issue_id,
