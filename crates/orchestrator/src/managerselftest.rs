@@ -1649,12 +1649,17 @@ mod tests {
         let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
         let (events, subscriber) = crate::testsupport::recording_subscriber();
         let _guard = tracing::subscriber::set_default(subscriber);
+        // Register both verdict callsites before rebuilding their global Interest cache. Their
+        // first hits can race sibling tests with no subscriber (TRA-243); the throwaway state keeps
+        // the captured pass below a genuine boot, with neither verdict nor retry deadline reused.
+        run_entry_self_tests(&factory(), &ManagerSelfTestState::new(entries())).await;
         tracing::callsite::rebuild_interest_cache();
+        events.lock().expect("logs").clear();
         run_entry_self_tests(&f, &state).await;
         assert_eq!(*f.calls.lock().expect("lock"), vec!["opencode", "claude"]);
+        let events = events.lock().expect("logs");
+        assert_eq!(events.len(), 2, "one log per entry: {events:?}");
         let logs = events
-            .lock()
-            .expect("logs")
             .iter()
             .map(|e| format!("{} {} {:?}", e.level, e.message, e.fields))
             .collect::<Vec<_>>()
@@ -1668,7 +1673,6 @@ mod tests {
                 && logs.contains("unknown tool exposed"),
             "{logs}"
         );
-        println!("{logs}");
     }
     #[tokio::test]
     async fn version_change_reruns_only_that_entry() {
