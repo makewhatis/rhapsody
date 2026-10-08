@@ -28,6 +28,7 @@ const EXPECTED: Record<PillVariant, string> = {
   queued: "var(--ink-3)",
   done: "var(--info)",
   blocked: "var(--bad)",
+  operator: "var(--operator)",
   parked: "var(--parked)",
 };
 

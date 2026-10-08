@@ -10,6 +10,7 @@ import type {
   IssueCountsResponse,
   IssueRun,
   IssueStatusBucket,
+  LeadDecisionsResponse,
   StateResponse,
   TicketCostRow,
 } from "@/lib/api";
@@ -27,6 +28,8 @@ const h = vi.hoisted(() => ({
   fetchIssueCounts: vi.fn(),
   fetchHistoryCosts: vi.fn(async (): Promise<{ costs: TicketCostRow[] }> => ({ costs: [] })),
   fetchTeamsOverview: vi.fn(),
+  fetchLeadDecisions: vi.fn(async (): Promise<LeadDecisionsResponse> => ({ decisions: [], queued: [] })),
+  leadEnabled: false,
   fetchRunTranscript: vi.fn(),
   // The per-project `active_states` the parked classification resolves against (STUDIO-966). An
   // empty answer by default — every test that does not set it reads no row as parked.
@@ -42,6 +45,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchIssueCounts: h.fetchIssueCounts,
     fetchHistoryCosts: h.fetchHistoryCosts,
     fetchTeamsOverview: h.fetchTeamsOverview,
+    fetchLeadDecisions: h.fetchLeadDecisions,
     fetchRunTranscript: h.fetchRunTranscript,
     fetchTypedConfig: h.fetchTypedConfig,
     fetchVersion: vi.fn(async () => ({
@@ -49,6 +53,7 @@ vi.mock("@/lib/api", async (orig) => {
       commit: "abc",
       built_at: "",
       teams_enabled: true,
+      lead_enabled: h.leadEnabled,
     })),
     fetchLinearProjects: vi.fn(async () => []),
     postRefresh: vi.fn(async () => {}),
@@ -212,11 +217,47 @@ afterEach(() => {
 // the next test's mount in board mode and its table assertions empty. Storage is absent in some test
 // environments (a Node with no localStorage global behind jsdom), hence the guards.
 beforeEach(() => {
+  h.leadEnabled = false;
   try {
     window.localStorage?.clear();
   } catch {
     // No storage to reset.
   }
+});
+
+describe("lead work is not a ticket job (STUDIO-1145)", () => {
+  it("keeps stored, live and retrying lead runs off ticket lanes and teammate activity", async () => {
+    const key = "lead:makewhatis/rhapsody#0:2@manager";
+    const rows = [run({ issue_identifier: key, issue_id: key, outcome: "completed", assignee: "jerry" })];
+    h.fetchIssueRuns.mockResolvedValue({ issues: rows, next_offset: null });
+    h.fetchState.mockResolvedValue({ ...EMPTY_STATE, running: [{ issue_identifier: key, run_id: 55 }], retrying: [{ issue_identifier: "lead:makewhatis/rhapsody#0:3@manager" }] });
+    h.fetchIssueCounts.mockResolvedValue({ issues: 0, buckets: [] });
+    h.fetchTeamsOverview.mockResolvedValue({ roster: [{ name: "jerry", live_runs: 1, tickets: [key] }] });
+    mount();
+    fireEvent.click(screen.getByRole("button", { name: "Display options" }));
+    fireEvent.click(screen.getByRole("button", { name: "Board" }));
+    await waitFor(() => expect(h.fetchIssueRuns).toHaveBeenCalled());
+    await waitFor(() => expect(stat("running")).toBe("0"));
+    await waitFor(() => expect(screen.getByText("jerry").closest(".mate")?.textContent).toContain("idle"));
+    expect(document.body.textContent).not.toContain(key);
+    expect(document.body.textContent).not.toContain("#0");
+    expect(document.body.textContent).not.toContain(`${key} title`);
+  });
+
+  it("adds escalations, but no routine lead decisions, to Needs you", async () => {
+    h.leadEnabled = true;
+    h.fetchLeadDecisions.mockResolvedValue({ decisions: [
+      { id: 2, subject: "STUDIO-598", decision: "proposed: diagnosis" },
+      { id: 3, subject: "STUDIO-1142", decision: "escalate: needs access" },
+      { id: 4, subject: "STUDIO-1143", decision: "escalate: old need", overruled_at: "2026-10-08" },
+    ].map((d) => ({ trigger: "blocked_handoff", at: "2026-10-08T07:00:00Z", reasoning: "", evidence: "", actions: "[]", harness: "opencode", model: "test", ...d })), queued: [] });
+    h.fetchIssueRuns.mockResolvedValue({ issues: [], next_offset: null });
+    h.fetchState.mockResolvedValue(EMPTY_STATE);
+    h.fetchIssueCounts.mockResolvedValue({ issues: 0, buckets: [] });
+    h.fetchTeamsOverview.mockResolvedValue({ roster: [] });
+    mount();
+    await waitFor(() => expect(stat("needs you")).toBe("1"));
+  });
 });
 
 describe("the Now strip (§3)", () => {

@@ -8,6 +8,7 @@ import type { DaySummary, LinearProject, LogEntry, RunSummary, StateResponse } f
 import { elapsedSeconds, formatDuration, formatTokens, runDuration } from "@/lib/format";
 import { repoShortName } from "@/lib/project";
 import { projShort } from "@/lib/settings-model";
+import { isLeadRun } from "@/lib/lead";
 
 // outcomeToStatus maps a stored per-SEGMENT outcome (taxonomy v2: running|continued|completed|
 // stopped|failed|interrupted) 1:1 onto a StatusChip status key. This is the SEGMENT-level chip
@@ -558,6 +559,7 @@ export function mergeJobs(
   // row key) so an unattributed run never collapses other jobs into one synthetic row.
   const groups = new Map<string, MergedRow[]>();
   for (const row of merged) {
+    if (isLeadRun(row.issue)) continue;
     const gk = row.issue ? `issue:${row.issue}` : `solo:${row.key}`;
     const g = groups.get(gk);
     if (g) g.push(row);

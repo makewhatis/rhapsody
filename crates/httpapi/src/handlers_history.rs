@@ -460,13 +460,15 @@ pub(crate) async fn handle_issue_counts(
     // set is bounded by the number of ISSUES the daemon has ever run (425 on the operator's own
     // store when this landed), the same set `GET /api/v1/history/issues?limit=…` already lets any
     // client ask for in one request, and the response it produces is O(1) in that number.
-    let runs = match provider.history().list_issue_runs(RunFilter {
+    let mut runs = match provider.history().list_issue_runs(RunFilter {
         limit: i64::MAX,
         ..RunFilter::default()
     }) {
         Ok(runs) => runs,
         Err(_) => return store_error("issue counts query failed"),
     };
+    // Lead work has its own subject/queue on the Lead page, never a ticket card (STUDIO-1145).
+    runs.retain(|r| !r.issue_id.starts_with("lead:") && !r.issue_identifier.starts_with("lead:"));
     let ids: Vec<String> = runs
         .iter()
         .map(|r| r.issue_id.clone())
@@ -510,9 +512,15 @@ pub(crate) async fn handle_issue_counts(
     let mut budget_held: HashSet<String> = HashSet::new();
     if let Ok(Ok(snap)) = snap {
         for r in &snap.running {
+            if r.issue_id.starts_with("lead:") || r.issue_identifier.starts_with("lead:") {
+                continue;
+            }
             live_work.push((r.issue_identifier.clone(), r.issue_id.clone()));
         }
         for r in &snap.retrying {
+            if r.issue_id.starts_with("lead:") || r.issue_identifier.starts_with("lead:") {
+                continue;
+            }
             live_work.push((r.issue_identifier.clone(), r.issue_id.clone()));
         }
         for h in &snap.held_for_human {
@@ -2422,6 +2430,30 @@ mod tests {
     }
 
     // ---- GET /api/v1/history/issues/counts (STUDIO-828) ----
+
+    #[tokio::test]
+    async fn issue_counts_exclude_stored_live_and_retrying_lead_runs() {
+        let store = mem_store();
+        seed_run_at(&store, "MT-1", "2026-10-08T07:00:00Z");
+        let key = "lead:makewhatis/rhapsody#0:2@manager";
+        seed_run_for(key, key, "2026-10-08T07:15:00Z", &store);
+        let mut snap = empty_snapshot();
+        let mut running = crate::testutil::running_row(key);
+        running.issue_id = key.into();
+        snap.running.push(running);
+        let retry_key = "lead:makewhatis/rhapsody#0:3@manager";
+        let mut retry = crate::testutil::retry_row(retry_key);
+        retry.issue_id = retry_key.into();
+        snap.retrying.push(retry);
+        let base = spawn(FakeProvider::ok(snap).with_history(Arc::new(store))).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["issues"], 1, "lead runs are not tickets: {body}");
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([("completed/-".into(), 1)])
+        );
+    }
 
     /// Collapse the counts payload into `bucket-key -> count`, so a test asserts on the tally
     /// rather than on the array's order. The key is spelled the way the wire spells it: an absent

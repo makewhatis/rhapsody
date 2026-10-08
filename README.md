@@ -78,6 +78,11 @@ Investigation settings can tighten its existing hard ceilings (2 CPUs, 4g, 10-mi
 Advise decisions become terminal proposals in the human feed, without work mutations. Explicit
 escalations still page with the stated need. The console's Lead page lists the paper trail and
 offers Overrule in both the browser dashboard and desktop window.
+Lead decisions appear in a compact notification centre, using informational/neutral styling;
+escalations use the operator tone and are the only lead decisions added to “Needs you”
+(STUDIO-1145). The PR-attention banner excludes lead entries. Lead runs stay out of Jobs
+ticket lanes, nav counts and whole-store ticket tallies; the Lead page shows running/queued
+work under its real ticket or PR subject, without displaying the synthetic `#0` coordinate.
 The additive `/api/v1/version` capability `lead_enabled: true` is present only when the reporting
 service is installed (lead enabled and durable storage available); otherwise it is omitted.
 The console omits Lead and redirects its deep link when that capability is unavailable.

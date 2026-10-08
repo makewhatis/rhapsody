@@ -33,7 +33,10 @@ import { useStateQuery } from "@/hooks/useStateQuery";
  */
 export function DivergenceBanner() {
   const state = useStateQuery();
-  const rows = state.data?.review_divergence ?? [];
+  // The legacy lead-report projection is not a PR hold. A real reviewer can be named lead.
+  const rows = (state.data?.review_divergence ?? []).filter((row) => !(
+    row.reviewer === "lead" && row.kind === "manager_deferred" && row.reason?.startsWith("Lead decision ")
+  ));
   const limits = state.data?.limit_items ?? [];
   if (rows.length === 0 && limits.length === 0) return null;
   return (

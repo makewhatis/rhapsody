@@ -33,6 +33,8 @@ import { LogsView, ProvidersView, ToolsView, UpdatesView } from "./SettingsTabVi
 import { WorkflowView } from "./WorkflowView";
 import { AccountsPage } from "./AccountsPanel";
 import { LeadRoute } from "./LeadPage";
+import { LeadNotifications } from "./LeadNotifications";
+import { isLeadRun } from "@/lib/lead";
 
 // The Rhapsody Console shell — STUDIO-681 §2, built by STUDIO-683. The persistent rail on every
 // view, the capability gate that decides what it contains, and the router that decides what the
@@ -153,6 +155,7 @@ export function ConsoleApp() {
         <OnboardErrorBanner message={onboardErr} onDismiss={() => setOnboardErr("")} />
         <DrainBanner />
         <DivergenceBanner />
+        {leadEnabled === true ? <LeadNotifications /> : null}
         <ConsoleBody
           route={route}
           teamsEnabled={teamsEnabled}
@@ -318,5 +321,6 @@ function useOpenJobCount(): number {
   for (const b of state.data?.blocked ?? []) keys.add(b.issue_identifier);
   for (const i of issues.data?.issues ?? []) keys.add(i.issue_identifier);
   keys.delete("");
+  for (const key of keys) if (isLeadRun(key)) keys.delete(key);
   return keys.size;
 }

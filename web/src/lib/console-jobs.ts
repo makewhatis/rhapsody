@@ -1131,11 +1131,11 @@ export interface MateState {
 
 export function mateStates(overview: TeamsOverview | undefined): MateState[] {
   return (overview?.roster ?? []).map((mate) => {
-    const tickets = mate.tickets ?? [];
+    const tickets = (mate.tickets ?? []).filter((ticket) => !ticket.startsWith("lead:"));
     return {
       name: mate.name,
       task: tickets.length > 0 ? tickets.join(", ") : "idle",
-      running: mate.live_runs > 0,
+      running: mate.live_runs > 0 && ((mate.tickets ?? []).length === 0 || tickets.length > 0),
     };
   });
 }

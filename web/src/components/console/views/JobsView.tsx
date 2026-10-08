@@ -49,6 +49,8 @@ import { useJobsViewMode } from "@/hooks/useJobsViewMode";
 import { useBoardLaneWidth } from "@/hooks/useBoardLaneWidth";
 import { useBoardCardFields } from "@/hooks/useBoardCardFields";
 import { BoardView } from "./BoardView";
+import { useLeadDecisions } from "@/hooks/useLeadDecisions";
+import { leadNeedsOperator } from "@/lib/lead";
 
 const ALL_PROJECTS = "";
 
@@ -144,6 +146,10 @@ export function JobsView({
   // `payload.held_for_human` itself, by identity, which is the only way to avoid counting a hold
   // that already ran twice. See `consoleStoreCounts`.
   const counts = consoleStoreCounts(issueCounts.data, state.data?.blocked);
+  const lead = useLeadDecisions();
+  const needsYou = counts?.needsYou == null ? null
+    : lead.enabled && lead.data === undefined ? null
+    : counts.needsYou + (lead.enabled ? (lead.data?.decisions ?? []).filter(leadNeedsOperator).length : 0);
   const mates = mateStates(overview.data);
   const roster = mates.map((m) => m.name);
   // In Board mode the lanes ARE the status axis (STUDIO-932), so the status filter does not apply:
@@ -220,7 +226,7 @@ export function JobsView({
               daemon resolved no ticket lifecycle at all, it says "—" rather than a number — see
               `ConsoleJobCounts`. All four say "—" before the first tally arrives, because a zero
               there would be a claim that the store is empty. */}
-          <Stat value={counts?.needsYou ?? "—"} label="needs you" tone="op" />
+          <Stat value={needsYou ?? "—"} label="needs you" tone="op" />
         </NowStats>
       </NowStrip>
 

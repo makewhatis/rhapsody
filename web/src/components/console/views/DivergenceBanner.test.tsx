@@ -57,6 +57,27 @@ describe("DivergenceBanner", () => {
     vi.clearAllMocks();
   });
 
+  it("keeps legacy lead decisions out of the PR banner while retaining a stuck PR", async () => {
+    h.fetchState.mockResolvedValue(state({ review_divergence: [
+      divergence({ pr: "STUDIO-598", reviewer: "lead", kind: "manager_deferred", reason: "Lead decision 2 — proposed: diagnosis. Full reasoning." }),
+      divergence(),
+    ] }));
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("1 pull request needs attention");
+    expect(banner.textContent).toContain("makewhatis/rhapsody#164");
+    expect(banner.textContent).not.toContain("Lead decision");
+    expect(banner.textContent).not.toContain("STUDIO-598");
+  });
+
+  it("still reports a real stuck PR whose reviewer is named lead", async () => {
+    h.fetchState.mockResolvedValue(state({ review_divergence: [divergence({ reviewer: "lead" })] }));
+    renderBanner();
+    const banner = await screen.findByRole("status");
+    expect(banner.textContent).toContain("makewhatis/rhapsody#164");
+    expect(banner.textContent).toContain("1 pull request needs attention");
+  });
+
   it("routes a limit decision item to the human feed until manager actions exist", async () => {
     h.fetchState.mockResolvedValue(state({ limit_items: [{
       account: "claude-subscription", windows: [], credits_policy: "never",
