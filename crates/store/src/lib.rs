@@ -126,6 +126,18 @@ impl From<rusqlite::Error> for StoreError {
 /// err)` triple for a single lookup becomes `Result<Option<_>, _>`, and Go pointer fields map to
 /// [`Option`].
 pub trait Store {
+    /// Persist an authoritative, configured terminal/live observation. Terminal releases parks.
+    fn observe_subject_state(&self, _subject: &str, _terminal: bool) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Open episodes including upgrade folds awaiting their first scoped state observation.
+    fn load_subject_observations(&self) -> Result<Vec<SubjectHold>, StoreError> {
+        self.load_subject_holds()
+    }
+    /// Admit a deferred fold only after a scoped live-state read; head-only updates cannot admit it.
+    fn confirm_subject_hold_state(&self, _id: i64, _snapshot: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
     /// Episode/kind checks refuse stale observations and escalation upgrades during lead release.
     fn release_subject_episode(
         &self,
@@ -139,13 +151,15 @@ pub trait Store {
     fn resolve_lead_escalation(&self, _decision: i64, _reason: &str) -> Result<bool, StoreError> {
         Ok(false)
     }
+    /// Admission guard, including a deferred upgrade fold while its ticket state is unknown.
     fn subject_hold(&self, _subject: &str) -> Result<Option<SubjectHold>, StoreError> {
         Ok(None)
     }
+    /// Confirmed open holds for operator reporting; deferred folds are not notices yet.
     fn load_subject_holds(&self) -> Result<Vec<SubjectHold>, StoreError> {
         Ok(Vec::new())
     }
-    /// Atomically folds PR origins and upserts the one open episode. Zero means storage is off.
+    /// Atomically folds PR origins and upserts the one open episode. Zero means off or terminal.
     fn park_subject(&self, _hold: &SubjectHold) -> Result<i64, StoreError> {
         Ok(0)
     }

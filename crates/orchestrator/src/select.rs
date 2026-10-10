@@ -517,7 +517,7 @@ impl Orchestrator {
         // verdict says the board could not be read (STUDIO-949 round 13).
         self.human_holds.begin_pass(read_the_board);
         for issue in &tagged {
-            self.observe_parked_issue(&issue.iss);
+            self.observe_parked_issue_in_project(&issue.iss, issue.proj);
         }
         sort_tagged_stable(&mut tagged);
 

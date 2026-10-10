@@ -391,11 +391,22 @@ impl LeadHost for RuntimeHost<'_> {
                 .map_err(|_| "lead freshness read failed")?
                 .ok_or("lead subject moved out of the configured project")?
         };
+        let state = rhapsody_core::normalize_state(&ticket.state);
+        let terminal = self.project.terminal_states.contains(&state)
+            || self
+                .runtime
+                .teams
+                .review_done_state()
+                .is_some_and(|done| rhapsody_core::normalize_state(done) == state);
+        if !ticket.identifier.is_empty() && !state.is_empty() {
+            stored(
+                self.runtime
+                    .store
+                    .observe_subject_state(&ticket.identifier, terminal),
+            )?;
+        }
         let mut subject = LeadSubject {
-            open: !self
-                .project
-                .terminal_states
-                .contains(&rhapsody_core::normalize_state(&ticket.state)),
+            open: !terminal,
             ticket,
             pr: self.pr.clone(),
             head: String::new(),

@@ -3315,6 +3315,7 @@ mod tests {
                 let mut eff = empty_effective(tracker.clone());
                 eff.active_states = set_of(&["todo"]);
                 eff.review_states = set_of(&["in review"]);
+                eff.terminal_states = set_of(&["done"]);
                 if multi {
                     let mut project = proj_with_tracker("test", tracker, "prompt");
                     project.disabled = state == "paused";
@@ -3354,7 +3355,8 @@ mod tests {
                 );
                 assert_eq!(
                     o.store().subject_resume_pending("TEST-1").unwrap(),
-                    released
+                    state == "Backlog",
+                    "only a live material change grants resume; Done clears it"
                 );
                 assert!(o.running.is_empty());
             }

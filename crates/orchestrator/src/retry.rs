@@ -1462,7 +1462,11 @@ impl Orchestrator {
         // newer summons has already shipped — release instead of re-dispatching (mirrors the
         // selectDispatch guard). Restricted to recovered entries so continuations / in-session failure
         // retries are never suppressed by a PR they themselves opened.
-        self.observe_parked_issue(&iss);
+        let project = self
+            .eff
+            .as_ref()
+            .and_then(|eff| eff.projects.iter().position(|p| p.slug == re.project_slug));
+        self.observe_parked_issue_in_project(&iss, project);
         if self.subject_parked(&iss.identifier, "author")
             || (re.recovered && self.pr_suppressed(&iss))
         {

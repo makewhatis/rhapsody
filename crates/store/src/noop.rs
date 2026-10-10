@@ -12,6 +12,15 @@ use crate::*;
 pub struct Noop;
 
 impl Store for Noop {
+    fn observe_subject_state(&self, _subject: &str, _terminal: bool) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn load_subject_observations(&self) -> Result<Vec<SubjectHold>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn confirm_subject_hold_state(&self, _id: i64, _snapshot: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn release_subject_episode(
         &self,
         _id: i64,
