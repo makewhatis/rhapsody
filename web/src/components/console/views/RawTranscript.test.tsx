@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fetchRawTranscript, type RawTranscriptPage } from "@/lib/api";
 import { RawTranscript } from "./RawTranscript";
+import { clockTime } from "@/lib/console-job-detail";
 
 vi.mock("@/lib/api", async (original) => ({
   ...await original<typeof import("@/lib/api")>(),
@@ -31,6 +32,15 @@ function mount(inFlight = false) {
 }
 
 describe("lossless Raw transcript", () => {
+  it("raw_time_column_uses_clock_time", async () => {
+    const timestamp = new Date(2026, 9, 10, 17, 3, 16).toISOString();
+    vi.mocked(fetchRawTranscript).mockResolvedValue(page([JSON.stringify({ timestamp }) + "\n"]));
+    const { container } = mount();
+    await screen.findByText(/timestamp/);
+    expect(container.querySelector("time")?.textContent).toBe(clockTime(timestamp, true));
+    expect(container.querySelector("time")?.textContent).toBe("17:03:16");
+  });
+
   it("shows system/result records and expands a tool result in full, with download endpoints", async () => {
     const output = "x".repeat(300);
     vi.mocked(fetchRawTranscript).mockResolvedValue(page([
