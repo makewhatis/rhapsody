@@ -53,22 +53,66 @@ describe("lossless Raw transcript", () => {
     expect(fetchRawTranscript).toHaveBeenCalledWith(42);
   });
 
-  it("loads earlier with prev_cursor, then later from the loaded end on a live run", async () => {
+  it.each([false, true])("keeps appended bytes reachable after loading earlier (initially live: %s)", async (inFlight) => {
     vi.mocked(fetchRawTranscript)
       .mockResolvedValueOnce(page(["later\n"], { lines: [{ offset: 8, text: "later\n" }], size_bytes: 14, prev_cursor: 8, at_start: false }))
       // The file grew during the earlier read. Later must start at the loaded end (14), not
       // this newer size (18), or the new line is silently skipped.
       .mockResolvedValueOnce(page(["earlier\n"], { next_cursor: 8, at_end: false, size_bytes: 18 }))
       .mockResolvedValueOnce(page(["new\n"], { lines: [{ offset: 14, text: "new\n" }], size_bytes: 18, prev_cursor: 14 }));
-    mount(true);
+    const { client, rerender } = mount(inFlight);
     await screen.findByText("later");
     fireEvent.click(screen.getByRole("button", { name: "Load earlier" }));
     await screen.findByText("earlier");
     expect(fetchRawTranscript).toHaveBeenLastCalledWith(42, 8, "backward");
     expect(screen.getByText("later")).toBeTruthy();
+    rerender(<QueryClientProvider client={client}><RawTranscript runId={42} inFlight={false} /></QueryClientProvider>);
+    expect((screen.getByRole("button", { name: "Load later" }) as HTMLButtonElement).disabled).toBe(false);
     fireEvent.click(screen.getByRole("button", { name: "Load later" }));
     await screen.findByText("new");
     expect(fetchRawTranscript).toHaveBeenLastCalledWith(42, 14, "forward");
+    expect((screen.getByRole("button", { name: "Load later" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("pretty-prints original JSON tokens without rounding numbers or dropping duplicate keys", async () => {
+    const text = '{"id":9007199254740993,"k":1,"k":2,"number":1.2300e+45,"escaped":"\\u0061\\\" , {}","nested":[{},[],true,null,-0]}\n';
+    vi.mocked(fetchRawTranscript).mockResolvedValue(page([text]));
+    const { container } = mount();
+    await screen.findByText(/9007199254740993/);
+    fireEvent.click(container.querySelector(".rawline button")!);
+    expect(container.querySelector("pre")?.textContent).toBe([
+      '{',
+      '  "id": 9007199254740993,',
+      '  "k": 1,',
+      '  "k": 2,',
+      '  "number": 1.2300e+45,',
+      '  "escaped": "\\u0061\\\" , {}",',
+      '  "nested": [',
+      '    {},',
+      '    [],',
+      '    true,',
+      '    null,',
+      '    -0',
+      '  ]',
+      '}',
+    ].join("\n"));
+  });
+
+  it("allows a final later read while paused even when no page observed the final append", async () => {
+    vi.mocked(fetchRawTranscript)
+      .mockResolvedValueOnce(page(["partial"], { lines: [{ offset: 8, text: "partial" }], size_bytes: 15, prev_cursor: 8, at_start: false }))
+      .mockResolvedValueOnce(page(["earlier\n"], { next_cursor: 8, at_end: false, size_bytes: 15 }))
+      .mockResolvedValueOnce(page(["partial complete\n"], { lines: [{ offset: 8, text: "partial complete\n" }], size_bytes: 25, prev_cursor: 8 }));
+    const { client, rerender } = mount(true);
+    await screen.findByText("partial");
+    fireEvent.click(screen.getByRole("button", { name: "Load earlier" }));
+    await screen.findByText("earlier");
+    rerender(<QueryClientProvider client={client}><RawTranscript runId={42} inFlight={false} /></QueryClientProvider>);
+    fireEvent.click(screen.getByRole("button", { name: "Load later" }));
+    await screen.findByText("partial complete");
+    expect(fetchRawTranscript).toHaveBeenLastCalledWith(42, 8, "forward");
+    expect(document.querySelectorAll(".rawline")).toHaveLength(2);
+    expect((screen.getByRole("button", { name: "Load later" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
   it("keeps invalid JSON verbatim and reads OpenCode epoch timestamps", async () => {

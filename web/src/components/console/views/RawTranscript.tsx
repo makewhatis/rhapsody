@@ -36,18 +36,43 @@ function lineTimestamp(text: string): Date | null {
   return null;
 }
 
+// Validate once expanded, then change only whitespace between lexical tokens. Serializing
+// parsed objects would round large numbers, discard duplicate keys and rewrite escapes.
+function prettyLine(text: string): string {
+  try {
+    JSON.parse(text);
+    const tokens = text.match(/"(?:\\[\s\S]|[^"\\])*"|[{}\[\],:]|[^\s{}\[\],:]+/g) ?? [];
+    const out: string[] = [];
+    let depth = 0;
+    const newline = () => out.push("\n", "  ".repeat(depth));
+    for (let i = 0; i < tokens.length; i++) {
+      const token = tokens[i];
+      if (token === "{" || token === "[") {
+        out.push(token);
+        depth++;
+        if (tokens[i + 1] !== "}" && tokens[i + 1] !== "]") newline();
+      } else if (token === "}" || token === "]") {
+        depth--;
+        if (tokens[i - 1] !== "{" && tokens[i - 1] !== "[") newline();
+        out.push(token);
+      } else if (token === ",") {
+        out.push(token);
+        newline();
+      } else {
+        out.push(token === ":" ? ": " : token);
+      }
+    }
+    return out.join("");
+  } catch {
+    return text;
+  }
+}
+
 const RawRow = memo(function RawRow({ line }: { line: RawTranscriptLine }) {
   const [expanded, setExpanded] = useState(false);
   const timestamp = useMemo(() => lineTimestamp(line.text), [line.text]);
   const size = useMemo(() => bytes(line.text), [line.text]);
-  const full = useMemo(() => {
-    if (!expanded) return "";
-    try {
-      return JSON.stringify(JSON.parse(line.text), null, 2);
-    } catch {
-      return line.text;
-    }
-  }, [expanded, line.text]);
+  const full = useMemo(() => expanded ? prettyLine(line.text) : "", [expanded, line.text]);
   const previewEnd = /[\uD800-\uDBFF]/.test(line.text[199] ?? "") ? 199 : 200;
   const clipped = line.text.length > previewEnd;
   return (
@@ -107,7 +132,12 @@ export function RawTranscript({ runId, inFlight }: { runId: number; inFlight: bo
   }, [window, following, inFlight]);
   const wasInFlight = useRef(inFlight);
   useEffect(() => {
-    if (wasInFlight.current && !inFlight && following) void tail.refetch();
+    if (wasInFlight.current && !inFlight) {
+      if (following) void tail.refetch();
+      // A paused EOF is an older snapshot: final output can arrive after the last page read.
+      // Leave one later read available even when no intervening page saw the file grow.
+      else setWindow((current) => current ? { ...current, at_end: false } : current);
+    }
     wasInFlight.current = inFlight;
   }, [inFlight, following, tail.refetch]);
 
@@ -129,13 +159,18 @@ export function RawTranscript({ runId, inFlight }: { runId: number; inFlight: bo
         if (!current || page.missing) return page;
         const lines = new Map(current.lines.map((line) => [line.offset, line]));
         for (const line of page.lines) lines.set(line.offset, line);
+        const merged = [...lines.values()].sort((a, b) => a.offset - b.offset);
+        const last = merged.at(-1);
+        const loadedEnd = last ? last.offset + bytes(last.text) : 0;
+        const size = Math.max(current.size_bytes, page.size_bytes);
         return {
           ...page,
-          lines: [...lines.values()].sort((a, b) => a.offset - b.offset),
+          lines: merged,
+          size_bytes: size,
           prev_cursor: direction === "backward" ? page.prev_cursor : current.prev_cursor,
           next_cursor: direction === "forward" ? page.next_cursor : current.next_cursor,
           at_start: direction === "backward" ? page.at_start : current.at_start,
-          at_end: direction === "forward" ? page.at_end : current.at_end,
+          at_end: loadedEnd >= size,
         };
       });
     } catch (error) {
