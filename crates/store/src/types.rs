@@ -8,6 +8,29 @@
 //! wire mapping lands with rhapsody-httpapi in a later phase).
 
 // --- tech-lead queue (STUDIO-1134; no Go counterpart) -----------------------------------------
+/// A durable admission stop and (for escalation) one operator-notice episode. Released rows stay
+/// in the ledger; only an open episode can be updated by a repeated escalation (STUDIO-1156).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubjectHold {
+    pub id: i64,
+    pub subject: String,
+    pub kind: String,
+    pub snapshot: String,
+    pub need: String,
+    pub at: String,
+    pub repeats: i64,
+    pub decision: i64,
+}
+
+/// The shared ticket-bearing watch origin, also used by the orchestrator's route-back guard.
+pub fn origin_ticket(origin: &str) -> Option<&str> {
+    let ticket = origin
+        .strip_prefix("handoff:")
+        .or_else(|| origin.strip_prefix("adopt:"))?
+        .trim();
+    (!ticket.is_empty()).then_some(ticket)
+}
+
 /// Tech-lead work (STUDIO-1134); no Go counterpart. Shared here to avoid a store/orchestrator cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeadTrigger {

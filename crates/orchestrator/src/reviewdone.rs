@@ -65,7 +65,6 @@ use rhapsody_store::{ReviewDoneRow, RunFilter};
 
 use crate::orchestrator::Orchestrator;
 use crate::prstate::PrCoord;
-use crate::reviewintro::{REVIEW_ORIGIN_ADOPT, REVIEW_ORIGIN_HANDOFF};
 use crate::stop::ControlHandle;
 
 /// How many times ONE merged pull request's terminal move is attempted before it is given up on
@@ -132,14 +131,7 @@ pub struct ReviewDonePlan {
 /// ledger and its own configured repository, through the same gates. A `console:` origin still
 /// yields `None` for the reason it always did, which is not that it is untrusted: it names an
 /// OPERATOR, so there is no ticket in it to move.
-pub fn origin_ticket(introduced_by: &str) -> Option<&str> {
-    let identifier = introduced_by
-        .strip_prefix(REVIEW_ORIGIN_HANDOFF)
-        .or_else(|| introduced_by.strip_prefix(REVIEW_ORIGIN_ADOPT))?
-        .strip_prefix(':')?
-        .trim();
-    (!identifier.is_empty()).then_some(identifier)
-}
+pub use rhapsody_store::origin_ticket;
 
 impl Orchestrator {
     /// Resolves the ticket a just-MERGED pull request's implementation work belongs to, and the

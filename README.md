@@ -82,6 +82,33 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Blocked-work circuit breaker and subject parks (STUDIO-1156)
+
+Lead enablement no longer replaces a breaker hold: a crossing always persists and applies the
+hold, and also queues a lead judgment. The additive `release {ticket, reason}` lead action may
+remove a breaker/blocked hold for a concrete change; the reason remains in the decision trail.
+Escalations are operator/material-change holds, outside that release authority.
+
+Migration **34** adds `rhapsody_subject_holds` and its `rhapsody_subject_holds_open` index,
+`rhapsody_subject_prs` (tracker attachments folded into the ticket), and
+`rhapsody_review_head_findings`. A blocked ending stops author redispatch; an escalation parks
+the ticket and its attached PRs, including reviews and further lead admission. Ticket description,
+state or hold-label changes, a PR-head move, and explicit operator message/review rerun/clear or
+overrule release the park. Released episodes remain auditable. One open escalation notice per
+ticket folds its PR origins through the shared `origin_ticket` guard, updating need, time and repeat
+count in place rather than keying on model wording. The console reports these tickets as held.
+Lead evidence includes bounded, quoted prior subject decisions and the open escalation, if any.
+The operator-guarded `POST /api/v1/lead/decisions/{id}/resolve {note}` records the resolution
+reason and lifts that escalation episode; it never resolves a newer episode through a stale id.
+Material releases grant one durable author admission, consumed with the next stored author run,
+so linked-PR suppression cannot swallow the operator's change. Existing escalations are folded at
+upgrade; already-delivered latest-decision pages keep their delivery reservation.
+
+An unchanged-head author handoff preserves findings as well as approvals. A durable findings-head
+guard refuses automatic re-review at a head that reviewer already decided; the operator rerun is
+the explicit exception. Changed heads remain edge-triggered. These Teams/lead extensions have no
+frozen Go counterpart; Go tables, goldens and the lead-disabled human feed are unchanged.
+
 ### Shutdown cancellation backstops (STUDIO-1147)
 
 The prune scheduler now observes shutdown while awaiting asynchronous worktree GC, so a pending
@@ -360,8 +387,8 @@ tests pin the first-turn `--resume` argument and avoid real quota.
 decision, review escalations, and impossible states (zero verdicts at the escalated head,
 In Review with an authoritative empty PR lookup, exhausted draft pokes, and exhausted review
 or manager attempts) queue lead work instead of reaching the existing human feed or escalation
-audit. Breaker crossings queue `BreakerHold { ticket, pr, kinds }` instead of the human hold and
-notification plan; no notification task is needed for lead detection. The queue deduplicates on
+audit. Breaker crossings also queue `BreakerHold { ticket, pr, kinds }` alongside the hold and
+notification plan (STUDIO-1156); no notification task is needed for lead detection. The queue deduplicates on
 `(subject, question)` across restarts; detecting the same condition again does not charge a
 decision attempt. The usage-limit judgment seam queues an
 account item only; its policy producer belongs to the limits program.

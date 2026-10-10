@@ -12,6 +12,44 @@ use crate::*;
 pub struct Noop;
 
 impl Store for Noop {
+    fn release_subject_episode(
+        &self,
+        _id: i64,
+        _kind: &str,
+        _reason: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn resolve_lead_escalation(&self, _decision: i64, _reason: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn subject_resume_pending(&self, _subject: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn link_subject_pr(&self, _ticket: &str, _pr: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn subject_hold(&self, _subject: &str) -> Result<Option<SubjectHold>, StoreError> {
+        Ok(None)
+    }
+    fn load_subject_holds(&self) -> Result<Vec<SubjectHold>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn park_subject(&self, _hold: &SubjectHold) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+    fn release_subject(&self, _subject: &str, _reason: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn update_hold_snapshot(&self, _id: i64, _snapshot: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn same_head_findings(&self, _key: &ReviewWatchKey, _head: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn allow_review_rerun(&self, _pr: &str, _head: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn notices_enabled(&self) -> bool {
         false
     }

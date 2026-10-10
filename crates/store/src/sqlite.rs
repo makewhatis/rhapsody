@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 33;
+const SCHEMA_VERSION: i64 = 34;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -705,6 +705,50 @@ CREATE UNIQUE INDEX rhapsody_notifications_active_source
   ON rhapsody_notifications(source) WHERE active = 1;
 CREATE TABLE rhapsody_notifications_snapshot (id INTEGER PRIMARY KEY CHECK(id = 1), at TEXT NOT NULL);
 "#,
+    // v33 -> v34: durable subject parks and same-head findings guard (STUDIO-1156).
+    r#"
+CREATE TABLE rhapsody_subject_holds (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  subject TEXT NOT NULL COLLATE NOCASE,
+  kind TEXT NOT NULL,
+  snapshot TEXT NOT NULL,
+  need TEXT NOT NULL,
+  at TEXT NOT NULL,
+  repeats INTEGER NOT NULL DEFAULT 1,
+  decision INTEGER NOT NULL DEFAULT 0,
+  resume_pending INTEGER NOT NULL DEFAULT 0,
+  released_reason TEXT
+);
+CREATE UNIQUE INDEX rhapsody_subject_holds_open ON rhapsody_subject_holds(subject) WHERE released_reason IS NULL;
+CREATE TABLE rhapsody_subject_prs (pr TEXT PRIMARY KEY COLLATE NOCASE, ticket TEXT NOT NULL COLLATE NOCASE);
+CREATE TABLE rhapsody_review_head_findings (
+  owner TEXT NOT NULL, repo TEXT NOT NULL, number INTEGER NOT NULL, reviewer TEXT NOT NULL,
+  head TEXT NOT NULL, rerun INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY(owner, repo, number, reviewer, head)
+);
+INSERT INTO rhapsody_review_head_findings(owner, repo, number, reviewer, head)
+  SELECT owner, repo, number, reviewer, last_reviewed_sha FROM rhapsody_review_watch
+  WHERE status = 'reviewed' AND last_reviewed_sha != '';
+INSERT INTO rhapsody_subject_holds(subject, kind, snapshot, need, at, repeats, decision)
+  SELECT subject, 'escalation', '', substr(decision, 11), at, repeats, id FROM (
+    SELECT d.*, COALESCE((SELECT upper(trim(CASE WHEN substr(w.introduced_by,1,8) = 'handoff:'
+        THEN substr(w.introduced_by,9) ELSE substr(w.introduced_by,7) END))
+      FROM rhapsody_review_watch w WHERE lower(w.owner || '/' || w.repo || '#' || w.number) = lower(i.subject)
+        AND (w.introduced_by LIKE 'handoff:%' OR w.introduced_by LIKE 'adopt:%') LIMIT 1), upper(i.subject)) AS subject,
+      COUNT(*) OVER (PARTITION BY COALESCE((SELECT upper(trim(substr(w.introduced_by, instr(w.introduced_by, ':') + 1)))
+        FROM rhapsody_review_watch w WHERE lower(w.owner || '/' || w.repo || '#' || w.number) = lower(i.subject)
+          AND (w.introduced_by LIKE 'handoff:%' OR w.introduced_by LIKE 'adopt:%') LIMIT 1), upper(i.subject))) AS repeats,
+      ROW_NUMBER() OVER (PARTITION BY COALESCE((SELECT upper(trim(substr(w.introduced_by, instr(w.introduced_by, ':') + 1)))
+        FROM rhapsody_review_watch w WHERE lower(w.owner || '/' || w.repo || '#' || w.number) = lower(i.subject)
+          AND (w.introduced_by LIKE 'handoff:%' OR w.introduced_by LIKE 'adopt:%') LIMIT 1), upper(i.subject)) ORDER BY d.id DESC) AS newest
+    FROM rhapsody_lead_decisions d JOIN rhapsody_lead_items i ON d.item = i.id
+    WHERE d.overruled_at IS NULL AND substr(d.decision,1,10) = 'escalate: '
+  ) WHERE newest = 1;
+INSERT INTO rhapsody_lead_reporting(key, count)
+  SELECT 'page-park:' || h.id, 1 FROM rhapsody_subject_holds h
+  WHERE EXISTS(SELECT 1 FROM rhapsody_lead_reporting r WHERE r.key = 'page-decision:' || h.decision)
+  ON CONFLICT(key) DO NOTHING;
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1231,7 +1275,163 @@ impl Sqlite {
     }
 }
 
+fn canonical_subject(conn: &Connection, subject: &str) -> Result<String, StoreError> {
+    if let Some(ticket) = conn
+        .query_row(
+            "SELECT ticket FROM rhapsody_subject_prs WHERE pr = ?1",
+            [subject],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(ticket);
+    }
+    let mut stmt = conn.prepare("SELECT introduced_by FROM rhapsody_review_watch WHERE lower(owner || '/' || repo || '#' || number) = lower(?1) ORDER BY owner, repo, number, reviewer")?;
+    for origin in stmt.query_map([subject], |r| r.get::<_, String>(0))? {
+        if let Some(ticket) = origin_ticket(&origin?) {
+            return Ok(ticket.to_ascii_uppercase());
+        }
+    }
+    Ok(if subject.contains('#') {
+        subject.to_ascii_lowercase()
+    } else {
+        subject.to_ascii_uppercase()
+    })
+}
+
+fn map_subject_hold(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubjectHold> {
+    Ok(SubjectHold {
+        id: r.get(0)?,
+        subject: r.get(1)?,
+        kind: r.get(2)?,
+        snapshot: r.get(3)?,
+        need: r.get(4)?,
+        at: r.get(5)?,
+        repeats: r.get(6)?,
+        decision: r.get(7)?,
+    })
+}
+
+fn upsert_subject_hold(conn: &Connection, hold: &SubjectHold) -> Result<i64, StoreError> {
+    let subject = canonical_subject(conn, &hold.subject)?;
+    conn.execute("INSERT INTO rhapsody_subject_holds(subject, kind, snapshot, need, at, decision) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+        ON CONFLICT(subject) WHERE released_reason IS NULL DO UPDATE SET
+        kind = CASE WHEN excluded.kind = 'escalation' THEN excluded.kind ELSE kind END,
+        need = CASE WHEN excluded.kind = 'escalation' THEN excluded.need ELSE need END,
+        at = CASE WHEN excluded.kind = 'escalation' THEN excluded.at ELSE at END,
+        decision = CASE WHEN excluded.kind = 'escalation' THEN excluded.decision ELSE decision END,
+        snapshot = CASE WHEN excluded.kind = 'escalation' AND kind != 'escalation' THEN excluded.snapshot
+            WHEN (kind != 'escalation' OR snapshot = '') AND excluded.snapshot != '' THEN excluded.snapshot ELSE snapshot END,
+        repeats = CASE WHEN kind = 'escalation' AND excluded.kind = 'escalation' AND (excluded.decision = 0 OR decision != excluded.decision) THEN repeats + 1 WHEN kind = 'escalation' THEN repeats ELSE 1 END",
+        params![subject, hold.kind, hold.snapshot, hold.need, hold.at, hold.decision])?;
+    Ok(conn.query_row(
+        "SELECT id FROM rhapsody_subject_holds WHERE subject = ?1 AND released_reason IS NULL",
+        [subject],
+        |r| r.get(0),
+    )?)
+}
+
+fn release_subject(conn: &Connection, subject: &str, reason: &str) -> Result<(), StoreError> {
+    let subject = canonical_subject(conn, subject)?;
+    let changed = conn.execute("UPDATE rhapsody_subject_holds SET released_reason = ?2, resume_pending = 1 WHERE subject = ?1 AND released_reason IS NULL", params![subject, reason])?;
+    if changed > 0 {
+        let items = {
+            let mut stmt = conn.prepare(
+                "SELECT id, subject FROM rhapsody_lead_items WHERE trigger != 'overrule'",
+            )?;
+            stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, key) in items {
+            if canonical_subject(conn, &key)? == subject {
+                conn.execute("UPDATE rhapsody_lead_items SET question = question || ':released:' || id, state = 'done' WHERE id = ?1", [id])?;
+            }
+        }
+    }
+    Ok(())
+}
+
 impl Store for Sqlite {
+    fn release_subject_episode(
+        &self,
+        id: i64,
+        kind: &str,
+        reason: &str,
+    ) -> Result<bool, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let subject = tx.query_row("SELECT subject FROM rhapsody_subject_holds WHERE id = ?1 AND kind = ?2 AND released_reason IS NULL", params![id, kind], |r| r.get::<_, String>(0)).optional()?;
+        let Some(subject) = subject else {
+            return Ok(false);
+        };
+        release_subject(&tx, &subject, reason)?;
+        tx.commit()?;
+        Ok(true)
+    }
+    fn resolve_lead_escalation(&self, decision: i64, reason: &str) -> Result<bool, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let hold = tx.query_row("SELECT subject, released_reason FROM rhapsody_subject_holds WHERE decision = ?1 AND kind = 'escalation'", [decision], |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))).optional()?;
+        let Some((subject, released)) = hold else {
+            return Ok(false);
+        };
+        if released.is_none() {
+            release_subject(&tx, &subject, reason)?;
+        }
+        tx.commit()?;
+        Ok(true)
+    }
+    fn subject_resume_pending(&self, subject: &str) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        let subject = canonical_subject(&conn, subject)?;
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE subject = ?1 AND released_reason IS NOT NULL AND resume_pending = 1)", [subject], |r| r.get(0))?)
+    }
+    fn link_subject_pr(&self, ticket: &str, pr: &str) -> Result<(), StoreError> {
+        self.lock().execute("INSERT INTO rhapsody_subject_prs(pr, ticket) VALUES (?1, ?2) ON CONFLICT(pr) DO UPDATE SET ticket = excluded.ticket", params![pr.to_ascii_lowercase(), ticket.to_ascii_uppercase()])?;
+        Ok(())
+    }
+    fn subject_hold(&self, subject: &str) -> Result<Option<SubjectHold>, StoreError> {
+        let conn = self.lock();
+        let subject = canonical_subject(&conn, subject)?;
+        Ok(conn.query_row("SELECT id, subject, kind, snapshot, need, at, repeats, decision FROM rhapsody_subject_holds WHERE subject = ?1 AND released_reason IS NULL", [subject], map_subject_hold).optional()?)
+    }
+    fn load_subject_holds(&self) -> Result<Vec<SubjectHold>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id, subject, kind, snapshot, need, at, repeats, decision FROM rhapsody_subject_holds WHERE released_reason IS NULL ORDER BY id")?;
+        Ok(stmt
+            .query_map([], map_subject_hold)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+    fn park_subject(&self, hold: &SubjectHold) -> Result<i64, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let id = upsert_subject_hold(&tx, hold)?;
+        tx.commit()?;
+        Ok(id)
+    }
+    fn release_subject(&self, subject: &str, reason: &str) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        release_subject(&tx, subject, reason)?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn update_hold_snapshot(&self, id: i64, snapshot: &str) -> Result<(), StoreError> {
+        self.lock().execute("UPDATE rhapsody_subject_holds SET snapshot = ?2 WHERE id = ?1 AND released_reason IS NULL", params![id, snapshot])?;
+        Ok(())
+    }
+    fn same_head_findings(&self, key: &ReviewWatchKey, head: &str) -> Result<bool, StoreError> {
+        Ok(self.lock().query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_review_head_findings WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4 AND head = ?5 AND rerun = 0)", params![key.owner, key.repo, key.number, key.reviewer, head], |r| r.get(0))?)
+    }
+    fn allow_review_rerun(&self, pr: &str, head: &str) -> Result<(), StoreError> {
+        self.lock().execute("UPDATE rhapsody_review_head_findings SET rerun = 1
+            WHERE lower(owner || '/' || repo || '#' || number) = lower(?1)
+            AND head = CASE WHEN ?2 != '' THEN ?2 ELSE (SELECT CASE WHEN w.requested_sha != '' THEN w.requested_sha ELSE w.last_reviewed_sha END
+                FROM rhapsody_review_watch w WHERE w.owner = rhapsody_review_head_findings.owner
+                AND w.repo = rhapsody_review_head_findings.repo AND w.number = rhapsody_review_head_findings.number
+                AND w.reviewer = rhapsody_review_head_findings.reviewer) END", params![pr, head])?;
+        Ok(())
+    }
     fn notices_enabled(&self) -> bool {
         true
     }
@@ -1274,7 +1474,8 @@ impl Store for Sqlite {
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                  ON CONFLICT(source) WHERE active = 1 DO UPDATE SET
                  kind = excluded.kind, notice_group = excluded.notice_group,
-                 subject = excluded.subject, summary = excluded.summary, href = excluded.href",
+                  subject = excluded.subject, summary = excluded.summary, href = excluded.href,
+                  at = CASE WHEN excluded.source LIKE 'lead-park:%' THEN excluded.at ELSE at END",
                 params![row.source, row.kind, row.group, row.subject, row.summary, row.href, row.at, row.transient],
             )?;
         }
@@ -1320,6 +1521,11 @@ impl Store for Sqlite {
         let subject = trigger.subject();
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        let canonical = canonical_subject(&tx, subject)?;
+        let parked: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE subject = ?1 AND kind = 'escalation' AND released_reason IS NULL)", [&canonical], |r| r.get(0))?;
+        if parked && kind != "overrule" {
+            return Ok(tx.query_row("SELECT d.item FROM rhapsody_subject_holds h JOIN rhapsody_lead_decisions d ON d.id = h.decision WHERE h.subject = ?1 AND h.released_reason IS NULL", [&canonical], |r| r.get(0)).optional()?.unwrap_or(0));
+        }
         tx.execute(
             "INSERT INTO rhapsody_lead_items (trigger, subject, question, detail, created_at, kinds) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6) ON CONFLICT (subject, question) DO UPDATE SET \
@@ -1516,10 +1722,11 @@ impl Store for Sqlite {
         // snapshot cannot admit a page after the operator's note has committed.
         Ok(self.lock().execute(
             "INSERT INTO rhapsody_lead_reporting (key, count)
-             SELECT ?1, 1 FROM rhapsody_lead_decisions
-             WHERE id = ?2 AND overruled_at IS NULL AND substr(decision, 1, 10) = 'escalate: '
+             SELECT 'page-park:' || h.id, 1 FROM rhapsody_lead_decisions d
+             JOIN rhapsody_subject_holds h ON h.decision = d.id AND h.released_reason IS NULL
+             WHERE d.id = ?1 AND d.overruled_at IS NULL AND substr(d.decision, 1, 10) = 'escalate: '
              ON CONFLICT(key) DO NOTHING",
-            params![format!("page-decision:{decision}"), decision],
+            params![decision],
         )? == 1)
     }
 
@@ -1537,7 +1744,10 @@ impl Store for Sqlite {
         };
         let question = format!("overrule:{id}");
         tx.execute("INSERT INTO rhapsody_lead_items (trigger, subject, question, detail, created_at) VALUES ('overrule', ?1, ?2, ?3, ?4) ON CONFLICT(subject, question) DO NOTHING", params![subject, question, note, at])?;
-        tx.execute("UPDATE rhapsody_lead_decisions SET overruled_at = ?2, overrule_note = ?3 WHERE id = ?1 AND overruled_at IS NULL", params![id, at, note])?;
+        let changed = tx.execute("UPDATE rhapsody_lead_decisions SET overruled_at = ?2, overrule_note = ?3 WHERE id = ?1 AND overruled_at IS NULL", params![id, at, note])?;
+        if changed > 0 {
+            release_subject(&tx, &subject, "operator overruled escalation")?;
+        }
         let item = tx.query_row(
             "SELECT id FROM rhapsody_lead_items WHERE subject = ?1 AND question = ?2",
             params![subject, question],
@@ -1569,13 +1779,39 @@ impl Store for Sqlite {
     }
 
     fn save_lead_decision(&self, row: &LeadDecisionRow) -> Result<i64, StoreError> {
-        let conn = self.lock();
-        if row.id > 0 {
-            conn.execute("UPDATE rhapsody_lead_decisions SET decision = ?2, reasoning = ?3, evidence = ?4, actions = ?5 WHERE id = ?1", params![row.id, row.decision, row.reasoning, row.evidence, row.actions])?;
-            return Ok(row.id);
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let was_escalation = tx.query_row("SELECT substr(decision,1,10) = 'escalate: ' FROM rhapsody_lead_decisions WHERE id = ?1", [row.id], |r| r.get::<_, bool>(0)).optional()?.unwrap_or(false);
+        let id = if row.id > 0 {
+            tx.execute("UPDATE rhapsody_lead_decisions SET decision = ?2, reasoning = ?3, evidence = ?4, actions = ?5 WHERE id = ?1", params![row.id, row.decision, row.reasoning, row.evidence, row.actions])?;
+            row.id
+        } else {
+            tx.execute("INSERT INTO rhapsody_lead_decisions (item, at, decision, reasoning, evidence, actions, harness, model, overruled_at, overrule_note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", params![row.item, row.at, row.decision, row.reasoning, row.evidence, row.actions, row.harness, row.model, row.overruled_at, row.overrule_note])?;
+            tx.last_insert_rowid()
+        };
+        let active_decision: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE decision = ?1 AND released_reason IS NULL)", [id], |r| r.get(0))?;
+        if let Some(need) = row.decision.strip_prefix("escalate: ")
+            && (!was_escalation || active_decision)
+        {
+            let subject = tx.query_row(
+                "SELECT subject FROM rhapsody_lead_items WHERE id = ?1",
+                [row.item],
+                |r| r.get::<_, String>(0),
+            )?;
+            upsert_subject_hold(
+                &tx,
+                &SubjectHold {
+                    subject,
+                    kind: "escalation".into(),
+                    need: need.into(),
+                    at: row.at.clone(),
+                    decision: id,
+                    ..Default::default()
+                },
+            )?;
         }
-        conn.execute("INSERT INTO rhapsody_lead_decisions (item, at, decision, reasoning, evidence, actions, harness, model, overruled_at, overrule_note) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)", params![row.item, row.at, row.decision, row.reasoning, row.evidence, row.actions, row.harness, row.model, row.overruled_at, row.overrule_note])?;
-        Ok(conn.last_insert_rowid())
+        tx.commit()?;
+        Ok(id)
     }
 
     fn load_lead_decisions(&self) -> Result<Vec<LeadDecisionRow>, StoreError> {
@@ -1609,8 +1845,9 @@ impl Store for Sqlite {
         } else {
             r.started_at
         };
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
             "INSERT INTO runs
                (issue_id, issue_identifier, title, attempt, session_uuid, branch,
                 started_at, outcome, turns, input_tokens, output_tokens, total_tokens,
@@ -1631,7 +1868,10 @@ impl Store for Sqlite {
                 r.team_id,
             ],
         )?;
-        Ok(conn.last_insert_rowid())
+        let id = tx.last_insert_rowid();
+        tx.execute("UPDATE rhapsody_subject_holds SET resume_pending = 0 WHERE subject = ?1 COLLATE NOCASE", [&r.issue_identifier])?;
+        tx.commit()?;
+        Ok(id)
     }
 
     fn end_run(&self, run_id: i64, e: RunEnd) -> Result<(), StoreError> {
@@ -2786,6 +3026,7 @@ impl Store for Sqlite {
                 REVIEW_STATUS_IN_FLIGHT,
             ],
         )?;
+        conn.execute("UPDATE rhapsody_review_head_findings SET rerun = 0 WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4 AND head = ?5", params![key.owner, key.repo, key.number, key.reviewer, requested_sha])?;
         Ok(())
     }
 
@@ -3318,10 +3559,11 @@ impl Store for Sqlite {
         status: &str,
         completed: &ReviewCompleted,
     ) -> Result<(), StoreError> {
-        let conn = self.lock();
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
         // `last_reviewed_sha` and `last_completed_sha` are written together because they describe the
         // same completed round; the four `last_completed_*` columns are this method's alone.
-        conn.execute(
+        tx.execute(
             &format!(
                 "UPDATE rhapsody_review_watch \
                     SET last_reviewed_sha = ?5, status = ?6, \
@@ -3342,6 +3584,10 @@ impl Store for Sqlite {
                 completed.verdict,
             ],
         )?;
+        if completed.verdict == REVIEW_COMPLETION_CHANGES && !completed.sha.is_empty() {
+            tx.execute("INSERT INTO rhapsody_review_head_findings(owner, repo, number, reviewer, head) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO UPDATE SET rerun = 0", params![key.owner, key.repo, key.number, key.reviewer, completed.sha])?;
+        }
+        tx.commit()?;
         Ok(())
     }
 
@@ -4516,6 +4762,319 @@ impl Store for Sqlite {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn paraphrased_escalation_updates_in_place() {
+        use super::*;
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        let mut hold = SubjectHold {
+            subject: "TEST-1".into(),
+            kind: "escalation".into(),
+            need: "Need screenshot".into(),
+            at: "2026-10-10T05:00:00Z".into(),
+            ..Default::default()
+        };
+        let id = store.park_subject(&hold).unwrap();
+        hold.need = "Operator must capture evidence".into();
+        hold.at = "2026-10-10T05:01:00Z".into();
+        assert_eq!(store.park_subject(&hold).unwrap(), id);
+        let rows = store.load_subject_holds().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].repeats, 2);
+        assert_eq!(rows[0].need, hold.need);
+        assert_eq!(rows[0].at, hold.at);
+        store
+            .release_subject("TEST-1", "operator answered")
+            .unwrap();
+        assert!(store.load_subject_holds().unwrap().is_empty());
+        assert_ne!(store.park_subject(&hold).unwrap(), id);
+    }
+
+    #[test]
+    fn closed_episode_resolution_never_releases_a_new_park() {
+        let store = open_mem();
+        let trigger = LeadTrigger::BlockedHandoff {
+            ticket: "TEST-1".into(),
+            question: "evidence?".into(),
+        };
+        let item = store.enqueue_lead_item(&trigger, "at").unwrap();
+        let decision = store
+            .save_lead_decision(&LeadDecisionRow {
+                item,
+                decision: "escalate: evidence required".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            store
+                .resolve_lead_escalation(decision, "operator resolved")
+                .unwrap()
+        );
+        let next = store.enqueue_lead_item(&trigger, "later").unwrap();
+        assert_ne!(next, item);
+        let next_decision = store
+            .save_lead_decision(&LeadDecisionRow {
+                item: next,
+                decision: "escalate: still requires evidence".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            store
+                .resolve_lead_escalation(decision, "repeated stale request")
+                .unwrap()
+        );
+        assert_eq!(
+            store.subject_hold("TEST-1").unwrap().unwrap().decision,
+            next_decision
+        );
+        let old = store.load_lead_decisions().unwrap().remove(0);
+        store
+            .save_lead_decision(&LeadDecisionRow {
+                reasoning: "late paper trail mirror".into(),
+                ..old
+            })
+            .unwrap();
+        assert_eq!(store.load_subject_holds().unwrap().len(), 1);
+        assert_eq!(
+            store.subject_hold("TEST-1").unwrap().unwrap().decision,
+            next_decision
+        );
+    }
+
+    #[test]
+    fn operator_rerun_grants_only_the_current_head() {
+        let store = open_mem();
+        let key = ReviewWatchKey {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 1,
+            reviewer: "alice".into(),
+        };
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                open: true,
+                ..Default::default()
+            })
+            .unwrap();
+        for head in ["head-a", "head-b"] {
+            store
+                .record_review_completion(
+                    &key,
+                    REVIEW_STATUS_REVIEWED,
+                    &ReviewCompleted {
+                        sha: head.into(),
+                        verdict: REVIEW_COMPLETION_CHANGES.into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+        }
+        store.allow_review_rerun("o/r#1", "head-b").unwrap();
+        assert!(store.same_head_findings(&key, "head-a").unwrap());
+        assert!(!store.same_head_findings(&key, "head-b").unwrap());
+        store.mark_review_requested(&key, "head-b").unwrap();
+        assert!(store.same_head_findings(&key, "head-b").unwrap());
+    }
+
+    #[test]
+    fn stale_or_upgraded_hold_observation_cannot_release_the_current_episode() {
+        let store = open_mem();
+        let id = store
+            .park_subject(&SubjectHold {
+                subject: "TEST-1".into(),
+                kind: "blocked".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .park_subject(&SubjectHold {
+                    subject: "TEST-1".into(),
+                    kind: "escalation".into(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            id
+        );
+        assert!(
+            !store
+                .release_subject_episode(id, "blocked", "lead concrete change")
+                .unwrap()
+        );
+        assert!(store.subject_hold("TEST-1").unwrap().is_some());
+        assert!(
+            store
+                .release_subject_episode(id, "escalation", "operator action")
+                .unwrap()
+        );
+        let next = store
+            .park_subject(&SubjectHold {
+                subject: "TEST-1".into(),
+                kind: "escalation".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_ne!(next, id);
+        assert!(
+            !store
+                .release_subject_episode(id, "escalation", "stale poll")
+                .unwrap()
+        );
+        assert_eq!(store.subject_hold("TEST-1").unwrap().unwrap().id, next);
+    }
+
+    #[test]
+    fn v33_upgrade_folds_existing_ticket_pr_escalations_and_keeps_page_dedupe() {
+        let dir = scratch_dir();
+        let db = dir.join("v33.db");
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in &MIGRATIONS[..33] {
+                tx.execute_batch(migration).unwrap();
+            }
+            tx.execute_batch("PRAGMA user_version = 33;
+                INSERT INTO rhapsody_review_watch(owner,repo,number,reviewer,introduced_by,status,open,last_reviewed_sha)
+                    VALUES ('o','r',1,'alice','handoff:TEST-1','reviewed',1,'head-a');
+                INSERT INTO rhapsody_lead_items(id,trigger,subject,question,detail,created_at) VALUES
+                    (1,'blocked_handoff','TEST-1','evidence?','evidence?','2026-10-10T05:00:00Z'),
+                    (2,'review_escalation','o/r#1','review','head-a','2026-10-10T05:01:00Z');
+                INSERT INTO rhapsody_lead_decisions(id,item,at,decision,reasoning,evidence,actions,harness,model) VALUES
+                    (1,1,'2026-10-10T05:00:00Z','escalate: Need screenshot','','','','',''),
+                    (2,2,'2026-10-10T05:01:00Z','escalate: Operator must capture evidence','','','','','');
+                INSERT INTO rhapsody_lead_reporting(key,count) VALUES ('page-decision:2',1);").unwrap();
+            tx.commit().unwrap();
+        }
+        let store = Sqlite::open(StorePath::Disk(db)).unwrap();
+        let holds = store.load_subject_holds().unwrap();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].subject, "TEST-1");
+        assert_eq!(holds[0].repeats, 2);
+        assert_eq!(holds[0].need, "Operator must capture evidence");
+        assert!(
+            !store.reserve_lead_page(2).unwrap(),
+            "upgrade must not repeat a delivered page"
+        );
+        assert!(
+            store
+                .same_head_findings(
+                    &ReviewWatchKey {
+                        owner: "o".into(),
+                        repo: "r".into(),
+                        number: 1,
+                        reviewer: "alice".into()
+                    },
+                    "head-a"
+                )
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn subject_release_is_one_durable_author_admission_and_findings_survive_restart() {
+        let (dir, store) = open_temp();
+        let key = ReviewWatchKey {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 1,
+            reviewer: "alice".into(),
+        };
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                introduced_by: "handoff:TEST-1".into(),
+                open: true,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .record_review_completion(
+                &key,
+                REVIEW_STATUS_REVIEWED,
+                &ReviewCompleted {
+                    sha: "head-a".into(),
+                    verdict: REVIEW_COMPLETION_CHANGES.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .park_subject(&SubjectHold {
+                subject: "TEST-1".into(),
+                kind: "blocked".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store.release_subject("o/r#1", "head moved").unwrap();
+        assert!(store.subject_resume_pending("TEST-1").unwrap());
+        assert!(store.same_head_findings(&key, "head-a").unwrap());
+        assert!(!store.same_head_findings(&key, "head-b").unwrap());
+        drop(store);
+        let reopened = Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).unwrap();
+        assert!(reopened.subject_resume_pending("TEST-1").unwrap());
+        assert!(reopened.same_head_findings(&key, "head-a").unwrap());
+        reopened
+            .start_run(RunStart {
+                issue_identifier: "TEST-1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!reopened.subject_resume_pending("TEST-1").unwrap());
+    }
+
+    #[test]
+    fn escalation_on_pr_and_ticket_is_one_notice() {
+        use super::*;
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: ReviewWatchKey {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    number: 1,
+                    reviewer: "alice".into(),
+                },
+                introduced_by: "handoff:TEST-1".into(),
+                open: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let id = store
+            .park_subject(&SubjectHold {
+                subject: "o/r#1".into(),
+                kind: "escalation".into(),
+                need: "first".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .park_subject(&SubjectHold {
+                    subject: "test-1".into(),
+                    kind: "escalation".into(),
+                    need: "paraphrase".into(),
+                    ..Default::default()
+                })
+                .unwrap(),
+            id
+        );
+        assert_eq!(store.subject_hold("O/R#1").unwrap().unwrap().repeats, 2);
+        let before = store.load_lead_items().unwrap().len();
+        assert_eq!(
+            store
+                .enqueue_lead_item(
+                    &LeadTrigger::ImpossibleState {
+                        subject: "o/r#1".into(),
+                        kind: "retry".into()
+                    },
+                    "now"
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(store.load_lead_items().unwrap().len(), before);
+    }
     use super::*;
     use crate::parse_store_path;
     use rusqlite::{Connection, params};
@@ -8578,6 +9137,10 @@ mod tests {
                 "rhapsody_notifications".to_string(),
                 "rhapsody_notifications_active_source".to_string(),
                 "rhapsody_notifications_snapshot".to_string(),
+                "rhapsody_subject_holds".to_string(),
+                "rhapsody_subject_holds_open".to_string(),
+                "rhapsody_subject_prs".to_string(),
+                "rhapsody_review_head_findings".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
