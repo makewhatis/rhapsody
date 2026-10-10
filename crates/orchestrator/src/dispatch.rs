@@ -713,6 +713,16 @@ impl Orchestrator {
     /// PR with no comparable activity time stays lenient so a legitimately-summoned issue is never
     /// wedged by missing metadata. Applied to FRESH pickups only.
     pub(crate) fn pr_suppressed(&self, iss: &Issue) -> bool {
+        if self.subject_parked(&iss.identifier, "author") {
+            return true;
+        }
+        if self
+            .store()
+            .subject_resume_pending(&iss.identifier)
+            .unwrap_or(false)
+        {
+            return false;
+        }
         if !iss.linked_pr {
             return false;
         }
@@ -756,6 +766,9 @@ impl Orchestrator {
     /// "Divergences"): a comment created while the ticket's own author run was live, or before it
     /// handed off, is not a summons and must not re-engage the author.
     pub(crate) fn review_reopen_eligible(&self, iss: &Issue, running: &HashSet<String>) -> bool {
+        if self.subject_parked(&iss.identifier, "author") {
+            return false;
+        }
         // Human-only gate (STUDIO-949). This ladder runs BEFORE `eligibility` — a review-state issue
         // is never active, so `eligibility` rejects it outright and the reopen path is the only one
         // that can move it back to an active state and dispatch it. Without the gate here, a
@@ -771,6 +784,13 @@ impl Orchestrator {
         }
         if running.contains(&iss.id) || self.claimed.contains(&iss.id) {
             return false;
+        }
+        if self
+            .store()
+            .subject_resume_pending(&iss.identifier)
+            .unwrap_or(false)
+        {
+            return true;
         }
         let summon = match iss.latest_summon_at {
             Some(s) => s,

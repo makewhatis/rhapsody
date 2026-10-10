@@ -1440,6 +1440,9 @@ impl Orchestrator {
                 let mut cur = issue.clone();
                 cur.state = cur_state.state;
                 cur.labels = labels;
+                if self.subject_parked(&cur.identifier, "author") {
+                    return PreparedValidity::Stale;
+                }
                 // The selection fingerprint must be unchanged, or the credential requirement this
                 // reservation resolved is no longer the one a fresh dispatch would have.
                 if ticket_gate_key(&cur, route.as_ref()) != entry.fingerprint {
@@ -1490,6 +1493,12 @@ impl Orchestrator {
                 PreparedValidity::Current
             }
             PreparedTarget::Review { run, .. } => {
+                if self.subject_parked(
+                    &format!("{}/{}#{}", run.owner, run.repo, run.number),
+                    "review",
+                ) {
+                    return PreparedValidity::Stale;
+                }
                 let coord = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
                 match self.review_observed_head.get(&coord) {
                     // The last observation agrees: the pull request is open at the same head.

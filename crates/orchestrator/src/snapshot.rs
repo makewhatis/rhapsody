@@ -283,7 +283,7 @@ impl Orchestrator {
                 .collect(),
             // STUDIO-949: the current hold set, replaced every selection pass; empty on a daemon with
             // no human-gated ticket, which keeps the wire payload — and the golden — unchanged.
-            held_for_human: self.human_holds.held(),
+            held_for_human: self.subject_human_holds(),
             // STUDIO-957: the current per-provider budget refusals; empty on a daemon with no
             // configured budget, which keeps the wire payload — and the golden — unchanged.
             budget_held: self.budget_ledger.held(self.budget_hold_ttl()),

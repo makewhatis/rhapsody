@@ -489,6 +489,50 @@ impl Orchestrator {
         if self.running.contains_key(&id) || self.claimed.contains(&id) {
             return ReviewDispatchOutcome::AlreadyInFlight;
         }
+        let pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
+        if self.subject_parked(&pr, "review") {
+            return ReviewDispatchOutcome::Refused("subject is parked".into());
+        }
+        match self.store().subject_hold(&pr) {
+            Ok(Some(hold)) if hold.kind == "blocked" => {
+                match self
+                    .store()
+                    .review_dispute_pending(&run.watch_key(), &run.head_sha)
+                {
+                    Ok(true) => {
+                        return ReviewDispatchOutcome::Refused(
+                            "blocked author cannot receive a dispute re-read".into(),
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return ReviewDispatchOutcome::Refused(format!(
+                            "dispute ledger unreadable: {error}"
+                        ));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return ReviewDispatchOutcome::Refused(format!("subject hold unreadable: {error}"));
+            }
+        }
+        match self
+            .store()
+            .same_head_findings(&run.watch_key(), &run.head_sha)
+        {
+            Ok(false) => {}
+            Ok(true) => {
+                return ReviewDispatchOutcome::Refused(
+                    "findings already recorded at this head; dispute grant or operator rerun required".into(),
+                );
+            }
+            Err(error) => {
+                return ReviewDispatchOutcome::Refused(format!(
+                    "review head guard unreadable: {error}"
+                ));
+            }
+        }
 
         // STUDIO-908: the operator's `review.model` is scoped by harness, so a review routed to a
         // reviewer whose harness has no entry is refused HERE — before the watch-set writes below,
@@ -2992,6 +3036,7 @@ mod tests {
 
         o.dispatch_review(run.clone());
         let findings = exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_FINDINGS);
+        let run = review_run("alice", HEAD_B);
         o.dispatch_review(run.clone());
         let approved = exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_APPROVED);
 
@@ -3010,6 +3055,50 @@ mod tests {
                 .as_deref(),
             Some(REVIEW_VERDICT_APPROVED),
             "the later approval must not overwrite the earlier round's findings"
+        );
+    }
+
+    #[test]
+    fn stale_same_head_request_requires_one_operator_rerun() {
+        let (mut o, _d) = orch_with_review(true);
+        let run = review_run("alice", HEAD_A);
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+        exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_FINDINGS);
+        let row = o
+            .store()
+            .get_review_watch(&run.watch_key())
+            .unwrap()
+            .unwrap();
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                status: rhapsody_store::REVIEW_STATUS_REQUESTED.into(),
+                ..row
+            })
+            .unwrap();
+        assert!(
+            matches!(
+                o.dispatch_review(run.clone()),
+                ReviewDispatchOutcome::Refused(_)
+            ),
+            "an old producer cannot bypass the findings-head guard"
+        );
+        assert!(matches!(
+            o.handle_review_rerun(&crate::prstate::PrCoord::new(
+                &run.owner, &run.repo, run.number
+            )),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        ));
+        assert_eq!(
+            o.dispatch_review(run.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+        exit_review_as(&mut o, &run, false, "", true, REVIEW_STATE_FINDINGS);
+        assert!(
+            matches!(o.dispatch_review(run), ReviewDispatchOutcome::Refused(_)),
+            "the explicit rerun permits exactly one round"
         );
     }
 

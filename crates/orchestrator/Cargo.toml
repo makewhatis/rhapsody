@@ -77,6 +77,9 @@ libc = "0.2"
 rhapsody-provider-broker = { path = "../provider-broker", default-features = false }
 
 [dev-dependencies]
+# STUDIO-1156: inject a real SQLite queue-write failure without failing the independent hold
+# ledger. Already the store's locked dependency; test-only, no new runtime or external crate.
+rusqlite = { version = "0.40", features = ["bundled"] }
 # harness-fixtures (test-only): the O4 snapshot-shape cross-check renders a snapshot through
 # `snapshot_json`, normalizes it, and asserts byte-equality with the committed `api/state.json`
 # fixture — the same golden pattern the config crate's `tests/golden.rs` uses. Already in Cargo.lock.

@@ -1001,6 +1001,10 @@ where
             "/api/v1/lead/decisions/{id}/overrule",
             operator_write(crate::handlers_lead::handle_overrule),
         )
+        .route(
+            "/api/v1/lead/decisions/{id}/resolve",
+            operator_write(crate::handlers_lead::handle_resolve),
+        )
         .route("/api/v1/metrics", any(handle_metrics))
         // The same daily rollup split by provider (STUDIO-957). A route of its own rather than a
         // field on `/metrics`: that body is byte-pinned to the Go capture and cannot gain the

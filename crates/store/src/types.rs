@@ -8,6 +8,42 @@
 //! wire mapping lands with rhapsody-httpapi in a later phase).
 
 // --- tech-lead queue (STUDIO-1134; no Go counterpart) -----------------------------------------
+/// A durable admission stop and (for escalation) one operator-notice episode. Released rows stay
+/// in the ledger; only an open episode can be updated by a repeated escalation (STUDIO-1156).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SubjectHold {
+    pub id: i64,
+    pub subject: String,
+    pub kind: String,
+    pub snapshot: String,
+    pub need: String,
+    pub at: String,
+    pub repeats: i64,
+    pub decision: i64,
+}
+
+/// An unchanged-head non-blocked handoff's durable disposition (STUDIO-1156 B1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDisputeOutcome {
+    /// A subject park prevents both the grant and the adjudication enqueue.
+    Held,
+    /// Grant and watch-row arming committed together.
+    Granted,
+    /// The sole grant is waiting for dispatch; duplicate delivery is inert.
+    Pending,
+    /// The grant was spent; one PR/head adjudication item now exists.
+    Adjudication,
+}
+
+/// The shared ticket-bearing watch origin, also used by the orchestrator's route-back guard.
+pub fn origin_ticket(origin: &str) -> Option<&str> {
+    let ticket = origin
+        .strip_prefix("handoff:")
+        .or_else(|| origin.strip_prefix("adopt:"))?
+        .trim();
+    (!ticket.is_empty()).then_some(ticket)
+}
+
 /// Tech-lead work (STUDIO-1134); no Go counterpart. Shared here to avoid a store/orchestrator cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeadTrigger {

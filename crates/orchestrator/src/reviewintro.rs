@@ -670,20 +670,8 @@ impl Orchestrator {
                 );
                 continue;
             }
-            if gate_active {
-                tracing::debug!(
-                    review = %id, pr = %pr.pr,
-                    "manager exchange: act mode past the round threshold, so a re-introduction \
-                     arms nothing; the row is left exactly as it is"
-                );
-                continue;
-            }
-            // STUDIO-1006 (the F9 defect): a re-introduction must NOT reset a row whose last
-            // COMPLETED review already approved the change at the current head. The write below
-            // would put such a row back to `requested`, the watcher would dispatch a second review
-            // of code nobody has changed, and `auto_merge_verdict` would refuse `RoundInFlight`
-            // until an operator cleared the pull request by hand. Leave the settled row exactly as
-            // it is and arm only the rows that have not approved this head.
+            // STUDIO-1006/1156: settled approvals are preserved; settled findings may receive the
+            // sole durable non-blocked dispute grant. All other same-head introductions are inert.
             //
             // The verdict is read off the STORED row — the recorded completed review (its
             // `status` and the `last_reviewed_sha` it was recorded against) — and never off the
@@ -710,17 +698,55 @@ impl Orchestrator {
                     continue;
                 }
             };
-            let approved_at_current_head = stored.as_ref().is_some_and(|row| {
-                row.status == REVIEW_STATUS_APPROVED
+            let settled_at_current_head = stored.as_ref().is_some_and(|row| {
+                (row.status == REVIEW_STATUS_APPROVED
+                    || row.status == rhapsody_store::REVIEW_STATUS_REVIEWED)
                     && !row.last_reviewed_sha.is_empty()
                     && observed_head.is_none_or(|head| head == row.last_reviewed_sha)
             });
-            if approved_at_current_head {
+            if settled_at_current_head {
+                if let Some(row) = stored
+                    .as_ref()
+                    .filter(|row| row.status == REVIEW_STATUS_REVIEWED)
+                    && pr.introduced_by.starts_with("handoff:")
+                    && !pr.only_if_unwatched
+                {
+                    // A blocked ending is not a dispute. Its durable park survives introductions,
+                    // including an introduction already queued before the ending was detected.
+                    match self.store().subject_hold(&pr.pr.to_string()) {
+                        Ok(Some(_)) => continue,
+                        Ok(None) => {}
+                        Err(error) => {
+                            tracing::warn!(review = %id, %error, "dispute hold unreadable; leaving findings settled");
+                            continue;
+                        }
+                    }
+                    let mode = self
+                        .manager_routing_enabled()
+                        .then(|| self.manager_mode_token());
+                    let at = rhapsody_store::format_summon_at((self.now)());
+                    match self.store().request_review_dispute(
+                        &key,
+                        &row.last_reviewed_sha,
+                        mode,
+                        &at,
+                    ) {
+                        Ok(rhapsody_store::ReviewDisputeOutcome::Granted) => written += 1,
+                        Ok(_) => {}
+                        Err(error) => {
+                            tracing::warn!(review = %id, %error, "dispute could not be recorded; leaving findings settled")
+                        }
+                    }
+                    continue;
+                }
                 tracing::debug!(
                     review = %id,
-                    "ticketless review: this reviewer already approved the current head; the \
+                    "ticketless review: this reviewer already decided the current head; the \
                      re-introduction leaves its watch row as it is"
                 );
+                continue;
+            }
+            if gate_active {
                 continue;
             }
             let row = ReviewWatchRow {
@@ -1452,8 +1478,8 @@ mod tests {
         }
     }
 
-    /// Re-introducing a pull request re-arms its row and CANNOT forget the two SHAs. Forgetting
-    /// `last_reviewed_sha` would send a reviewer back over a head they already read; forgetting
+    /// Re-introducing an unchanged pull request CANNOT forget either SHA. The one dispute grant
+    /// keeps `last_reviewed_sha` as the delta review's prior head; forgetting
     /// `requested_sha` is §14.1 F-DUP's level-trigger, one agent per tick onto one worktree.
     #[test]
     fn re_introducing_a_pull_request_preserves_both_recorded_heads() {
@@ -1478,7 +1504,10 @@ mod tests {
             .expect("row");
         assert_eq!(row.requested_sha, HEAD_A);
         assert_eq!(row.last_reviewed_sha, HEAD_A);
-        assert_eq!(row.status, REVIEW_STATUS_REQUESTED, "re-armed");
+        assert_eq!(
+            row.status, REVIEW_STATUS_REQUESTED,
+            "one dispute re-read preserves both recorded heads"
+        );
     }
 
     /// **STUDIO-1046 acceptance: a handoff keeps the pull request's existing reviewer.** The pull
@@ -1500,8 +1529,9 @@ mod tests {
             .mark_review_completed(&watch_key("bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
             .expect("completed");
 
-        // The author hands off the fixes. Selection would name `alice`, but this pull request
+        // The author pushed fixes. Selection would name `alice`, but this pull request
         // already has a reviewer, so no selection is made.
+        o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), HEAD_B, &[]);
         assert_eq!(
             o.handle_review_introduce(&introduced("makewhatis", "rhapsody", 12, &["alice"])),
             ReviewIntroOutcome::Introduced(1),
@@ -1714,14 +1744,244 @@ mod tests {
         }
     }
 
-    /// Only an APPROVAL at the current head is left alone. A `reviewed` row (findings) has not
-    /// approved the head and is armed exactly as before, so the fix cannot quietly swallow a round
-    /// a reviewer asked for. This is the ticket's "a row that hasn't approved it must still be
-    /// armed".
-    ///
-    /// MUTATION: widen the skip to any terminal row and this reds.
+    fn findings_at_head(o: &Orchestrator, reviewer: &str) {
+        o.store()
+            .mark_review_requested(&watch_key(reviewer), HEAD_A)
+            .unwrap();
+        o.store()
+            .record_review_completion(
+                &watch_key(reviewer),
+                REVIEW_STATUS_REVIEWED,
+                &rhapsody_store::ReviewCompleted {
+                    generation: 1,
+                    sha: HEAD_A.into(),
+                    patch_id: String::new(),
+                    verdict: rhapsody_store::REVIEW_COMPLETION_CHANGES.into(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn dispute_sweep(
+        o: &mut Orchestrator,
+        pr: &IntroducedPr,
+    ) -> crate::reviewwatch::ReviewSweepReport {
+        o.human_holds.begin_pass(true);
+        o.spawn = Some(Box::new(|_, _, _| {}));
+        o.handle_review_sweep(&[crate::prstate::PrObservation {
+            pr: pr.pr.clone(),
+            lookup: crate::ghsummons::PrLookup::Found(crate::ghsummons::PrSnapshot {
+                status: crate::ghsummons::PrStatus::Open,
+                head_sha: HEAD_A.into(),
+                head_repo: "makewhatis/rhapsody".into(),
+                is_draft: Some(false),
+                merged_at: None,
+                merge_state: String::new(),
+            }),
+            unchanged_from: Vec::new(),
+            head_patch_id: String::new(),
+        }])
+    }
+
+    fn finish_dispute(o: &mut Orchestrator) {
+        let run = o
+            .running
+            .values()
+            .find(|r| r.review.is_some())
+            .unwrap()
+            .clone();
+        o.on_worker_exit(crate::EvWorkerExit {
+            issue_id: run.issue.id,
+            started_at: run.started_at,
+            failed: false,
+            err_msg: String::new(),
+            last_state: crate::review::REVIEW_STATE_FINDINGS.into(),
+            declared_handoff: true,
+            review_verdict: None,
+            manager_text: None,
+            refused: false,
+            auth_needed: false,
+        });
+    }
+
     #[test]
-    fn a_reviewed_row_at_the_current_head_is_still_armed() {
+    fn dispute_handoff_gets_exactly_one_reread() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+        o.handle_review_introduce(&pr);
+        findings_at_head(&o, "bob");
+        assert_eq!(dispute_sweep(&mut o, &pr).dispatched, 0);
+        assert_eq!(
+            o.handle_review_introduce(&pr),
+            ReviewIntroOutcome::Introduced(1)
+        );
+        // A duplicate introduction while waiting does not mint another grant or adjudication.
+        o.handle_review_introduce(&pr);
+        assert_eq!(dispute_sweep(&mut o, &pr).dispatched, 1);
+        assert_eq!(dispute_sweep(&mut o, &pr).dispatched, 0);
+        finish_dispute(&mut o);
+        assert_eq!(dispute_sweep(&mut o, &pr).dispatched, 0);
+        assert!(
+            o.store()
+                .same_head_findings(&watch_key("bob"), HEAD_A)
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn second_dispute_at_same_head_goes_to_adjudication_not_rereview() {
+        use rhapsody_config::teams::ReviewAuthority;
+        for authority in [ReviewAuthority::Act, ReviewAuthority::Off] {
+            let mut teams = teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]);
+            teams.manager.review_authority = authority;
+            teams.manager.lead.enabled = true;
+            let mut o = orch(teams);
+            let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+            o.handle_review_introduce(&pr);
+            findings_at_head(&o, "bob");
+            o.handle_review_introduce(&pr);
+            assert_eq!(dispute_sweep(&mut o, &pr).dispatched, 1);
+            finish_dispute(&mut o);
+            for _ in 0..3 {
+                assert_eq!(
+                    o.handle_review_introduce(&pr),
+                    ReviewIntroOutcome::Introduced(0)
+                );
+                assert_eq!(dispute_sweep(&mut o, &pr).dispatched, 0);
+            }
+            let manager = o.store().load_manager_interventions().unwrap();
+            let lead = o.store().load_lead_items().unwrap();
+            if authority == ReviewAuthority::Act {
+                assert_eq!(manager.len(), 1, "second dispute must reach the manager");
+                assert!(lead.is_empty());
+                assert_eq!(manager[0].pr, pr.pr.to_string());
+                assert_eq!(
+                    manager[0].state,
+                    rhapsody_store::MANAGER_INTERVENTION_QUEUED
+                );
+            } else {
+                assert!(manager.is_empty());
+                assert_eq!(lead.len(), 1, "manager off must reach the lead");
+                assert_eq!(
+                    lead[0].trigger,
+                    rhapsody_store::LeadTrigger::ReviewEscalation {
+                        pr: pr.pr.to_string(),
+                        head: HEAD_A.into(),
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dispute_grant_survives_restart() {
+        let dir = crate::testsupport::TempDir::new();
+        let path = std::path::PathBuf::from(dir.child("dispute.db"));
+        let teams = teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]);
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+        {
+            let mut o = orch(teams.clone());
+            o.set_store(Arc::new(
+                Sqlite::open(StorePath::Disk(path.clone())).unwrap(),
+            ));
+            o.handle_review_introduce(&pr);
+            findings_at_head(&o, "bob");
+            assert_eq!(
+                o.handle_review_introduce(&pr),
+                ReviewIntroOutcome::Introduced(1)
+            );
+        }
+        {
+            let mut o = orch(teams.clone());
+            o.set_store(Arc::new(
+                Sqlite::open(StorePath::Disk(path.clone())).unwrap(),
+            ));
+            assert_eq!(
+                dispute_sweep(&mut o, &pr).dispatched,
+                1,
+                "pending grant survived"
+            );
+            finish_dispute(&mut o);
+        }
+        let mut o = orch(teams);
+        o.set_store(Arc::new(Sqlite::open(StorePath::Disk(path)).unwrap()));
+        assert_eq!(
+            o.handle_review_introduce(&pr),
+            ReviewIntroOutcome::Introduced(0)
+        );
+        assert_eq!(
+            dispute_sweep(&mut o, &pr).dispatched,
+            0,
+            "consumed grant survived"
+        );
+        assert_eq!(o.store().load_lead_items().unwrap().len(), 1);
+        drop(o);
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::Disk(std::path::PathBuf::from(
+                dir.child("dispute.db"),
+            )))
+            .unwrap(),
+        ));
+        o.handle_review_introduce(&pr);
+        assert_eq!(
+            o.store().load_lead_items().unwrap().len(),
+            1,
+            "adjudication dedupe survived"
+        );
+    }
+
+    #[test]
+    fn dispute_grant_is_reviewer_scoped_even_past_the_manager_threshold() {
+        let mut teams = teams_with(true, ReviewMode::Ticketless, &["alice", "bob", "carol"]);
+        teams.review.reviewers = 2;
+        teams.review.adjudicate_after_rounds = 1;
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Act;
+        let mut o = orch(teams);
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob", "carol"]);
+        o.handle_review_introduce(&pr);
+        findings_at_head(&o, "bob");
+        approve_row(&o, "carol", HEAD_A);
+        o.review_rounds
+            .insert(crate::reviewwatch::churn_key(&pr.pr), 1);
+        assert_eq!(
+            o.handle_review_introduce(&pr),
+            ReviewIntroOutcome::Introduced(1)
+        );
+        assert_eq!(dispute_sweep(&mut o, &pr).dispatched, 1);
+        assert_eq!(o.running.values().next().unwrap().identity, "bob");
+        assert!(o.store().load_manager_interventions().unwrap().is_empty());
+        assert_eq!(
+            o.store()
+                .get_review_watch(&watch_key("carol"))
+                .unwrap()
+                .unwrap()
+                .status,
+            REVIEW_STATUS_APPROVED
+        );
+    }
+
+    #[test]
+    fn a_blocked_ending_cannot_spend_an_already_pending_dispute() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
+        o.handle_review_introduce(&pr);
+        findings_at_head(&o, "bob");
+        o.handle_review_introduce(&pr);
+        o.store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "STUDIO-720".into(),
+                kind: "blocked".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(dispute_sweep(&mut o, &pr).dispatched, 0);
+        assert!(o.store().load_lead_items().unwrap().is_empty());
+    }
+
+    /// A blocked handoff keeps findings settled; operator rerun remains an explicit override.
+    #[test]
+    fn a_blocked_reviewed_row_at_the_current_head_requires_operator_rerun() {
         let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
         let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
         o.handle_review_introduce(&pr);
@@ -1740,17 +2000,37 @@ mod tests {
             },
         );
 
+        o.store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "STUDIO-720".into(),
+                kind: "blocked".into(),
+                ..Default::default()
+            })
+            .unwrap();
+
         assert_eq!(
             o.handle_review_introduce(&pr),
-            ReviewIntroOutcome::Introduced(1),
-            "findings are not an approval"
+            ReviewIntroOutcome::Introduced(0),
+            "unchanged findings are not new work"
         );
         let row = o
             .store()
             .get_review_watch(&watch_key("bob"))
             .expect("read")
             .expect("row");
-        assert_eq!(row.status, REVIEW_STATUS_REQUESTED);
+        assert_eq!(row.status, REVIEW_STATUS_REVIEWED);
+        assert!(matches!(
+            o.handle_review_rerun(&pr.pr),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        ));
+        assert_eq!(
+            o.store()
+                .get_review_watch(&watch_key("bob"))
+                .unwrap()
+                .unwrap()
+                .status,
+            REVIEW_STATUS_REQUESTED
+        );
     }
 
     /// The observed-head memo is in-memory (STUDIO-1005), so a restart leaves it empty while the

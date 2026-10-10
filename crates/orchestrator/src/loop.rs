@@ -458,6 +458,7 @@ pub enum Event {
     /// that otherwise clears only on a restart or a close.
     ReviewClear {
         pr: crate::prstate::PrCoord,
+        operator: bool,
         reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
     },
     /// The operator asking, from the console, to merge a run's pull request — phase 1, the
@@ -927,8 +928,17 @@ impl Orchestrator {
             } => {
                 let _ = reply.send(self.handle_review_dismiss(&pr, reviewer.as_deref()));
             }
-            Event::ReviewClear { pr, reply } => {
-                let _ = reply.send(self.handle_review_clear(&pr));
+            Event::ReviewClear {
+                pr,
+                operator,
+                reply,
+            } => {
+                let result = if operator {
+                    self.handle_review_clear(&pr)
+                } else {
+                    self.handle_review_clear_from(&pr, false)
+                };
+                let _ = reply.send(result);
             }
             Event::RunMergePlan {
                 run_id,
@@ -984,7 +994,9 @@ impl Orchestrator {
             } => {
                 let allowed = self.lead_enabled()
                     && self.review_route(&repo).is_some()
-                    && (ticket.is_empty() || !self.ticket_run_live(&ticket));
+                    && (ticket.is_empty()
+                        || (!self.ticket_run_live(&ticket)
+                            && !self.subject_parked(&ticket, "lead")));
                 let _ = reply.send(allowed);
             }
             Event::LimitReassigned(result) => {
@@ -1077,6 +1089,7 @@ impl Orchestrator {
         self.resume_due_limits().await;
         self.pump_limit_managers();
         self.reconcile().await;
+        self.reconcile_parked_subject_states().await;
         // STUDIO-898: the review reconciliation sweep — compare each watched pull request's board
         // state against its activity and REPORT any that disagree. Local reads only (the watch set
         // + the `runs` ledger), no network, and it acts on nothing.
@@ -3275,6 +3288,77 @@ mod tests {
         );
         assert_eq!(ta.candidate_calls(), 1, "project a polled once");
         assert_eq!(tb.candidate_calls(), 1, "project b polled once");
+    }
+
+    #[tokio::test]
+    async fn a_human_move_outside_candidate_states_releases_the_park() {
+        for multi in [false, true] {
+            for state in [
+                "Backlog",
+                "Done",
+                "In Review",
+                "",
+                "missing",
+                "error",
+                "paused",
+            ] {
+                let mut tr = Fake::new();
+                // Reproduce the real candidate filter: Backlog/Done are absent, not sparse rows.
+                assert!(tr.candidates.is_empty());
+                if state == "error" {
+                    tr.by_identifier_err = Some(TrackerError::Other("read failed".into()));
+                } else if state != "missing" {
+                    tr.by_identifier
+                        .insert("TEST-1".into(), issue("id", "TEST-1", state));
+                }
+                let tracker = Arc::new(tr);
+                let mut eff = empty_effective(tracker.clone());
+                eff.active_states = set_of(&["todo"]);
+                eff.review_states = set_of(&["in review"]);
+                if multi {
+                    let mut project = proj_with_tracker("test", tracker, "prompt");
+                    project.disabled = state == "paused";
+                    eff.projects = vec![project];
+                } else if state == "paused" {
+                    continue; // legacy has no paused-project shape
+                }
+                let mut o = Orchestrator::new("WORKFLOW.md");
+                o.eff = Some(eff);
+                o.set_store(Arc::new(
+                    rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).unwrap(),
+                ));
+                let mut old = issue("id", "TEST-1", "In Review");
+                old.description = Some("Acceptance text is unchanged".into());
+                old.labels = Some(vec![crate::teams::HUMAN_LABEL.into()]);
+                o.store()
+                    .park_subject(&rhapsody_store::SubjectHold {
+                        subject: "TEST-1".into(),
+                        kind: "escalation".into(),
+                        snapshot: crate::leaditems::park_snapshot(o.store(), &old, None, false)
+                            .unwrap(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                // A gated daemon must still observe the human move; it must never dispatch the
+                // excluded ticket or infer departure from an empty/failed candidate fetch.
+                o.drain.arm(Utc::now(), crate::drain::DrainReason::Operator);
+                o.on_tick().await;
+                if let Some(timer) = o.tick_timer.take() {
+                    timer.abort();
+                }
+                let released = matches!(state, "Backlog" | "Done");
+                assert_eq!(
+                    o.store().subject_hold("TEST-1").unwrap().is_none(),
+                    released,
+                    "multi={multi} state={state}"
+                );
+                assert_eq!(
+                    o.store().subject_resume_pending("TEST-1").unwrap(),
+                    released
+                );
+                assert!(o.running.is_empty());
+            }
+        }
     }
 
     // Mirrors Go `TestOnTickSkipsDisabledProject`: a paused project (enabled:false) is never polled.

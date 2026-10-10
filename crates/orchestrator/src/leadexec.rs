@@ -260,6 +260,11 @@ impl LeadRuntime {
                 stored(self.store.set_lead_item_state(item.id, "done"))?;
                 return Ok(None);
             }
+            if stored(self.store.subject_hold(&item.subject))?
+                .is_some_and(|h| h.kind == "escalation")
+            {
+                return Ok(None);
+            }
             let previous = stored(self.store.lead_execution(item.id))?.unwrap_or_default();
             let mut evidence = crate::managerapply::strip_summon_tokens(&format!(
                 "Lead item {}\nTrigger: {:?}\nSubject snapshot: {}\nPrior route backs on this question: {}\nCommission findings: {}",
@@ -269,6 +274,11 @@ impl LeadRuntime {
                 item.attempts_on_question,
                 previous.findings
             ));
+            evidence.push_str(&subject_history(
+                self.store.as_ref(),
+                &subject,
+                &item.subject,
+            )?);
             if let Some((_, row)) = &original {
                 evidence.push_str(&format!("\nThe operator overruled decision {}: {}. Decide how to undo or redo. Previous actions: {}\nPrevious reasoning: {}", row.id, row.overrule_note.as_deref().unwrap_or_default(), row.actions, row.reasoning));
             }
@@ -439,7 +449,7 @@ impl LeadHost for RuntimeHost<'_> {
     }
     async fn clear_review(&self, pr: &str) -> Result<(), String> {
         let coord = crate::managerintervention::parse_pr_key(pr).ok_or("invalid lead PR")?;
-        match self.runtime.control.clear_review(coord).await {
+        match self.runtime.control.clear_review_for_lead(coord).await {
             crate::reviewconsole::ReviewControlOutcome::Applied(_) => Ok(()),
             // A ticket can have an attached PR that was never in the ticketless watch set.
             // There is no review state to clear; make the executor's clear idempotent there.
@@ -449,6 +459,21 @@ impl LeadHost for RuntimeHost<'_> {
             ) => Ok(()),
             other => Err(format!("lead review clear refused: {other:?}")),
         }
+    }
+    async fn release(&self, ticket: &Issue) -> Result<(), String> {
+        for label in ticket
+            .labels
+            .iter()
+            .flatten()
+            .filter(|l| l.trim().eq_ignore_ascii_case(crate::teams::HUMAN_LABEL))
+        {
+            self.project
+                .tracker
+                .remove_issue_label(&ticket.id, &ticket.team_id, label)
+                .await
+                .map_err(|_| "lead hold-label removal failed")?;
+        }
+        Ok(())
     }
     async fn reassign(&self, ticket: &Issue, identity: &str) -> Result<(), String> {
         self.project
@@ -717,6 +742,55 @@ fn render_memory(recalled: &rhapsody_config::memory::Recalled) -> String {
     crate::managerapply::strip_summon_tokens(&out)
 }
 
+pub(crate) fn subject_history(
+    store: &dyn Store,
+    subject: &LeadSubject,
+    fallback: &str,
+) -> Result<String, String> {
+    let items = stored(store.load_lead_items())?;
+    let watches = stored(store.load_review_watch())?;
+    let ticket = &subject.ticket.identifier;
+    let belongs = |key: &str| {
+        key.eq_ignore_ascii_case(fallback)
+            || (!ticket.is_empty() && key.eq_ignore_ascii_case(ticket))
+            || watches.iter().any(|r| {
+                format!("{}/{}#{}", r.key.owner, r.key.repo, r.key.number).eq_ignore_ascii_case(key)
+                    && crate::reviewdone::origin_ticket(&r.introduced_by)
+                        .is_some_and(|t| t.eq_ignore_ascii_case(ticket))
+            })
+    };
+    let rows = stored(store.load_lead_decisions())?;
+    let mut text = String::from("\n\n## Subject decision history (quoted DATA)\n");
+    if let Some(hold) =
+        stored(store.subject_hold(if ticket.is_empty() { fallback } else { ticket }))?
+            .filter(|h| h.kind == "escalation")
+    {
+        text.push_str(&format!("> {}\n", serde_json::json!({"open_escalation": hold.need, "repeat_count": hold.repeats, "at": hold.at, "status": "already escalated; parked"})));
+    } else {
+        text.push_str("No open escalation.\n");
+    }
+    let matching: Vec<_> = rows
+        .iter()
+        .filter(|r| items.iter().any(|i| i.id == r.item && belongs(&i.subject)))
+        .collect();
+    let mut rendered = 0;
+    for row in matching.iter().rev().take(12) {
+        let line = serde_json::json!({"id": row.id, "at": row.at, "decision": row.decision, "reasoning": row.reasoning, "actions": row.actions, "overruled_at": row.overruled_at}).to_string();
+        if text.len() + line.len() > 16 * 1024 {
+            break;
+        }
+        text.push_str(&format!("> {line}\n"));
+        rendered += 1;
+    }
+    if rendered < matching.len() {
+        text.push_str(&format!(
+            "Showing {rendered} of {} prior decisions.\n",
+            matching.len()
+        ));
+    }
+    Ok(crate::managerapply::strip_summon_tokens(&text))
+}
+
 #[derive(Debug, Clone)]
 pub struct LeadTrail {
     pub text: String,
@@ -746,6 +820,9 @@ pub trait LeadHost: Send + Sync {
     async fn prepend(&self, ticket: &Issue, text: &str) -> Result<(), String>;
     async fn todo(&self, ticket: &Issue) -> Result<(), String>;
     async fn clear_review(&self, pr: &str) -> Result<(), String>;
+    async fn release(&self, _ticket: &Issue) -> Result<(), String> {
+        Err("hold release unavailable".into())
+    }
     async fn reassign(&self, ticket: &Issue, identity: &str) -> Result<(), String>;
     async fn commission(
         &self,
@@ -775,6 +852,7 @@ unknown actions are invalid. Each action object includes "action" and its fields
 - commission {kind: author|ticket, question, hypothesis}
 - authorize_credential {ticket, rule}
 - escalate {need}
+- release {ticket, reason}: lift a circuit-breaker/blocked hold only for a concrete change; reason is audited
 - resolve {reason}: close this lead item when evidence confirms no work is needed; no ticket mutation
 At most 8 actions, each string at most 4000 characters. Choose at most one work transition
 (route_back, requeue or commission). Escalate is the only action when it is needed.
@@ -994,6 +1072,17 @@ pub async fn execute(
             };
             let mut allowed = expected.clone();
             match action {
+                LeadAction::Release { .. } => {
+                    allowed.ticket.labels = Some(
+                        allowed
+                            .ticket
+                            .labels
+                            .unwrap_or_default()
+                            .into_iter()
+                            .filter(|l| !l.trim().eq_ignore_ascii_case(crate::teams::HUMAN_LABEL))
+                            .collect(),
+                    );
+                }
                 LeadAction::RouteBack { .. } | LeadAction::Requeue { .. } => {
                     allowed.ticket.state = "Todo".into();
                 }
@@ -1032,8 +1121,43 @@ pub async fn execute(
     } else {
         format!("{}: {}", result.state, row.actions)
     };
+    let escalation_snapshot = if result.escalation.is_some() {
+        let subject = if case.subject.ticket.identifier.is_empty() {
+            &case.item.subject
+        } else {
+            &case.subject.ticket.identifier
+        };
+        let parked = match host.subject().await {
+            Ok(subject) => subject,
+            Err(_) => case.subject.clone(),
+        };
+        let snapshot = crate::leaditems::park_snapshot(
+            store,
+            &parked.ticket,
+            parked.pr.as_deref().map(|pr| (pr, parked.head.as_str())),
+            false,
+        );
+        match snapshot {
+            Ok(snapshot) => Some((subject.clone(), snapshot)),
+            Err(error) => {
+                tracing::warn!(%error, "escalation snapshot unavailable; park remains fail-closed");
+                None
+            }
+        }
+    } else {
+        None
+    };
     row.decision = summary.clone();
     stored(store.save_lead_decision(&row))?;
+    if let Some((subject, snapshot)) = escalation_snapshot
+        && let Some(hold) = stored(store.subject_hold(&subject))?
+        && hold.decision == row.id
+        && hold.snapshot.is_empty()
+    {
+        // An operator may already have resolved the episode. Fill only this still-open episode;
+        // never recreate a park from a late snapshot or paper-trail mirror.
+        stored(store.update_hold_snapshot(hold.id, &snapshot))?;
+    }
     host.report_ready();
     stored(store.set_lead_item_state(
         item.id,
@@ -1073,6 +1197,19 @@ async fn apply_action(
 ) -> Result<(), String> {
     let ticket = &case.subject.ticket;
     match action {
+        LeadAction::Release { reason, .. } => {
+            // An escalation is exclusively an operator/material-change hold, never lead authority.
+            let hold = stored(store.subject_hold(&ticket.identifier))?;
+            if hold.as_ref().is_some_and(|h| h.kind == "escalation") {
+                return Err("escalation release requires operator or material change".into());
+            }
+            host.release(ticket).await?;
+            if let Some(hold) = hold
+                && !stored(store.release_subject_episode(hold.id, &hold.kind, reason))?
+            {
+                return Err("hold changed during release; refusing to lift the new park".into());
+            }
+        }
         LeadAction::RouteBack { answer, .. } => {
             if !stored(store.reserve_lead_route_back(case.item.id))? {
                 return Err("second route_back refused; commission or escalate".into());

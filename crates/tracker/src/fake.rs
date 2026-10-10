@@ -117,6 +117,9 @@ pub struct Fake {
     pub by_state: HashMap<String, Vec<Issue>>,
     /// Issue id -> issue.
     pub by_id: HashMap<String, Issue>,
+    /// Full scoped reads can see issues excluded from the candidate-state query.
+    pub by_identifier: HashMap<String, Issue>,
+    pub by_identifier_err: Option<TrackerError>,
 
     /// The programmable `fetch_blocked_backlog_issues` result (Backlog-state issues with
     /// `blocked_by` populated); `blocked_backlog_err`, when set, is returned instead. INF-318.
@@ -398,9 +401,13 @@ impl Tracker for Fake {
         &self,
         identifier: &str,
     ) -> Result<Option<Issue>, TrackerError> {
+        if let Some(error) = &self.by_identifier_err {
+            return Err(error.clone());
+        }
         Ok(self
-            .candidates
-            .iter()
+            .by_identifier
+            .values()
+            .chain(self.candidates.iter())
             .find(|i| i.identifier.eq_ignore_ascii_case(identifier))
             .cloned())
     }

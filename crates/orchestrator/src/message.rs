@@ -121,6 +121,34 @@ impl Orchestrator {
         let re = match self.running.get(&id) {
             Some(re) => re,
             None => {
+                // An explicit operator answer can resume a blocked run that has already ended.
+                // Preserve the note for its next run before lifting the durable admission stop.
+                if let Ok(Some(run)) = self.store().get_run(run_id)
+                    && self.subject_parked(&run.issue_identifier, "author")
+                {
+                    let saved = self
+                        .store()
+                        .record_summon_watermark(rhapsody_store::SummonWatermark {
+                            identifier: run.issue_identifier.clone(),
+                            at: rhapsody_store::format_summon_at((self.now)()),
+                            body: text.into(),
+                        })
+                        .and_then(|()| {
+                            self.store()
+                                .release_subject(&run.issue_identifier, "operator posted a message")
+                        });
+                    match saved {
+                        Ok(()) => {
+                            return RunMessageResult {
+                                identifier: run.issue_identifier,
+                                ..Default::default()
+                            };
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "operator answer could not release subject")
+                        }
+                    }
+                }
                 return RunMessageResult {
                     not_running: true,
                     ..Default::default()
@@ -135,6 +163,12 @@ impl Orchestrator {
                 identifier,
                 ..Default::default()
             };
+        }
+        if let Err(error) = self
+            .store()
+            .release_subject(&identifier, "operator delivered a message")
+        {
+            tracing::warn!(%error, "message delivered but subject release failed");
         }
         RunMessageResult {
             id: row_id,
@@ -361,6 +395,42 @@ mod tests {
         // run's mailbox receiver) — these tests assert on the mailbox admission path, not the worker.
         o.spawn = Some(Box::new(|_iss, _attempt, _re| {}));
         (o, st)
+    }
+
+    #[test]
+    fn operator_answer_resumes_an_ended_parked_run_and_keeps_its_note() {
+        let (o, store) = message_orch();
+        let run = store
+            .start_run(rhapsody_store::RunStart {
+                issue_id: "id".into(),
+                issue_identifier: "TEST-1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .end_run(
+                run,
+                rhapsody_store::RunEnd {
+                    outcome: rhapsody_store::OUTCOME_STOPPED.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "TEST-1".into(),
+                kind: "escalation".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let result = o.handle_run_message(run, "The acceptance requirement is corrected");
+        assert!(!result.not_running && !result.full);
+        assert!(store.subject_hold("TEST-1").unwrap().is_none());
+        assert!(store.subject_resume_pending("TEST-1").unwrap());
+        assert_eq!(
+            store.summon_watermark("TEST-1").unwrap().unwrap().body,
+            "The acceptance requirement is corrected"
+        );
     }
 
     // operator_wrap must render byte-identically to Go `operatorWrap` (the wrapper is written to the

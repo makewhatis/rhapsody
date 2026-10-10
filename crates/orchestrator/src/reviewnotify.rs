@@ -344,13 +344,20 @@ pub async fn run_review_notify_task(
 /// reason to leave the ticket in the review state — see [`route_back`] — and all three mean the
 /// same thing to the author, which is that nothing reopened their run.
 async fn post_completion(deps: &ReviewNotifyDeps, c: &ReviewCompletion) -> bool {
+    let mut c = c.clone();
+    if let Some(tickets) = &deps.tickets
+        && !tickets.may_reengage(&c.to_string()).await
+    {
+        c.suppress_summons = true;
+        c.changes = None;
+    }
     let Some(sink) = deps.comments.as_ref() else {
         tracing::debug!(
             pr = %c, "ticketless review: no GitHub comment sink, so the author is not re-engaged"
         );
         return false;
     };
-    let body = re_engage_comment(c);
+    let body = re_engage_comment(&c);
     // The contract, in the log, on every comment: whether THIS body will reopen the author's
     // ticket. Recomputed from the body that is actually about to be posted rather than from
     // `c.approved`/`c.suppress_summons`, so an edit to the template that lost the token reads as
@@ -416,7 +423,14 @@ async fn route_back(deps: &ReviewNotifyDeps, c: ReviewCompletion, re_engaged: bo
         );
         return;
     };
-    tickets.route_back(plan, re_engaged).await;
+    if tickets.may_reengage(&plan.pr).await {
+        tickets.route_back(plan, re_engaged).await;
+    }
+}
+
+fn origin_parked(o: &Orchestrator, origin: &str) -> bool {
+    crate::reviewdone::origin_ticket(origin)
+        .is_some_and(|ticket| o.subject_parked(ticket, "author"))
 }
 
 impl Orchestrator {
@@ -476,7 +490,9 @@ impl Orchestrator {
         // its automatic findings route-back, and the summon in this comment with it. The review
         // becomes evidence for the manager's next decision, which is what may wake the author.
         let coord = crate::prstate::PrCoord::new(&run.owner, &run.repo, run.number);
-        let suppress_summons = !approved && self.review_exchange_gate_active(&coord);
+        let suppress_summons = !approved
+            && (self.review_exchange_gate_active(&coord)
+                || origin_parked(self, &run.introduced_by));
         Some(ReviewCompletion {
             reason: CompletionReason::Verdict,
             owner: run.owner.clone(),
@@ -1083,6 +1099,7 @@ mod tests {
     #[derive(Default)]
     struct RecordingTickets {
         moved: Mutex<Vec<(ReviewChangesPlan, bool)>>,
+        parked: bool,
     }
 
     impl RecordingTickets {
@@ -1096,6 +1113,9 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ReviewChangesSink for RecordingTickets {
+        async fn may_reengage(&self, _pr: &str) -> bool {
+            !self.parked
+        }
         async fn route_back(&self, plan: ReviewChangesPlan, re_engaged: bool) {
             self.moved
                 .lock()
@@ -1109,6 +1129,26 @@ mod tests {
             comments: Some(Arc::clone(sink) as Arc<dyn PrCommentSink>),
             tickets: Some(Arc::clone(tickets) as Arc<dyn ReviewChangesSink>),
         }
+    }
+
+    #[tokio::test]
+    async fn a_park_after_planning_suppresses_the_findings_summon_and_move() {
+        let sink = RecordingSink::new(false);
+        let tickets = Arc::new(RecordingTickets {
+            parked: true,
+            ..Default::default()
+        });
+        drain(
+            deps(&sink, &tickets),
+            vec![completion_moving(false, "@symphony")],
+        )
+        .await;
+        assert_eq!(sink.taken().len(), 1, "the verdict is still recorded");
+        assert!(!summons_author(&sink.taken()[0].2, "@symphony"));
+        assert!(
+            tickets.taken().is_empty(),
+            "a queued completion cannot move a parked ticket"
+        );
     }
 
     /// Arm one of the pairing, at the point of ACTION rather than of planning: a findings

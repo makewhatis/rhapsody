@@ -1363,6 +1363,9 @@ impl Orchestrator {
                             unchanged_from: obs.unchanged_from.clone(),
                         },
                     );
+                    if self.review_repo_is_configured(&obs.pr.owner, &obs.pr.repo) {
+                        self.observe_parked_head(&obs.pr.to_string(), &snap.head_sha);
+                    }
                 }
                 // A `Found` naming no head, `Gone`, or `Untrusted`: the coordinate has no current
                 // head the sweep may compare against. Clear rather than keep an older head — an
@@ -1618,6 +1621,10 @@ impl Orchestrator {
         let head = snap.head_sha.trim();
         if head.is_empty() {
             return; // an answer with no head is not an answer about a head
+        }
+        if self.subject_parked(&pr.to_string(), "review") {
+            report.deferred += 1;
+            return;
         }
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
         // Only a pull request this daemon parked for a TICKET can be re-engaged by a summons: the
@@ -3007,6 +3014,10 @@ impl Orchestrator {
             head_patch_id,
             draft,
         } = observed;
+        if self.subject_parked(&pr.to_string(), "review") {
+            report.deferred += 1;
+            return;
+        }
         if head.is_empty() {
             return; // an answer with no head is not an answer about a head
         }
@@ -3179,7 +3190,22 @@ impl Orchestrator {
         {
             ledger.clear(pr);
         }
-        if !mine.is_empty()
+        // B1's single dispute read is an explicit, durable reviewer/head edge even after the
+        // ordinary round threshold. A settled manager verdict must not swallow that grant.
+        let mut disputes = Vec::new();
+        for row in &mine {
+            match self.store().review_dispute_pending(&row.key, head) {
+                Ok(true) => disputes.push(&row.key),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%pr, %error, "dispute ledger unreadable; deferring review and adjudication");
+                    report.deferred += 1;
+                    return;
+                }
+            }
+        }
+        if disputes.is_empty()
+            && !mine.is_empty()
             && verdict_at_head
             && let Some(threshold) = self.adjudication_threshold()
         {
@@ -3608,7 +3634,10 @@ impl Orchestrator {
             // MUTATION: delete this gate and
             // `an_act_round_past_the_threshold_arms_only_under_an_authorization` reds on its first
             // assert (a round is dispatched with no authorization).
-            if !self.review_round_arm_authorized(pr, head, head_patch_id, held_origin) {
+            let dispute_authorized = chosen == row.key.reviewer && disputes.contains(&&row.key);
+            if !dispute_authorized
+                && !self.review_round_arm_authorized(pr, head, head_patch_id, held_origin)
+            {
                 report.deferred += 1;
                 continue;
             }
@@ -7617,6 +7646,7 @@ mod tests {
         teams.review.reviewers = 1;
         let (mut o, dispatched) = orch(teams);
         introduce(&o, reviewed_row(78, "jimmy", HEAD_A));
+        o.handle_review_head_advanced(&coord(78), HEAD_B, &[]);
 
         // The author hands off the fixes; selection — load-ranked — names `alice`.
         let handoff = crate::reviewintro::IntroducedPr {
@@ -7637,7 +7667,7 @@ mod tests {
             "no row was created for the reviewer selection named"
         );
 
-        let report = o.handle_review_sweep(&[open_at(78, HEAD_A)]);
+        let report = o.handle_review_sweep(&[open_at(78, HEAD_B)]);
 
         assert_eq!(report.retired, 0, "the incumbent's row is not surplus");
         assert_eq!(
