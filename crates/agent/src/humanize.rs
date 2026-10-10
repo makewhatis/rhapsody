@@ -22,6 +22,7 @@
 //! dispatch should become explicit and this note should go with it — the disjointness argued above
 //! is a property of today's two vocabularies, and a third harness is not obliged to preserve it.
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Deserialize;
 use serde_json::value::RawValue;
 use std::collections::BTreeMap;
@@ -40,6 +41,10 @@ pub struct LogEntry {
     pub kind: String,
     pub tool: String,
     pub text: String,
+    /// Source line's own instant, UTC with milliseconds; empty when absent or invalid.
+    pub at: String,
+    /// OpenCode's tool interval, not its enclosing step/turn duration. None means unknown.
+    pub duration_ms: Option<i64>,
 }
 
 /// Bounds summarized tool I/O (inputs/results) — the usual verbosity offenders.
@@ -71,6 +76,7 @@ struct HumanizeLine {
     part: Option<OpencodePart>,
     /// opencode: the in-band `error` line's payload.
     error: Option<OpencodeError>,
+    timestamp: serde_json::Value,
 }
 
 /// opencode's `part` object. One struct covers all of its line types because the CLI reuses the
@@ -95,6 +101,7 @@ struct OpencodeToolState {
     status: String,
     input: Option<Box<RawValue>>,
     output: Option<Box<RawValue>>,
+    time: serde_json::Value,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -158,7 +165,7 @@ pub fn humanize_stream_line(raw: &[u8]) -> Vec<LogEntry> {
         Err(_) => return Vec::new(),
     };
 
-    match line.r#type.as_str() {
+    let mut entries = match line.r#type.as_str() {
         "system" => {
             if line.subtype == "init" {
                 vec![event_entry("session started")]
@@ -205,6 +212,7 @@ pub fn humanize_stream_line(raw: &[u8]) -> Vec<LogEntry> {
                     kind: "text".to_string(),
                     tool: String::new(),
                     text: truncate(t, MAX_PROSE_RUNES),
+                    ..LogEntry::default()
                 }]
             }
         }
@@ -225,6 +233,13 @@ pub fn humanize_stream_line(raw: &[u8]) -> Vec<LogEntry> {
                     &summarize_input(state.and_then(|s| s.input.as_deref())),
                     MAX_LOG_TEXT_RUNES,
                 ),
+                duration_ms: state.and_then(|s| {
+                    s.time["end"]
+                        .as_i64()?
+                        .checked_sub(s.time["start"].as_i64()?)
+                        .filter(|ms| *ms >= 0)
+                }),
+                ..LogEntry::default()
             }];
             // Only a finished call has a result to show; a `pending`/`running` state has not
             // produced one yet, and rendering "(ok)" for it would claim an outcome that has not
@@ -241,6 +256,7 @@ pub fn humanize_stream_line(raw: &[u8]) -> Vec<LogEntry> {
                     } else {
                         truncate(&summary, MAX_LOG_TEXT_RUNES)
                     },
+                    ..LogEntry::default()
                 });
             }
             out
@@ -266,7 +282,19 @@ pub fn humanize_stream_line(raw: &[u8]) -> Vec<LogEntry> {
             vec![event_entry(&truncate(&label, MAX_LOG_TEXT_RUNES))]
         }
         _ => Vec::new(),
+    };
+    let at = match &line.timestamp {
+        serde_json::Value::String(s) => DateTime::parse_from_rfc3339(s)
+            .ok()
+            .map(|t| t.with_timezone(&Utc)),
+        v => v.as_i64().and_then(DateTime::<Utc>::from_timestamp_millis),
     }
+    .map(|t| t.to_rfc3339_opts(SecondsFormat::Millis, true))
+    .unwrap_or_default();
+    for entry in &mut entries {
+        entry.at.clone_from(&at);
+    }
+    entries
 }
 
 /// Builds an `"event"`-kind entry with the given label.
@@ -275,6 +303,7 @@ fn event_entry(text: &str) -> LogEntry {
         kind: "event".to_string(),
         tool: String::new(),
         text: text.to_string(),
+        ..LogEntry::default()
     }
 }
 
@@ -292,6 +321,7 @@ fn humanize_blocks(blocks: &[HumanizeBlock]) -> Vec<LogEntry> {
                         kind: "text".to_string(),
                         tool: String::new(),
                         text: truncate(t, MAX_PROSE_RUNES),
+                        ..LogEntry::default()
                     });
                 }
             }
@@ -302,6 +332,7 @@ fn humanize_blocks(blocks: &[HumanizeBlock]) -> Vec<LogEntry> {
                         kind: "thinking".to_string(),
                         tool: String::new(),
                         text: truncate(t, MAX_PROSE_RUNES),
+                        ..LogEntry::default()
                     });
                 }
             }
@@ -310,6 +341,7 @@ fn humanize_blocks(blocks: &[HumanizeBlock]) -> Vec<LogEntry> {
                     kind: "tool_use".to_string(),
                     tool: b.name.clone(),
                     text: truncate(&summarize_input(b.input.as_deref()), MAX_LOG_TEXT_RUNES),
+                    ..LogEntry::default()
                 });
             }
             "tool_result" => {
@@ -323,6 +355,7 @@ fn humanize_blocks(blocks: &[HumanizeBlock]) -> Vec<LogEntry> {
                     kind: "tool_result".to_string(),
                     tool: String::new(),
                     text,
+                    ..LogEntry::default()
                 });
             }
             _ => {}
@@ -416,6 +449,58 @@ fn truncate(s: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_timing_normalizes_both_harnesses_without_inventing_time() {
+        let claude = humanize_stream_line(br#"{"type":"assistant","timestamp":"2026-10-08T18:28:31.772+02:00","message":{"content":[{"type":"thinking","thinking":"plan"},{"type":"text","text":"hello"}]}}"#);
+        let opencode = humanize_stream_line(
+            br#"{"type":"text","timestamp":1791476911772,"part":{"text":"hello"}}"#,
+        );
+        assert_eq!(claude.len(), 2);
+        assert_eq!(opencode.len(), 1);
+        for entry in claude.iter().chain(&opencode) {
+            assert_eq!(entry.at, "2026-10-08T16:28:31.772Z");
+            assert_eq!(entry.duration_ms, None);
+        }
+        for timestamp in [
+            "",
+            r#", "timestamp": null"#,
+            r#", "timestamp": "bad""#,
+            r#", "timestamp": {}"#,
+            r#", "timestamp": 9223372036854775807"#,
+        ] {
+            let raw = format!(r#"{{"type":"result","duration_ms":1234{timestamp}}}"#);
+            let entries = humanize_stream_line(raw.as_bytes());
+            assert_eq!(entries.len(), 1, "bad timing must not discard content");
+            assert_eq!(entries[0].at, "");
+            assert_eq!(entries[0].duration_ms, None);
+        }
+    }
+
+    #[test]
+    fn opencode_tool_timing_uses_state_interval_and_source_line_time() {
+        for (time, expected) in [
+            (r#"{"start":1000,"end":3250}"#, Some(2250)),
+            (r#"{"start":1000,"end":1000}"#, Some(0)),
+            (r#"{"start":3250,"end":1000}"#, None),
+            (r#"{"start":1000}"#, None),
+            (r#"{"start":"bad","end":3250}"#, None),
+            (
+                r#"{"start":-9223372036854775808,"end":9223372036854775807}"#,
+                None,
+            ),
+        ] {
+            let raw = format!(
+                r#"{{"type":"tool_use","timestamp":1791476911772,"part":{{"tool":"bash","state":{{"status":"completed","time":{time},"output":"ok"}}}}}}"#
+            );
+            let entries = humanize_stream_line(raw.as_bytes());
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].at, "2026-10-08T16:28:31.772Z");
+            assert_eq!(entries[1].at, entries[0].at);
+            assert_eq!(entries[0].duration_ms, expected);
+            assert_eq!(entries[1].duration_ms, None);
+        }
+    }
 
     // Mirrors Go `agent.TestHumanizeStreamLine_SystemInit` (humanize_test.go).
     #[test]
