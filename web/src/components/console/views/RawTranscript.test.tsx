@@ -115,6 +115,26 @@ describe("lossless Raw transcript", () => {
     expect((screen.getByRole("button", { name: "Load later" }) as HTMLButtonElement).disabled).toBe(true);
   });
 
+  it("keeps the final later read available when an older earlier-page response arrives after termination", async () => {
+    let finishEarlier!: (value: RawTranscriptPage) => void;
+    vi.mocked(fetchRawTranscript)
+      .mockResolvedValueOnce(page(["partial"], { lines: [{ offset: 8, text: "partial" }], size_bytes: 15, prev_cursor: 8, at_start: false }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishEarlier = resolve; }))
+      .mockResolvedValueOnce(page(["partial complete\n"], { lines: [{ offset: 8, text: "partial complete\n" }], size_bytes: 25, prev_cursor: 8 }));
+    const { client, rerender } = mount(true);
+    await screen.findByText("partial");
+    fireEvent.click(screen.getByRole("button", { name: "Load earlier" }));
+    await waitFor(() => expect(fetchRawTranscript).toHaveBeenLastCalledWith(42, 8, "backward"));
+    rerender(<QueryClientProvider client={client}><RawTranscript runId={42} inFlight={false} /></QueryClientProvider>);
+    finishEarlier(page(["earlier\n"], { next_cursor: 8, at_end: false, size_bytes: 15 }));
+    await screen.findByText("earlier");
+    expect((screen.getByRole("button", { name: "Load later" }) as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "Load later" }));
+    await screen.findByText("partial complete");
+    expect(fetchRawTranscript).toHaveBeenLastCalledWith(42, 8, "forward");
+    expect((screen.getByRole("button", { name: "Load later" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("keeps invalid JSON verbatim and reads OpenCode epoch timestamps", async () => {
     const text = "partial **markdown**\r\n";
     vi.mocked(fetchRawTranscript).mockResolvedValue(page([text, '{"type":"step_finish","timestamp":1791547200000,"part":{"tokens":{"total":12}}}\n']));

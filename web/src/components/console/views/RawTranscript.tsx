@@ -131,12 +131,16 @@ export function RawTranscript({ runId, inFlight }: { runId: number; inFlight: bo
     if (following && inFlight) end.current?.scrollIntoView?.({ block: "nearest" });
   }, [window, following, inFlight]);
   const wasInFlight = useRef(inFlight);
+  const needsFinalRead = useRef(false);
   useEffect(() => {
     if (wasInFlight.current && !inFlight) {
       if (following) void tail.refetch();
       // A paused EOF is an older snapshot: final output can arrive after the last page read.
       // Leave one later read available even when no intervening page saw the file grow.
-      else setWindow((current) => current ? { ...current, at_end: false } : current);
+      else {
+        needsFinalRead.current = true;
+        setWindow((current) => current ? { ...current, at_end: false } : current);
+      }
     }
     wasInFlight.current = inFlight;
   }, [inFlight, following, tail.refetch]);
@@ -149,12 +153,15 @@ export function RawTranscript({ runId, inFlight }: { runId: number; inFlight: bo
     const later = last ? last.offset + (last.text.endsWith("\n") ? bytes(last.text) : 0) : 0;
     const cursor = direction === "backward" ? window.prev_cursor : (window.next_cursor ?? later);
     if (cursor === null) return;
+    // An earlier read begun before termination cannot satisfy the final forward-read obligation.
+    const finalRead = direction === "forward" && !inFlight;
     setFollowing(false);
     setLoading(true);
     setPageError("");
     try {
       const page = await fetchRawTranscript(runId, cursor, direction);
       if (!mounted.current) return;
+      if (finalRead) needsFinalRead.current = false;
       setWindow((current) => {
         if (!current || page.missing) return page;
         const lines = new Map(current.lines.map((line) => [line.offset, line]));
@@ -170,7 +177,7 @@ export function RawTranscript({ runId, inFlight }: { runId: number; inFlight: bo
           prev_cursor: direction === "backward" ? page.prev_cursor : current.prev_cursor,
           next_cursor: direction === "forward" ? page.next_cursor : current.next_cursor,
           at_start: direction === "backward" ? page.at_start : current.at_start,
-          at_end: loadedEnd >= size,
+          at_end: loadedEnd >= size && !needsFinalRead.current,
         };
       });
     } catch (error) {
