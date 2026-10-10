@@ -1,14 +1,16 @@
-import { useEffect, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState, type ReactNode } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button, Card, Note, Pill } from "@/components/console";
-import { overruleLeadDecision, type LeadDecision, type LeadDecisionsResponse } from "@/lib/api";
+import { fetchLeadHarnesses, saveLeadHarnesses, overruleLeadDecision, type LeadDecision, type LeadDecisionsResponse } from "@/lib/api";
+import { LeadHarnessCard } from "./LeadHarnessCard";
 import { LEAD_DECISIONS_QUERY_KEY, useLeadDecisions } from "@/hooks/useLeadDecisions";
 export type { LeadDecision } from "@/lib/api";
 
-export function LeadPage({ decisions, work = [], onOverrule }: {
-  decisions: LeadDecision[]; work?: LeadDecisionsResponse["queued"]; onOverrule: (id: number, note: string) => Promise<void>;
+export function LeadPage({ decisions, work = [], onOverrule, runsOn }: {
+  decisions: LeadDecision[]; work?: LeadDecisionsResponse["queued"]; onOverrule: (id: number, note: string) => Promise<void>; runsOn?: ReactNode;
 }) {
   return <section><h1>Lead</h1><p className="sub">Decisions, reasoning and evidence. Overrule records your preference and asks the lead to undo or redo.</p>
+    {runsOn}
     {work.length > 0 ? <Card title="Lead work" sub="Non-escalation work waits until tomorrow when the daily cap is reached.">
       {work.map((item) => <p key={item.id} className="lead-work"><b>{item.subject}</b>{" "}<Pill variant={item.state === "running" ? "run" : "queued"}>{item.state === "running" ? "Running" : item.state === "parked" ? "Parked" : "Queued"}</Pill></p>)}
     </Card> : null}
@@ -57,10 +59,16 @@ export function LeadRoute({ entry = "" }: { entry?: string }) {
   const client = useQueryClient();
   const [warning, setWarning] = useState("");
   const query = useLeadDecisions();
+  const harnesses = useQuery({ queryKey: ["lead-harnesses"], queryFn: fetchLeadHarnesses, refetchInterval: 30_000 });
   useEffect(() => { if (entry) document.getElementById(entry)?.scrollIntoView?.({ block: "start" }); }, [entry, query.data]);
   if (query.isPending) return <div className="empty">Loading lead decisions…</div>;
   if (query.isError) return <div role="alert">{query.error.message}</div>;
-  return <>{warning ? <Note variant="warn">{warning}</Note> : null}<LeadPage decisions={query.data.decisions} work={query.data.queued} onOverrule={async (id, note) => {
+  return <>{warning ? <Note variant="warn">{warning}</Note> : null}
+    <LeadPage decisions={query.data.decisions} work={query.data.queued} runsOn={harnesses.data ? <LeadHarnessCard live={harnesses.data} onSave={async (entries) => {
+      const result = await saveLeadHarnesses(entries);
+      client.setQueryData(["lead-harnesses"], result.active);
+      return result;
+    }} /> : harnesses.isError ? <Note variant="warn">{harnesses.error.message}</Note> : <div className="sub">Loading lead harnesses…</div>} onOverrule={async (id, note) => {
     const result = await overruleLeadDecision(id, note);
     setWarning(result.memory_retained ? "" : "Overrule recorded and work queued, but preference memory is unavailable. The note remains on the decision.");
     await client.invalidateQueries({ queryKey: LEAD_DECISIONS_QUERY_KEY });

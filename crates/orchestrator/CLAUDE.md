@@ -149,7 +149,13 @@ the `Orchestrator` struct itself. Concretely:
   - `managerselftest.rs`'s `ManagerSelfTestState` — the boot gate and off-loop watcher write
     version-bound verdicts per manager-run entry; the control task reads them at launch and marks
     a rejected login auth-blocked against its dispatch-time fingerprint (STUDIO-1119). Entry
-    configuration is installed at boot. The credential probe runs outside the bookkeeping lock,
+    configuration is installed at boot. STUDIO-1157 adds an off-loop operator update service in
+    `leadharnesses.rs`: it tests a private candidate through the identical per-entry canary, saves
+    only the YAML harness key, then atomically replaces the live entries. An async test gate
+    serializes updates with boot/watcher canaries; selection never waits for that gate. Generation
+    stamps protect replacement rows from old dispatch probes/auth failures and reset fallback
+    cursors on the next dispatch. RunningEntry continues owning its launch-time engine.
+    The credential probe runs outside the bookkeeping lock,
     and no lock is held across the canary await. HTTP reads cached failures through ControlHandle
     for notification/health status (STUDIO-1145), never running a probe or changing selection.
     Attempt cursors and fallback provenance remain

@@ -175,6 +175,21 @@ impl ManagerAttempt {
     }
 }
 
+impl Orchestrator {
+    /// Boot normally configures the state. Legacy tests and hermetic boots initialize it lazily;
+    /// an installed live list must never be overwritten by the boot-loaded Teams clone.
+    pub(crate) fn ensure_manager_entries(&self) {
+        if self.manager_selftest.entries().is_empty() {
+            self.manager_selftest.configure(
+                self.teams
+                    .as_ref()
+                    .map(|t| t.manager.effective_harnesses())
+                    .unwrap_or_default(),
+            );
+        }
+    }
+}
+
 /// The checkout coordinates a manager launch carries onto its [`RunningEntry`](crate::orchestrator::RunningEntry)
 /// and hands to the worker. Deliberately narrow: the worker provisions an EMPTY cwd and never a
 /// repository, so all it needs is the run's key (to name the per-run directory) and the run timeout.
@@ -595,16 +610,14 @@ impl Orchestrator {
         // itself in place mid-process can never be acted on before the off-loop self-test watcher
         // re-runs the canary (the watcher re-runs because the verdict's version no longer matches).
         // Re-probe each entry's own command before selecting it.
-        let entries = self
-            .teams
-            .as_ref()
-            .map(|t| t.manager.effective_harnesses())
-            .unwrap_or_default();
-        self.manager_selftest.configure(entries.clone());
+        self.ensure_manager_entries();
+        let generation = self.manager_selftest.generation();
+        let entries = self.manager_selftest.entries();
         for (index, entry) in entries.iter().enumerate() {
             let command = self.manager_cli_command(&route.slug, &entry.harness);
             let probed = crate::managerselftest::probe_cli_version(&command);
-            self.manager_selftest.observe_entry_probe(index, &probed);
+            self.manager_selftest
+                .observe_live_entry_probe(generation, index, entry, &probed);
         }
         let selected = match self.select_manager_entry(&run) {
             Ok(selected) => selected,
@@ -700,6 +713,7 @@ impl Orchestrator {
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("; ");
+        let dispatched_entry = selected.entry.clone();
         self.manager_attempts.insert(
             id,
             ManagerAttempt {
@@ -716,6 +730,9 @@ impl Orchestrator {
         let lead_item = run.lead_item;
         let key = run.key();
         self.finish_manager_dispatch(run, route, iss);
+        if self.running.contains_key(&key) {
+            self.manager_selftest.note_dispatched(&dispatched_entry);
+        }
         if let Some(item) = lead_item
             && !self.running.contains_key(&key)
         {
@@ -761,10 +778,11 @@ impl Orchestrator {
         inherited: rhapsody_agent::ModelOverride,
         entry: &rhapsody_config::teams::ManagerHarnessEntry,
     ) -> rhapsody_agent::ModelOverride {
-        let mut model = if self
-            .teams
-            .as_ref()
-            .is_some_and(|t| !t.manager.harnesses.is_empty())
+        let mut model = if self.manager_selftest.generation() > 0
+            || self
+                .teams
+                .as_ref()
+                .is_some_and(|t| !t.manager.harnesses.is_empty())
         {
             rhapsody_agent::ModelOverride::default()
         } else {
@@ -890,7 +908,10 @@ impl Orchestrator {
         let start = self
             .manager_attempts
             .get(&run.key())
-            .filter(|a| a.intervention_id == active_id)
+            .filter(|a| {
+                a.intervention_id == active_id
+                    && a.selected.generation == self.manager_selftest.generation()
+            })
             .map_or(0, |a| a.next_index);
         let mut cursor = start;
         let mut reasons = Vec::new();
@@ -961,8 +982,8 @@ impl Orchestrator {
                 && let Some(attempt) = self.manager_attempts.get_mut(&re.issue.id)
             {
                 if e.auth_needed {
-                    self.manager_selftest.mark_auth_blocked(
-                        attempt.selected.index,
+                    self.manager_selftest.mark_selected_auth_blocked(
+                        &attempt.selected,
                         attempt.credential_fingerprint.clone(),
                     );
                 }
@@ -978,15 +999,16 @@ impl Orchestrator {
             self.settle_manager_intervention(&re.issue.id, e);
         }
         if e.failed
-            && self
-                .teams
-                .as_ref()
-                .is_some_and(|t| !t.manager.harnesses.is_empty())
+            && (self.manager_selftest.generation() > 0
+                || self
+                    .teams
+                    .as_ref()
+                    .is_some_and(|t| !t.manager.harnesses.is_empty()))
         {
             if let Some(attempt) = self.manager_attempts.get_mut(&re.issue.id) {
                 if e.auth_needed {
-                    self.manager_selftest.mark_auth_blocked(
-                        attempt.selected.index,
+                    self.manager_selftest.mark_selected_auth_blocked(
+                        &attempt.selected,
                         attempt.credential_fingerprint.clone(),
                     );
                 }
@@ -1123,6 +1145,102 @@ mod tests {
             team_id: String::new(),
             case_packet: String::new(),
         }
+    }
+
+    struct SwapCanary;
+    #[async_trait::async_trait]
+    impl crate::managerselftest::CanaryRunner for SwapCanary {
+        async fn run_canary(&self, _: &str) -> Vec<crate::managerselftest::CanaryObservation> {
+            crate::managerselftest::REQUIRED_ATTEMPTS
+                .iter()
+                .map(|attempt| crate::managerselftest::CanaryObservation {
+                    attempt: *attempt,
+                    refused: true,
+                    detail: "fake refused".into(),
+                })
+                .collect()
+        }
+    }
+    struct SwapFactory;
+    impl crate::managerselftest::CanaryRunnerFactory for SwapFactory {
+        fn probe_version(
+            &self,
+            _: &rhapsody_config::teams::ManagerHarnessEntry,
+        ) -> Result<String, String> {
+            Ok(test_cli_version())
+        }
+        fn runner(
+            &self,
+            _: &rhapsody_config::teams::ManagerHarnessEntry,
+        ) -> Option<Box<dyn crate::managerselftest::CanaryRunner>> {
+            Some(Box::new(SwapCanary))
+        }
+    }
+    struct SwapProbe;
+    impl crate::managerselftest::EntryCredentialProbe for SwapProbe {
+        fn status(
+            &self,
+            _: &rhapsody_config::teams::ManagerHarnessEntry,
+            _: i64,
+        ) -> crate::managerselftest::CredentialStatus {
+            crate::managerselftest::CredentialStatus::NotApplicable
+        }
+        fn fingerprint(&self, _: &rhapsody_config::teams::ManagerHarnessEntry) -> Option<String> {
+            None
+        }
+    }
+    async fn swap_test() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Act);
+        o.eff.as_mut().unwrap().projects[0].mcfg.opencode.command = test_cli_command();
+        o.manager_selftest.set_credential_probe(Arc::new(SwapProbe));
+        pass_self_test(&o, &test_cli_version());
+        assert_eq!(
+            o.dispatch_manager(manager_run()),
+            ManagerDispatchOutcome::Dispatched
+        );
+        let initial = o.running[&manager_run().key()].clone();
+        let dir = crate::testsupport::TempDir::new();
+        let path = std::path::PathBuf::from(dir.child("teams.yaml"));
+        Teams::save(&path, o.teams.as_ref().unwrap()).unwrap();
+        let service = crate::managerselftest::runtime::LeadHarnesses {
+            state: o.manager_selftest_handle(),
+            factory: Arc::new(SwapFactory),
+            path,
+            room: None,
+        };
+        let entries = vec![rhapsody_config::teams::ManagerHarnessEntry {
+            harness: "opencode".into(),
+            model: "openai/new-model".into(),
+            effort: "xhigh".into(),
+        }];
+        service.update(entries).await.unwrap();
+        assert_eq!(o.running[&manager_run().key()].harness, initial.harness);
+        assert_eq!(initial.harness, "claude");
+        assert_eq!(
+            o.running[&manager_run().key()].model_override,
+            initial.model_override
+        );
+        let mut next = manager_run();
+        next.number += 1;
+        o.teams.as_mut().unwrap().manager.max_concurrent = 2;
+        assert_eq!(o.dispatch_manager(next), ManagerDispatchOutcome::Dispatched);
+        let dispatched = dispatched.lock().unwrap();
+        assert_eq!(dispatched.len(), 2);
+        assert_eq!(dispatched[1].harness, "opencode");
+        assert_eq!(dispatched[1].model_override.model, "openai/new-model");
+        assert_eq!(dispatched[1].model_override.effort, "xhigh");
+        assert_eq!(
+            service.snapshot().last_used.unwrap().model,
+            "openai/new-model"
+        );
+    }
+    #[tokio::test]
+    async fn swap_takes_effect_on_next_dispatch_without_restart() {
+        swap_test().await;
+    }
+    #[tokio::test]
+    async fn inflight_run_keeps_its_harness() {
+        swap_test().await;
     }
 
     #[test]

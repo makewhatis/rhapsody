@@ -82,6 +82,26 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Live manager/lead harness selection (STUDIO-1157)
+
+`GET /api/v1/lead/harnesses` reports the live ordered manager/lead list, per-entry isolation
+self-test states (`passed`, `failed: <reason>`, `testing`), test times and the most recently
+dispatched entry. Operator-guarded `PUT /api/v1/lead/harnesses {harnesses: [...]}` validates 1–4
+unique harness/model entries and runs boot's same per-entry isolation canary off the control
+loop for every new/changed entry before publishing. Failed rows remain unavailable; if none
+passes, a 409 reports their reasons and retains the old live/saved list. Edits serialize with
+boot/version canaries, and a single atomic swap affects subsequent dispatches, leaving in-flight
+run engines untouched. Late probes/auth failures cannot poison replacement rows.
+
+The save patches only `manager.harnesses` in `teams.yaml` through Settings' atomic 0600 writer,
+preserving all other YAML keys (comments/formatting may canonicalize). A restart self-tests the
+saved list again; hand edits still require restart. Every accepted change emits a manager room
+post and INFO log. The Lead page's Runs on card edits/reorders rows, uses cache-only provider model
+suggestions with free text, and displays testing/results and the optional one-entry no-fallback
+warning. These additive endpoints have no Go counterpart; existing golden payloads stay unchanged.
+The existing native Claude/OpenAI manager credential and isolation contracts remain authoritative:
+a free-text model unsupported by that runtime fails the canary rather than gaining another auth path.
+
 ### Lossless transcript paging and downloads (STUDIO-1155)
 
 Three additive GET endpoints serve the persisted run file rather than the humanizer's summaries:

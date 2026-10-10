@@ -26,6 +26,9 @@
 
 use rhapsody_config::teams::{ManagerHarnessEntry, ReviewAuthority};
 
+#[path = "leadharnesses.rs"]
+pub mod runtime;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialStatus {
     NotApplicable,
@@ -64,6 +67,7 @@ pub trait CanaryRunnerFactory: Send + Sync {
 pub struct SelectedEntry {
     pub index: usize,
     pub entry: ManagerHarnessEntry,
+    pub generation: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -87,6 +91,8 @@ struct EntryState {
     entry: ManagerHarnessEntry,
     installed_version: Option<String>,
     record: Option<SelfTestRecord>,
+    tested_at: Option<String>,
+    testing: bool,
     auth_blocked: Option<Option<String>>,
     unavailable: String,
     warned_at_ms: Option<i64>,
@@ -467,6 +473,8 @@ struct SelfTestInner {
     record: Option<SelfTestRecord>,
     entries: Vec<EntryState>,
     credential_warnings: Vec<String>,
+    generation: u64,
+    last_used: Option<ManagerHarnessEntry>,
 }
 
 /// The daemon-wide, lock-guarded holder of the §4.7 self-test verdict (STUDIO-1049). The boot gate
@@ -478,6 +486,7 @@ struct SelfTestInner {
 pub struct ManagerSelfTestState {
     inner: std::sync::Mutex<SelfTestInner>,
     probe: std::sync::RwLock<std::sync::Arc<dyn EntryCredentialProbe>>,
+    test_gate: tokio::sync::Mutex<()>,
 }
 
 impl std::fmt::Debug for ManagerSelfTestState {
@@ -492,6 +501,7 @@ impl Default for ManagerSelfTestState {
         Self {
             inner: Default::default(),
             probe: std::sync::RwLock::new(std::sync::Arc::new(NativeCredentialProbe)),
+            test_gate: Default::default(),
         }
     }
 }
@@ -525,6 +535,8 @@ impl ManagerSelfTestState {
                 } else {
                     None
                 },
+                tested_at: None,
+                testing: false,
                 auth_blocked: None,
                 unavailable: String::new(),
                 warned_at_ms: None,
@@ -543,6 +555,34 @@ impl ManagerSelfTestState {
             .iter()
             .map(|e| e.entry.clone())
             .collect()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .generation
+    }
+
+    pub fn note_dispatched(&self, entry: &ManagerHarnessEntry) {
+        self.inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .last_used = Some(entry.clone());
+    }
+
+    pub fn mark_selected_auth_blocked(
+        &self,
+        selected: &SelectedEntry,
+        fingerprint: Option<String>,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.generation == selected.generation
+            && let Some(state) = inner.entries.get_mut(selected.index)
+            && state.entry == selected.entry
+        {
+            state.auth_blocked = Some(fingerprint);
+        }
     }
 
     /// A probeable entry awaits its first/version-change canary. This grants no availability;
@@ -582,6 +622,7 @@ impl ManagerSelfTestState {
             };
             state.installed_version = Some(record.cli_version.clone());
             state.record = Some(record.clone());
+            state.tested_at = Some(chrono::Utc::now().to_rfc3339());
         }
         if index == 0 {
             inner.installed_version = Some(record.cli_version.clone());
@@ -595,6 +636,22 @@ impl ManagerSelfTestState {
         }
         if index == 0 {
             inner.installed_version = probed.as_ref().ok().cloned();
+        }
+    }
+    /// A dispatch-time probe may finish after an operator swap. It cannot invalidate the new row.
+    pub fn observe_live_entry_probe(
+        &self,
+        generation: u64,
+        index: usize,
+        entry: &ManagerHarnessEntry,
+        probed: &Result<String, String>,
+    ) {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        if inner.generation == generation
+            && let Some(state) = inner.entries.get_mut(index)
+            && &state.entry == entry
+        {
+            state.installed_version = probed.as_ref().ok().cloned();
         }
     }
     pub fn mark_auth_blocked(&self, index: usize, fingerprint: Option<String>) {
@@ -686,30 +743,38 @@ impl ManagerSelfTestState {
         now_ms: i64,
         probe: &dyn EntryCredentialProbe,
     ) -> Result<SelectedEntry, ManagerUnavailable> {
-        // Credential I/O happens outside the bookkeeping lock.
-        let entries = self.entries();
-        let statuses: Vec<_> = entries
-            .iter()
-            .map(|e| (probe.status(e, now_ms), probe.fingerprint(e)))
-            .collect();
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut warnings = Vec::new();
-        let mut selected = None;
-        for (index, (state, (status, fingerprint))) in inner
-            .entries
-            .iter_mut()
-            .zip(&statuses)
-            .enumerate()
-            .skip(start)
-        {
-            if state
-                .auth_blocked
-                .as_ref()
-                .is_some_and(|blocked| blocked != fingerprint)
-            {
-                state.auth_blocked = None;
+        let mut start = start;
+        loop {
+            // Credential I/O happens outside the bookkeeping lock.
+            let generation = self.generation();
+            let entries = self.entries();
+            let statuses: Vec<_> = entries
+                .iter()
+                .map(|e| (probe.status(e, now_ms), probe.fingerprint(e)))
+                .collect();
+            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if generation != inner.generation {
+                drop(inner);
+                start = 0;
+                continue;
             }
-            let reason = if state.auth_blocked.is_some() {
+            let mut warnings = Vec::new();
+            let mut selected = None;
+            for (index, (state, (status, fingerprint))) in inner
+                .entries
+                .iter_mut()
+                .zip(&statuses)
+                .enumerate()
+                .skip(start)
+            {
+                if state
+                    .auth_blocked
+                    .as_ref()
+                    .is_some_and(|blocked| blocked != fingerprint)
+                {
+                    state.auth_blocked = None;
+                }
+                let reason = if state.auth_blocked.is_some() {
                 Some("authentication failed; run opencode auth login as the daemon's user".to_string())
             } else {
                 match status {
@@ -724,55 +789,57 @@ impl ManagerSelfTestState {
                 (_, Some(SelfTestRecord { verdict: SelfTestVerdict::Failed(reason), .. })) => Some(reason.detail.clone()),
                 _ => None,
             });
-            state.unavailable = reason.unwrap_or_default();
-            state.credential_notice = match status {
-                CredentialStatus::ExpiringSoon { expires_in_ms } => format!(
-                    "manager entry {} ({} {}): OpenAI login expires in {}h; run opencode auth login as the daemon's user",
-                    index + 1,
-                    state.entry.harness,
-                    state.entry.model,
-                    expires_in_ms / 3_600_000
-                ),
-                CredentialStatus::Expired => format!(
-                    "manager entry {} ({} {}): OpenAI login expired; run opencode auth login as the daemon's user",
-                    index + 1,
-                    state.entry.harness,
-                    state.entry.model
-                ),
-                _ => String::new(),
-            };
-            if let CredentialStatus::ExpiringSoon { .. } = status
-                && state
-                    .warned_at_ms
-                    .is_none_or(|last| now_ms.saturating_sub(last) >= 86_400_000)
-            {
-                state.warned_at_ms = Some(now_ms);
-                warnings.push(state.credential_notice.clone());
+                state.unavailable = reason.unwrap_or_default();
+                state.credential_notice = match status {
+                    CredentialStatus::ExpiringSoon { expires_in_ms } => format!(
+                        "manager entry {} ({} {}): OpenAI login expires in {}h; run opencode auth login as the daemon's user",
+                        index + 1,
+                        state.entry.harness,
+                        state.entry.model,
+                        expires_in_ms / 3_600_000
+                    ),
+                    CredentialStatus::Expired => format!(
+                        "manager entry {} ({} {}): OpenAI login expired; run opencode auth login as the daemon's user",
+                        index + 1,
+                        state.entry.harness,
+                        state.entry.model
+                    ),
+                    _ => String::new(),
+                };
+                if let CredentialStatus::ExpiringSoon { .. } = status
+                    && state
+                        .warned_at_ms
+                        .is_none_or(|last| now_ms.saturating_sub(last) >= 86_400_000)
+                {
+                    state.warned_at_ms = Some(now_ms);
+                    warnings.push(state.credential_notice.clone());
+                }
+                if state.unavailable.is_empty() && selected.is_none() {
+                    selected = Some(SelectedEntry {
+                        index,
+                        entry: state.entry.clone(),
+                        generation,
+                    });
+                }
             }
-            if state.unavailable.is_empty() && selected.is_none() {
-                selected = Some(SelectedEntry {
-                    index,
-                    entry: state.entry.clone(),
-                });
+            for warning in &warnings {
+                tracing::warn!("{warning}");
             }
+            if !warnings.is_empty() {
+                inner.credential_warnings = warnings;
+            }
+            return selected.ok_or_else(|| ManagerUnavailable {
+                cli_version: String::new(),
+                detail: inner
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .skip(start)
+                    .map(|(index, e)| format!("entry {} unavailable: {}", index + 1, e.unavailable))
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            });
         }
-        for warning in &warnings {
-            tracing::warn!("{warning}");
-        }
-        if !warnings.is_empty() {
-            inner.credential_warnings = warnings;
-        }
-        selected.ok_or_else(|| ManagerUnavailable {
-            cli_version: String::new(),
-            detail: inner
-                .entries
-                .iter()
-                .enumerate()
-                .skip(start)
-                .map(|(index, e)| format!("entry {} unavailable: {}", index + 1, e.unavailable))
-                .collect::<Vec<_>>()
-                .join("; "),
-        })
     }
 
     /// Records a measured verdict. The recorded version becomes the installed version: this is the
@@ -890,6 +957,7 @@ impl crate::orchestrator::Orchestrator {
 /// Boot and the watcher share this per-entry reconciliation. Version changes run immediately;
 /// same-version failures retry on a bounded cadence, and passing entries do not spend another turn.
 pub async fn run_entry_self_tests(factory: &dyn CanaryRunnerFactory, state: &ManagerSelfTestState) {
+    let _guard = state.test_gate.lock().await;
     for (index, entry) in state.entries().iter().enumerate() {
         let probed = factory.probe_version(entry);
         state.observe_entry_probe(index, &probed);
@@ -908,6 +976,7 @@ pub async fn run_entry_self_tests(factory: &dyn CanaryRunnerFactory, state: &Man
         if unchanged {
             continue;
         }
+        let _testing = EntrySelfTest::new(state, index);
         let verdict = match probed {
             Err(detail) => SelfTestVerdict::Failed(ManagerUnavailable {
                 cli_version: version.clone(),
@@ -943,6 +1012,41 @@ pub async fn run_entry_self_tests(factory: &dyn CanaryRunnerFactory, state: &Man
                 verdict,
             },
         );
+    }
+}
+
+/// Reset the presentation flag on cancellation as well as completion. Verdicts still decide
+/// availability; a pending/version-invalid entry cannot launch merely because this flag cleared.
+struct EntrySelfTest<'a> {
+    state: &'a ManagerSelfTestState,
+    index: usize,
+}
+impl<'a> EntrySelfTest<'a> {
+    fn new(state: &'a ManagerSelfTestState, index: usize) -> Self {
+        if let Some(entry) = state
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get_mut(index)
+        {
+            entry.testing = true;
+        }
+        Self { state, index }
+    }
+}
+impl Drop for EntrySelfTest<'_> {
+    fn drop(&mut self) {
+        if let Some(entry) = self
+            .state
+            .inner
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entries
+            .get_mut(self.index)
+        {
+            entry.testing = false;
+        }
     }
 }
 

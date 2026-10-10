@@ -760,6 +760,29 @@ where
     let mut server_task = None;
     let mut runtime_heal_task = None;
     let mut manager_api_port = None;
+    let canary_port = Arc::new(std::sync::atomic::AtomicI32::new(0));
+    let manager_selftest_watch = manager_selftest_watch.map(|(state, factory)| {
+        let factory: Arc<dyn rhapsody_orchestrator::managerselftest::CanaryRunnerFactory> =
+            Arc::new(ListeningManagerCanaryFactory {
+                inner: factory,
+                home: runtime_home.clone(),
+                port: canary_port.clone(),
+            });
+        (state, factory)
+    });
+    let live_harnesses = manager_selftest_watch
+        .as_ref()
+        .and_then(|(state, factory)| {
+            let path = resolve_teams_path(resolved.as_ref(), &flags.db, flags.no_store)?;
+            Some(Arc::new(
+                rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses {
+                    state: state.clone(),
+                    factory: factory.clone(),
+                    path,
+                    room: teams_room.clone(),
+                },
+            ))
+        });
     if let (eff_port, true) = resolve_server_port(flags.port, &flags.path) {
         // The enable flow (STUDIO-652) reads and writes the SAME `teams.yaml` the boot load above
         // resolved, so `GET/POST /api/v1/teams/config` and the daemon can never disagree about
@@ -803,6 +826,7 @@ where
         let provider = Arc::new(
             DaemonState::new(handle.clone())
                 .with_account_clock(account_now_s)
+                .with_lead_harnesses(live_harnesses)
                 .with_teams_config_path(teams_config_path)
                 .with_provider_runtime(provider_runtime),
         );
@@ -823,6 +847,7 @@ where
                 dashboard_url = format!("http://{addr}");
                 let bound_port = i32::from(addr.port());
                 manager_api_port = Some(bound_port);
+                canary_port.store(bound_port, std::sync::atomic::Ordering::Release);
                 // Publish the ACTUAL bound loopback port so `rhapsodyd mcp` reaches a daemon launched
                 // on a dynamic/ephemeral --port (best-effort; removed on clean shutdown). The write is
                 // GUARDED (STUDIO-1041): a runtime file naming another LIVE daemon is left untouched.
@@ -965,11 +990,6 @@ where
     let manager_watch_task = manager_selftest_watch.map(|(state, factory)| {
         let mut ctx = shutdown.wait();
         let handle = handle.clone();
-        let factory = Arc::new(ListeningManagerCanaryFactory {
-            inner: factory,
-            home: runtime_home.clone(),
-            port: manager_api_port,
-        });
         tokio::spawn(async move {
             tokio::select! {
                 _ = ctx.cancelled() => return,
@@ -2393,7 +2413,7 @@ fn enforce_manager_storage_requirement(
 struct ListeningManagerCanaryFactory {
     inner: Arc<dyn rhapsody_orchestrator::managerselftest::CanaryRunnerFactory>,
     home: Option<PathBuf>,
-    port: Option<i32>,
+    port: Arc<std::sync::atomic::AtomicI32>,
 }
 impl rhapsody_orchestrator::managerselftest::CanaryRunnerFactory for ListeningManagerCanaryFactory {
     fn probe_version(
@@ -2404,9 +2424,10 @@ impl rhapsody_orchestrator::managerselftest::CanaryRunnerFactory for ListeningMa
             .home
             .as_deref()
             .and_then(|h| runtimeport::read_in(h).ok());
-        if !published
-            .is_some_and(|p| Some(p.port) == self.port && p.pid == std::process::id() as i32)
-        {
+        if !published.is_some_and(|p| {
+            p.port == self.port.load(std::sync::atomic::Ordering::Acquire)
+                && p.pid == std::process::id() as i32
+        }) {
             return Err(
                 "manager API is not listening with this daemon's runtime.json publication".into(),
             );
@@ -2495,7 +2516,7 @@ impl rhapsody_orchestrator::managerselftest::CanaryRunnerFactory for ManagerCana
         entry: &rhapsody_config::teams::ManagerHarnessEntry,
     ) -> Option<Box<dyn rhapsody_orchestrator::managerselftest::CanaryRunner>> {
         match entry.harness.as_str() {
-            "claude" if self.legacy => Some(Box::new(
+            "claude" if self.legacy && entry.model.is_empty() => Some(Box::new(
                 rhapsody_orchestrator::managerselftest::CliCanaryRunner {
                     command: self.command.clone(),
                     workspace_root: self.workspace_root.clone(),
