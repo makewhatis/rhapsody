@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 34;
+const SCHEMA_VERSION: i64 = 35;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -749,6 +749,12 @@ INSERT INTO rhapsody_lead_reporting(key, count)
   WHERE EXISTS(SELECT 1 FROM rhapsody_lead_reporting r WHERE r.key = 'page-decision:' || h.decision)
   ON CONFLICT(key) DO NOTHING;
 "#,
+    // v34 -> v35: one durable dispute re-read and PR/head adjudication (STUDIO-1156 B1).
+    r#"
+ALTER TABLE rhapsody_review_head_findings ADD COLUMN dispute_granted INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE rhapsody_review_head_findings ADD COLUMN dispute_pending INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE rhapsody_review_head_findings ADD COLUMN dispute_adjudication INTEGER NOT NULL DEFAULT 0;
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1421,7 +1427,84 @@ impl Store for Sqlite {
         Ok(())
     }
     fn same_head_findings(&self, key: &ReviewWatchKey, head: &str) -> Result<bool, StoreError> {
-        Ok(self.lock().query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_review_head_findings WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4 AND head = ?5 AND rerun = 0)", params![key.owner, key.repo, key.number, key.reviewer, head], |r| r.get(0))?)
+        Ok(self.lock().query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_review_head_findings WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4 AND head = ?5 AND rerun = 0 AND dispute_pending = 0)", params![key.owner, key.repo, key.number, key.reviewer, head], |r| r.get(0))?)
+    }
+    fn review_dispute_pending(&self, key: &ReviewWatchKey, head: &str) -> Result<bool, StoreError> {
+        Ok(self.lock().query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_review_head_findings WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4 AND head = ?5 AND dispute_pending = 1)", params![key.owner, key.repo, key.number, key.reviewer, head], |r| r.get(0))?)
+    }
+    fn request_review_dispute(
+        &self,
+        key: &ReviewWatchKey,
+        head: &str,
+        manager_mode: Option<&str>,
+        at: &str,
+    ) -> Result<ReviewDisputeOutcome, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        // Older completion writers and migrated watch rows may lack a ledger entry.
+        let subject =
+            canonical_subject(&tx, &format!("{}/{}#{}", key.owner, key.repo, key.number))?;
+        let held: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE subject = ?1 AND released_reason IS NULL)", [&subject], |r| r.get(0))?;
+        if held {
+            return Ok(ReviewDisputeOutcome::Held);
+        }
+        tx.execute("INSERT INTO rhapsody_review_head_findings(owner, repo, number, reviewer, head) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO NOTHING", params![key.owner, key.repo, key.number, key.reviewer, head])?;
+        let (granted, pending): (bool, bool) = tx.query_row("SELECT dispute_granted, dispute_pending FROM rhapsody_review_head_findings WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4 AND head = ?5", params![key.owner, key.repo, key.number, key.reviewer, head], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        if pending {
+            return Ok(ReviewDisputeOutcome::Pending);
+        }
+        if !granted {
+            tx.execute("UPDATE rhapsody_review_head_findings SET dispute_granted = 1, dispute_pending = 1 WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4 AND head = ?5", params![key.owner, key.repo, key.number, key.reviewer, head])?;
+            tx.execute(
+                &format!(
+                    "UPDATE rhapsody_review_watch SET status = ?5 WHERE {REVIEW_WATCH_KEY_WHERE}"
+                ),
+                params![
+                    key.owner,
+                    key.repo,
+                    key.number,
+                    key.reviewer,
+                    REVIEW_STATUS_REQUESTED
+                ],
+            )?;
+            tx.commit()?;
+            return Ok(ReviewDisputeOutcome::Granted);
+        }
+        let pr = format!("{}/{}#{}", key.owner, key.repo, key.number).to_ascii_lowercase();
+        let queued: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_review_head_findings WHERE lower(owner || '/' || repo || '#' || number) = ?1 AND head = ?2 AND dispute_adjudication = 1)", params![pr, head], |r| r.get(0))?;
+        if !queued {
+            if let Some(mode) = manager_mode {
+                tx.execute("INSERT INTO rhapsody_review_bound(pr, generation) VALUES (?1, 1) ON CONFLICT(pr) DO NOTHING", [&pr])?;
+                let generation: i64 = tx.query_row(
+                    "SELECT generation FROM rhapsody_review_bound WHERE pr = ?1",
+                    [&pr],
+                    |r| r.get(0),
+                )?;
+                let active: Option<(String, String)> = tx.query_row("SELECT id, stall_kinds FROM rhapsody_manager_intervention WHERE pr = ?1 AND state NOT IN ('complete', 'effect_timeout', 'no_review_gap', 'escalated', 'exhausted', 'apply_failed', 'apply_uncertain', 'superseded', 'proposed')", [&pr], |r| Ok((r.get(0)?, r.get(1)?))).optional()?;
+                let kind = format!("review_dispute:{head}");
+                if let Some((id, kinds)) = active {
+                    let mut kinds = split_findings(&kinds);
+                    if !kinds.contains(&kind) {
+                        kinds.push(kind);
+                        tx.execute("UPDATE rhapsody_manager_intervention SET stall_kinds = ?2 WHERE id = ?1", params![id, join_findings(&kinds)])?;
+                    }
+                } else {
+                    tx.execute("INSERT INTO rhapsody_manager_intervention(id, pr, generation, stall_kinds, mode, state) VALUES (?1, ?2, ?3, ?4, ?5, 'queued')", params![format!("dispute:{pr}:{head}"), pr, generation.max(1), kind, mode])?;
+                }
+            } else {
+                let trigger = LeadTrigger::ReviewEscalation {
+                    pr: pr.clone(),
+                    head: head.into(),
+                };
+                let (kind, _, detail) = trigger.queue_parts();
+                // A prior ordinary review escalation's resolution must not swallow this dispute.
+                let question = format!("review_dispute:{head}");
+                tx.execute("INSERT INTO rhapsody_lead_items(trigger, subject, question, detail, created_at) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(subject, question) DO NOTHING", params![kind, pr, question, detail, at])?;
+            }
+            tx.execute("UPDATE rhapsody_review_head_findings SET dispute_adjudication = 1 WHERE lower(owner || '/' || repo || '#' || number) = ?1 AND head = ?2", params![pr, head])?;
+        }
+        tx.commit()?;
+        Ok(ReviewDisputeOutcome::Adjudication)
     }
     fn allow_review_rerun(&self, pr: &str, head: &str) -> Result<(), StoreError> {
         self.lock().execute("UPDATE rhapsody_review_head_findings SET rerun = 1
@@ -3011,8 +3094,9 @@ impl Store for Sqlite {
         key: &ReviewWatchKey,
         requested_sha: &str,
     ) -> Result<(), StoreError> {
-        let conn = self.lock();
-        conn.execute(
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        tx.execute(
             &format!(
                 "UPDATE rhapsody_review_watch SET requested_sha = ?5, status = ?6 \
                    WHERE {REVIEW_WATCH_KEY_WHERE}"
@@ -3026,7 +3110,8 @@ impl Store for Sqlite {
                 REVIEW_STATUS_IN_FLIGHT,
             ],
         )?;
-        conn.execute("UPDATE rhapsody_review_head_findings SET rerun = 0 WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4 AND head = ?5", params![key.owner, key.repo, key.number, key.reviewer, requested_sha])?;
+        tx.execute("UPDATE rhapsody_review_head_findings SET rerun = 0, dispute_pending = 0 WHERE owner = ?1 AND repo = ?2 AND number = ?3 AND reviewer = ?4 AND head = ?5", params![key.owner, key.repo, key.number, key.reviewer, requested_sha])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -3585,7 +3670,7 @@ impl Store for Sqlite {
             ],
         )?;
         if completed.verdict == REVIEW_COMPLETION_CHANGES && !completed.sha.is_empty() {
-            tx.execute("INSERT INTO rhapsody_review_head_findings(owner, repo, number, reviewer, head) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO UPDATE SET rerun = 0", params![key.owner, key.repo, key.number, key.reviewer, completed.sha])?;
+            tx.execute("INSERT INTO rhapsody_review_head_findings(owner, repo, number, reviewer, head) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT DO UPDATE SET rerun = 0, dispute_pending = 0", params![key.owner, key.repo, key.number, key.reviewer, completed.sha])?;
         }
         tx.commit()?;
         Ok(())
@@ -4762,6 +4847,196 @@ impl Store for Sqlite {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn dispute_adjudication_enqueue_failure_is_atomic_and_retryable() {
+        for mode in [None, Some(MANAGER_MODE_ACT)] {
+            let store = open_mem();
+            let key = ReviewWatchKey {
+                owner: "o".into(),
+                repo: "r".into(),
+                number: 1,
+                reviewer: "bob".into(),
+            };
+            store
+                .save_review_watch(ReviewWatchRow {
+                    key: key.clone(),
+                    open: true,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(
+                store
+                    .request_review_dispute(&key, "head", mode, "at")
+                    .unwrap(),
+                ReviewDisputeOutcome::Granted
+            );
+            store.mark_review_requested(&key, "head").unwrap();
+            let table = if mode.is_some() {
+                "rhapsody_manager_intervention"
+            } else {
+                "rhapsody_lead_items"
+            };
+            store.lock().execute_batch(&format!("CREATE TRIGGER refuse_dispute BEFORE INSERT ON {table} BEGIN SELECT RAISE(ABORT, 'refuse'); END;")).unwrap();
+            assert!(
+                store
+                    .request_review_dispute(&key, "head", mode, "at")
+                    .is_err()
+            );
+            assert!(
+                store.same_head_findings(&key, "head").unwrap(),
+                "failure must not mint another re-read"
+            );
+            store
+                .lock()
+                .execute_batch("DROP TRIGGER refuse_dispute;")
+                .unwrap();
+            assert_eq!(
+                store
+                    .request_review_dispute(&key, "head", mode, "at")
+                    .unwrap(),
+                ReviewDisputeOutcome::Adjudication
+            );
+            // Other reviewers and repeated handoffs share the one PR/head adjudication.
+            let other = ReviewWatchKey {
+                reviewer: "carol".into(),
+                ..key.clone()
+            };
+            store
+                .save_review_watch(ReviewWatchRow {
+                    key: other.clone(),
+                    open: true,
+                    ..Default::default()
+                })
+                .unwrap();
+            store
+                .request_review_dispute(&other, "head", mode, "at")
+                .unwrap();
+            store.mark_review_requested(&other, "head").unwrap();
+            store
+                .request_review_dispute(&other, "head", mode, "at")
+                .unwrap();
+            store
+                .request_review_dispute(&key, "head", mode, "at")
+                .unwrap();
+            assert_eq!(
+                store.load_manager_interventions().unwrap().len()
+                    + store.load_lead_items().unwrap().len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .request_review_dispute(&key, "new-head", mode, "at")
+                    .unwrap(),
+                ReviewDisputeOutcome::Granted,
+                "a new head owns its own grant"
+            );
+        }
+    }
+
+    #[test]
+    fn v34_upgrade_keeps_findings_and_adds_an_unused_dispute_grant() {
+        let dir = scratch_dir();
+        let path = dir.join("v34.db");
+        let key = ReviewWatchKey {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 1,
+            reviewer: "bob".into(),
+        };
+        {
+            let conn = Connection::open(&path).unwrap();
+            for migration in &MIGRATIONS[..34] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.execute("INSERT INTO rhapsody_review_head_findings(owner, repo, number, reviewer, head) VALUES ('o', 'r', 1, 'bob', 'head')", []).unwrap();
+            conn.pragma_update(None, "user_version", 34).unwrap();
+        }
+        let store = Sqlite::open(StorePath::Disk(path)).unwrap();
+        assert!(store.same_head_findings(&key, "head").unwrap());
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                open: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            store
+                .request_review_dispute(&key, "head", None, "at")
+                .unwrap(),
+            ReviewDisputeOutcome::Granted
+        );
+        assert_eq!(
+            store
+                .request_review_dispute(&key, "head", None, "at")
+                .unwrap(),
+            ReviewDisputeOutcome::Pending
+        );
+    }
+
+    #[test]
+    fn a_resolved_lead_escalation_does_not_swallow_a_later_dispute() {
+        let store = open_mem();
+        let key = ReviewWatchKey {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 1,
+            reviewer: "bob".into(),
+        };
+        let prior = store
+            .enqueue_lead_item(
+                &LeadTrigger::ReviewEscalation {
+                    pr: "o/r#1".into(),
+                    head: "head".into(),
+                },
+                "at",
+            )
+            .unwrap();
+        store
+            .lock()
+            .execute(
+                "UPDATE rhapsody_lead_items SET state = 'done' WHERE id = ?1",
+                [prior],
+            )
+            .unwrap();
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                open: true,
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .request_review_dispute(&key, "head", None, "at")
+            .unwrap();
+        store.mark_review_requested(&key, "head").unwrap();
+        store
+            .request_review_dispute(&key, "head", None, "at")
+            .unwrap();
+        let items = store.load_lead_items().unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].state, "done");
+        assert_eq!(
+            items[1].state, "queued",
+            "dispute must create live adjudication work"
+        );
+        store
+            .lock()
+            .execute("UPDATE rhapsody_lead_items SET state = 'done'", [])
+            .unwrap();
+        store
+            .request_review_dispute(&key, "head", None, "at")
+            .unwrap();
+        assert!(
+            store
+                .load_lead_items()
+                .unwrap()
+                .iter()
+                .all(|item| item.state == "done"),
+            "a third handoff cannot reopen adjudication"
+        );
+    }
+
     #[test]
     fn paraphrased_escalation_updates_in_place() {
         use super::*;

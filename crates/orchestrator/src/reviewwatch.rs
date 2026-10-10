@@ -3190,7 +3190,22 @@ impl Orchestrator {
         {
             ledger.clear(pr);
         }
-        if !mine.is_empty()
+        // B1's single dispute read is an explicit, durable reviewer/head edge even after the
+        // ordinary round threshold. A settled manager verdict must not swallow that grant.
+        let mut disputes = Vec::new();
+        for row in &mine {
+            match self.store().review_dispute_pending(&row.key, head) {
+                Ok(true) => disputes.push(&row.key),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(%pr, %error, "dispute ledger unreadable; deferring review and adjudication");
+                    report.deferred += 1;
+                    return;
+                }
+            }
+        }
+        if disputes.is_empty()
+            && !mine.is_empty()
             && verdict_at_head
             && let Some(threshold) = self.adjudication_threshold()
         {
@@ -3619,7 +3634,10 @@ impl Orchestrator {
             // MUTATION: delete this gate and
             // `an_act_round_past_the_threshold_arms_only_under_an_authorization` reds on its first
             // assert (a round is dispatched with no authorization).
-            if !self.review_round_arm_authorized(pr, head, head_patch_id, held_origin) {
+            let dispute_authorized = chosen == row.key.reviewer && disputes.contains(&&row.key);
+            if !dispute_authorized
+                && !self.review_round_arm_authorized(pr, head, head_patch_id, held_origin)
+            {
                 report.deferred += 1;
                 continue;
             }

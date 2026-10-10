@@ -104,10 +104,13 @@ Material releases grant one durable author admission, consumed with the next sto
 so linked-PR suppression cannot swallow the operator's change. Existing escalations are folded at
 upgrade; already-delivered latest-decision pages keep their delivery reservation.
 
-An unchanged-head author handoff preserves findings as well as approvals. A durable findings-head
-guard refuses automatic re-review at a head that reviewer already decided; the operator rerun is
-the explicit exception. Changed heads remain edge-triggered. These Teams/lead extensions have no
-frozen Go counterpart; Go tables, goldens and the lead-disabled human feed are unchanged.
+An unchanged-head blocked author handoff preserves findings as well as approvals. Migration **35**
+adds a durable one-time dispute grant per (reviewer, head) to the findings-head ledger: a non-blocked
+handoff may request one re-read from the incumbent reviewer. Dispatch consumes the pending grant,
+without resetting its spent marker. A second same-head dispute atomically queues one manager
+adjudication item per PR/head, or a lead review-escalation item when the manager is off. Operator
+rerun remains an explicit override. Changed heads remain edge-triggered. These Teams/lead extensions
+have no frozen Go counterpart; Go tables, goldens and the lead-disabled human feed are unchanged.
 
 ### Lossless transcript paging and downloads (STUDIO-1155)
 

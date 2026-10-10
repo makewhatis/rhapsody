@@ -50,6 +50,22 @@ impl Store for Noop {
     fn allow_review_rerun(&self, _pr: &str, _head: &str) -> Result<(), StoreError> {
         Ok(())
     }
+    fn request_review_dispute(
+        &self,
+        _key: &ReviewWatchKey,
+        _head: &str,
+        _manager_mode: Option<&str>,
+        _at: &str,
+    ) -> Result<ReviewDisputeOutcome, StoreError> {
+        Ok(ReviewDisputeOutcome::Pending)
+    }
+    fn review_dispute_pending(
+        &self,
+        _key: &ReviewWatchKey,
+        _head: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn notices_enabled(&self) -> bool {
         false
     }

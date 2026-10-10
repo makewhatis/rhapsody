@@ -161,6 +161,25 @@ pub trait Store {
     fn allow_review_rerun(&self, _pr: &str, _head: &str) -> Result<(), StoreError> {
         Ok(())
     }
+    /// One grant per (reviewer, head), then one PR/head adjudication. `None` routes to the lead;
+    /// a manager mode routes to its existing intervention queue. Each effect is atomic with its
+    /// ledger marker so a restart cannot lose an obligation or mint another one.
+    fn request_review_dispute(
+        &self,
+        _key: &ReviewWatchKey,
+        _head: &str,
+        _manager_mode: Option<&str>,
+        _at: &str,
+    ) -> Result<ReviewDisputeOutcome, StoreError> {
+        Ok(ReviewDisputeOutcome::Pending)
+    }
+    fn review_dispute_pending(
+        &self,
+        _key: &ReviewWatchKey,
+        _head: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn subject_resume_pending(&self, _subject: &str) -> Result<bool, StoreError> {
         Ok(false)
     }

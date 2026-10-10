@@ -493,6 +493,30 @@ impl Orchestrator {
         if self.subject_parked(&pr, "review") {
             return ReviewDispatchOutcome::Refused("subject is parked".into());
         }
+        match self.store().subject_hold(&pr) {
+            Ok(Some(hold)) if hold.kind == "blocked" => {
+                match self
+                    .store()
+                    .review_dispute_pending(&run.watch_key(), &run.head_sha)
+                {
+                    Ok(true) => {
+                        return ReviewDispatchOutcome::Refused(
+                            "blocked author cannot receive a dispute re-read".into(),
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return ReviewDispatchOutcome::Refused(format!(
+                            "dispute ledger unreadable: {error}"
+                        ));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                return ReviewDispatchOutcome::Refused(format!("subject hold unreadable: {error}"));
+            }
+        }
         match self
             .store()
             .same_head_findings(&run.watch_key(), &run.head_sha)
@@ -500,7 +524,7 @@ impl Orchestrator {
             Ok(false) => {}
             Ok(true) => {
                 return ReviewDispatchOutcome::Refused(
-                    "findings already recorded at this head; operator rerun required".into(),
+                    "findings already recorded at this head; dispute grant or operator rerun required".into(),
                 );
             }
             Err(error) => {

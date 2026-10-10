@@ -22,6 +22,19 @@ pub struct SubjectHold {
     pub decision: i64,
 }
 
+/// An unchanged-head non-blocked handoff's durable disposition (STUDIO-1156 B1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewDisputeOutcome {
+    /// A subject park prevents both the grant and the adjudication enqueue.
+    Held,
+    /// Grant and watch-row arming committed together.
+    Granted,
+    /// The sole grant is waiting for dispatch; duplicate delivery is inert.
+    Pending,
+    /// The grant was spent; one PR/head adjudication item now exists.
+    Adjudication,
+}
+
 /// The shared ticket-bearing watch origin, also used by the orchestrator's route-back guard.
 pub fn origin_ticket(origin: &str) -> Option<&str> {
     let ticket = origin
