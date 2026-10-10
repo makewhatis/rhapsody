@@ -10,7 +10,7 @@ import { fenceSpans, inlineText } from "@/lib/markdown";
 // room-model, runs-model, console-job-detail).
 //
 // WHY EVERY RULE BELOW IS A HEURISTIC (design record §5's "honest caveat"). A `LogEntry` is
-// `{seq, kind, tool, text}` and nothing else: the daemon serves no structured tool arguments, no
+// `{seq, kind, tool, text, at?, duration_ms?}`: the daemon serves no structured tool arguments, no
 // exit codes and no file paths. `text` is whatever `crates/agent/src/humanize.rs` rendered, which
 // for a `tool_use` is the tool's input object as SORTED `key=value` pairs with each value clipped
 // to 60 runes. That is much more than free prose and much less than structured data, so the rules
@@ -55,6 +55,8 @@ export interface DidCard {
   /** The `seq` of the entry the result came from; null when unpaired. */
   resultSeq: number | null;
   failed: boolean;
+  at?: string;
+  durationMs?: number;
 }
 
 /** One SAID: agent prose, rendered as markdown by the view (muted/collapsed per §2). */
@@ -62,6 +64,15 @@ export interface SaidBlock {
   seq: number;
   kind: "thinking" | "text";
   text: string;
+  at?: string;
+}
+
+export interface IdleGap {
+  /** Position in transcript order, including gaps ending at a folded result. */
+  beforeSeq: number;
+  fromAt: string;
+  toAt: string;
+  durationMs: number;
 }
 
 export interface TracePhase {
@@ -80,6 +91,10 @@ export interface TracePhase {
   failed: boolean;
   /** Results with no call to fold onto (a truncated transcript) — surfaced, never dropped. */
   orphanResults: string[];
+  startAt?: string;
+  endAt?: string;
+  durationMs?: number;
+  gaps?: IdleGap[];
 }
 
 /**
@@ -97,6 +112,7 @@ export type TraceGrouping = "turns" | "clusters" | "single";
 
 export interface TraceModel {
   phases: TracePhase[];
+  gaps: IdleGap[];
   grouping: TraceGrouping;
   /** Every `event` entry's label, in order — the raw dividers, for the view's turn ruler. */
   events: string[];
@@ -539,6 +555,18 @@ interface OpenPhase {
   said: SaidBlock[];
   orphanResults: string[];
   failed: boolean;
+  members: number[];
+}
+
+/** An untimed/invalid entry is never filled from its neighbours. */
+function sourceTime(at: string | undefined): string | undefined {
+  return at !== undefined && Number.isFinite(Date.parse(at)) ? at : undefined;
+}
+
+function durationBetween(start: string | undefined, end: string | undefined): number | undefined {
+  if (start === undefined || end === undefined) return undefined;
+  const ms = Date.parse(end) - Date.parse(start);
+  return ms >= 0 ? ms : undefined;
 }
 
 /** One transcript entry after pairing, before grouping — the hand-off between the two passes. */
@@ -576,6 +604,9 @@ function pairEntries(entries: readonly LogEntry[]): TraceItem[] {
           result: "",
           resultSeq: null,
           failed: false,
+          at: sourceTime(entry.at),
+          durationMs: Number.isFinite(entry.duration_ms) && (entry.duration_ms ?? -1) >= 0
+            ? entry.duration_ms : undefined,
         };
         awaiting.push(card);
         items.push({ type: "did", card });
@@ -591,10 +622,11 @@ function pairEntries(entries: readonly LogEntry[]): TraceItem[] {
         card.result = entry.text;
         card.resultSeq = entry.seq;
         card.failed = resultFailed(entry.text);
+        card.durationMs ??= durationBetween(card.at, sourceTime(entry.at));
         break;
       }
       default:
-        items.push({ type: "said", block: { seq: entry.seq, kind: entry.kind, text: entry.text } });
+        items.push({ type: "said", block: { seq: entry.seq, kind: entry.kind, text: entry.text, at: sourceTime(entry.at) } });
     }
   }
   return items;
@@ -618,6 +650,7 @@ function pairEntries(entries: readonly LogEntry[]): TraceItem[] {
 export function buildTrace(entries: readonly LogEntry[]): TraceModel {
   const phases: TracePhase[] = [];
   const events: string[] = [];
+  const phaseBySeq = new Map<number, TracePhase>();
   let open: OpenPhase | null = null;
   let pendingSaid: SaidBlock[] = [];
   let turn = 0;
@@ -625,13 +658,16 @@ export function buildTrace(entries: readonly LogEntry[]): TraceModel {
 
   const flushSaid = (into: OpenPhase) => {
     into.said.push(...pendingSaid);
+    into.members.push(...pendingSaid.map((block) => block.seq));
     pendingSaid = [];
   };
 
   /** Ends the phase in progress, leaving any buffered prose for the phase that comes next. */
   const endPhase = () => {
     if (open !== null) {
-      phases.push(finishPhase(open));
+      const phase = finishPhase(open);
+      phases.push(phase);
+      for (const seq of open.members) phaseBySeq.set(seq, phase);
       open = null;
     }
   };
@@ -673,6 +709,7 @@ export function buildTrace(entries: readonly LogEntry[]): TraceModel {
         turnHasPhase = true;
       }
       open.orphanResults.push(item.text);
+      open.members.push(item.seq);
       continue;
     }
 
@@ -686,6 +723,8 @@ export function buildTrace(entries: readonly LogEntry[]): TraceModel {
       }
       flushSaid(open);
       open.did.push(item.card);
+      open.members.push(item.card.seq);
+      if (item.card.resultSeq !== null) open.members.push(item.card.resultSeq);
       if (item.card.failed) open.failed = true;
       continue;
     }
@@ -694,14 +733,56 @@ export function buildTrace(entries: readonly LogEntry[]): TraceModel {
     pendingSaid.push(item.block);
   }
   close();
+  const gaps = addTiming(entries, phases, phaseBySeq);
 
   const grouping: TraceGrouping =
     phases.length < 2 ? "single" : events.length > 0 ? "turns" : "clusters";
-  return { phases, grouping, events };
+  return { phases, gaps, grouping, events };
 }
 
 function newPhase(kind: PhaseKind, turn: number, seq: number): OpenPhase {
-  return { kind, turn, id: `p${seq}`, did: [], said: [], orphanResults: [], failed: false };
+  return { kind, turn, id: `p${seq}`, did: [], said: [], orphanResults: [], failed: false, members: [] };
+}
+
+/** Timing is a separate pass over source order: folding results must not hide an idle interval. */
+function addTiming(
+  entries: readonly LogEntry[],
+  phases: TracePhase[],
+  phaseBySeq: Map<number, TracePhase>,
+): IdleGap[] {
+  const gaps: IdleGap[] = [];
+  for (const phase of phases) phase.gaps = [];
+  // Dividers have no card of their own. Put their gap markers beside the next/previous phase,
+  // but never use their times to fill a phase whose actual members are untimed.
+  const nextPhases = new Map<number, TracePhase>();
+  let next: TracePhase | undefined;
+  for (let i = entries.length - 1; i >= 0; i -= 1) {
+    next = phaseBySeq.get(entries[i].seq) ?? next;
+    if (next !== undefined) nextPhases.set(entries[i].seq, next);
+  }
+  let previousPhase: TracePhase | undefined;
+  let previousTimed: string | undefined;
+  for (const entry of entries) {
+    const memberPhase = phaseBySeq.get(entry.seq);
+    const phase = memberPhase ??
+      (entry.text === "session started" ? nextPhases.get(entry.seq) : previousPhase ?? nextPhases.get(entry.seq));
+    previousPhase = phase ?? previousPhase;
+    const at = sourceTime(entry.at);
+    if (at === undefined) continue;
+    if (memberPhase !== undefined) {
+      if (memberPhase.startAt === undefined || Date.parse(at) < Date.parse(memberPhase.startAt)) memberPhase.startAt = at;
+      if (memberPhase.endAt === undefined || Date.parse(at) > Date.parse(memberPhase.endAt)) memberPhase.endAt = at;
+      memberPhase.durationMs = durationBetween(memberPhase.startAt, memberPhase.endAt);
+    }
+    const ms = durationBetween(previousTimed, at);
+    if (ms !== undefined && ms >= 60_000 && previousTimed !== undefined) {
+      const gap = { beforeSeq: entry.seq, fromAt: previousTimed, toAt: at, durationMs: ms };
+      gaps.push(gap);
+      phase?.gaps?.push(gap);
+    }
+    previousTimed = at;
+  }
+  return gaps;
 }
 
 function finishPhase(open: OpenPhase): TracePhase {

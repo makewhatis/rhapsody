@@ -4859,6 +4859,23 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn run_transcript_omits_absent_timing_and_preserves_known_zero_duration() {
+        let entries = [
+            rhapsody_agent::humanize_stream_line(br#"{"type":"system","subtype":"init"}"#),
+            rhapsody_agent::humanize_stream_line(br#"{"type":"tool_use","timestamp":1791476911772,"part":{"tool":"bash","state":{"status":"completed","time":{"start":1000,"end":1000},"output":"ok"}}}"#),
+        ].concat();
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_transcript(Some(entries))).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/runs/5/transcript")).await;
+        assert_eq!(status, 200);
+        assert!(body["entries"][0].get("at").is_none());
+        assert!(body["entries"][0].get("duration_ms").is_none());
+        assert_eq!(body["entries"][1]["at"], "2026-10-08T16:28:31.772Z");
+        assert_eq!(body["entries"][1]["duration_ms"], 0);
+        assert_eq!(body["entries"][2]["at"], "2026-10-08T16:28:31.772Z");
+        assert!(body["entries"][2].get("duration_ms").is_none());
+    }
+
     // Mirrors the handler assertions of Go `TestRunTranscriptHandlerEndToEnd`: given the humanized
     // entries, the handler assigns 1-based seq and passes kind/tool/text through in the live-`/log`
     // wire shape. (The raw-jsonl → LogEntry humanize step is covered by the agent crate's own tests
@@ -4870,31 +4887,37 @@ mod tests {
                 kind: "event".into(),
                 tool: String::new(),
                 text: "session started".into(),
+                ..LogEntry::default()
             },
             LogEntry {
                 kind: "thinking".into(),
                 tool: String::new(),
                 text: "hmm".into(),
+                ..LogEntry::default()
             },
             LogEntry {
                 kind: "tool_use".into(),
                 tool: "Bash".into(),
                 text: "command=ls".into(),
+                ..LogEntry::default()
             },
             LogEntry {
                 kind: "tool_result".into(),
                 tool: String::new(),
                 text: "output".into(),
+                ..LogEntry::default()
             },
             LogEntry {
                 kind: "text".into(),
                 tool: String::new(),
                 text: "done".into(),
+                ..LogEntry::default()
             },
             LogEntry {
                 kind: "event".into(),
                 tool: String::new(),
                 text: "turn completed".into(),
+                ..LogEntry::default()
             },
         ];
         let base = spawn(FakeProvider::ok(empty_snapshot()).with_transcript(Some(entries))).await;

@@ -101,6 +101,16 @@ golden byte-for-byte. Trace states that boundary and links to Raw. Raw renders o
 with byte offsets, local line timestamps, explicit 200-character previews, full expandable JSON
 (or verbatim non-JSON), download links and live-tail polling. The humanizer's text clamps are unchanged.
 
+### Source transcript timing (STUDIO-1154)
+
+Humanized transcript entries add optional `at` (the source line's RFC3339 UTC instant, with
+milliseconds) and `duration_ms` (OpenCode's own tool interval). Claude RFC3339 strings and OpenCode
+epoch-millisecond timestamps normalize to the same clock. Missing or invalid time stays absent;
+turn durations and receipt time are never substituted for a line's time. The untimed transcript
+payloads, including the fake-Claude H2 golden, remain byte-identical. This is additive observability
+with no Go counterpart: the job page uses these fields for phase spans, call times/durations and
+gaps of at least 60 seconds between timed entries, plus a visible run start and live elapsed clock.
+
 ### Shutdown cancellation backstops (STUDIO-1147)
 
 The prune scheduler now observes shutdown while awaiting asynchronous worktree GC, so a pending

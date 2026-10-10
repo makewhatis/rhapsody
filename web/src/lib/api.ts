@@ -331,6 +331,10 @@ export interface LogEntry {
   kind: "thinking" | "text" | "tool_use" | "tool_result" | "event";
   tool: string;
   text: string;
+  /** Source line's own RFC3339 UTC time; absent when the harness supplied none. */
+  at?: string;
+  /** OpenCode tool's own interval. Zero is known, absent is unknown. */
+  duration_ms?: number;
 }
 
 // --- History API (design §7) ---

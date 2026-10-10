@@ -390,6 +390,7 @@ async fn run_transcript_matches_golden() {
                 kind: (*kind).into(),
                 tool: String::new(),
                 text: (*text).into(),
+                ..TranscriptEntry::default()
             })
         })
         .collect();

@@ -40,13 +40,13 @@ function parseMs(iso: string): number {
   return Number.isNaN(ms) ? 0 : ms;
 }
 
-/** "19:11" in the viewer's local zone; "" when the instant is absent or unparseable. */
-export function clockTime(iso: string): string {
+/** Local clock, optionally with seconds; "" when the instant is absent or unparseable. */
+export function clockTime(iso: string, seconds = false): string {
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) return "";
   const d = new Date(ms);
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}${seconds ? `:${pad(d.getSeconds())}` : ""}`;
 }
 
 /**
