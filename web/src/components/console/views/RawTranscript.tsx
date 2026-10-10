@@ -120,6 +120,8 @@ export function RawTranscript({ runId, inFlight }: { runId: number; inFlight: bo
     enabled: runId > 0 && following,
     refetchInterval: inFlight && following ? 1500 : false,
     staleTime: inFlight ? 0 : Infinity,
+    // Raw can be closed while live and reopened after completion with a cached pre-final tail.
+    refetchOnMount: "always",
     refetchOnWindowFocus: false,
   });
   // Following retains only the current tail page. The displayed byte range and Load earlier

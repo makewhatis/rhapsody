@@ -159,6 +159,19 @@ describe("lossless Raw transcript", () => {
     await screen.findByText(/"final":true/);
   });
 
+  it.each([true, false])("refreshes a cached tail when reopened after completion (initially live: %s)", async (inFlight) => {
+    vi.mocked(fetchRawTranscript).mockResolvedValue(page(["before\n"]));
+    const { client, unmount } = mount(inFlight);
+    await screen.findByText("before");
+    unmount(); // Returning to Trace unmounts Raw but preserves the shared query cache.
+    vi.mocked(fetchRawTranscript).mockResolvedValue(page(["before\n", "final\n"]));
+    render(<QueryClientProvider client={client}><RawTranscript runId={42} inFlight={false} /></QueryClientProvider>);
+    await screen.findByText("final");
+    expect(fetchRawTranscript).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("Showing bytes 0–13 of 13")).toBeTruthy();
+    expect((screen.getByRole("button", { name: "Load later" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
   it("states missing files and read failures explicitly", async () => {
     vi.mocked(fetchRawTranscript).mockResolvedValue(page([], { missing: true }));
     const { client } = mount();
