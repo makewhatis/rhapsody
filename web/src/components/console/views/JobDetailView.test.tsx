@@ -424,6 +424,75 @@ afterEach(() => {
 // ---------------------------------------------------------------------------------------------
 // Acceptance 1 — a completed run renders header + Result card + The Split, from the slice-1 model.
 // ---------------------------------------------------------------------------------------------
+describe("source timing on the job page", () => {
+  it("renders a gap even when timed events have no tool/prose phase", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [
+      entry({ seq: 1, kind: "event", text: "session started", at: "2026-09-01T19:11:00Z" }),
+      entry({ seq: 2, kind: "event", text: "turn completed", at: "2026-09-01T19:12:00Z" }),
+    ] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    expect(document.querySelector(".trinsp .trgap")?.textContent).toBe("1m 0s with no output");
+    expect(document.querySelectorAll(".trstep")).toHaveLength(0);
+  });
+
+  it("shows a visible local start, phase offset/span, call clocks and an idle marker between cards", async () => {
+    const at = "2026-09-01T19:11:00.000Z";
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [
+      entry({ seq: 1, kind: "tool_use", tool: "Read", text: "file_path=a", at }),
+      entry({ seq: 2, kind: "tool_result", text: "ok", at: "2026-09-01T19:11:02.000Z" }),
+      entry({ seq: 3, kind: "tool_use", tool: "Read", text: "file_path=b", at: "2026-09-01T19:15:14.000Z", duration_ms: 2250 }),
+      entry({ seq: 4, kind: "tool_result", text: "ok", at: "2026-09-01T19:15:14.000Z" }),
+    ] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    const start = document.querySelector(".trstart");
+    expect(start?.textContent).toMatch(/started \d{2}:\d{2}:\d{2}/);
+    expect(start?.getAttribute("title")).toContain("2026");
+    expect(document.querySelector(".trstep .trtiming")?.textContent).toContain("+00:00 · 4m 14s");
+    const cards = document.querySelectorAll(".trcard");
+    expect(cards[0].querySelector(".trclock")?.textContent).toMatch(/^\d{2}:\d{2}:\d{2}$/);
+    expect(cards[0].querySelector(".trduration")?.textContent).toBe("2s");
+    expect(cards[1].querySelector(".trduration")?.textContent).toBe("2.25s");
+    const gap = document.querySelector(".trinsp .trgap");
+    expect(gap?.textContent).toContain("4m 12s with no output");
+    expect(cards[0].nextElementSibling).toBe(gap);
+    expect(gap?.nextElementSibling).toBe(cards[1]);
+  });
+
+  it("has no marker for a 59s gap and gives untimed cards no clock or duration", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [
+      entry({ seq: 1, kind: "tool_use", tool: "Read", at: "2026-09-01T19:11:00Z" }),
+      entry({ seq: 2, kind: "tool_result", at: "2026-09-01T19:11:59Z" }),
+      entry({ seq: 3, kind: "tool_use", tool: "Edit", text: "file_path=b" }),
+      entry({ seq: 4, kind: "tool_result", text: "ok" }),
+    ] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    expect(document.querySelector(".trgap")).toBeNull();
+    fireEvent.click(document.querySelectorAll(".trstep")[1]);
+    expect(document.querySelector(".trstep[aria-pressed='true'] .trtiming")).toBeNull();
+    expect(document.querySelector(".trcard .trclock")).toBeNull();
+    expect(document.querySelector(".trcard .trduration")).toBeNull();
+  });
+
+  it("ticks elapsed time without a new transcript and freezes to the final duration", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-09-01T19:11:10Z"));
+    const row = run({ id: 547, outcome: "running", ended_at: "" });
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [] });
+    mountDetail([row]);
+    await waitFor(() => expect(document.querySelector(".trelapsed")?.textContent).toBe("10s elapsed"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(document.querySelector(".trelapsed")?.textContent).toBe("11s elapsed");
+    act(() => client.setQueryData(["run-detail", 547], detailOf(row, { outcome: "completed", live: false, ended_at: "2026-09-01T19:11:12Z" })));
+    await waitFor(() => expect(document.querySelector(".trrunclock")?.textContent).toContain("12s"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(document.querySelector(".trelapsed")).toBeNull();
+    expect(document.querySelector(".trrunclock")?.textContent).toContain("12s");
+  });
+});
+
 describe("zone A — the sticky header (§3A)", () => {
   it("carries the key, the title, the outcome and the assignee", async () => {
     mountDetail([run({ id: 547 })]);

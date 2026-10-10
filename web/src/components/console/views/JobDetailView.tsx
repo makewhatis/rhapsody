@@ -32,6 +32,7 @@ import {
   useTranscript,
 } from "@/hooks/useRunDetail";
 import { useLinearIdentity } from "@/hooks/useConfig";
+import { useNow } from "@/hooks/useNow";
 import { useIssueRuns, useLiveHistoryCosts } from "@/hooks/useHistory";
 import {
   useMergeRun,
@@ -50,7 +51,7 @@ import { ticketAssignees } from "@/lib/console-jobs";
 import { clockTime, runOutcomeLabel, runOutcomePill, runsNewestFirst } from "@/lib/console-job-detail";
 import { checksSummary, diffFiles, diffStat } from "@/lib/console-diff";
 import { mergeStateNote, ungatedMergeStateNote } from "@/lib/console-merge";
-import { formatDateTime } from "@/lib/format";
+import { elapsedSeconds, formatDateTime, formatDuration } from "@/lib/format";
 import { isAtBottom } from "@/lib/follow-scroll";
 import {
   OUTCOME_RUNNING,
@@ -81,6 +82,9 @@ import {
   ticketUrl,
   BRANCH_DISPLAY_MAX,
   middleEllipsis,
+  inspectorCalls,
+  phaseTiming,
+  traceDuration,
   type AttemptOption,
   type Baton,
   harnessFidelity,
@@ -116,6 +120,7 @@ import {
   buildResult,
   buildTrace,
   type DidCard,
+  type IdleGap,
   type PhaseKind,
   type ResultCard,
   type SaidBlock,
@@ -490,6 +495,8 @@ function RunTrace({
           <TraceSplit
             key={run.id}
             phases={trace.phases}
+            gaps={trace.gaps}
+            runStart={live.started_at}
             who={who}
             roster={roster}
             pending={transcript.isPending}
@@ -731,6 +738,15 @@ export function TraceHeader({
         )}
       </div>
 
+      <div className="trrunclock">
+        {clockTime(run.started_at) === "" ? null : (
+          <span className="trstart" title={timeTitle(run.started_at)}>
+            started <Timestamp>{clockTime(run.started_at, true)}</Timestamp>
+          </span>
+        )}
+        {inFlight ? <LiveElapsed startedAt={run.started_at} /> : <Timestamp>{vitals.duration}</Timestamp>}
+      </div>
+
       {/* --- Row 3: controls. Attempts · reviews · branch · actions, actions right-aligned. --- */}
       <div className="trctl">
         {/* The attempt selector — the implement→revise relay. Switching swaps the Result card, the
@@ -828,6 +844,17 @@ export function TraceHeader({
       </div>
     </div>
   );
+}
+
+function timeTitle(at: string): string {
+  return `${new Date(at).getFullYear()} ${formatDateTime(at)} · ${clockTime(at, true)}`;
+}
+
+/** Mounted only while running, so its one-second timer ends with the run. */
+function LiveElapsed({ startedAt }: { startedAt: string }) {
+  const now = useNow();
+  if (!Number.isFinite(Date.parse(startedAt))) return null;
+  return <Timestamp className="trelapsed">{formatDuration(elapsedSeconds(startedAt, now))} elapsed</Timestamp>;
 }
 
 /**
@@ -1660,6 +1687,8 @@ function ResultCardZone({
 
 function TraceSplit({
   phases,
+  gaps,
+  runStart,
   who,
   roster,
   pending,
@@ -1669,6 +1698,8 @@ function TraceSplit({
   reducedEvents,
 }: {
   phases: readonly TracePhase[];
+  gaps: readonly IdleGap[];
+  runStart: string;
   /** The teammate this attempt is attributed to; "" when none resolves. */
   who: string;
   roster: readonly string[];
@@ -1779,6 +1810,7 @@ function TraceSplit({
             <SpineStep
               key={phase.id}
               phase={phase}
+              runStart={runStart}
               who={who}
               roster={roster}
               selected={phase.id === selected?.id}
@@ -1806,6 +1838,7 @@ function TraceSplit({
           the Split (STUDIO-766). */}
       <div className="trright">
         <div className="trinsp">
+          {phases.length === 0 ? gaps.map((gap) => <GapMarker key={gap.beforeSeq} gap={gap} />) : null}
           {selected === undefined ? null : (
             <Inspector
               phase={selected}
@@ -1971,6 +2004,7 @@ const SIGNED_PHASES: ReadonlySet<PhaseKind> = new Set<PhaseKind>(["coordinated",
 
 function SpineStep({
   phase,
+  runStart,
   who,
   roster,
   selected,
@@ -1978,6 +2012,7 @@ function SpineStep({
   onSelect,
 }: {
   phase: TracePhase;
+  runStart: string;
   /** The teammate this attempt is attributed to; "" when none resolves. */
   who: string;
   roster: readonly string[];
@@ -1989,6 +2024,7 @@ function SpineStep({
   // Unattributed rather than guessed: a step signed with a name nothing recorded would put words
   // in a teammate's mouth about a post the room can be read back for.
   const signed = who !== "" && SIGNED_PHASES.has(phase.kind);
+  const timing = phaseTiming(phase, runStart);
   return (
     <button
       type="button"
@@ -2014,6 +2050,14 @@ function SpineStep({
           ) : null}
         </span>
         {phase.subtitle === "" ? null : <span className="ssub">{phase.subtitle}</span>}
+        {timing === "" ? null : (
+          <Timestamp
+            className="trtiming"
+            title={phase.startAt === undefined ? undefined : `${timeTitle(phase.startAt)} — ${timeTitle(phase.endAt ?? phase.startAt)}`}
+          >
+            {timing}
+          </Timestamp>
+        )}
         {phase.effects.length === 0 ? null : (
           <span className="fx">
             {phase.effects.map((effect) => (
@@ -2050,9 +2094,13 @@ function Inspector({
       <h4 className="insphead">
         {phase.title} — what {name} did
       </h4>
-      {phase.did.map((card) => (
-        <CallCard key={card.seq} card={card} jump={card.seq === openSeq ? openNonce : 0} />
-      ))}
+      {inspectorCalls(phase).map((item) =>
+        item.type === "call" ? (
+          <CallCard key={`call:${item.card.seq}`} card={item.card} jump={item.card.seq === openSeq ? openNonce : 0} />
+        ) : (
+          <GapMarker key={`gap:${item.gap.beforeSeq}`} gap={item.gap} />
+        ),
+      )}
       {phase.did.length === 0 ? <div className="empty">No tool calls in this step.</div> : null}
       {/* A result with no call to fold onto — a truncated transcript. Surfaced, never dropped. */}
       {phase.orphanResults.map((text, i) => (
@@ -2065,6 +2113,14 @@ function Inspector({
       ))}
       {phase.said.length === 0 ? null : <Said said={phase.said} who={name} />}
     </>
+  );
+}
+
+function GapMarker({ gap }: { gap: IdleGap }) {
+  return (
+    <div className="trgap" title={`${timeTitle(gap.fromAt)} — ${timeTitle(gap.toAt)}`}>
+      <Timestamp>{formatDuration(gap.durationMs / 1000)} with no output</Timestamp>
+    </div>
   );
 }
 
@@ -2098,6 +2154,12 @@ function CallCard({ card, jump }: { card: DidCard; jump: number }) {
         </span>
         <span className="tool">{baseToolName(card.tool)}</span>
         <span className="tgt">{card.target}</span>
+        {card.at === undefined ? null : (
+          <Timestamp className="trclock" title={timeTitle(card.at)}>{clockTime(card.at, true)}</Timestamp>
+        )}
+        {card.durationMs === undefined ? null : (
+          <Timestamp className="trduration" title="Tool duration">{traceDuration(card.durationMs)}</Timestamp>
+        )}
         {/* The daemon serves no exit code, so the badge says only what the folded result proves:
             that it failed, that it came back, or that nothing came back at all. */}
         <span className={card.failed ? "res bad" : hasResult ? "res ok" : "res"}>
