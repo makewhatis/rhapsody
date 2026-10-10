@@ -24,6 +24,7 @@ const h = vi.hoisted(() => ({
   fetchHistoryCosts: vi.fn(),
   fetchRunProvenance: vi.fn(),
   fetchRunTranscript: vi.fn(),
+  fetchRawTranscript: vi.fn(),
   fetchRunIdentityEvents: vi.fn(),
   sendRunMessage: vi.fn(),
   fetchRunMessages: vi.fn(),
@@ -55,6 +56,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchHistoryCosts: h.fetchHistoryCosts,
     fetchRunProvenance: h.fetchRunProvenance,
     fetchRunTranscript: h.fetchRunTranscript,
+    fetchRawTranscript: h.fetchRawTranscript,
     fetchRunIdentityEvents: h.fetchRunIdentityEvents,
     sendRunMessage: h.sendRunMessage,
     fetchRunMessages: h.fetchRunMessages,
@@ -84,6 +86,10 @@ vi.mock("@/lib/bindings", async (orig) => {
 });
 
 const { JobDetailView } = await import("./JobDetailView");
+
+beforeEach(() => {
+  h.fetchRawTranscript.mockResolvedValue({ run_id: 547, size_bytes: 0, lines: [], prev_cursor: null, next_cursor: null, at_start: true, at_end: true });
+});
 
 const EMPTY_STATE: StateResponse = {
   status: "ok",
@@ -424,6 +430,75 @@ afterEach(() => {
 // ---------------------------------------------------------------------------------------------
 // Acceptance 1 — a completed run renders header + Result card + The Split, from the slice-1 model.
 // ---------------------------------------------------------------------------------------------
+describe("source timing on the job page", () => {
+  it("renders a gap even when timed events have no tool/prose phase", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [
+      entry({ seq: 1, kind: "event", text: "session started", at: "2026-09-01T19:11:00Z" }),
+      entry({ seq: 2, kind: "event", text: "turn completed", at: "2026-09-01T19:12:00Z" }),
+    ] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    expect(document.querySelector(".trinsp .trgap")?.textContent).toBe("1m 0s with no output");
+    expect(document.querySelectorAll(".trstep")).toHaveLength(0);
+  });
+
+  it("shows a visible local start, phase offset/span, call clocks and an idle marker between cards", async () => {
+    const at = "2026-09-01T19:11:00.000Z";
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [
+      entry({ seq: 1, kind: "tool_use", tool: "Read", text: "file_path=a", at }),
+      entry({ seq: 2, kind: "tool_result", text: "ok", at: "2026-09-01T19:11:02.000Z" }),
+      entry({ seq: 3, kind: "tool_use", tool: "Read", text: "file_path=b", at: "2026-09-01T19:15:14.000Z", duration_ms: 2250 }),
+      entry({ seq: 4, kind: "tool_result", text: "ok", at: "2026-09-01T19:15:14.000Z" }),
+    ] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    const start = document.querySelector(".trstart");
+    expect(start?.textContent).toMatch(/started \d{2}:\d{2}:\d{2}/);
+    expect(start?.getAttribute("title")).toContain("2026");
+    expect(document.querySelector(".trstep .trtiming")?.textContent).toContain("+00:00 · 4m 14s");
+    const cards = document.querySelectorAll(".trcard");
+    expect(cards[0].querySelector(".trclock")?.textContent).toMatch(/^\d{2}:\d{2}:\d{2}$/);
+    expect(cards[0].querySelector(".trduration")?.textContent).toBe("2s");
+    expect(cards[1].querySelector(".trduration")?.textContent).toBe("2.25s");
+    const gap = document.querySelector(".trinsp .trgap");
+    expect(gap?.textContent).toContain("4m 12s with no output");
+    expect(cards[0].nextElementSibling).toBe(gap);
+    expect(gap?.nextElementSibling).toBe(cards[1]);
+  });
+
+  it("has no marker for a 59s gap and gives untimed cards no clock or duration", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [
+      entry({ seq: 1, kind: "tool_use", tool: "Read", at: "2026-09-01T19:11:00Z" }),
+      entry({ seq: 2, kind: "tool_result", at: "2026-09-01T19:11:59Z" }),
+      entry({ seq: 3, kind: "tool_use", tool: "Edit", text: "file_path=b" }),
+      entry({ seq: 4, kind: "tool_result", text: "ok" }),
+    ] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    expect(document.querySelector(".trgap")).toBeNull();
+    fireEvent.click(document.querySelectorAll(".trstep")[1]);
+    expect(document.querySelector(".trstep[aria-pressed='true'] .trtiming")).toBeNull();
+    expect(document.querySelector(".trcard .trclock")).toBeNull();
+    expect(document.querySelector(".trcard .trduration")).toBeNull();
+  });
+
+  it("ticks elapsed time without a new transcript and freezes to the final duration", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.setSystemTime(new Date("2026-09-01T19:11:10Z"));
+    const row = run({ id: 547, outcome: "running", ended_at: "" });
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [] });
+    mountDetail([row]);
+    await waitFor(() => expect(document.querySelector(".trelapsed")?.textContent).toBe("10s elapsed"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(document.querySelector(".trelapsed")?.textContent).toBe("11s elapsed");
+    act(() => client.setQueryData(["run-detail", 547], detailOf(row, { outcome: "completed", live: false, ended_at: "2026-09-01T19:11:12Z" })));
+    await waitFor(() => expect(document.querySelector(".trrunclock")?.textContent).toContain("12s"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(3000); });
+    expect(document.querySelector(".trelapsed")).toBeNull();
+    expect(document.querySelector(".trrunclock")?.textContent).toContain("12s");
+  });
+});
+
 describe("zone A — the sticky header (§3A)", () => {
   it("carries the key, the title, the outcome and the assignee", async () => {
     mountDetail([run({ id: 547 })]);
@@ -2312,22 +2387,23 @@ describe("zone C — the spine's filter (§3C)", () => {
 // Acceptance 4 — the "Raw transcript" escape hatch (§4, mandatory).
 // ---------------------------------------------------------------------------------------------
 describe("the raw-transcript escape hatch (§4)", () => {
-  it("drops to the flat oldest→newest LogEntry list, and back", async () => {
+  it("opens the run's raw file separately from Trace, and back", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    h.fetchRawTranscript.mockResolvedValue({ run_id: 547, size_bytes: 36, lines: [{ offset: 0, text: '{"type":"system"}\n' }, { offset: 18, text: '{"type":"result"}\n' }], prev_cursor: null, next_cursor: null, at_start: true, at_end: true });
     mountDetail([run({ id: 547 })]);
     await settleTrace();
 
     fireEvent.click(screen.getByRole("button", { name: "Raw transcript" }));
     await waitFor(() => expect(document.querySelector(".trraw")).toBeTruthy());
 
-    // Every entry, in the served order, tagged with its kind — the folding heuristics are gone.
+    await screen.findByText(/"type":"system"/);
     const lines = [...document.querySelectorAll(".trraw .rawline")];
-    expect(lines).toHaveLength(COMPLETED.length);
-    expect(lines[0].querySelector(".rk")?.textContent).toBe("event");
-    expect(lines[0].textContent).toContain("session started");
-    expect(lines[2].querySelector(".rk")?.textContent).toBe("tool_use");
-    expect(lines[2].textContent).toContain("Read");
-    expect(lines[2].textContent).toContain("file_path=/repo/src/lib/api.ts");
+    expect(lines).toHaveLength(2);
+    expect(lines[0].textContent).toContain('"type":"system"');
+    expect(lines[1].textContent).toContain('"type":"result"');
+    expect(h.fetchRawTranscript).toHaveBeenCalledWith(547);
+    // A raw read must not keep the full-file humanizer polling alongside its bounded pages.
+    expect(client?.getQueryCache().find({ queryKey: ["run-transcript", 547] })?.isActive()).toBe(false);
     // The trace's two zones are gone while the hatch is open.
     expect(document.querySelector(".trrc")).toBeNull();
     expect(document.querySelector(".trsplit")).toBeNull();
@@ -2335,9 +2411,11 @@ describe("the raw-transcript escape hatch (§4)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Trace" }));
     await waitFor(() => expect(document.querySelector(".trsplit")).toBeTruthy());
     expect(document.querySelector(".trraw")).toBeNull();
+    expect(client?.getQueryCache().find({ queryKey: ["run-transcript", 547] })?.isActive()).toBe(true);
   });
 
   it("shows the raw prose verbatim — the hatch is the one place markdown is NOT interpreted", async () => {
+    h.fetchRawTranscript.mockResolvedValue({ run_id: 547, size_bytes: 18, lines: [{ offset: 0, text: "Ran **make lint**." }], prev_cursor: null, next_cursor: null, at_start: true, at_end: true });
     h.fetchRunTranscript.mockResolvedValue({
       run_id: 547,
       generated_at: "",
@@ -2347,8 +2425,17 @@ describe("the raw-transcript escape hatch (§4)", () => {
     await settleTrace();
     fireEvent.click(screen.getByRole("button", { name: "Raw transcript" }));
     await waitFor(() => expect(document.querySelector(".trraw")).toBeTruthy());
+    await screen.findByText("Ran **make lint**.");
     expect(document.querySelector(".trraw .rawline")?.textContent).toContain("Ran **make lint**.");
     expect(document.querySelector(".trraw strong")).toBeNull();
+  });
+
+  it("states the Trace's dropped-entry boundary and links to Raw", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: Array.from({ length: 1000 }, (_, i) => entry({ seq: i + 1, text: "synthetic" })), total_entries: 1200, dropped: 200 });
+    mountDetail([run({ id: 547 })]);
+    await screen.findByText(/Showing the last 1000 of 1200 entries/);
+    fireEvent.click(screen.getByRole("button", { name: "Open Raw transcript" }));
+    await waitFor(() => expect(h.fetchRawTranscript).toHaveBeenCalledWith(547));
   });
 });
 

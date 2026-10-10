@@ -38,8 +38,9 @@ use crate::handlers_drain::handle_drain;
 use crate::handlers_history::{
     handle_event_search, handle_history, handle_history_costs, handle_history_summary,
     handle_issue_counts, handle_issue_history, handle_issue_runs, handle_metrics,
-    handle_metrics_by_provider, handle_run_detail, handle_run_events, handle_run_provenance,
-    handle_run_transcript,
+    handle_metrics_by_provider, handle_raw_transcript, handle_run_detail, handle_run_events,
+    handle_run_provenance, handle_run_transcript, handle_stderr_download,
+    handle_transcript_download,
 };
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
@@ -171,6 +172,23 @@ pub trait StateProvider: Send + Sync {
     /// Mirrors Go `StateProvider.RunTranscript`, whose `([]agent.LogEntry, bool)` return collapses to
     /// this `Option`.
     fn run_transcript(&self, run_id: i64) -> Option<Vec<rhapsody_agent::LogEntry>>;
+
+    /// Humanized tail plus its pre-cap entry count. The default preserves legacy providers;
+    /// the daemon counts while reading, without retaining the dropped prefix (STUDIO-1155).
+    fn run_transcript_summary(
+        &self,
+        run_id: i64,
+    ) -> Option<(Vec<rhapsody_agent::LogEntry>, usize)> {
+        self.run_transcript(run_id).map(|entries| {
+            let total = entries.len();
+            (entries, total)
+        })
+    }
+
+    /// Configured transcript root, published by the existing reload read seam.
+    fn transcript_log_dir(&self) -> std::path::PathBuf {
+        std::path::PathBuf::new()
+    }
 
     /// The workspace's Linear projects for the add-agent picker (`GET /api/v1/linear/projects`).
     /// [`ReadsError::ConfigNotLoaded`] (before the first config load) maps to 503 `config_not_loaded`;
@@ -986,6 +1004,15 @@ where
         .route("/api/v1/metrics/providers", any(handle_metrics_by_provider))
         .route("/api/v1/runs/{id}/events", any(handle_run_events))
         .route("/api/v1/runs/{id}/transcript", any(handle_run_transcript))
+        .route(
+            "/api/v1/runs/{id}/transcript/raw",
+            any(handle_raw_transcript),
+        )
+        .route(
+            "/api/v1/runs/{id}/transcript.jsonl",
+            any(handle_transcript_download),
+        )
+        .route("/api/v1/runs/{id}/stderr.log", any(handle_stderr_download))
         // What the run actually ran on (STUDIO-909). Rhapsody-only, and a route of its own rather
         // than fields on runs/{id}: that body is byte-pinned to the Go capture by api/run_detail.json.
         .route("/api/v1/runs/{id}/provenance", any(handle_run_provenance))

@@ -1,8 +1,8 @@
 import type { RunDetail, RunProvenance, RunSummary, TicketCostRow } from "@/lib/api";
 import { ticketCostsByIssue } from "@/lib/console-jobs";
-import { formatTokens, runDuration } from "@/lib/format";
+import { formatDuration, formatTokens, runDuration } from "@/lib/format";
 import { fenceSpans, inlineText } from "@/lib/markdown";
-import { baseToolName, type PhaseKind, type ResultCard, type TracePhase } from "@/lib/trace-model";
+import { baseToolName, type DidCard, type IdleGap, type PhaseKind, type ResultCard, type TracePhase } from "@/lib/trace-model";
 
 // console-trace-view — the derivations the "Trace" run detail needs on top of the slice-1 trace
 // model (design record `~/.rhapsody/docs/console-run-detail-design.md` §3; slice 2 of its §9 plan).
@@ -15,6 +15,34 @@ import { baseToolName, type PhaseKind, type ResultCard, type TracePhase } from "
 // every rule the view leans on is asserted directly rather than through a render.
 
 const DASH = "—";
+
+/** Short tool spans keep milliseconds; longer spans share the run duration vocabulary. */
+export function traceDuration(ms: number): string {
+  return ms < 60_000 && ms % 1000 !== 0
+    ? `${Number((ms / 1000).toFixed(3))}s`
+    : formatDuration(ms / 1000);
+}
+
+export function phaseTiming(phase: TracePhase, runStart: string): string {
+  if (phase.durationMs === undefined) return "";
+  const offset = Date.parse(phase.startAt ?? "") - Date.parse(runStart);
+  const seconds = Math.floor(offset / 1000);
+  const prefix =
+    Number.isFinite(offset) && offset >= 0
+      ? `+${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")} · `
+      : "";
+  return `${prefix}${traceDuration(phase.durationMs)}`;
+}
+
+/** Keep gaps in source order even when a result was folded into an earlier card. */
+export function inspectorCalls(
+  phase: TracePhase,
+): ({ type: "call"; card: DidCard } | { type: "gap"; gap: IdleGap })[] {
+  return [
+    ...phase.did.map((card) => ({ type: "call" as const, card, seq: card.seq })),
+    ...(phase.gaps ?? []).map((gap) => ({ type: "gap" as const, gap, seq: gap.beforeSeq })),
+  ].sort((a, b) => a.seq - b.seq || (a.type === "gap" ? -1 : 1));
+}
 
 /**
  * The observability a run's harness actually offers, read from the run's provenance (STUDIO-978).

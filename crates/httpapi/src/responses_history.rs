@@ -639,7 +639,7 @@ pub(crate) fn metrics_response(days: &[DayRollup]) -> Value {
     json!({ "days": Value::Array(days.iter().map(day_rollup_json).collect()) })
 }
 
-/// `{run_id, entries:[{seq,kind,tool,text}], generated_at}` — the `GET /api/v1/runs/{id}/transcript`
+/// `{run_id, entries:[{seq,kind,tool,text,at?,duration_ms?}], generated_at}` — the transcript
 /// payload. `entries` mirrors the live `/log` shape so the shared frontend renderer is fed the same
 /// `LogEntry`; `seq` is 1-based, assigned here after the orchestrator's cap. Mirrors Go
 /// `runTranscriptJSON` (+ `logEntryJSON`).
@@ -651,9 +651,21 @@ pub(crate) fn run_transcript_json(
     let entries: Vec<Value> = entries
         .iter()
         .enumerate()
-        .map(
-            |(i, e)| json!({ "seq": i as i64 + 1, "kind": e.kind, "tool": e.tool, "text": e.text }),
-        )
+        .map(|(i, e)| {
+            let mut row = serde_json::Map::from_iter([
+                ("seq".to_string(), json!(i as i64 + 1)),
+                ("kind".to_string(), json!(e.kind)),
+                ("tool".to_string(), json!(e.tool)),
+                ("text".to_string(), json!(e.text)),
+            ]);
+            if !e.at.is_empty() {
+                row.insert("at".to_string(), json!(e.at));
+            }
+            if let Some(ms) = e.duration_ms {
+                row.insert("duration_ms".to_string(), json!(ms));
+            }
+            Value::Object(row)
+        })
         .collect();
     json!({ "run_id": run_id, "entries": Value::Array(entries), "generated_at": now })
 }
