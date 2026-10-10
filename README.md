@@ -98,6 +98,10 @@ overrule release the park. Released episodes remain auditable. One open escalati
 ticket folds its PR origins through the shared `origin_ticket` guard, updating need, time and repeat
 count in place rather than keying on model wording. The console reports these tickets as held.
 Lead evidence includes bounded, quoted prior subject decisions and the open escalation, if any.
+Parked ticket states are also read by project-scoped identifier before dispatch gates, so human
+moves to Backlog/Done release parks even though those tickets leave the candidate query. Reads are
+rotating and bounded (16 tickets per tick, four concurrent, ten seconds total); absence/read failures
+never imply a move or release a park.
 The operator-guarded `POST /api/v1/lead/decisions/{id}/resolve {note}` records the resolution
 reason and lifts that escalation episode; it never resolves a newer episode through a stale id.
 Material releases grant one durable author admission, consumed with the next stored author run,

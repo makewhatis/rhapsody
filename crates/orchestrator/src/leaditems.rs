@@ -260,6 +260,121 @@ fn blocked_question(text: &str) -> Option<String> {
 }
 
 impl Orchestrator {
+    /// Candidate queries intentionally exclude Backlog/Done. A park must therefore observe its
+    /// ticket by identifier too, before dispatch gates, without treating absence as a state move.
+    /// Owned tracker reads run off-task: at most 16 tickets per tick, 4 concurrent, 10 seconds total.
+    /// Rotation prevents an unavailable ticket at the front of the ledger starving later holds.
+    pub(crate) async fn reconcile_parked_subject_states(&mut self) {
+        let Some(eff) = self.eff.as_ref() else { return };
+        let trackers: Vec<_> = if eff.projects.is_empty() {
+            vec![(String::new(), eff.tracker.clone())]
+        } else {
+            eff.projects
+                .iter()
+                .filter(|p| !p.disabled)
+                .map(|p| (p.slug.clone(), p.tracker.clone()))
+                .collect()
+        };
+        if trackers.is_empty() {
+            return;
+        }
+        let mut holds = match self.store().load_subject_holds() {
+            Ok(holds) => holds
+                .into_iter()
+                .filter(|h| !h.subject.contains('#'))
+                .collect::<Vec<_>>(),
+            Err(error) => {
+                tracing::warn!(%error, "parked state ledger unreadable; keeping holds");
+                return;
+            }
+        };
+        if holds.is_empty() {
+            return;
+        }
+        let offset = self.parked_state_cursor % holds.len();
+        holds.rotate_left(offset);
+        self.parked_state_cursor = (offset + holds.len().min(16)) % holds.len();
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let mut tasks = tokio::task::JoinSet::new();
+        for hold in holds.into_iter().take(16) {
+            let snapshot: ParkSnapshot = match serde_json::from_str(&hold.snapshot) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    tracing::warn!(ticket = %hold.subject, %error, "park state baseline unavailable; keeping hold");
+                    continue;
+                }
+            };
+            // A blocked ending's own handoff move is not a human move. Candidate observation owns
+            // its initial baseline; never invent one from an excluded/unknown state here.
+            let Some(state) = snapshot.state else {
+                continue;
+            };
+            let project = match self.store().list_issue_runs(rhapsody_store::RunFilter {
+                issue: hold.subject.clone(),
+                limit: 1,
+                ..Default::default()
+            }) {
+                Ok(runs) => runs
+                    .first()
+                    .map(|r| r.project_slug.clone())
+                    .unwrap_or_default(),
+                Err(error) => {
+                    tracing::warn!(ticket = %hold.subject, %error, "park project unreadable; keeping hold");
+                    continue;
+                }
+            };
+            let owned: Vec<_> = trackers
+                .iter()
+                .filter(|(slug, _)| project.is_empty() || *slug == project)
+                .map(|(_, tr)| tr.clone())
+                .collect();
+            let semaphore = semaphore.clone();
+            tasks.spawn(async move {
+                let Ok(_permit) = semaphore.acquire_owned().await else {
+                    tracing::warn!(ticket = %hold.subject, "parked state read permit unavailable; keeping hold");
+                    return None;
+                };
+                for tracker in owned {
+                    match tracker.fetch_issue_by_identifier(&hold.subject).await {
+                        Ok(Some(issue)) if issue.identifier.eq_ignore_ascii_case(&hold.subject) => {
+                            return Some((hold, state, issue.state));
+                        }
+                        Ok(_) => {}
+                        Err(error) => tracing::warn!(ticket = %hold.subject, %error, "parked ticket state read failed; keeping hold"),
+                    }
+                }
+                None
+            });
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(deadline, tasks.join_next()).await {
+                Ok(Some(Ok(Some((hold, before, after)))))
+                    if !after.is_empty() && before != after =>
+                {
+                    if let Err(error) = self.store().release_subject_episode(
+                        hold.id,
+                        &hold.kind,
+                        "ticket state changed (scoped hold observation)",
+                    ) {
+                        tracing::warn!(ticket = %hold.subject, %error, "park state release failed; keeping hold");
+                    }
+                }
+                Ok(Some(Ok(_))) => {}
+                Ok(Some(Err(error))) => {
+                    tracing::warn!(%error, "parked state task failed; keeping hold")
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    tracing::warn!(
+                        "parked state observation timed out; unread holds remain parked"
+                    );
+                    break; // dropping JoinSet cancels unfinished reads
+                }
+            }
+        }
+    }
+
     pub(crate) fn subject_human_holds(&self) -> Vec<crate::dispatch::HeldForHuman> {
         let mut held = self.human_holds.held();
         match self.store().load_subject_holds() {
@@ -666,6 +781,40 @@ mod tests {
                 change != "unchanged"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn parked_state_reads_rotate_past_the_per_tick_bound() {
+        let mut tracker = rhapsody_tracker::fake::Fake::new();
+        let mut o = orch(true);
+        for n in 0..17 {
+            let ticket = format!("TEST-{n}");
+            let old = crate::testsupport::issue(&ticket, &ticket, "In Review");
+            tracker.by_identifier.insert(
+                ticket.clone(),
+                crate::testsupport::issue(&ticket, &ticket, "Done"),
+            );
+            o.store()
+                .park_subject(&rhapsody_store::SubjectHold {
+                    subject: ticket,
+                    kind: "escalation".into(),
+                    snapshot: park_snapshot(o.store(), &old, None, false).unwrap(),
+                    ..Default::default()
+                })
+                .unwrap();
+        }
+        o.eff = Some(crate::testsupport::empty_effective(Arc::new(tracker)));
+        o.reconcile_parked_subject_states().await;
+        assert_eq!(
+            o.store().load_subject_holds().unwrap().len(),
+            1,
+            "one bounded batch, no unbounded read burst"
+        );
+        o.reconcile_parked_subject_states().await;
+        assert!(
+            o.store().load_subject_holds().unwrap().is_empty(),
+            "the next batch reaches the remaining hold"
+        );
     }
 
     fn orch(enabled: bool) -> Orchestrator {
