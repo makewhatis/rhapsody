@@ -624,8 +624,13 @@ export interface ApiError {
 export const OPERATOR_HEADER = "X-Rhapsody-Operator";
 
 export function operatorPost(url: string, body: unknown = {}): Promise<Response> {
+  return operatorWrite("POST", url, body);
+}
+
+type OperatorMethod = "POST" | "PUT";
+function operatorWrite(method: OperatorMethod, url: string, body: unknown): Promise<Response> {
   return fetch(url, {
-    method: "POST",
+    method,
     credentials: "omit",
     headers: {
       "Content-Type": "application/json",
@@ -634,6 +639,36 @@ export function operatorPost(url: string, body: unknown = {}): Promise<Response>
     },
     body: JSON.stringify(body),
   });
+}
+
+export interface LeadHarnessEntry {
+  harness: string;
+  model: string;
+  effort: string;
+}
+export interface LeadHarnessState extends LeadHarnessEntry {
+  state: string;
+  tested_at: string | null;
+}
+export interface LeadHarnessesView {
+  harnesses: LeadHarnessState[];
+  last_used: LeadHarnessEntry | null;
+}
+export type LeadHarnessSaveResult = { ok: true; active: LeadHarnessesView } | {
+  ok: false; active: LeadHarnessesView; tested: LeadHarnessState[]; reason: string;
+};
+export function fetchLeadHarnesses(): Promise<LeadHarnessesView> {
+  return getJSON<LeadHarnessesView>("/api/v1/lead/harnesses");
+}
+export async function saveLeadHarnesses(harnesses: LeadHarnessEntry[]): Promise<LeadHarnessSaveResult> {
+  const response = await operatorWrite("PUT", "/api/v1/lead/harnesses", { harnesses });
+  if (response.ok) return { ok: true, active: await response.json() as LeadHarnessesView };
+  if (response.status === 409) {
+    const body = await response.json() as { error: { message: string }; active?: LeadHarnessesView; tested?: LeadHarnessState[] };
+    if (body.active && body.tested) return { ok: false, active: body.active, tested: body.tested, reason: body.error.message };
+    throw new Error(body.error.message);
+  }
+  throw new Error(await daemonErrorMessage(response, "Lead harnesses could not be saved"));
 }
 
 // daemonErrorMessage reads the daemon's `{error:{code,message}}` envelope off a failed write so a

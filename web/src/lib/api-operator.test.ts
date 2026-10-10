@@ -13,6 +13,7 @@ import {
   postTeamsRoom,
   resumeRun,
   saveConfig,
+  saveLeadHarnesses,
   saveTeamsConfig,
   saveTypedConfig,
   sendRunMessage,
@@ -28,6 +29,18 @@ import {
 afterEach(() => {
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
+});
+
+it("lead Save sends an operator-guarded PUT and preserves 409 entry reasons", async () => {
+  const active = { harnesses: [{ harness: "claude", model: "old", effort: "high", state: "passed", tested_at: null }], last_used: null };
+  const tested = [{ ...active.harnesses[0], model: "new", state: "failed: unsafe tool" }];
+  const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { message: "old list is still active" }, active, tested }), { status: 409 }));
+  vi.stubGlobal("fetch", fetch);
+  const entries = [{ harness: "claude", model: "new", effort: "high" }];
+  expect(await saveLeadHarnesses(entries)).toEqual({ ok: false, active, tested, reason: "old list is still active" });
+  expect(fetch).toHaveBeenCalledWith("/api/v1/lead/harnesses", {
+    method: "PUT", credentials: "omit", headers: { "Content-Type": "application/json", Accept: "application/json", [OPERATOR_HEADER]: "1" }, body: JSON.stringify({ harnesses: entries }),
+  });
 });
 
 const job: ReviewJob = {
@@ -114,9 +127,9 @@ describe("operator-write guard contract (STUDIO-982)", () => {
     await expect(setDrain(false)).rejects.toThrow("drain cancel failed: 403");
   });
 
-  // The inventory: no dashboard source sends a mutating method except through operatorPost, so a
+  // The inventory: no dashboard source sends a mutating method except through operatorWrite, so a
   // new write cannot skip the header by calling fetch directly.
-  it("operatorPost is the only place the dashboard sends a mutating method", () => {
+  it("operatorWrite is the only place the dashboard sends a mutating method", () => {
     const root = path.resolve(__dirname, "..");
     const hits: string[] = [];
     const walk = (dir: string) => {
@@ -133,10 +146,15 @@ describe("operator-write guard contract (STUDIO-982)", () => {
       }
     };
     walk(root);
-    expect(hits).toEqual(["lib/api.ts:POST"]);
+    expect(hits).toEqual([]); // No literal fetch method bypasses the shared writer.
     const api = fs.readFileSync(path.join(root, "lib/api.ts"), "utf8");
-    const helper = api.slice(api.indexOf("export function operatorPost"));
-    expect(helper.indexOf('method: "POST"')).toBeGreaterThan(0);
-    expect(helper.indexOf('method: "POST"')).toBeLessThan(helper.indexOf("\n}\n"));
+    const helper = api.slice(api.indexOf("function operatorWrite"));
+    const body = helper.slice(0, helper.indexOf("\n}\n"));
+    expect(body).toContain("return fetch(url, {");
+    expect(body).toContain("method,");
+    expect(body).toContain('credentials: "omit"');
+    expect(body).toContain('[OPERATOR_HEADER]: "1"');
+    expect(api).toContain('return operatorWrite("POST", url, body)');
+    expect(api).toContain('operatorWrite("PUT", "/api/v1/lead/harnesses", { harnesses })');
   });
 });
