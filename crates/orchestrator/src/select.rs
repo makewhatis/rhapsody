@@ -78,6 +78,9 @@ impl Orchestrator {
             return (Vec::new(), Vec::new(), HashMap::new());
         };
         self.human_holds.begin_pass(true);
+        for issue in &issues {
+            self.observe_parked_issue(issue);
+        }
         crate::dispatch::sort_for_dispatch(&mut issues);
 
         let mut running = self.running_id_set();
@@ -106,6 +109,9 @@ impl Orchestrator {
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
         let mut issues = issues.into_iter();
         while let Some(iss) = issues.next() {
+            if self.subject_parked(&iss.identifier, "author") {
+                continue;
+            }
             // Observe the CURRENT label on every candidate, BEFORE any branch or filter — including
             // one the daemon is running (STUDIO-949 round 8). The reporting rule below deliberately
             // excludes live work from `held`, but the refusal is absolute and the handoff's review
@@ -510,6 +516,9 @@ impl Orchestrator {
         // See the single-project ladder: the hold set is per-PASS. Skipped entirely when the fetch
         // verdict says the board could not be read (STUDIO-949 round 13).
         self.human_holds.begin_pass(read_the_board);
+        for issue in &tagged {
+            self.observe_parked_issue(&issue.iss);
+        }
         sort_tagged_stable(&mut tagged);
 
         let mut running = self.running_id_set();
@@ -531,6 +540,9 @@ impl Orchestrator {
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
         let mut tagged = tagged.into_iter();
         while let Some(ti) = tagged.next() {
+            if self.subject_parked(&ti.iss.identifier, "author") {
+                continue;
+            }
             // See the single-project ladder: observe the current label on every candidate before
             // any branch, live work included (STUDIO-949 round 8).
             if crate::teams::is_human(&ti.iss) {

@@ -50,7 +50,7 @@ impl crate::Orchestrator {
                 return Vec::new();
             }
         };
-        view["decisions"].as_array().into_iter().flatten().filter(|r| r["decision"].as_str().is_some_and(|s| s.starts_with("proposed:") || s.starts_with("escalate:")) && r["overruled_at"].is_null()).map(|r| crate::reviewreconcile::Divergence {
+        view["decisions"].as_array().into_iter().flatten().filter(|r| r["decision"].as_str().is_some_and(|s| s.starts_with("proposed:") || (s.starts_with("escalate:") && !r["escalation_episode"].is_null())) && r["overruled_at"].is_null()).map(|r| crate::reviewreconcile::Divergence {
             pr: r["subject"].as_str().unwrap_or_default().into(),
             kind: crate::reviewreconcile::DivergenceKind::ManagerDeferred,
             ticket: String::new(), reviewer: "lead".into(), stale_secs: 0,
@@ -63,6 +63,34 @@ impl crate::Orchestrator {
 }
 
 impl LeadReports {
+    pub fn resolve(&self, id: i64, note: &str) -> Result<(), String> {
+        let note = note.trim();
+        if id <= 0
+            || note.is_empty()
+            || note.len() > 3000
+            || crate::managerdecision::contains_secret_shape(note)
+        {
+            return Err(
+                "resolve requires a positive decision id and a non-secret note of 1–3000 bytes"
+                    .into(),
+            );
+        }
+        let resolved = self
+            .store
+            .resolve_lead_escalation(
+                id,
+                &format!(
+                    "operator resolved decision {id}: {}",
+                    crate::managerapply::strip_summon_tokens(note)
+                ),
+            )
+            .map_err(|e| e.to_string())?;
+        if resolved {
+            Ok(())
+        } else {
+            Err("escalation decision not found".into())
+        }
+    }
     pub fn decisions(&self, since: &str) -> Result<serde_json::Value, String> {
         let since_time = if since.is_empty() {
             None
@@ -83,6 +111,7 @@ impl LeadReports {
             )
         };
         let items = self.store.load_lead_items().map_err(|e| e.to_string())?;
+        let holds = self.store.load_subject_holds().map_err(|e| e.to_string())?;
         let rows = self
             .store
             .lead_digest_entries(&since)
@@ -103,10 +132,26 @@ impl LeadReports {
             let mut value = serde_json::json!({"id": row.id, "item": row.item, "at": row.at, "decision": row.decision, "reasoning": row.reasoning, "evidence": row.evidence, "actions": row.actions, "harness": row.harness, "model": row.model, "overruled_at": row.overruled_at, "overrule_note": row.overrule_note});
             value["subject"] = item.subject.clone().into();
             value["trigger"] = trigger_name(&item.trigger).into();
+            if let Some(hold) = holds
+                .iter()
+                .find(|h| h.kind == "escalation" && h.decision == row.id)
+            {
+                value["subject"] = hold.subject.clone().into();
+                value["escalation_episode"] = hold.id.into();
+                value["repeat_count"] = hold.repeats.into();
+                value["at"] = hold.at.clone().into();
+            }
             decisions.push(value);
         }
         let queued = items.iter().filter(|i| matches!(i.state.as_str(), "queued" | "running" | "parked")).map(|i| serde_json::json!({"id": i.id, "subject": i.subject, "state": i.state, "trigger": trigger_name(&i.trigger)})).collect::<Vec<_>>();
-        Ok(serde_json::json!({"decisions": decisions, "queued": queued}))
+        let held = holds
+            .iter()
+            .map(|h| {
+                serde_json::json!({"id": h.id, "subject": h.subject, "kind": h.kind,
+            "need": h.need, "at": h.at, "repeat_count": h.repeats, "decision": h.decision})
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::json!({"decisions": decisions, "queued": queued, "held": held}))
     }
     pub async fn overrule(&self, id: i64, note: &str) -> Result<serde_json::Value, String> {
         let note = note.trim();

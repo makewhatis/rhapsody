@@ -143,6 +143,9 @@ async fn observe(
                 continue;
             }
             let kind = if text.starts_with("escalate:") {
+                if decision["escalation_episode"].is_null() {
+                    continue;
+                }
                 Kind::LeadEscalation
             } else {
                 Kind::LeadDecision
@@ -159,9 +162,20 @@ async fn observe(
             let summary = text.split_once(':').map_or(text, |(_, s)| s.trim());
             rows.push(notice(
                 kind,
-                format!("lead:{id}"),
+                if kind == Kind::LeadEscalation {
+                    format!("lead-park:{}", decision["escalation_episode"])
+                } else {
+                    format!("lead:{id}")
+                },
                 subject,
-                &format!("{verb}: {summary}"),
+                &if kind == Kind::LeadEscalation {
+                    format!(
+                        "Held — {summary} ({} escalations)",
+                        decision["repeat_count"]
+                    )
+                } else {
+                    format!("{verb}: {summary}")
+                },
                 format!("#lead/decision-{id}"),
                 decision["at"].as_str().unwrap_or(&at),
                 kind == Kind::LeadEscalation,
@@ -169,6 +183,13 @@ async fn observe(
         }
     }
     for d in &snapshot.review_divergence {
+        if rows.iter().any(|row| {
+            row.kind == "lead_escalation"
+                && (row.subject.eq_ignore_ascii_case(&d.ticket)
+                    || row.subject.eq_ignore_ascii_case(&d.pr))
+        }) {
+            continue;
+        }
         // Ignore only the host's legacy lead projection, not a real reviewer named lead.
         if d.reviewer == "lead"
             && d.kind.as_str() == "manager_deferred"
@@ -236,6 +257,12 @@ async fn observe(
         ));
     }
     for held in &snapshot.held_for_human {
+        if rows.iter().any(|row| {
+            row.kind == "lead_escalation"
+                && row.subject.eq_ignore_ascii_case(&held.issue_identifier)
+        }) {
+            continue;
+        }
         // An approved PR's human hold is already represented by its PR notice.
         if snapshot
             .review_divergence
@@ -506,6 +533,142 @@ pub(crate) async fn handle_read(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn ticket_and_pr_reescalations_update_one_needs_you_notice() {
+        use rhapsody_store::{LeadDecisionRow, LeadTrigger, ReviewWatchKey, ReviewWatchRow};
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: ReviewWatchKey {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    number: 1,
+                    reviewer: "alice".into(),
+                },
+                introduced_by: "handoff:TEST-1".into(),
+                open: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let ticket = store
+            .enqueue_lead_item(
+                &LeadTrigger::BlockedHandoff {
+                    ticket: "TEST-1".into(),
+                    question: "evidence?".into(),
+                },
+                "at",
+            )
+            .unwrap();
+        let pr = store
+            .enqueue_lead_item(
+                &LeadTrigger::ReviewEscalation {
+                    pr: "o/r#1".into(),
+                    head: "a".into(),
+                },
+                "at",
+            )
+            .unwrap();
+        let mut snapshot = empty_snapshot();
+        snapshot
+            .held_for_human
+            .push(rhapsody_orchestrator::dispatch::HeldForHuman {
+                issue_identifier: "TEST-1".into(),
+                title: "Evidence".into(),
+                project: "test".into(),
+            });
+        let reports = Arc::new(rhapsody_orchestrator::leadreport::LeadReports {
+            store: store.clone(),
+            memory: None,
+        });
+        let url = spawn_router(crate::new_handler(
+            Arc::new(
+                FakeProvider::ok(snapshot)
+                    .with_notification_store(store.clone())
+                    .with_lead_reports(reports),
+            ),
+            None,
+        ))
+        .await;
+        store
+            .save_lead_decision(&LeadDecisionRow {
+                item: ticket,
+                at: "2026-10-10T05:00:00Z".into(),
+                decision: "escalate: Capture evidence".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let fetch = || async {
+            reqwest::get(format!("{url}/api/v1/notifications"))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+        let first = fetch().await;
+        let needs = |view: &serde_json::Value| {
+            view["notifications"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|n| n["group"] == "needs_you" && n["active"] == true)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let first = needs(&first);
+        assert_eq!(first.len(), 1, "no duplicate generic held notice");
+        store
+            .read_notice(first[0]["id"].as_i64().unwrap(), "read")
+            .unwrap();
+        let decision = store
+            .save_lead_decision(&LeadDecisionRow {
+                item: pr,
+                at: "2026-10-10T05:01:00Z".into(),
+                decision: "escalate: Operator must supply the screenshot".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let second = needs(&fetch().await);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0]["id"], first[0]["id"]);
+        assert_eq!(second[0]["subject"], "TEST-1");
+        assert_eq!(second[0]["at"], "2026-10-10T05:01:00Z");
+        assert_eq!(
+            second[0]["read_at"], "read",
+            "updates preserve acknowledgement"
+        );
+        assert!(
+            second[0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("2 escalations")
+        );
+        let path = format!("{url}/api/v1/lead/decisions/{decision}/resolve");
+        let client = reqwest::Client::new();
+        assert_eq!(
+            client
+                .post(&path)
+                .json(&serde_json::json!({"note":"Acceptance corrected"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            client
+                .post(&path)
+                .header("X-Rhapsody-Operator", "1")
+                .json(&serde_json::json!({"note":"Acceptance corrected"}))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK
+        );
+        assert!(store.subject_hold("o/r#1").unwrap().is_none());
+        assert!(store.subject_resume_pending("TEST-1").unwrap());
+    }
     use super::*;
     use crate::testutil::{FakeProvider, empty_snapshot, spawn_router};
     use rhapsody_store::{EventRow, LeadDecisionRow, LeadTrigger, RunStart, Store};

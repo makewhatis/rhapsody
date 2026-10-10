@@ -119,6 +119,9 @@ impl Orchestrator {
             }
         };
         for iss in backlog {
+            if self.subject_parked(&iss.identifier, "author") {
+                continue;
+            }
             // SAFETY: only edge-bearing tickets are ever auto-promoted (a standalone Backlog ticket is
             // never touched).
             if iss.blocked_by.iter().flatten().next().is_none() {

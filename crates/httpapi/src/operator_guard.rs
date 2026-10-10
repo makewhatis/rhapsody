@@ -384,6 +384,7 @@ mod router_tests {
     const MUTATING: &[&str] = &[
         "/api/v1/notifications/7/read",
         "/api/v1/lead/decisions/7/overrule",
+        "/api/v1/lead/decisions/7/resolve",
         "/api/v1/manager/investigate",
         "/api/v1/refresh",
         "/api/v1/drain",
@@ -688,6 +689,7 @@ mod router_tests {
     fn valid_body(path: &str) -> &'static str {
         match path {
             "/api/v1/lead/decisions/7/overrule" => r#"{"note":"Prefer diagnosis before retry."}"#,
+            "/api/v1/lead/decisions/7/resolve" => r#"{"note":"Acceptance input corrected."}"#,
             "/api/v1/manager/investigate" => {
                 r#"{"ref":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","cmd":"true"}"#
             }

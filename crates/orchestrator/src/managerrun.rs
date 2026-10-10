@@ -389,12 +389,14 @@ impl Orchestrator {
             .iter()
             .find(|i| {
                 matches!(i.state.as_str(), "queued" | "parked" | "running")
+                    && !self.subject_parked(&i.subject, "lead")
                     && !matches!(i.trigger, rhapsody_store::LeadTrigger::Escalation { .. })
                     && i.id > self.lead_cursor
             })
             .or_else(|| {
                 items.iter().find(|i| {
                     matches!(i.state.as_str(), "queued" | "parked" | "running")
+                        && !self.subject_parked(&i.subject, "lead")
                         && !matches!(i.trigger, rhapsody_store::LeadTrigger::Escalation { .. })
                 })
             })
@@ -423,6 +425,9 @@ impl Orchestrator {
         self.lead_pending.remove(&item);
         match result {
             Ok(Some((case, run))) if self.lead_enabled() => {
+                if self.subject_parked(&case.item.subject, "lead") {
+                    return;
+                }
                 if !case.subject.ticket.identifier.is_empty()
                     && self.ticket_run_live(&case.subject.ticket.identifier)
                 {

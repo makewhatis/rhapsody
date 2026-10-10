@@ -458,6 +458,7 @@ pub enum Event {
     /// that otherwise clears only on a restart or a close.
     ReviewClear {
         pr: crate::prstate::PrCoord,
+        operator: bool,
         reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
     },
     /// The operator asking, from the console, to merge a run's pull request — phase 1, the
@@ -927,8 +928,17 @@ impl Orchestrator {
             } => {
                 let _ = reply.send(self.handle_review_dismiss(&pr, reviewer.as_deref()));
             }
-            Event::ReviewClear { pr, reply } => {
-                let _ = reply.send(self.handle_review_clear(&pr));
+            Event::ReviewClear {
+                pr,
+                operator,
+                reply,
+            } => {
+                let result = if operator {
+                    self.handle_review_clear(&pr)
+                } else {
+                    self.handle_review_clear_from(&pr, false)
+                };
+                let _ = reply.send(result);
             }
             Event::RunMergePlan {
                 run_id,
@@ -984,7 +994,9 @@ impl Orchestrator {
             } => {
                 let allowed = self.lead_enabled()
                     && self.review_route(&repo).is_some()
-                    && (ticket.is_empty() || !self.ticket_run_live(&ticket));
+                    && (ticket.is_empty()
+                        || (!self.ticket_run_live(&ticket)
+                            && !self.subject_parked(&ticket, "lead")));
                 let _ = reply.send(allowed);
             }
             Event::LimitReassigned(result) => {

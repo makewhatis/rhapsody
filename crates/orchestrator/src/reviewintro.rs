@@ -678,12 +678,10 @@ impl Orchestrator {
                 );
                 continue;
             }
-            // STUDIO-1006 (the F9 defect): a re-introduction must NOT reset a row whose last
-            // COMPLETED review already approved the change at the current head. The write below
-            // would put such a row back to `requested`, the watcher would dispatch a second review
-            // of code nobody has changed, and `auto_merge_verdict` would refuse `RoundInFlight`
-            // until an operator cleared the pull request by hand. Leave the settled row exactly as
-            // it is and arm only the rows that have not approved this head.
+            // STUDIO-1006/1156 (the F9 defect): a re-introduction must NOT reset a row whose last
+            // completed review decided the current head, whether approval or findings. A handoff
+            // without a push is not a new round. Leave that verdict settled; the operator rerun
+            // and the head-advance path own the two legitimate arming edges.
             //
             // The verdict is read off the STORED row — the recorded completed review (its
             // `status` and the `last_reviewed_sha` it was recorded against) — and never off the
@@ -710,15 +708,16 @@ impl Orchestrator {
                     continue;
                 }
             };
-            let approved_at_current_head = stored.as_ref().is_some_and(|row| {
-                row.status == REVIEW_STATUS_APPROVED
+            let settled_at_current_head = stored.as_ref().is_some_and(|row| {
+                (row.status == REVIEW_STATUS_APPROVED
+                    || row.status == rhapsody_store::REVIEW_STATUS_REVIEWED)
                     && !row.last_reviewed_sha.is_empty()
                     && observed_head.is_none_or(|head| head == row.last_reviewed_sha)
             });
-            if approved_at_current_head {
+            if settled_at_current_head {
                 tracing::debug!(
                     review = %id,
-                    "ticketless review: this reviewer already approved the current head; the \
+                    "ticketless review: this reviewer already decided the current head; the \
                      re-introduction leaves its watch row as it is"
                 );
                 continue;
@@ -1452,7 +1451,7 @@ mod tests {
         }
     }
 
-    /// Re-introducing a pull request re-arms its row and CANNOT forget the two SHAs. Forgetting
+    /// Re-introducing an unchanged pull request CANNOT forget its verdict or either SHA. Forgetting
     /// `last_reviewed_sha` would send a reviewer back over a head they already read; forgetting
     /// `requested_sha` is §14.1 F-DUP's level-trigger, one agent per tick onto one worktree.
     #[test]
@@ -1469,7 +1468,7 @@ mod tests {
 
         assert_eq!(
             o.handle_review_introduce(&pr),
-            ReviewIntroOutcome::Introduced(1)
+            ReviewIntroOutcome::Introduced(0)
         );
         let row = o
             .store()
@@ -1478,7 +1477,10 @@ mod tests {
             .expect("row");
         assert_eq!(row.requested_sha, HEAD_A);
         assert_eq!(row.last_reviewed_sha, HEAD_A);
-        assert_eq!(row.status, REVIEW_STATUS_REQUESTED, "re-armed");
+        assert_eq!(
+            row.status, REVIEW_STATUS_REVIEWED,
+            "same-head verdict preserved"
+        );
     }
 
     /// **STUDIO-1046 acceptance: a handoff keeps the pull request's existing reviewer.** The pull
@@ -1500,8 +1502,9 @@ mod tests {
             .mark_review_completed(&watch_key("bob"), HEAD_A, REVIEW_STATUS_REVIEWED)
             .expect("completed");
 
-        // The author hands off the fixes. Selection would name `alice`, but this pull request
+        // The author pushed fixes. Selection would name `alice`, but this pull request
         // already has a reviewer, so no selection is made.
+        o.handle_review_head_advanced(&PrCoord::new("makewhatis", "rhapsody", 12), HEAD_B, &[]);
         assert_eq!(
             o.handle_review_introduce(&introduced("makewhatis", "rhapsody", 12, &["alice"])),
             ReviewIntroOutcome::Introduced(1),
@@ -1714,14 +1717,10 @@ mod tests {
         }
     }
 
-    /// Only an APPROVAL at the current head is left alone. A `reviewed` row (findings) has not
-    /// approved the head and is armed exactly as before, so the fix cannot quietly swallow a round
-    /// a reviewer asked for. This is the ticket's "a row that hasn't approved it must still be
-    /// armed".
-    ///
-    /// MUTATION: widen the skip to any terminal row and this reds.
+    /// Findings at the current head are settled too (STUDIO-1156). A handoff with no push must
+    /// never buy a re-read; only the operator's rerun can re-arm this head.
     #[test]
-    fn a_reviewed_row_at_the_current_head_is_still_armed() {
+    fn a_reviewed_row_at_the_current_head_requires_operator_rerun() {
         let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
         let pr = introduced("makewhatis", "rhapsody", 12, &["bob"]);
         o.handle_review_introduce(&pr);
@@ -1742,15 +1741,27 @@ mod tests {
 
         assert_eq!(
             o.handle_review_introduce(&pr),
-            ReviewIntroOutcome::Introduced(1),
-            "findings are not an approval"
+            ReviewIntroOutcome::Introduced(0),
+            "unchanged findings are not new work"
         );
         let row = o
             .store()
             .get_review_watch(&watch_key("bob"))
             .expect("read")
             .expect("row");
-        assert_eq!(row.status, REVIEW_STATUS_REQUESTED);
+        assert_eq!(row.status, REVIEW_STATUS_REVIEWED);
+        assert!(matches!(
+            o.handle_review_rerun(&pr.pr),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        ));
+        assert_eq!(
+            o.store()
+                .get_review_watch(&watch_key("bob"))
+                .unwrap()
+                .unwrap()
+                .status,
+            REVIEW_STATUS_REQUESTED
+        );
     }
 
     /// The observed-head memo is in-memory (STUDIO-1005), so a restart leaves it empty while the

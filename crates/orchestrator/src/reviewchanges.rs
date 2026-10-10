@@ -108,6 +108,9 @@ pub struct ReviewChangesPlan {
 /// asked for rather than on a side effect two hops away.
 #[async_trait::async_trait]
 pub trait ReviewChangesSink: Send + Sync {
+    async fn may_reengage(&self, _pr: &str) -> bool {
+        true
+    }
     /// Moves ONE ticket out of the review state.
     ///
     /// `re_engaged` is what the notification task observed of the OTHER consequence of this same
@@ -136,6 +139,9 @@ impl ControlChangesSink {
 
 #[async_trait::async_trait]
 impl ReviewChangesSink for ControlChangesSink {
+    async fn may_reengage(&self, pr: &str) -> bool {
+        matches!(self.control.store().subject_hold(pr), Ok(None))
+    }
     async fn route_back(&self, plan: ReviewChangesPlan, re_engaged: bool) {
         self.control
             .route_back_review_ticket(plan, re_engaged)
@@ -186,6 +192,9 @@ impl Orchestrator {
             return None;
         }
         let identifier = origin_ticket(&run.introduced_by)?.to_string();
+        if self.subject_parked(&identifier, "author") {
+            return None;
+        }
         let pr = format!("{}/{}#{}", run.owner, run.repo, run.number);
         // The anti-race guard against `reviewdone`: a merged pull request's rows are retired, so an
         // absent-or-closed row means the ticket has either already been finished or is about to be,
@@ -286,6 +295,10 @@ impl ControlHandle {
     /// condition rather than promising a run. A ticket sitting in the changes state with no run is
     /// then traceable to one line naming both the ticket and the pull request.
     pub(crate) async fn route_back_review_ticket(&self, plan: ReviewChangesPlan, re_engaged: bool) {
+        if !matches!(self.store().subject_hold(&plan.identifier), Ok(None)) {
+            tracing::info!(ticket = %plan.identifier, "review route-back: subject was parked after planning; refusing move");
+            return;
+        }
         if let Err(e) = self
             .move_issue_state(&plan.issue_id, &plan.team_id, &plan.state)
             .await

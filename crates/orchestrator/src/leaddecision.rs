@@ -11,6 +11,10 @@ pub enum LeadAction {
     Resolve {
         reason: String,
     },
+    Release {
+        ticket: String,
+        reason: String,
+    },
     RouteBack {
         ticket: String,
         answer: String,
@@ -83,6 +87,7 @@ impl LeadAction {
     fn strings(&self) -> Vec<&str> {
         match self {
             Self::Resolve { reason } => vec![reason],
+            Self::Release { ticket, reason } => vec![ticket, reason],
             Self::RouteBack { ticket, answer } => vec![ticket, answer],
             Self::Requeue { ticket } => vec![ticket],
             Self::ClearReview { pr } => vec![pr],
@@ -117,6 +122,7 @@ pub fn guard(a: &LeadAction, ctx: &GuardCtx) -> Result<(), String> {
     }
     let ticket = match a {
         LeadAction::RouteBack { ticket, .. }
+        | LeadAction::Release { ticket, .. }
         | LeadAction::Requeue { ticket }
         | LeadAction::Reassign { ticket, .. }
         | LeadAction::AuthorizeCredential { ticket, .. } => Some(ticket),

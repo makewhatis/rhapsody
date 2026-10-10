@@ -420,6 +420,20 @@ impl Orchestrator {
         if mine.is_empty() {
             return ReviewControlOutcome::Refused("no live review of that pull request is watched");
         }
+        if let Err(error) = self
+            .store()
+            .release_subject(&pr.to_string(), "operator reran reviews")
+            .and_then(|()| {
+                self.store().allow_review_rerun(
+                    &pr.to_string(),
+                    self.review_observed_head
+                        .get(pr)
+                        .map_or("", |h| h.head.as_str()),
+                )
+            })
+        {
+            return ReviewControlOutcome::Failed(error.to_string());
+        }
         let mut armed = 0usize;
         self.review_attempts.retain(|key, _| {
             !(key.owner.eq_ignore_ascii_case(&pr.owner)
@@ -515,6 +529,17 @@ impl Orchestrator {
     /// make the budgets an operator most wants gone — the ones a paused or repointed project left
     /// behind — the only ones that could never be cleared.
     pub(crate) fn handle_review_clear(&mut self, pr: &PrCoord) -> ReviewControlOutcome {
+        self.handle_review_clear_from(pr, true)
+    }
+
+    pub(crate) fn handle_review_clear_from(
+        &mut self,
+        pr: &PrCoord,
+        operator: bool,
+    ) -> ReviewControlOutcome {
+        if !operator && self.subject_parked(&pr.to_string(), "lead") {
+            return ReviewControlOutcome::Refused("subject is parked by an escalation");
+        }
         if !self.review_ticketless_enabled() {
             return ReviewControlOutcome::Dormant; // §16
         }
@@ -553,6 +578,13 @@ impl Orchestrator {
             return ReviewControlOutcome::Refused(
                 "no review budget to clear for that pull request",
             );
+        }
+        if operator
+            && let Err(error) = self
+                .store()
+                .release_subject(&pr.to_string(), "operator cleared reviews")
+        {
+            return ReviewControlOutcome::Failed(error.to_string());
         }
         // STUDIO-1009 (§7.4): the operator's clear is the ONE event that bumps the loop generation,
         // and it does so on the same write that zeroes the counter and the decision. The row is NOT
@@ -759,8 +791,20 @@ impl ControlHandle {
     /// review↔author round budget so both halves of the loop may run again, without a restart
     /// (STUDIO-956). The same trusted path as the other two.
     pub async fn clear_review(&self, pr: PrCoord) -> ReviewControlOutcome {
-        self.review_control(|reply| Event::ReviewClear { pr, reply })
-            .await
+        self.review_control(|reply| Event::ReviewClear {
+            pr,
+            operator: true,
+            reply,
+        })
+        .await
+    }
+    pub(crate) async fn clear_review_for_lead(&self, pr: PrCoord) -> ReviewControlOutcome {
+        self.review_control(|reply| Event::ReviewClear {
+            pr,
+            operator: false,
+            reply,
+        })
+        .await
     }
 
     /// Sends one console control and waits for the control task's verdict.

@@ -372,6 +372,14 @@ impl Orchestrator {
         if engine.is_none() && attempt.is_some() {
             engine = self.limit_policy.pinned_engines.get(&iss.id).cloned();
         }
+        if !crate::review::is_review_key(&iss.id)
+            && !crate::managerrun::is_manager_key(&iss.id)
+            && self.subject_parked(&iss.identifier, "author")
+        {
+            self.claimed.remove(&iss.id);
+            self.persist_release(&iss.identifier);
+            return;
+        }
         if prepared.is_none()
             && engine.is_none()
             && !self.pending_manager.contains_key(&iss.id)
@@ -1170,6 +1178,19 @@ impl Orchestrator {
             self.claimed.insert(e.issue_id.clone());
             return;
         }
+        if self.subject_parked(&re.issue.identifier, "author") {
+            self.limit_policy.pinned_engines.remove(&e.issue_id);
+            self.completed.remove(&e.issue_id);
+            self.claimed.remove(&e.issue_id);
+            self.persist_end_run(
+                &re,
+                store::OUTCOME_STOPPED,
+                "blocked; waiting for a material change or operator action",
+            );
+            self.persist_complete(&re.issue.identifier);
+            self.persist_totals();
+            return;
+        }
         if !e.failed {
             // The two freshest state samples: the worker's per-turn refresh (e.last_state) and
             // reconcile's snapshot (re.issue.state). classify_clean_exit treats the ticket as having
@@ -1441,7 +1462,10 @@ impl Orchestrator {
         // newer summons has already shipped — release instead of re-dispatching (mirrors the
         // selectDispatch guard). Restricted to recovered entries so continuations / in-session failure
         // retries are never suppressed by a PR they themselves opened.
-        if re.recovered && self.pr_suppressed(&iss) {
+        self.observe_parked_issue(&iss);
+        if self.subject_parked(&iss.identifier, "author")
+            || (re.recovered && self.pr_suppressed(&iss))
+        {
             tracing::info!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "releasing recovered claim: issue has a linked PR and no newer summons");
             self.claimed.remove(&e.issue_id);
             self.completed.remove(&e.issue_id);

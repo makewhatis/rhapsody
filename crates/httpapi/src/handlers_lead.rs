@@ -115,6 +115,63 @@ pub(crate) async fn handle_overrule(
     }
 }
 
+pub(crate) async fn handle_resolve(
+    State(provider): State<Arc<dyn StateProvider>>,
+    method: Method,
+    Path(id): Path<String>,
+    body: Bytes,
+) -> Response {
+    if let Some(response) = require_post(&method, "use POST to resolve an escalation") {
+        return response;
+    }
+    if body.len() > 4096 {
+        return write_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body_too_large",
+            "resolve body exceeds 4096 bytes",
+            None,
+        );
+    }
+    let (Ok(id), Ok(request)) = (id.parse::<i64>(), serde_json::from_slice::<Overrule>(&body))
+    else {
+        return write_error(
+            StatusCode::BAD_REQUEST,
+            "bad_request",
+            "provide a positive decision id and JSON note",
+            None,
+        );
+    };
+    let Some(reports) = provider.lead_reports() else {
+        return write_error(
+            StatusCode::CONFLICT,
+            "lead_disabled",
+            "lead reporting is unavailable",
+            None,
+        );
+    };
+    match reports.resolve(id, &request.note) {
+        Ok(()) => write_json(
+            StatusCode::OK,
+            &serde_json::json!({"decision": id, "resolved": true}),
+        ),
+        Err(error) if error.starts_with("resolve requires") => {
+            write_error(StatusCode::BAD_REQUEST, "bad_request", &error, None)
+        }
+        Err(error) if error == "escalation decision not found" => {
+            write_error(StatusCode::NOT_FOUND, "not_found", &error, None)
+        }
+        Err(error) => {
+            tracing::warn!(%error, "escalation resolution unavailable");
+            write_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "resolve_failed",
+                "escalation could not be resolved",
+                None,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

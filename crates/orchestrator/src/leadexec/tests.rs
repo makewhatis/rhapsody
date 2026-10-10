@@ -97,6 +97,19 @@ impl LeadHost for RecordingHost {
         self.after_effect("clear:");
         Ok(())
     }
+    async fn release(&self, ticket: &Issue) -> Result<(), String> {
+        self.record(format!("release:{}", ticket.identifier));
+        self.subject.lock().unwrap().ticket.labels = Some(
+            ticket
+                .labels
+                .iter()
+                .flatten()
+                .filter(|l| !l.eq_ignore_ascii_case(crate::teams::HUMAN_LABEL))
+                .cloned()
+                .collect(),
+        );
+        Ok(())
+    }
     async fn reassign(&self, ticket: &Issue, identity: &str) -> Result<(), String> {
         self.record(format!("reassign:{}:{identity}", ticket.identifier));
         self.subject.lock().expect("subject").ticket.labels =
@@ -132,6 +145,285 @@ fn setup(question: &str) -> (Arc<Sqlite>, RecordingHost, LeadCase) {
             question: question.into(),
         },
     )
+}
+
+#[tokio::test]
+async fn lead_release_lifts_hold_with_reason() {
+    let (store, host, mut case) = setup("breaker crossed");
+    case.subject
+        .ticket
+        .labels
+        .as_mut()
+        .unwrap()
+        .push(crate::teams::HUMAN_LABEL.into());
+    *host.subject.lock().unwrap() = case.subject.clone();
+    store
+        .park_subject(&rhapsody_store::SubjectHold {
+            subject: "TEST-100".into(),
+            kind: "breaker".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let reason = "The description now supplies the missing fake input; proceed with that change";
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([
+            {"action":"release", "ticket":"TEST-100", "reason":reason}
+        ]),
+    )
+    .await;
+    assert_eq!(result.state, "done");
+    assert!(result.escalation.is_none());
+    assert!(store.subject_hold("TEST-100").unwrap().is_none());
+    assert!(!crate::teams::is_human(
+        &host.subject.lock().unwrap().ticket
+    ));
+    assert!(host.trail.lock().unwrap()[0].text.contains(reason));
+    assert!(
+        store.load_lead_decisions().unwrap()[0]
+            .actions
+            .contains(reason)
+    );
+}
+
+#[tokio::test]
+async fn escalated_subject_history_includes_open_need_and_previous_decisions() {
+    let (store, host, case) = setup("cannot proceed");
+    replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([{"action":"escalate", "need":"Operator must supply evidence"}]),
+    )
+    .await;
+    let history = subject_history(store.as_ref(), &case.subject, "TEST-100").unwrap();
+    assert!(history.contains("already escalated; parked"));
+    assert!(history.contains("Operator must supply evidence"));
+    assert!(history.contains("\"id\":1"));
+    assert!(history.contains("\"decision\":\"escalate:"));
+}
+
+/// Finite incident replay, using scripted Fake turns and the real selection, handoff, review
+/// introduction/sweep/exit and lead executor. No poll task, live daemon, network or stress loop.
+#[tokio::test]
+async fn replay_blocked_author_same_head_findings_parks_and_resumes_once() {
+    use crate::testsupport::{empty_effective, empty_resolved_project, set_of};
+    use rhapsody_agent::Runner;
+    let (store, host, case) = setup("Operator must provide the missing evidence.");
+    let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+    let mut eff = empty_effective(tracker.clone());
+    eff.active_states = set_of(&["todo", "in progress"]);
+    eff.review_states = set_of(&["in review"]);
+    eff.max_concurrent = 10;
+    let mut project = empty_resolved_project("replay", tracker);
+    project.repo = "https://github.com/o/r.git".into();
+    project.active_states = eff.active_states.clone();
+    project.review_states = eff.review_states.clone();
+    eff.projects = vec![project];
+    let mut teams = rhapsody_config::teams::Teams::disabled();
+    teams.enabled = true;
+    teams.manager.lead.enabled = true;
+    teams.review.mode = rhapsody_config::teams::ReviewMode::Ticketless;
+    teams.roster = ["jerry", "alice"]
+        .into_iter()
+        .map(|name| rhapsody_config::teams::Identity {
+            name: name.into(),
+            ..Default::default()
+        })
+        .collect();
+    let mut o = crate::Orchestrator::new("WORKFLOW.md");
+    o.eff = Some(eff);
+    o.teams = Some(teams);
+    o.set_store(store.clone());
+    o.human_holds.begin_pass(true);
+    let spawned = Arc::new(Mutex::new(Vec::new()));
+    let sink = spawned.clone();
+    o.spawn = Some(Box::new(move |_, _, re| {
+        sink.lock().unwrap().push(re.clone())
+    }));
+    let coord = crate::prstate::PrCoord::new("o", "r", 290);
+    let introduction = crate::reviewintro::IntroducedPr {
+        pr: coord.clone(),
+        repo_url: "https://github.com/o/r.git".into(),
+        reviewers: vec!["alice".into()],
+        author: "jerry".into(),
+        introduced_by: "handoff:TEST-100".into(),
+        only_if_unwatched: false,
+    };
+    o.handle_review_introduce(&introduction);
+    let observation = |head: &str| crate::prstate::PrObservation {
+        pr: coord.clone(),
+        lookup: crate::ghsummons::PrLookup::Found(crate::ghsummons::PrSnapshot {
+            status: crate::ghsummons::PrStatus::Open,
+            head_sha: head.into(),
+            head_repo: "o/r".into(),
+            is_draft: Some(false),
+            merged_at: None,
+            merge_state: String::new(),
+        }),
+        unchanged_from: Vec::new(),
+        head_patch_id: String::new(),
+    };
+    let mut issue = case.subject.ticket.clone();
+    issue.title = "Capture the transcript evidence".into();
+    issue.state = "Todo".into();
+    // Both actors always return the same response; only a material head/description edge may
+    // admit another turn. Fake never pushes or mutates a workspace.
+    let mut author = Fake::new();
+    author.turns = vec![TurnScript {
+        result: TurnResult {
+            result_text: "Operator must provide the missing evidence.\nHANDOFF: blocked".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+    let mut reviewer = Fake::new();
+    reviewer.turns = vec![TurnScript {
+        result: TurnResult {
+            result_text: "The required evidence is absent.\nHANDOFF: findings".into(),
+            ..Default::default()
+        },
+        ..Default::default()
+    }];
+    let run_author = |o: &mut crate::Orchestrator, issue: &Issue, text: &str| {
+        let re = o.running.get(&issue.id).unwrap();
+        let at = re.started_at;
+        o.handle_lead_blocked(
+            &issue.id,
+            at,
+            crate::leaditems::detect_blocked_handoff(text, None).unwrap(),
+        );
+        o.on_worker_exit(crate::EvWorkerExit {
+            issue_id: issue.id.clone(),
+            started_at: at,
+            failed: false,
+            err_msg: String::new(),
+            last_state: "Todo".into(),
+            declared_handoff: true,
+            review_verdict: None,
+            manager_text: None,
+            refused: false,
+            auth_needed: false,
+        });
+    };
+    o.dispatch_issue(issue.clone(), None, None, String::new());
+    let session = author.start_session("", issue.clone(), None).await.unwrap();
+    let (turn, error) = session.run_turn("implement", None, None, &|_| {}).await;
+    assert!(error.is_none());
+    run_author(&mut o, &issue, &turn.result_text);
+    assert!(
+        o.select_dispatch(vec![issue.clone()]).is_empty(),
+        "first blocked ending stops authors immediately"
+    );
+    assert_eq!(
+        o.handle_review_sweep(&[observation("head-a")]).dispatched,
+        1
+    );
+    let review = o
+        .running
+        .values()
+        .find(|r| r.review.is_some())
+        .unwrap()
+        .clone();
+    let session = reviewer
+        .start_session("", review.issue.clone(), None)
+        .await
+        .unwrap();
+    let (finding, error) = session.run_turn("review", None, None, &|_| {}).await;
+    assert!(error.is_none());
+    assert!(finding.result_text.contains("HANDOFF: findings"));
+    o.on_worker_exit(crate::EvWorkerExit {
+        issue_id: review.issue.id,
+        started_at: review.started_at,
+        failed: false,
+        err_msg: String::new(),
+        last_state: crate::review::REVIEW_STATE_FINDINGS.into(),
+        declared_handoff: true,
+        review_verdict: None,
+        manager_text: None,
+        refused: false,
+        auth_needed: false,
+    });
+    // Two already-admitted lead answers race to escalate with paraphrased text. They update one
+    // episode; a parked subject cannot admit a third automatic model/queue item.
+    replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([{"action":"escalate", "need":"Operator must capture evidence"}]),
+    )
+    .await;
+    replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([{"action":"escalate", "need":"Supply the required screenshot"}]),
+    )
+    .await;
+    assert_eq!(store.load_subject_holds().unwrap().len(), 1);
+    assert_eq!(store.load_subject_holds().unwrap()[0].repeats, 2);
+    assert!(o.subject_parked("TEST-100", "lead"));
+    let queue_count = store.load_lead_items().unwrap().len();
+    crate::leaditems::enqueue(
+        store.as_ref(),
+        LeadTrigger::ImpossibleState {
+            subject: "o/r#290".into(),
+            kind: "still blocked".into(),
+        },
+    );
+    assert_eq!(store.load_lead_items().unwrap().len(), queue_count);
+    // The host's authoritative escalation snapshot is the board's baseline.
+    issue.state = "In Review".into();
+    for _ in 0..3 {
+        assert!(o.select_dispatch(vec![issue.clone()]).is_empty());
+        assert!(
+            o.subject_parked("TEST-100", "lead"),
+            "an unchanged poll must keep the escalation park"
+        );
+        assert_eq!(
+            o.handle_review_introduce(&introduction),
+            crate::reviewintro::ReviewIntroOutcome::Introduced(0)
+        );
+        assert_eq!(
+            o.handle_review_sweep(&[observation("head-a")]).dispatched,
+            0
+        );
+    }
+    assert_eq!(
+        spawned.lock().unwrap().len(),
+        2,
+        "one author, one findings review"
+    );
+    // An observed push releases the park and buys exactly one new review round.
+    assert_eq!(
+        o.handle_review_sweep(&[observation("head-b")]).dispatched,
+        1
+    );
+    assert!(!o.subject_parked("TEST-100", "author"));
+    assert_eq!(
+        o.handle_review_sweep(&[observation("head-b")]).dispatched,
+        0
+    );
+    // Re-block at the new head, then edit only the description. This admits exactly one author.
+    issue.state = "Todo".into();
+    o.dispatch_issue(issue.clone(), None, None, String::new());
+    run_author(&mut o, &issue, &turn.result_text);
+    assert!(o.select_dispatch(vec![issue.clone()]).is_empty());
+    issue.description = Some("The screenshot requirement is removed; fakes are sufficient.".into());
+    let selected = o.select_dispatch(vec![issue.clone()]);
+    assert_eq!(selected.len(), 1);
+    o.dispatch_issue(selected[0].clone(), None, None, String::new());
+    assert!(
+        o.select_dispatch(vec![issue.clone()]).is_empty(),
+        "one admitted author owns the ticket"
+    );
+    run_author(&mut o, &issue, &turn.result_text);
+    assert!(
+        o.select_dispatch(vec![issue]).is_empty(),
+        "the new blocked ending parks it again"
+    );
 }
 
 fn setup_subject(identifier: &str, trigger: LeadTrigger) -> (Arc<Sqlite>, RecordingHost, LeadCase) {

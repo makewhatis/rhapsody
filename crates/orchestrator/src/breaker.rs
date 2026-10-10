@@ -817,8 +817,8 @@ impl Orchestrator {
         }
         for (ticket, owner, repo, number) in seen {
             if let Some(plan) = self.plan_crossing(&ticket, &owner, &repo, number, &persisted) {
-                if self.lead_enabled()
-                    && crate::leaditems::enqueue(
+                if self.lead_enabled() {
+                    crate::leaditems::enqueue(
                         self.store(),
                         rhapsody_store::LeadTrigger::BreakerHold {
                             ticket: plan.plan.ticket.clone(),
@@ -830,12 +830,21 @@ impl Orchestrator {
                                 .map(|k| k.as_str().to_string())
                                 .collect(),
                         },
-                    ) > 0
-                {
-                    // Detection only: T2 owns the lead's convergence judgment and release/hold.
-                    // A durable item replaces the operator hold and page; enqueue failure falls
-                    // through to the existing crossing so it never hides the operator's report.
-                    continue;
+                    );
+                    // Admission closes synchronously, before the remote label task runs. The lead
+                    // is additive and enqueue failure cannot bypass either hold.
+                    if let Err(error) = self.store().park_subject(&rhapsody_store::SubjectHold {
+                        subject: ticket.clone(),
+                        kind: "breaker".into(),
+                        need:
+                            "Circuit breaker crossed; concrete change or operator release required"
+                                .into(),
+                        at: rhapsody_store::format_summon_at(Utc::now()),
+                        ..Default::default()
+                    }) {
+                        tracing::warn!(%error, "breaker local hold could not be persisted");
+                    }
+                    self.human_holds.note_human_label(&ticket);
                 }
                 // Persist BEFORE handing off, so a restart in the gap still counts the crossing.
                 let row = rhapsody_store::BreakerCrossingRow {
@@ -1234,8 +1243,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn breaker_hold_becomes_lead_item_instead_of_human_plan() {
+    #[tokio::test]
+    async fn breaker_crossing_holds_with_lead_enabled() {
         let store = store();
         seed_watch(&store, "STUDIO-1123");
         for _ in 0..5 {
@@ -1262,7 +1271,29 @@ mod tests {
                 kinds: vec!["review rounds".into()],
             }
         );
-        assert!(rx.try_recv().is_err(), "no human hold/notification plan");
+        let plan = rx.try_recv().expect("lead must never replace the hold");
+        assert!(crossing_applies_hold(&plan.kinds));
+        let held = Arc::new(RecordingHold(Mutex::new(Vec::new())));
+        perform_crossing(
+            &plan,
+            &BreakerDeps {
+                hold: Some(held.clone()),
+                room: None,
+                channels: Vec::new(),
+            },
+            Utc::now(),
+        )
+        .await;
+        assert_eq!(
+            held.0.lock().unwrap().len(),
+            1,
+            "the production crossing applies the remote hold too"
+        );
+        assert!(o.subject_parked("STUDIO-1123", "author"));
+        assert_eq!(
+            store.load_breaker_crossings().unwrap()[0].notified_rounds,
+            5
+        );
         o.reconcile_breaker();
         let mut restarted = orch(store.clone(), 5, &[]);
         restarted
@@ -1300,6 +1331,36 @@ mod tests {
                 kinds: vec!["review rounds".into(), "per-ticket spend".into()],
             }
         );
+    }
+
+    #[test]
+    fn enqueue_failure_still_holds() {
+        let dir = crate::testsupport::TempDir::new();
+        let path = std::path::PathBuf::from(dir.child("queue-failure.db"));
+        let store: SharedStore = Arc::new(Sqlite::open(StorePath::Disk(path.clone())).unwrap());
+        seed_watch(&store, "STUDIO-1156");
+        seed_run(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            OUTCOME_COMPLETED,
+            10,
+            "",
+        );
+        let mut o = orch(store.clone(), 1, &[]);
+        o.teams.as_mut().unwrap().manager.lead.enabled = true;
+        rusqlite::Connection::open(&path).unwrap().execute_batch(
+            "CREATE TRIGGER refuse_lead_enqueue BEFORE INSERT ON rhapsody_lead_items BEGIN SELECT RAISE(ABORT, 'injected queue failure'); END;"
+        ).unwrap();
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        assert!(crossing_applies_hold(&rx.try_recv().unwrap().kinds));
+        assert!(o.subject_parked("STUDIO-1156", "author"));
+        assert!(o.subject_parked("makewhatis/rhapsody#12", "review"));
+        assert!(
+            store.load_lead_items().unwrap().is_empty(),
+            "queue really refused the enqueue"
+        );
+        assert_eq!(store.load_breaker_crossings().unwrap().len(), 1);
     }
 
     #[test]

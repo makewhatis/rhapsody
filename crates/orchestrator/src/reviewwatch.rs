@@ -1363,6 +1363,9 @@ impl Orchestrator {
                             unchanged_from: obs.unchanged_from.clone(),
                         },
                     );
+                    if self.review_repo_is_configured(&obs.pr.owner, &obs.pr.repo) {
+                        self.observe_parked_head(&obs.pr.to_string(), &snap.head_sha);
+                    }
                 }
                 // A `Found` naming no head, `Gone`, or `Untrusted`: the coordinate has no current
                 // head the sweep may compare against. Clear rather than keep an older head — an
@@ -1618,6 +1621,10 @@ impl Orchestrator {
         let head = snap.head_sha.trim();
         if head.is_empty() {
             return; // an answer with no head is not an answer about a head
+        }
+        if self.subject_parked(&pr.to_string(), "review") {
+            report.deferred += 1;
+            return;
         }
         let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
         // Only a pull request this daemon parked for a TICKET can be re-engaged by a summons: the
@@ -3007,6 +3014,10 @@ impl Orchestrator {
             head_patch_id,
             draft,
         } = observed;
+        if self.subject_parked(&pr.to_string(), "review") {
+            report.deferred += 1;
+            return;
+        }
         if head.is_empty() {
             return; // an answer with no head is not an answer about a head
         }
@@ -7617,6 +7628,7 @@ mod tests {
         teams.review.reviewers = 1;
         let (mut o, dispatched) = orch(teams);
         introduce(&o, reviewed_row(78, "jimmy", HEAD_A));
+        o.handle_review_head_advanced(&coord(78), HEAD_B, &[]);
 
         // The author hands off the fixes; selection — load-ranked — names `alice`.
         let handoff = crate::reviewintro::IntroducedPr {
@@ -7637,7 +7649,7 @@ mod tests {
             "no row was created for the reviewer selection named"
         );
 
-        let report = o.handle_review_sweep(&[open_at(78, HEAD_A)]);
+        let report = o.handle_review_sweep(&[open_at(78, HEAD_B)]);
 
         assert_eq!(report.retired, 0, "the incumbent's row is not surplus");
         assert_eq!(

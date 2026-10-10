@@ -1,11 +1,72 @@
 //! leaditems — tech-lead triggers and durable queue (STUDIO-1134). No Go counterpart.
-//! Detection queues work only; the isolated lead run and its actions belong to T2.
+//! Durable subject admission guards and tech-lead triggers; no model judgment on the control task.
 
 use rhapsody_store::Store;
 pub use rhapsody_store::{LeadItem, LeadTrigger};
 
 use crate::orchestrator::Orchestrator;
 use crate::reviewreconcile::{Divergence, DivergenceKind};
+
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ParkSnapshot {
+    description: Option<String>,
+    state: Option<String>,
+    human: bool,
+    heads: std::collections::BTreeMap<String, String>,
+}
+
+pub(crate) fn park_snapshot(
+    store: &dyn Store,
+    issue: &rhapsody_core::Issue,
+    pr_head: Option<(&str, &str)>,
+    blocked: bool,
+) -> Result<String, String> {
+    let mut snapshot = ParkSnapshot {
+        description: Some(issue.description.clone().unwrap_or_default()),
+        // A blocked ending can precede its own handoff state move. Establish the state baseline
+        // at the next authoritative poll rather than treating that daemon move as operator action.
+        state: (!blocked && !issue.state.is_empty()).then(|| issue.state.clone()),
+        human: crate::teams::is_human(issue),
+        ..Default::default()
+    };
+    for link in issue.linked_prs.iter().flatten() {
+        let pr = format!("{}/{}#{}", link.owner, link.repo, link.number);
+        if !issue.identifier.is_empty() {
+            store
+                .link_subject_pr(&issue.identifier, &pr)
+                .map_err(|e| e.to_string())?;
+        }
+    }
+    if let Some((pr, _)) = pr_head
+        && !issue.identifier.is_empty()
+    {
+        store
+            .link_subject_pr(&issue.identifier, pr)
+            .map_err(|e| e.to_string())?;
+    }
+    for row in store.load_review_watch().map_err(|e| e.to_string())? {
+        if crate::reviewdone::origin_ticket(&row.introduced_by)
+            .is_some_and(|t| t.eq_ignore_ascii_case(&issue.identifier))
+        {
+            let head = if row.requested_sha.is_empty() {
+                row.last_reviewed_sha
+            } else {
+                row.requested_sha
+            };
+            if !head.is_empty() {
+                snapshot.heads.insert(
+                    format!("{}/{}#{}", row.key.owner, row.key.repo, row.key.number)
+                        .to_ascii_lowercase(),
+                    head,
+                );
+            }
+        }
+    }
+    if let Some((pr, head)) = pr_head.filter(|(_, head)| !head.is_empty()) {
+        snapshot.heads.insert(pr.to_ascii_lowercase(), head.into());
+    }
+    serde_json::to_string(&snapshot).map_err(|e| e.to_string())
+}
 
 /// Bounded off-loop read, with a ticket-only filename; symlink notes are refused.
 pub(crate) async fn read_progress(dir: Option<&std::path::Path>, ticket: &str) -> Option<String> {
@@ -77,6 +138,12 @@ pub(crate) fn review_escalation_trigger(
 
 /// Returns zero when the queue could not accept the item; callers keep their existing report.
 pub fn enqueue(store: &dyn Store, t: LeadTrigger) -> i64 {
+    if let Ok(Some(hold)) = store.subject_hold(t.subject())
+        && hold.kind == "escalation"
+        && !matches!(t, LeadTrigger::Overrule { .. })
+    {
+        return hold.id; // already parked: no new work and no duplicate fallback human report
+    }
     let at = rhapsody_store::format_summon_at(chrono::Utc::now());
     match store.enqueue_lead_item(&t, &at) {
         Ok(id) if id > 0 => id,
@@ -193,6 +260,142 @@ fn blocked_question(text: &str) -> Option<String> {
 }
 
 impl Orchestrator {
+    pub(crate) fn subject_human_holds(&self) -> Vec<crate::dispatch::HeldForHuman> {
+        let mut held = self.human_holds.held();
+        match self.store().load_subject_holds() {
+            Ok(rows) => {
+                for hold in rows {
+                    if held
+                        .iter()
+                        .any(|h| h.issue_identifier.eq_ignore_ascii_case(&hold.subject))
+                        || self.ticket_run_live(&hold.subject)
+                        || hold.subject.contains('#')
+                    {
+                        continue;
+                    }
+                    let run = self
+                        .store()
+                        .list_issue_runs(rhapsody_store::RunFilter {
+                            issue: hold.subject.clone(),
+                            limit: 1,
+                            ..Default::default()
+                        })
+                        .ok()
+                        .and_then(|rows| rows.into_iter().next());
+                    held.push(crate::dispatch::HeldForHuman {
+                        issue_identifier: hold.subject,
+                        title: run.as_ref().map_or(hold.need, |r| r.title.clone()),
+                        project: run.map_or_else(String::new, |r| r.project_slug),
+                    });
+                }
+            }
+            Err(error) => tracing::warn!(%error, "held subject snapshot unavailable"),
+        }
+        held
+    }
+    /// One durable gate at every admission path. A blocked author may still receive its first
+    /// review and a lead judgment; an escalation parks all three work producers.
+    pub(crate) fn subject_parked(&self, subject: &str, work: &str) -> bool {
+        match self.store().subject_hold(subject) {
+            Ok(Some(hold)) => match work {
+                "lead" => hold.kind == "escalation",
+                "review" => hold.kind != "blocked",
+                _ => true,
+            },
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(subject, %error, "subject hold unreadable; refusing new work");
+                true
+            }
+        }
+    }
+
+    pub(crate) fn observe_parked_issue(&self, issue: &rhapsody_core::Issue) {
+        let result = (|| -> Result<(), String> {
+            let Some(hold) = self
+                .store()
+                .subject_hold(&issue.identifier)
+                .map_err(|e| e.to_string())?
+            else {
+                return Ok(());
+            };
+            let mut snapshot: ParkSnapshot = if hold.snapshot.is_empty() {
+                ParkSnapshot::default()
+            } else {
+                serde_json::from_str(&hold.snapshot).map_err(|e| e.to_string())?
+            };
+            let description = issue.description.clone().unwrap_or_default();
+            let state = &issue.state;
+            let human = crate::teams::is_human(issue);
+            let changed = snapshot
+                .description
+                .as_ref()
+                .is_some_and(|old| old != &description)
+                || snapshot
+                    .state
+                    .as_ref()
+                    .is_some_and(|old| !state.is_empty() && old != state)
+                || (snapshot.human && !human);
+            if changed {
+                return self
+                    .store()
+                    .release_subject_episode(
+                        hold.id,
+                        &hold.kind,
+                        "ticket description/state/hold label changed",
+                    )
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+            }
+            snapshot.description = Some(description);
+            if !state.is_empty() {
+                snapshot.state = Some(state.clone());
+            }
+            snapshot.human |= human;
+            let encoded = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
+            self.store()
+                .update_hold_snapshot(hold.id, &encoded)
+                .map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(ticket = %issue.identifier, %error, "material change could not be confirmed; keeping park");
+        }
+    }
+
+    pub(crate) fn observe_parked_head(&self, pr: &str, head: &str) {
+        if head.is_empty() {
+            return;
+        }
+        let result = (|| -> Result<(), String> {
+            let Some(hold) = self.store().subject_hold(pr).map_err(|e| e.to_string())? else {
+                return Ok(());
+            };
+            let mut snapshot: ParkSnapshot = if hold.snapshot.is_empty() {
+                ParkSnapshot::default()
+            } else {
+                serde_json::from_str(&hold.snapshot).map_err(|e| e.to_string())?
+            };
+            let key = pr.to_ascii_lowercase();
+            if snapshot.heads.get(&key).is_some_and(|old| old != head) {
+                return self
+                    .store()
+                    .release_subject_episode(hold.id, &hold.kind, "PR head moved")
+                    .map(|_| ())
+                    .map_err(|e| e.to_string());
+            }
+            snapshot.heads.insert(key, head.into());
+            self.store()
+                .update_hold_snapshot(
+                    hold.id,
+                    &serde_json::to_string(&snapshot).map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())
+        })();
+        if let Err(error) = result {
+            tracing::warn!(pr, %error, "head change unconfirmed; keeping park");
+        }
+    }
+
     pub(crate) fn lead_enabled(&self) -> bool {
         self.teams
             .as_ref()
@@ -376,9 +579,35 @@ impl Orchestrator {
                 self.store(),
                 LeadTrigger::BlockedHandoff {
                     ticket: re.issue.identifier.clone(),
-                    question,
+                    question: question.clone(),
                 },
             );
+            let snapshot = park_snapshot(self.store(), &re.issue, None, true).and_then(|text| {
+                let mut snapshot: ParkSnapshot =
+                    serde_json::from_str(&text).map_err(|e| e.to_string())?;
+                for (pr, observed) in &self.review_observed_head {
+                    let key = pr.to_string().to_ascii_lowercase();
+                    if snapshot.heads.contains_key(&key) && !observed.head.is_empty() {
+                        snapshot.heads.insert(key, observed.head.clone());
+                    }
+                }
+                serde_json::to_string(&snapshot).map_err(|e| e.to_string())
+            });
+            match snapshot.and_then(|snapshot| {
+                self.store()
+                    .park_subject(&rhapsody_store::SubjectHold {
+                        subject: re.issue.identifier.clone(),
+                        kind: "blocked".into(),
+                        need: question,
+                        at: rhapsody_store::format_summon_at(chrono::Utc::now()),
+                        snapshot,
+                        ..Default::default()
+                    })
+                    .map_err(|e| e.to_string())
+            }) {
+                Ok(_) => {}
+                Err(error) => tracing::warn!(%error, "blocked ending could not be parked"),
+            }
         }
     }
 
@@ -403,6 +632,41 @@ mod tests {
 
     use super::*;
     use crate::reviewreconcile::DivergenceKind;
+
+    #[test]
+    fn material_ticket_changes_release_and_identical_polls_keep_the_park() {
+        for change in ["description", "state", "label", "unchanged"] {
+            let o = orch(true);
+            let mut issue = crate::testsupport::issue("id", "TEST-1", "In Review");
+            issue.description = Some("original acceptance".into());
+            issue.labels = Some(vec![crate::teams::HUMAN_LABEL.into()]);
+            o.store()
+                .park_subject(&rhapsody_store::SubjectHold {
+                    subject: issue.identifier.clone(),
+                    kind: "escalation".into(),
+                    snapshot: park_snapshot(o.store(), &issue, Some(("o/r#1", "a")), false)
+                        .unwrap(),
+                    ..Default::default()
+                })
+                .unwrap();
+            match change {
+                "description" => issue.description = Some("corrected acceptance".into()),
+                "state" => issue.state = "Todo".into(),
+                "label" => issue.labels = None,
+                _ => {}
+            }
+            o.observe_parked_issue(&issue);
+            assert_eq!(
+                o.subject_parked("TEST-1", "author"),
+                change == "unchanged",
+                "{change}"
+            );
+            assert_eq!(
+                o.store().subject_resume_pending("TEST-1").unwrap(),
+                change != "unchanged"
+            );
+        }
+    }
 
     fn orch(enabled: bool) -> Orchestrator {
         let mut o = Orchestrator::new("WORKFLOW.md");
@@ -695,7 +959,7 @@ mod tests {
     }
 
     #[test]
-    fn lead_disabled_keeps_todays_human_feed() {
+    fn lead_disabled_behaviour_unchanged() {
         let mut o = orch(false);
         let before = vec![
             divergence(DivergenceKind::ReviewEscalated),

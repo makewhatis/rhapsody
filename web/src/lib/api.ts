@@ -686,10 +686,12 @@ export interface LeadDecision {
   id: number; subject: string; trigger: string; at: string; decision: string;
   reasoning: string; evidence: string; actions: string; harness: string; model: string;
   overruled_at?: string | null; overrule_note?: string | null;
+  escalation_episode?: number; repeat_count?: number;
 }
 export interface LeadDecisionsResponse {
   decisions: LeadDecision[];
   queued: { id: number; subject: string; state: string; trigger: string }[];
+  held?: { id: number; subject: string; kind: string; need: string; at: string; repeat_count: number; decision: number }[];
 }
 export type NoticeGroup = "needs_you" | "decisions" | "system" | "activity";
 export interface DaemonNotice {
@@ -706,6 +708,10 @@ export async function readNotification(id: number): Promise<void> {
 }
 export function fetchLeadDecisions(since = ""): Promise<LeadDecisionsResponse> {
   return getJSON(`/api/v1/lead/decisions${since ? `?since=${encodeURIComponent(since)}` : ""}`);
+}
+export async function resolveLeadEscalation(id: number, note: string): Promise<void> {
+  const response = await operatorPost(`/api/v1/lead/decisions/${id}/resolve`, { note });
+  if (!response.ok) throw new Error(await daemonErrorMessage(response, "Escalation could not be resolved"));
 }
 export async function overruleLeadDecision(id: number, note: string): Promise<{ item: number; memory_retained: boolean }> {
   const response = await operatorPost(`/api/v1/lead/decisions/${id}/overrule`, { note });
