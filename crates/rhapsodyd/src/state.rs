@@ -145,6 +145,7 @@ pub struct DaemonState {
     /// this cache only; the one credentialed operation is the operator-guarded refresh POST.
     provider: Option<Arc<crate::providers::ProviderRuntime>>,
     account_now_s: Option<i64>,
+    lead_harnesses: Option<Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>>,
 }
 
 impl DaemonState {
@@ -171,6 +172,7 @@ impl DaemonState {
             teams_config_path: String::new(),
             provider: None,
             account_now_s: None,
+            lead_harnesses: None,
         }
     }
 
@@ -197,10 +199,23 @@ impl DaemonState {
         self.teams_config_path = path.into();
         self
     }
+
+    pub fn with_lead_harnesses(
+        mut self,
+        service: Option<Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>>,
+    ) -> Self {
+        self.lead_harnesses = service;
+        self
+    }
 }
 
 #[async_trait]
 impl StateProvider for DaemonState {
+    fn lead_harnesses(
+        &self,
+    ) -> Option<Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>> {
+        self.lead_harnesses.clone()
+    }
     fn notification_store(&self) -> Option<Arc<dyn Store + Send + Sync>> {
         self.notifications.clone()
     }

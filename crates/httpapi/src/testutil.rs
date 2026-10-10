@@ -57,6 +57,7 @@ impl FakeResumeHoldError {
 pub(crate) struct FakeProvider {
     notification_store: Option<Arc<dyn rhapsody_store::Store + Send + Sync>>,
     lead_reports: Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>>,
+    lead_harnesses: Option<Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>>,
     snap: Snapshot,
     snap_err: Option<String>,
     history: Arc<dyn HistoryStore>,
@@ -185,6 +186,13 @@ pub(crate) struct FakeProvider {
 }
 
 impl FakeProvider {
+    pub(crate) fn with_lead_harnesses(
+        mut self,
+        service: Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>,
+    ) -> Self {
+        self.lead_harnesses = Some(service);
+        self
+    }
     pub(crate) fn with_notification_store(
         mut self,
         store: Arc<dyn rhapsody_store::Store + Send + Sync>,
@@ -249,6 +257,7 @@ impl FakeProvider {
             capabilities_registry: None,
             teams_memory: None,
             lead_reports: None,
+            lead_harnesses: None,
             notification_store: None,
             teams_config_path: String::new(),
             issue_lifecycles: HashMap::new(),
@@ -670,6 +679,12 @@ impl FakeProvider {
 
 #[async_trait]
 impl StateProvider for FakeProvider {
+    fn lead_harnesses(
+        &self,
+    ) -> Option<Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>> {
+        self.touch();
+        self.lead_harnesses.clone()
+    }
     fn notification_store(&self) -> Option<Arc<dyn rhapsody_store::Store + Send + Sync>> {
         self.touch();
         self.notification_store.clone()

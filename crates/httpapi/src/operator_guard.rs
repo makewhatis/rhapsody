@@ -22,7 +22,7 @@
 //!
 //! The guard is a per-route layer ([`operator_write`] in `server`). It sees the request before the
 //! handler's body extractor reads anything and before any [`crate::StateProvider`] call. It acts
-//! only on `POST`, the one mutating method, and on `OPTIONS`, a preflight for that `POST`. Every
+//! on `POST` and `PUT`, the mutating methods, and on `OPTIONS`, a preflight. Every
 //! other method reaches the handler unchanged: reads keep their wire contract, and a wrong method
 //! still gets the handler's own 405. Every denial is the same bounded 403 envelope. The specific
 //! reason is logged with the method and route path, but no header value is echoed back or logged.
@@ -107,7 +107,7 @@ impl Denial {
 /// The guard as a middleware. `server::operator_write` layers it onto every mutating route.
 pub(crate) async fn require_operator_write(req: Request, next: Next) -> Response {
     let method = req.method().clone();
-    if method != Method::POST && method != Method::OPTIONS {
+    if method != Method::POST && method != Method::PUT && method != Method::OPTIONS {
         return next.run(req).await;
     }
     let port = req
@@ -384,6 +384,7 @@ mod router_tests {
     const MUTATING: &[&str] = &[
         "/api/v1/notifications/7/read",
         "/api/v1/lead/decisions/7/overrule",
+        "/api/v1/lead/harnesses",
         "/api/v1/manager/investigate",
         "/api/v1/refresh",
         "/api/v1/drain",
@@ -719,7 +720,14 @@ mod router_tests {
                     ""
                 };
                 let mut req = client
-                    .post(format!("{}{path}{query}", f.base))
+                    .request(
+                        if *path == "/api/v1/lead/harnesses" {
+                            reqwest::Method::PUT
+                        } else {
+                            reqwest::Method::POST
+                        },
+                        format!("{}{path}{query}", f.base),
+                    )
                     .header(OPERATOR_HEADER, "1")
                     .header(CONTENT_TYPE, "application/json")
                     .body(body);
