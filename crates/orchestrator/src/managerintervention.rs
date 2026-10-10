@@ -985,12 +985,7 @@ impl Orchestrator {
                 self.release_budget_hold(&run.key());
                 return false;
             }
-            let entries = self
-                .teams
-                .as_ref()
-                .map(|t| t.manager.effective_harnesses())
-                .unwrap_or_default();
-            self.manager_selftest.configure(entries);
+            self.ensure_manager_entries();
             let Some(route) = self.review_route(&run.repo_url) else {
                 return false;
             };

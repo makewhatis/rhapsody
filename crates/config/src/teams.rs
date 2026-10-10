@@ -1986,6 +1986,40 @@ impl Teams {
     pub fn save(path: &Path, teams: &Teams) -> Result<(), TeamsError> {
         teams.validate()?;
         let yaml = serde_yaml_ng::to_string(teams).map_err(|e| TeamsError::Parse(e.to_string()))?;
+        Self::write_yaml(path, &yaml)
+    }
+
+    /// Live lead edits patch only the harness key, retaining unrecognized/future keys as well as
+    /// the operator's other settings. Shares Settings' atomic writer, not its full serialization.
+    pub fn save_manager_harnesses(
+        path: &Path,
+        entries: &[ManagerHarnessEntry],
+    ) -> Result<(), TeamsError> {
+        let text = std::fs::read_to_string(path).map_err(|e| TeamsError::Io(e.to_string()))?;
+        let mut teams = Self::parse(&text)?;
+        teams.manager.harnesses = entries.to_vec();
+        teams.validate()?;
+        let mut value: serde_yaml_ng::Value =
+            serde_yaml_ng::from_str(&text).map_err(|e| TeamsError::Parse(e.to_string()))?;
+        let Some(root) = value.as_mapping_mut() else {
+            return Err(TeamsError::Invalid("teams config must be a mapping".into()));
+        };
+        let manager = root
+            .entry(serde_yaml_ng::Value::String("manager".into()))
+            .or_insert_with(|| serde_yaml_ng::Value::Mapping(Default::default()));
+        let Some(manager) = manager.as_mapping_mut() else {
+            return Err(TeamsError::Invalid("manager must be a mapping".into()));
+        };
+        manager.insert(
+            "harnesses".into(),
+            serde_yaml_ng::to_value(entries).map_err(|e| TeamsError::Parse(e.to_string()))?,
+        );
+        let yaml =
+            serde_yaml_ng::to_string(&value).map_err(|e| TeamsError::Parse(e.to_string()))?;
+        Self::write_yaml(path, &yaml)
+    }
+
+    fn write_yaml(path: &Path, yaml: &str) -> Result<(), TeamsError> {
         let dir = match path.parent() {
             Some(p) if !p.as_os_str().is_empty() => p,
             _ => Path::new("."),

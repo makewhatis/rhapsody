@@ -100,6 +100,11 @@ pub trait StateProvider: Send + Sync {
     fn lead_reports(&self) -> Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>> {
         None
     }
+    fn lead_harnesses(
+        &self,
+    ) -> Option<Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>> {
+        None
+    }
     /// Read-only account ledger snapshot (STUDIO-1123); no control round-trip or provider I/O.
     fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
         Vec::new()
@@ -987,6 +992,10 @@ where
         .route(
             "/api/v1/lead/decisions",
             any(crate::handlers_lead::handle_decisions),
+        )
+        .route(
+            "/api/v1/lead/harnesses",
+            operator_write(crate::handlers_lead::handle_harnesses),
         )
         .route(
             "/api/v1/lead/decisions/{id}/overrule",
