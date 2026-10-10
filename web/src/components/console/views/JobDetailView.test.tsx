@@ -24,6 +24,7 @@ const h = vi.hoisted(() => ({
   fetchHistoryCosts: vi.fn(),
   fetchRunProvenance: vi.fn(),
   fetchRunTranscript: vi.fn(),
+  fetchRawTranscript: vi.fn(),
   fetchRunIdentityEvents: vi.fn(),
   sendRunMessage: vi.fn(),
   fetchRunMessages: vi.fn(),
@@ -55,6 +56,7 @@ vi.mock("@/lib/api", async (orig) => {
     fetchHistoryCosts: h.fetchHistoryCosts,
     fetchRunProvenance: h.fetchRunProvenance,
     fetchRunTranscript: h.fetchRunTranscript,
+    fetchRawTranscript: h.fetchRawTranscript,
     fetchRunIdentityEvents: h.fetchRunIdentityEvents,
     sendRunMessage: h.sendRunMessage,
     fetchRunMessages: h.fetchRunMessages,
@@ -84,6 +86,10 @@ vi.mock("@/lib/bindings", async (orig) => {
 });
 
 const { JobDetailView } = await import("./JobDetailView");
+
+beforeEach(() => {
+  h.fetchRawTranscript.mockResolvedValue({ run_id: 547, size_bytes: 0, lines: [], prev_cursor: null, next_cursor: null, at_start: true, at_end: true });
+});
 
 const EMPTY_STATE: StateResponse = {
   status: "ok",
@@ -2312,22 +2318,23 @@ describe("zone C — the spine's filter (§3C)", () => {
 // Acceptance 4 — the "Raw transcript" escape hatch (§4, mandatory).
 // ---------------------------------------------------------------------------------------------
 describe("the raw-transcript escape hatch (§4)", () => {
-  it("drops to the flat oldest→newest LogEntry list, and back", async () => {
+  it("opens the run's raw file separately from Trace, and back", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: COMPLETED });
+    h.fetchRawTranscript.mockResolvedValue({ run_id: 547, size_bytes: 36, lines: [{ offset: 0, text: '{"type":"system"}\n' }, { offset: 18, text: '{"type":"result"}\n' }], prev_cursor: null, next_cursor: null, at_start: true, at_end: true });
     mountDetail([run({ id: 547 })]);
     await settleTrace();
 
     fireEvent.click(screen.getByRole("button", { name: "Raw transcript" }));
     await waitFor(() => expect(document.querySelector(".trraw")).toBeTruthy());
 
-    // Every entry, in the served order, tagged with its kind — the folding heuristics are gone.
+    await screen.findByText(/"type":"system"/);
     const lines = [...document.querySelectorAll(".trraw .rawline")];
-    expect(lines).toHaveLength(COMPLETED.length);
-    expect(lines[0].querySelector(".rk")?.textContent).toBe("event");
-    expect(lines[0].textContent).toContain("session started");
-    expect(lines[2].querySelector(".rk")?.textContent).toBe("tool_use");
-    expect(lines[2].textContent).toContain("Read");
-    expect(lines[2].textContent).toContain("file_path=/repo/src/lib/api.ts");
+    expect(lines).toHaveLength(2);
+    expect(lines[0].textContent).toContain('"type":"system"');
+    expect(lines[1].textContent).toContain('"type":"result"');
+    expect(h.fetchRawTranscript).toHaveBeenCalledWith(547);
+    // A raw read must not keep the full-file humanizer polling alongside its bounded pages.
+    expect(client?.getQueryCache().find({ queryKey: ["run-transcript", 547] })?.isActive()).toBe(false);
     // The trace's two zones are gone while the hatch is open.
     expect(document.querySelector(".trrc")).toBeNull();
     expect(document.querySelector(".trsplit")).toBeNull();
@@ -2335,9 +2342,11 @@ describe("the raw-transcript escape hatch (§4)", () => {
     fireEvent.click(screen.getByRole("button", { name: "Trace" }));
     await waitFor(() => expect(document.querySelector(".trsplit")).toBeTruthy());
     expect(document.querySelector(".trraw")).toBeNull();
+    expect(client?.getQueryCache().find({ queryKey: ["run-transcript", 547] })?.isActive()).toBe(true);
   });
 
   it("shows the raw prose verbatim — the hatch is the one place markdown is NOT interpreted", async () => {
+    h.fetchRawTranscript.mockResolvedValue({ run_id: 547, size_bytes: 18, lines: [{ offset: 0, text: "Ran **make lint**." }], prev_cursor: null, next_cursor: null, at_start: true, at_end: true });
     h.fetchRunTranscript.mockResolvedValue({
       run_id: 547,
       generated_at: "",
@@ -2347,8 +2356,17 @@ describe("the raw-transcript escape hatch (§4)", () => {
     await settleTrace();
     fireEvent.click(screen.getByRole("button", { name: "Raw transcript" }));
     await waitFor(() => expect(document.querySelector(".trraw")).toBeTruthy());
+    await screen.findByText("Ran **make lint**.");
     expect(document.querySelector(".trraw .rawline")?.textContent).toContain("Ran **make lint**.");
     expect(document.querySelector(".trraw strong")).toBeNull();
+  });
+
+  it("states the Trace's dropped-entry boundary and links to Raw", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: Array.from({ length: 1000 }, (_, i) => entry({ seq: i + 1, text: "synthetic" })), total_entries: 1200, dropped: 200 });
+    mountDetail([run({ id: 547 })]);
+    await screen.findByText(/Showing the last 1000 of 1200 entries/);
+    fireEvent.click(screen.getByRole("button", { name: "Open Raw transcript" }));
+    await waitFor(() => expect(h.fetchRawTranscript).toHaveBeenCalledWith(547));
   });
 });
 
