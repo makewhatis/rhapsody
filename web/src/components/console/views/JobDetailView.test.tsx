@@ -425,6 +425,17 @@ afterEach(() => {
 // Acceptance 1 — a completed run renders header + Result card + The Split, from the slice-1 model.
 // ---------------------------------------------------------------------------------------------
 describe("source timing on the job page", () => {
+  it("renders a gap even when timed events have no tool/prose phase", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [
+      entry({ seq: 1, kind: "event", text: "session started", at: "2026-09-01T19:11:00Z" }),
+      entry({ seq: 2, kind: "event", text: "turn completed", at: "2026-09-01T19:12:00Z" }),
+    ] });
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    expect(document.querySelector(".trinsp .trgap")?.textContent).toBe("1m 0s with no output");
+    expect(document.querySelectorAll(".trstep")).toHaveLength(0);
+  });
+
   it("shows a visible local start, phase offset/span, call clocks and an idle marker between cards", async () => {
     const at = "2026-09-01T19:11:00.000Z";
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, entries: [

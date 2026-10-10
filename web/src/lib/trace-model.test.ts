@@ -21,6 +21,45 @@ const think = (text: string) => entry("thinking", text);
 const ev = (text: string) => entry("event", text);
 
 describe("source timing", () => {
+  it("retains idle gaps even when timed events have no content phase", () => {
+    const trace = buildTrace([
+      { ...ev("session started"), at: "2026-10-08T16:00:00.000Z" },
+      { ...ev("turn completed"), at: "2026-10-08T16:01:00.000Z" },
+    ]);
+    expect(trace.phases).toEqual([]);
+    expect(trace.gaps).toHaveLength(1);
+    expect(trace.gaps[0].durationMs).toBe(60000);
+  });
+
+  it("keeps untimed phases untimed even beside timed turn dividers", () => {
+    const trace = buildTrace([
+      { ...ev("session started"), at: "2026-10-08T16:00:00.000Z" },
+      use("Read", "file_path=a"),
+      res("ok"),
+      { ...ev("turn completed"), at: "2026-10-08T16:01:00.000Z" },
+    ]);
+    expect(trace.phases[0].startAt).toBeUndefined();
+    expect(trace.phases[0].endAt).toBeUndefined();
+    expect(trace.phases[0].durationMs).toBeUndefined();
+    expect(trace.phases[0].did[0].at).toBeUndefined();
+    expect(trace.phases[0].gaps).toHaveLength(1);
+  });
+
+  it("keeps a gap ending at a folded result after the call, including orphan results and prose-only phases", () => {
+    const trace = buildTrace([
+      { ...use("Read", "file_path=a"), at: "2026-10-08T16:00:00.000Z" },
+      { ...res("ok"), at: "2026-10-08T16:01:00.000Z" },
+      ev("turn completed"),
+      { ...res("orphan"), at: "2026-10-08T16:02:00.000Z" },
+      ev("turn completed"),
+      { ...say("notes"), at: "2026-10-08T16:03:00.000Z" },
+    ]);
+    expect(trace.phases.map((p) => p.gaps?.length)).toEqual([1, 1, 1]);
+    expect(trace.phases[0].gaps?.[0].beforeSeq).toBe(trace.phases[0].did[0].resultSeq);
+    expect(trace.phases[1].startAt).toBe("2026-10-08T16:02:00.000Z");
+    expect(trace.phases[2].startAt).toBe("2026-10-08T16:03:00.000Z");
+  });
+
   it("bounds a phase by its timed prose/calls/results, including parallel calls across phases", () => {
     const trace = buildTrace([
       { ...think("plan"), at: "2026-10-08T16:00:00.000Z" },

@@ -112,6 +112,7 @@ export type TraceGrouping = "turns" | "clusters" | "single";
 
 export interface TraceModel {
   phases: TracePhase[];
+  gaps: IdleGap[];
   grouping: TraceGrouping;
   /** Every `event` entry's label, in order — the raw dividers, for the view's turn ruler. */
   events: string[];
@@ -732,11 +733,11 @@ export function buildTrace(entries: readonly LogEntry[]): TraceModel {
     pendingSaid.push(item.block);
   }
   close();
-  addTiming(entries, phases, phaseBySeq);
+  const gaps = addTiming(entries, phases, phaseBySeq);
 
   const grouping: TraceGrouping =
     phases.length < 2 ? "single" : events.length > 0 ? "turns" : "clusters";
-  return { phases, grouping, events };
+  return { phases, gaps, grouping, events };
 }
 
 function newPhase(kind: PhaseKind, turn: number, seq: number): OpenPhase {
@@ -744,10 +745,15 @@ function newPhase(kind: PhaseKind, turn: number, seq: number): OpenPhase {
 }
 
 /** Timing is a separate pass over source order: folding results must not hide an idle interval. */
-function addTiming(entries: readonly LogEntry[], phases: TracePhase[], phaseBySeq: Map<number, TracePhase>) {
+function addTiming(
+  entries: readonly LogEntry[],
+  phases: TracePhase[],
+  phaseBySeq: Map<number, TracePhase>,
+): IdleGap[] {
+  const gaps: IdleGap[] = [];
   for (const phase of phases) phase.gaps = [];
-  // Dividers have no card of their own. A start belongs to the next phase, an ending to the
-  // previous one; their time is still their OWN, never copied onto an untimed content entry.
+  // Dividers have no card of their own. Put their gap markers beside the next/previous phase,
+  // but never use their times to fill a phase whose actual members are untimed.
   const nextPhases = new Map<number, TracePhase>();
   let next: TracePhase | undefined;
   for (let i = entries.length - 1; i >= 0; i -= 1) {
@@ -755,24 +761,28 @@ function addTiming(entries: readonly LogEntry[], phases: TracePhase[], phaseBySe
     if (next !== undefined) nextPhases.set(entries[i].seq, next);
   }
   let previousPhase: TracePhase | undefined;
-  let previousTimed: { seq: number; at: string } | undefined;
+  let previousTimed: string | undefined;
   for (const entry of entries) {
-    const phase = phaseBySeq.get(entry.seq) ??
+    const memberPhase = phaseBySeq.get(entry.seq);
+    const phase = memberPhase ??
       (entry.text === "session started" ? nextPhases.get(entry.seq) : previousPhase ?? nextPhases.get(entry.seq));
     previousPhase = phase ?? previousPhase;
     const at = sourceTime(entry.at);
     if (at === undefined) continue;
-    if (phase !== undefined) {
-      if (phase.startAt === undefined || Date.parse(at) < Date.parse(phase.startAt)) phase.startAt = at;
-      if (phase.endAt === undefined || Date.parse(at) > Date.parse(phase.endAt)) phase.endAt = at;
-      phase.durationMs = durationBetween(phase.startAt, phase.endAt);
-      const ms = durationBetween(previousTimed?.at, at);
-      if (ms !== undefined && ms >= 60_000 && previousTimed !== undefined) {
-        phase.gaps?.push({ beforeSeq: entry.seq, fromAt: previousTimed.at, toAt: at, durationMs: ms });
-      }
+    if (memberPhase !== undefined) {
+      if (memberPhase.startAt === undefined || Date.parse(at) < Date.parse(memberPhase.startAt)) memberPhase.startAt = at;
+      if (memberPhase.endAt === undefined || Date.parse(at) > Date.parse(memberPhase.endAt)) memberPhase.endAt = at;
+      memberPhase.durationMs = durationBetween(memberPhase.startAt, memberPhase.endAt);
     }
-    previousTimed = { seq: entry.seq, at };
+    const ms = durationBetween(previousTimed, at);
+    if (ms !== undefined && ms >= 60_000 && previousTimed !== undefined) {
+      const gap = { beforeSeq: entry.seq, fromAt: previousTimed, toAt: at, durationMs: ms };
+      gaps.push(gap);
+      phase?.gaps?.push(gap);
+    }
+    previousTimed = at;
   }
+  return gaps;
 }
 
 function finishPhase(open: OpenPhase): TracePhase {

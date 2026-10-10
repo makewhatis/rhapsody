@@ -120,6 +120,7 @@ import {
   buildResult,
   buildTrace,
   type DidCard,
+  type IdleGap,
   type PhaseKind,
   type ResultCard,
   type SaidBlock,
@@ -494,6 +495,7 @@ function RunTrace({
           <TraceSplit
             key={run.id}
             phases={trace.phases}
+            gaps={trace.gaps}
             runStart={live.started_at}
             who={who}
             roster={roster}
@@ -1685,6 +1687,7 @@ function ResultCardZone({
 
 function TraceSplit({
   phases,
+  gaps,
   runStart,
   who,
   roster,
@@ -1695,6 +1698,7 @@ function TraceSplit({
   reducedEvents,
 }: {
   phases: readonly TracePhase[];
+  gaps: readonly IdleGap[];
   runStart: string;
   /** The teammate this attempt is attributed to; "" when none resolves. */
   who: string;
@@ -1834,6 +1838,7 @@ function TraceSplit({
           the Split (STUDIO-766). */}
       <div className="trright">
         <div className="trinsp">
+          {phases.length === 0 ? gaps.map((gap) => <GapMarker key={gap.beforeSeq} gap={gap} />) : null}
           {selected === undefined ? null : (
             <Inspector
               phase={selected}
@@ -2093,9 +2098,7 @@ function Inspector({
         item.type === "call" ? (
           <CallCard key={`call:${item.card.seq}`} card={item.card} jump={item.card.seq === openSeq ? openNonce : 0} />
         ) : (
-          <div className="trgap" key={`gap:${item.gap.beforeSeq}`} title={`${timeTitle(item.gap.fromAt)} — ${timeTitle(item.gap.toAt)}`}>
-            <Timestamp>{formatDuration(item.gap.durationMs / 1000)} with no output</Timestamp>
-          </div>
+          <GapMarker key={`gap:${item.gap.beforeSeq}`} gap={item.gap} />
         ),
       )}
       {phase.did.length === 0 ? <div className="empty">No tool calls in this step.</div> : null}
@@ -2110,6 +2113,14 @@ function Inspector({
       ))}
       {phase.said.length === 0 ? null : <Said said={phase.said} who={name} />}
     </>
+  );
+}
+
+function GapMarker({ gap }: { gap: IdleGap }) {
+  return (
+    <div className="trgap" title={`${timeTitle(gap.fromAt)} — ${timeTitle(gap.toAt)}`}>
+      <Timestamp>{formatDuration(gap.durationMs / 1000)} with no output</Timestamp>
+    </div>
   );
 }
 
