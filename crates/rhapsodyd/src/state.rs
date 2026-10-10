@@ -277,6 +277,14 @@ impl StateProvider for DaemonState {
         found.then_some(entries)
     }
 
+    fn run_transcript_summary(&self, run_id: i64) -> Option<(Vec<LogEntry>, usize)> {
+        self.handle.run_transcript_summary(run_id)
+    }
+
+    fn transcript_log_dir(&self) -> std::path::PathBuf {
+        self.handle.transcript_log_dir()
+    }
+
     async fn list_linear_projects(&self) -> Result<Vec<Project>, ReadsError> {
         self.handle.list_linear_projects().await
     }

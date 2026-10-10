@@ -19,7 +19,7 @@ axum = "0.8"
 # tokio: the async runtime the server binds/serves on. `net` for the loopback `TcpListener` (Go
 # `net.Listen("tcp", addr)`), `time` for the `/state` handler's snapshot deadline (Go's
 # `context.WithTimeout(r.Context(), snapshotTimeout)`). Already in Cargo.lock (axum/tracker/etc.).
-tokio = { version = "1", features = ["net", "time"] }
+tokio = { version = "1", features = ["net", "time", "fs", "io-util"] }
 # serde (derive): the response-envelope DTOs (`ErrorEnvelope`/`ErrorBody`/`HealthzJson`), the Rust
 # mirror of Go `responses.go`'s tagged structs. Already in Cargo.lock (config/store/tracker).
 serde = { version = "1", features = ["derive"] }
