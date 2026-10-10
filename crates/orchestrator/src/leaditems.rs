@@ -260,6 +260,24 @@ fn blocked_question(text: &str) -> Option<String> {
 }
 
 impl Orchestrator {
+    fn park_state_is_terminal(&self, state: &str, project: Option<usize>) -> bool {
+        let state = rhapsody_core::normalize_state(state);
+        if state.is_empty() {
+            return false;
+        }
+        let terminal = self.eff.as_ref().is_some_and(|eff| {
+            project
+                .and_then(|i| eff.projects.get(i))
+                .map_or(&eff.terminal_states, |p| &p.terminal_states)
+                .contains(&state)
+        });
+        terminal
+            || self
+                .teams
+                .as_ref()
+                .and_then(|t| t.review_done_state())
+                .is_some_and(|done| rhapsody_core::normalize_state(done) == state)
+    }
     /// Candidate queries intentionally exclude Backlog/Done. A park must therefore observe its
     /// ticket by identifier too, before dispatch gates, without treating absence as a state move.
     /// Owned tracker reads run off-task: at most 16 tickets per tick, 4 concurrent, 10 seconds total.
@@ -267,18 +285,19 @@ impl Orchestrator {
     pub(crate) async fn reconcile_parked_subject_states(&mut self) {
         let Some(eff) = self.eff.as_ref() else { return };
         let trackers: Vec<_> = if eff.projects.is_empty() {
-            vec![(String::new(), eff.tracker.clone())]
+            vec![(String::new(), None, eff.tracker.clone())]
         } else {
             eff.projects
                 .iter()
-                .filter(|p| !p.disabled)
-                .map(|p| (p.slug.clone(), p.tracker.clone()))
+                .enumerate()
+                .filter(|(_, p)| !p.disabled)
+                .map(|(i, p)| (p.slug.clone(), Some(i), p.tracker.clone()))
                 .collect()
         };
         if trackers.is_empty() {
             return;
         }
-        let mut holds = match self.store().load_subject_holds() {
+        let mut holds = match self.store().load_subject_observations() {
             Ok(holds) => holds
                 .into_iter()
                 .filter(|h| !h.subject.contains('#'))
@@ -297,18 +316,6 @@ impl Orchestrator {
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
         let mut tasks = tokio::task::JoinSet::new();
         for hold in holds.into_iter().take(16) {
-            let snapshot: ParkSnapshot = match serde_json::from_str(&hold.snapshot) {
-                Ok(snapshot) => snapshot,
-                Err(error) => {
-                    tracing::warn!(ticket = %hold.subject, %error, "park state baseline unavailable; keeping hold");
-                    continue;
-                }
-            };
-            // A blocked ending's own handoff move is not a human move. Candidate observation owns
-            // its initial baseline; never invent one from an excluded/unknown state here.
-            let Some(state) = snapshot.state else {
-                continue;
-            };
             let project = match self.store().list_issue_runs(rhapsody_store::RunFilter {
                 issue: hold.subject.clone(),
                 limit: 1,
@@ -325,8 +332,8 @@ impl Orchestrator {
             };
             let owned: Vec<_> = trackers
                 .iter()
-                .filter(|(slug, _)| project.is_empty() || *slug == project)
-                .map(|(_, tr)| tr.clone())
+                .filter(|(slug, _, _)| project.is_empty() || *slug == project)
+                .map(|(_, i, tr)| (*i, tr.clone()))
                 .collect();
             let semaphore = semaphore.clone();
             tasks.spawn(async move {
@@ -334,10 +341,10 @@ impl Orchestrator {
                     tracing::warn!(ticket = %hold.subject, "parked state read permit unavailable; keeping hold");
                     return None;
                 };
-                for tracker in owned {
+                for (project, tracker) in owned {
                     match tracker.fetch_issue_by_identifier(&hold.subject).await {
                         Ok(Some(issue)) if issue.identifier.eq_ignore_ascii_case(&hold.subject) => {
-                            return Some((hold, state, issue.state));
+                            return Some((hold, project, issue.state));
                         }
                         Ok(_) => {}
                         Err(error) => tracing::warn!(ticket = %hold.subject, %error, "parked ticket state read failed; keeping hold"),
@@ -349,15 +356,47 @@ impl Orchestrator {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             match tokio::time::timeout_at(deadline, tasks.join_next()).await {
-                Ok(Some(Ok(Some((hold, before, after)))))
-                    if !after.is_empty() && before != after =>
-                {
-                    if let Err(error) = self.store().release_subject_episode(
-                        hold.id,
-                        &hold.kind,
-                        "ticket state changed (scoped hold observation)",
-                    ) {
-                        tracing::warn!(ticket = %hold.subject, %error, "park state release failed; keeping hold");
+                Ok(Some(Ok(Some((hold, project, after))))) if !after.trim().is_empty() => {
+                    let result = (|| -> Result<(), String> {
+                        let terminal = self.park_state_is_terminal(&after, project);
+                        self.store()
+                            .observe_subject_state(&hold.subject, terminal)
+                            .map_err(|e| e.to_string())?;
+                        if terminal {
+                            return Ok(());
+                        }
+                        let mut snapshot: ParkSnapshot = if hold.snapshot.is_empty() {
+                            ParkSnapshot::default()
+                        } else {
+                            serde_json::from_str(&hold.snapshot).map_err(|e| e.to_string())?
+                        };
+                        if snapshot
+                            .state
+                            .as_ref()
+                            .is_some_and(|before| before != &after)
+                        {
+                            self.store()
+                                .release_subject_episode(
+                                    hold.id,
+                                    &hold.kind,
+                                    "ticket state changed (scoped hold observation)",
+                                )
+                                .map_err(|e| e.to_string())?;
+                        } else if snapshot.state.is_some() || hold.kind == "escalation" {
+                            // A blocked handoff with state=None still lets candidate observation
+                            // establish its own move; escalation folds need a scoped live baseline.
+                            snapshot.state = Some(after);
+                            self.store()
+                                .confirm_subject_hold_state(
+                                    hold.id,
+                                    &serde_json::to_string(&snapshot).map_err(|e| e.to_string())?,
+                                )
+                                .map_err(|e| e.to_string())?;
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = result {
+                        tracing::warn!(ticket = %hold.subject, %error, "park state observation failed; keeping hold");
                     }
                 }
                 Ok(Some(Ok(_))) => {}
@@ -426,7 +465,24 @@ impl Orchestrator {
     }
 
     pub(crate) fn observe_parked_issue(&self, issue: &rhapsody_core::Issue) {
+        self.observe_parked_issue_in_project(issue, None);
+    }
+
+    pub(crate) fn observe_parked_issue_in_project(
+        &self,
+        issue: &rhapsody_core::Issue,
+        project: Option<usize>,
+    ) {
         let result = (|| -> Result<(), String> {
+            if !issue.state.trim().is_empty() {
+                let terminal = self.park_state_is_terminal(&issue.state, project);
+                self.store()
+                    .observe_subject_state(&issue.identifier, terminal)
+                    .map_err(|e| e.to_string())?;
+                if terminal {
+                    return Ok(());
+                }
+            }
             let Some(hold) = self
                 .store()
                 .subject_hold(&issue.identifier)
@@ -468,9 +524,12 @@ impl Orchestrator {
             }
             snapshot.human |= human;
             let encoded = serde_json::to_string(&snapshot).map_err(|e| e.to_string())?;
-            self.store()
-                .update_hold_snapshot(hold.id, &encoded)
-                .map_err(|e| e.to_string())
+            if state.trim().is_empty() {
+                self.store().update_hold_snapshot(hold.id, &encoded)
+            } else {
+                self.store().confirm_subject_hold_state(hold.id, &encoded)
+            }
+            .map_err(|e| e.to_string())
         })();
         if let Err(error) = result {
             tracing::warn!(ticket = %issue.identifier, %error, "material change could not be confirmed; keeping park");
@@ -690,6 +749,14 @@ impl Orchestrator {
             && re.review.is_none()
             && !crate::managerrun::is_manager_key(&re.issue.id)
         {
+            let project = self
+                .eff
+                .as_ref()
+                .and_then(|eff| eff.projects.iter().position(|p| p.slug == re.project_slug));
+            self.observe_parked_issue_in_project(&re.issue, project);
+            if self.park_state_is_terminal(&re.issue.state, project) {
+                return;
+            }
             enqueue(
                 self.store(),
                 LeadTrigger::BlockedHandoff {
@@ -747,6 +814,99 @@ mod tests {
 
     use super::*;
     use crate::reviewreconcile::DivergenceKind;
+
+    #[test]
+    fn terminal_observation_releases_park_and_notice() {
+        for snapshot in [
+            "",
+            "{\"state\":\"Done\",\"human\":false,\"heads\":{}}",
+            "invalid",
+        ] {
+            let mut o = orch(true);
+            let mut eff =
+                crate::testsupport::empty_effective(Arc::new(rhapsody_tracker::fake::Fake::new()));
+            eff.terminal_states = crate::testsupport::set_of(&["done"]);
+            o.eff = Some(eff);
+            let id = o
+                .store()
+                .park_subject(&rhapsody_store::SubjectHold {
+                    subject: "TEST-1".into(),
+                    kind: "escalation".into(),
+                    snapshot: snapshot.into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            o.store()
+                .observe_notices(
+                    &[rhapsody_store::Notice {
+                        source: format!("lead-park:{id}"),
+                        kind: "lead_escalation".into(),
+                        group: "needs_you".into(),
+                        subject: "TEST-1".into(),
+                        transient: true,
+                        ..Default::default()
+                    }],
+                    "2026-10-10T16:00:00Z",
+                )
+                .unwrap();
+            o.observe_parked_issue(&crate::testsupport::issue("id", "TEST-1", " Done "));
+            assert!(
+                o.store().subject_hold("TEST-1").unwrap().is_none(),
+                "{snapshot}"
+            );
+            assert!(!o.store().notices().unwrap()[0].active);
+            assert!(!o.store().subject_resume_pending("TEST-1").unwrap());
+            // A notification collection already in flight cannot resurrect the released episode.
+            let stale = o.store().notices().unwrap().remove(0);
+            o.store()
+                .observe_notices(&[stale], "2026-10-10T16:01:00Z")
+                .unwrap();
+            assert!(o.store().notices().unwrap().iter().all(|n| !n.active));
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_terminal_observation_covers_missing_and_invalid_baselines_and_done_state() {
+        for state in ["Shipped", "Archived", "In Review", ""] {
+            for baseline in [
+                "",
+                "invalid",
+                "{\"state\":null,\"human\":false,\"heads\":{}}",
+            ] {
+                let mut tracker = rhapsody_tracker::fake::Fake::new();
+                tracker.by_identifier.insert(
+                    "TEST-1".into(),
+                    crate::testsupport::issue("id", "TEST-1", state),
+                );
+                let mut o = orch(true);
+                o.teams.as_mut().unwrap().review.done_state = "Archived".into();
+                o.teams.as_mut().unwrap().review.mode =
+                    rhapsody_config::teams::ReviewMode::Ticketless;
+                let project =
+                    crate::testsupport::proj_with_tracker("project", Arc::new(tracker), "project");
+                let mut eff = crate::testsupport::empty_effective(Arc::new(
+                    rhapsody_tracker::fake::Fake::new(),
+                ));
+                eff.projects = vec![project];
+                eff.projects[0].terminal_states = crate::testsupport::set_of(&["shipped"]);
+                o.eff = Some(eff);
+                o.store()
+                    .park_subject(&rhapsody_store::SubjectHold {
+                        subject: "TEST-1".into(),
+                        kind: "escalation".into(),
+                        snapshot: baseline.into(),
+                        ..Default::default()
+                    })
+                    .unwrap();
+                o.reconcile_parked_subject_states().await;
+                assert_eq!(
+                    o.store().subject_hold("TEST-1").unwrap().is_none(),
+                    matches!(state, "Shipped" | "Archived"),
+                    "{state}/{baseline}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn material_ticket_changes_release_and_identical_polls_keep_the_park() {

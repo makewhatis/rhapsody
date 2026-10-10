@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 35;
+const SCHEMA_VERSION: i64 = 36;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -755,6 +755,29 @@ ALTER TABLE rhapsody_review_head_findings ADD COLUMN dispute_granted INTEGER NOT
 ALTER TABLE rhapsody_review_head_findings ADD COLUMN dispute_pending INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE rhapsody_review_head_findings ADD COLUMN dispute_adjudication INTEGER NOT NULL DEFAULT 0;
 "#,
+    // v35 -> v36: validate upgrade folds before admission and retain terminal observations.
+    r#"
+ALTER TABLE rhapsody_subject_holds ADD COLUMN state_pending INTEGER NOT NULL DEFAULT 0;
+CREATE TABLE rhapsody_subject_terminal (subject TEXT PRIMARY KEY COLLATE NOCASE);
+UPDATE rhapsody_subject_holds SET released_reason = 'read', resume_pending = 0
+  WHERE released_reason IS NULL AND snapshot = '' AND EXISTS (
+    SELECT 1 FROM rhapsody_notifications n WHERE n.read_at IS NOT NULL
+      AND n.id = (SELECT MAX(latest.id) FROM rhapsody_notifications latest
+        WHERE latest.source = 'lead:' || rhapsody_subject_holds.decision
+          OR latest.source = 'lead-park:' || rhapsody_subject_holds.id));
+UPDATE rhapsody_subject_holds SET state_pending = 1
+  WHERE released_reason IS NULL AND snapshot = '' AND decision != 0 AND instr(subject, '#') = 0;
+UPDATE rhapsody_notifications SET source = 'lead-park:' || (
+    SELECT h.id FROM rhapsody_subject_holds h WHERE source = 'lead:' || h.decision), transient = 1
+  WHERE kind = 'lead_escalation' AND EXISTS (
+    SELECT 1 FROM rhapsody_subject_holds h WHERE source = 'lead:' || h.decision
+      AND NOT EXISTS (SELECT 1 FROM rhapsody_notifications n WHERE n.source = 'lead-park:' || h.id));
+UPDATE rhapsody_notifications SET active = 0
+  WHERE kind = 'lead_escalation' AND EXISTS (
+    SELECT 1 FROM rhapsody_subject_holds h WHERE
+      (source = 'lead:' || h.decision OR source = 'lead-park:' || h.id)
+      AND (h.released_reason IS NOT NULL OR h.state_pending = 1));
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1320,6 +1343,15 @@ fn map_subject_hold(r: &rusqlite::Row<'_>) -> rusqlite::Result<SubjectHold> {
 
 fn upsert_subject_hold(conn: &Connection, hold: &SubjectHold) -> Result<i64, StoreError> {
     let subject = canonical_subject(conn, &hold.subject)?;
+    let terminal: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM rhapsody_subject_terminal WHERE subject = ?1)",
+        [&subject],
+        |r| r.get(0),
+    )?;
+    if terminal {
+        release_subject(conn, &subject, "terminal")?;
+        return Ok(0);
+    }
     conn.execute("INSERT INTO rhapsody_subject_holds(subject, kind, snapshot, need, at, decision) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
         ON CONFLICT(subject) WHERE released_reason IS NULL DO UPDATE SET
         kind = CASE WHEN excluded.kind = 'escalation' THEN excluded.kind ELSE kind END,
@@ -1339,7 +1371,16 @@ fn upsert_subject_hold(conn: &Connection, hold: &SubjectHold) -> Result<i64, Sto
 
 fn release_subject(conn: &Connection, subject: &str, reason: &str) -> Result<(), StoreError> {
     let subject = canonical_subject(conn, subject)?;
-    let changed = conn.execute("UPDATE rhapsody_subject_holds SET released_reason = ?2, resume_pending = 1 WHERE subject = ?1 AND released_reason IS NULL", params![subject, reason])?;
+    conn.execute("UPDATE rhapsody_notifications SET active = 0, read_at = COALESCE(read_at, ?2)
+        WHERE EXISTS(SELECT 1 FROM rhapsody_subject_holds h WHERE h.subject = ?1 AND h.released_reason IS NULL
+            AND (source = 'lead-park:' || h.id OR source = 'lead:' || h.decision))", params![subject, now_rfc3339()])?;
+    let changed = conn.execute("UPDATE rhapsody_subject_holds SET released_reason = ?2, resume_pending = CASE WHEN ?2 = 'terminal' THEN 0 ELSE 1 END WHERE subject = ?1 AND released_reason IS NULL", params![subject, reason])?;
+    if reason == "terminal" {
+        conn.execute(
+            "UPDATE rhapsody_subject_holds SET resume_pending = 0 WHERE subject = ?1",
+            [&subject],
+        )?;
+    }
     if changed > 0 {
         let items = {
             let mut stmt = conn.prepare(
@@ -1358,6 +1399,36 @@ fn release_subject(conn: &Connection, subject: &str, reason: &str) -> Result<(),
 }
 
 impl Store for Sqlite {
+    fn observe_subject_state(&self, subject: &str, terminal: bool) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let subject = canonical_subject(&tx, subject)?;
+        if terminal {
+            tx.execute(
+                "INSERT INTO rhapsody_subject_terminal(subject) VALUES (?1) ON CONFLICT DO NOTHING",
+                [&subject],
+            )?;
+            release_subject(&tx, &subject, "terminal")?;
+        } else {
+            tx.execute(
+                "DELETE FROM rhapsody_subject_terminal WHERE subject = ?1",
+                [&subject],
+            )?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+    fn load_subject_observations(&self) -> Result<Vec<SubjectHold>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT id, subject, kind, snapshot, need, at, repeats, decision FROM rhapsody_subject_holds WHERE released_reason IS NULL ORDER BY id")?;
+        Ok(stmt
+            .query_map([], map_subject_hold)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+    fn confirm_subject_hold_state(&self, id: i64, snapshot: &str) -> Result<(), StoreError> {
+        self.lock().execute("UPDATE rhapsody_subject_holds SET snapshot = ?2, state_pending = 0 WHERE id = ?1 AND released_reason IS NULL AND NOT EXISTS(SELECT 1 FROM rhapsody_subject_terminal t WHERE t.subject = rhapsody_subject_holds.subject)", params![id, snapshot])?;
+        Ok(())
+    }
     fn release_subject_episode(
         &self,
         id: i64,
@@ -1403,7 +1474,7 @@ impl Store for Sqlite {
     }
     fn load_subject_holds(&self) -> Result<Vec<SubjectHold>, StoreError> {
         let conn = self.lock();
-        let mut stmt = conn.prepare("SELECT id, subject, kind, snapshot, need, at, repeats, decision FROM rhapsody_subject_holds WHERE released_reason IS NULL ORDER BY id")?;
+        let mut stmt = conn.prepare("SELECT id, subject, kind, snapshot, need, at, repeats, decision FROM rhapsody_subject_holds WHERE released_reason IS NULL AND state_pending = 0 ORDER BY id")?;
         Ok(stmt
             .query_map([], map_subject_hold)?
             .collect::<Result<Vec<_>, _>>()?)
@@ -1552,6 +1623,16 @@ impl Store for Sqlite {
             }
         }
         for row in rows {
+            if let Some(episode) = row
+                .source
+                .strip_prefix("lead-park:")
+                .and_then(|s| s.parse::<i64>().ok())
+            {
+                let inactive: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE id = ?1 AND (released_reason IS NOT NULL OR state_pending = 1))", [episode], |r| r.get(0))?;
+                if inactive {
+                    continue;
+                }
+            }
             tx.execute(
                 "INSERT INTO rhapsody_notifications (source, kind, notice_group, subject, summary, href, at, transient)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
@@ -1806,7 +1887,7 @@ impl Store for Sqlite {
         Ok(self.lock().execute(
             "INSERT INTO rhapsody_lead_reporting (key, count)
              SELECT 'page-park:' || h.id, 1 FROM rhapsody_lead_decisions d
-             JOIN rhapsody_subject_holds h ON h.decision = d.id AND h.released_reason IS NULL
+             JOIN rhapsody_subject_holds h ON h.decision = d.id AND h.released_reason IS NULL AND h.state_pending = 0
              WHERE d.id = ?1 AND d.overruled_at IS NULL AND substr(d.decision, 1, 10) = 'escalate: '
              ON CONFLICT(key) DO NOTHING",
             params![decision],
@@ -5038,6 +5119,42 @@ mod tests {
     }
 
     #[test]
+    fn park_refused_or_released_for_terminal_ticket() {
+        let store = open_mem();
+        store.link_subject_pr("TEST-1", "o/r#1").unwrap();
+        let hold = SubjectHold {
+            subject: "o/r#1".into(),
+            kind: "escalation".into(),
+            ..Default::default()
+        };
+        store.observe_subject_state("TEST-1", true).unwrap();
+        assert_eq!(store.park_subject(&hold).unwrap(), 0);
+        assert!(store.subject_hold("TEST-1").unwrap().is_none());
+        let item = store
+            .enqueue_lead_item(
+                &LeadTrigger::BlockedHandoff {
+                    ticket: "TEST-1".into(),
+                    question: "old question".into(),
+                },
+                "at",
+            )
+            .unwrap();
+        store
+            .save_lead_decision(&LeadDecisionRow {
+                item,
+                decision: "escalate: stale result".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(store.load_subject_holds().unwrap().is_empty());
+        store.observe_subject_state("TEST-1", false).unwrap();
+        assert!(
+            store.park_subject(&hold).unwrap() > 0,
+            "reopened tickets may park"
+        );
+    }
+
+    #[test]
     fn paraphrased_escalation_updates_in_place() {
         use super::*;
         let store = Sqlite::open(StorePath::InMemory).unwrap();
@@ -5222,6 +5339,13 @@ mod tests {
             tx.commit().unwrap();
         }
         let store = Sqlite::open(StorePath::Disk(db)).unwrap();
+        // Upgrade folds need an authoritative live state, not an old run outcome.
+        let pending = store.load_subject_observations().unwrap();
+        assert_eq!(pending.len(), 1);
+        store.observe_subject_state("TEST-1", false).unwrap();
+        store
+            .confirm_subject_hold_state(pending[0].id, "live snapshot")
+            .unwrap();
         let holds = store.load_subject_holds().unwrap();
         assert_eq!(holds.len(), 1);
         assert_eq!(holds[0].subject, "TEST-1");
@@ -5244,6 +5368,83 @@ mod tests {
                 )
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn v33_fold_skips_terminal_and_read_escalations() {
+        let dir = scratch_dir();
+        let db = dir.join("v33.db");
+        {
+            let mut conn = Connection::open(&db).unwrap();
+            let tx = conn.transaction().unwrap();
+            for migration in &MIGRATIONS[..33] {
+                tx.execute_batch(migration).unwrap();
+            }
+            tx.execute_batch("PRAGMA user_version = 33;
+                INSERT INTO rhapsody_lead_items(id,trigger,subject,question,detail,created_at) VALUES
+                    (1,'blocked_handoff','TEST-1','live','live','at'),
+                    (2,'blocked_handoff','TEST-2','done','done','at'),
+                    (3,'blocked_handoff','TEST-3','read','read','at');
+                INSERT INTO rhapsody_lead_decisions(id,item,at,decision,reasoning,evidence,actions,harness,model) VALUES
+                    (1,1,'at','escalate: live','','','','',''),
+                    (2,2,'at','escalate: done','','','','',''),
+                    (3,3,'at','escalate: read','','','','','');
+                INSERT INTO rhapsody_notifications(source,kind,notice_group,subject,summary,href,at,read_at) VALUES
+                    ('lead:1','lead_escalation','needs_you','TEST-1','live','#lead','at',NULL),
+                    ('lead:2','lead_escalation','needs_you','TEST-2','done','#lead','at',NULL),
+                    ('lead:3','lead_escalation','needs_you','TEST-3','read','#lead','at','read-time');").unwrap();
+            tx.commit().unwrap();
+        }
+        let store = Sqlite::open(StorePath::Disk(db)).unwrap();
+        assert!(
+            store.load_subject_holds().unwrap().is_empty(),
+            "no upgrade pages before scoped validation"
+        );
+        assert!(!store.reserve_lead_page(1).unwrap());
+        assert!(store.subject_hold("TEST-3").unwrap().is_none());
+        for hold in store.load_subject_observations().unwrap() {
+            store
+                .update_hold_snapshot(hold.id, "PR-only observation")
+                .unwrap();
+            assert!(
+                store
+                    .load_subject_holds()
+                    .unwrap()
+                    .iter()
+                    .all(|h| h.id != hold.id)
+            );
+            store
+                .observe_subject_state(&hold.subject, hold.subject == "TEST-2")
+                .unwrap();
+            store
+                .confirm_subject_hold_state(hold.id, "observed state")
+                .unwrap();
+            if hold.subject == "TEST-2" {
+                let reason: String = store
+                    .lock()
+                    .query_row(
+                        "SELECT released_reason FROM rhapsody_subject_holds WHERE id = ?1",
+                        [hold.id],
+                        |r| r.get(0),
+                    )
+                    .unwrap();
+                assert_eq!(reason, "terminal");
+            }
+        }
+        let holds = store.load_subject_holds().unwrap();
+        assert_eq!(holds.len(), 1);
+        assert_eq!(holds[0].subject, "TEST-1");
+        assert!(store.reserve_lead_page(1).unwrap());
+        assert!(!store.reserve_lead_page(2).unwrap());
+        assert!(!store.reserve_lead_page(3).unwrap());
+        let read = store
+            .notices()
+            .unwrap()
+            .into_iter()
+            .find(|n| n.subject == "TEST-3")
+            .unwrap();
+        assert_eq!(read.read_at.as_deref(), Some("read-time"));
+        assert!(!read.active);
     }
 
     #[test]
@@ -9416,6 +9617,7 @@ mod tests {
                 "rhapsody_subject_holds_open".to_string(),
                 "rhapsody_subject_prs".to_string(),
                 "rhapsody_review_head_findings".to_string(),
+                "rhapsody_subject_terminal".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

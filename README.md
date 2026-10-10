@@ -108,6 +108,15 @@ Material releases grant one durable author admission, consumed with the next sto
 so linked-PR suppression cannot swallow the operator's change. Existing escalations are folded at
 upgrade; already-delivered latest-decision pages keep their delivery reservation.
 
+Migration **36** defers folded ticket escalations until that same bounded, scoped observer
+confirms a live state; SQLite has neither the tracker configuration nor a current ticket state.
+Folds whose latest notice was already read remain inactive history, preserving their read state.
+Configured terminal states (including the ticketless `done_state`) atomically release parks with
+reason `terminal`, deactivate their needs-you notices and clear resume grants. Durable terminal
+observations also refuse late park/lead-result writes, until a live observation confirms reopening.
+Terminal checks do not require a prior snapshot or a state-change edge, so excluded Done tickets
+and empty upgrade baselines cannot strand a park. Late notice snapshots cannot revive a closed park.
+
 An unchanged-head blocked author handoff preserves findings as well as approvals. Migration **35**
 adds a durable one-time dispute grant per (reviewer, head) to the findings-head ledger: a non-blocked
 handoff may request one re-read from the incumbent reviewer. Dispatch consumes the pending grant,

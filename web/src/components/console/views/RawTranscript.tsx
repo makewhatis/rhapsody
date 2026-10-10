@@ -1,6 +1,7 @@
 import { memo, useEffect, useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchRawTranscript, type RawTranscriptLine, type RawTranscriptPage } from "@/lib/api";
+import { clockTime } from "@/lib/console-job-detail";
 
 const bytes = (text: string) => new TextEncoder().encode(text).length;
 
@@ -86,7 +87,7 @@ const RawRow = memo(function RawRow({ line }: { line: RawTranscriptLine }) {
         <span className="trraw-time">
           {timestamp ? (
             <time dateTime={timestamp.toISOString()} title={timestamp.toLocaleString()}>
-              {timestamp.toLocaleTimeString()}
+              {clockTime(timestamp.toISOString(), true)}
             </time>
           ) : "—"}
         </span>
