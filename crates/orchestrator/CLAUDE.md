@@ -27,6 +27,9 @@ the `Orchestrator` struct itself. Concretely:
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
+    It also publishes the reload's configured log root for `rawtranscript.rs` (STUDIO-1155).
+    HTTP reads only the run row and confined file descriptors on its blocking pool; paging and
+    downloads never round-trip the control task.
   - `stop.rs`'s `ControlHandle` — the off-loop surface for Stop/Resume/handoff/operator-messages
     (`message.rs`, `handoff.rs` build on it too).
   - `warnings.rs`'s `WarningsState` (`Orchestrator::warnings: Arc<WarningsState>`, wrapping an

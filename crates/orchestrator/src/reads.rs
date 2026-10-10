@@ -110,6 +110,8 @@ pub struct TriageSnapshot {
 /// must never be logged).
 #[derive(Default, Clone)]
 pub struct ReadsTarget {
+    /// Configured log root for off-loop lossless transcript reads (STUDIO-1155).
+    pub log_dir: std::path::PathBuf,
     /// Policy thresholds for the read-only Accounts panel, published on workflow reload.
     pub limits: rhapsody_config::Limits,
     pub tracker: Option<Arc<dyn Tracker>>,

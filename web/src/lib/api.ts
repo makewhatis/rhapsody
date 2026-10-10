@@ -565,6 +565,25 @@ export interface RunTranscriptResponse {
   run_id: number;
   entries: LogEntry[];
   generated_at: string;
+  total_entries?: number;
+  dropped?: number;
+}
+
+export interface RawTranscriptLine {
+  offset: number;
+  /** Includes original newline bytes, if present. */
+  text: string;
+}
+
+export interface RawTranscriptPage {
+  run_id: number;
+  size_bytes: number;
+  lines: RawTranscriptLine[];
+  prev_cursor: number | null;
+  next_cursor: number | null;
+  at_start: boolean;
+  at_end: boolean;
+  missing?: boolean;
 }
 
 // EventHit is one cross-run event-search result (GET /api/v1/events?q=): the event plus
@@ -1171,6 +1190,17 @@ export async function fetchRunTranscript(runID: number): Promise<RunTranscriptRe
   // Defensive: tolerate a server that omits/nulls entries so the pane can .map() safely.
   r.entries ??= [];
   return r;
+}
+
+export function fetchRawTranscript(
+  runID: number,
+  cursor?: number,
+  dir: "forward" | "backward" = "backward",
+): Promise<RawTranscriptPage> {
+  const params = new URLSearchParams();
+  if (cursor !== undefined) params.set("cursor", String(cursor));
+  params.set("dir", dir);
+  return getJSON(`/api/v1/runs/${runID}/transcript/raw?${params}`);
 }
 
 export async function searchEvents(q: string, limit = 100): Promise<EventSearchResponse> {

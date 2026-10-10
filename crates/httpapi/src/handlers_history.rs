@@ -1147,18 +1147,248 @@ pub(crate) async fn handle_run_transcript(
         Ok(n) => n,
         Err(resp) => return *resp,
     };
-    match provider.run_transcript(run_id) {
-        Some(entries) => write_json(
-            StatusCode::OK,
-            &run_transcript_json(run_id, &entries, &now_rfc3339()),
-        ),
-        None => write_error(
+    let summary =
+        tokio::task::spawn_blocking(move || provider.run_transcript_summary(run_id)).await;
+    match summary {
+        Ok(Some((entries, total))) => {
+            let mut body = run_transcript_json(run_id, &entries, &now_rfc3339());
+            if total > entries.len() {
+                body["total_entries"] = serde_json::json!(total);
+                body["dropped"] = serde_json::json!(total - entries.len());
+            }
+            write_json(StatusCode::OK, &body)
+        }
+        Ok(None) => write_error(
             StatusCode::NOT_FOUND,
             "run_not_found",
             format!("no run with id: {id}"),
             None,
         ),
+        Err(_) => store_error("transcript read task failed"),
     }
+}
+
+/// Lossless reads use only the run row's path. All blocking store/path/file work stays off the
+/// control loop and Tokio workers; the returned descriptor is already confined to the log root.
+async fn open_run_transcript(
+    provider: Arc<dyn StateProvider>,
+    run_id: i64,
+    stderr: bool,
+) -> Result<(String, Option<std::fs::File>), Box<Response>> {
+    use rhapsody_orchestrator::rawtranscript::{OpenError, open_file};
+    tokio::task::spawn_blocking(move || {
+        let row = provider
+            .history()
+            .get_run(run_id)
+            .map_err(|_| Box::new(store_error("run lookup failed")))?
+            .ok_or_else(|| {
+                Box::new(write_error(
+                    StatusCode::NOT_FOUND,
+                    "run_not_found",
+                    "run not found",
+                    None,
+                ))
+            })?;
+        let file = open_file(
+            &provider.transcript_log_dir(),
+            std::path::Path::new(&row.transcript_path),
+            stderr,
+        )
+        .map_err(|e| {
+            Box::new(match e {
+                OpenError::Refused => write_error(
+                    StatusCode::NOT_FOUND,
+                    "not_found",
+                    "transcript unavailable",
+                    None,
+                ),
+                OpenError::Io(error) => {
+                    tracing::warn!(run_id, %error, "transcript open failed");
+                    store_error("transcript open failed")
+                }
+            })
+        })?;
+        Ok((row.issue_identifier, file))
+    })
+    .await
+    .map_err(|_| Box::new(store_error("transcript read task failed")))?
+}
+
+pub(crate) async fn handle_raw_transcript(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    Path(id): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    use rhapsody_orchestrator::rawtranscript::{Direction, RawPage, read_page};
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    let run_id = match parse_run_id(&id) {
+        Ok(id) => id,
+        Err(resp) => return *resp,
+    };
+    let invalid = || {
+        write_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_param",
+            "expected a byte cursor, dir=forward|backward and positive line limit",
+            None,
+        )
+    };
+    let cursor = match q.get("cursor") {
+        None => None,
+        Some(raw) => match raw.parse::<u64>() {
+            Ok(value) => Some(value),
+            Err(_) => return invalid(),
+        },
+    };
+    let direction = match qget(&q, "dir") {
+        "" | "backward" => Direction::Backward,
+        "forward" => Direction::Forward,
+        _ => return invalid(),
+    };
+    let limit = match q.get("limit") {
+        None => 500,
+        Some(raw) => match raw.parse::<usize>() {
+            Ok(value) if value > 0 => value.min(500),
+            _ => return invalid(),
+        },
+    };
+    let file = match open_run_transcript(provider, run_id, false).await {
+        Ok((_, Some(file))) => file,
+        Ok((_, None)) => {
+            return write_json(
+                StatusCode::OK,
+                &RawPage {
+                    run_id,
+                    missing: true,
+                    at_start: true,
+                    at_end: true,
+                    ..Default::default()
+                },
+            );
+        }
+        Err(resp) => return *resp,
+    };
+    match tokio::task::spawn_blocking(move || read_page(file, run_id, cursor, direction, limit))
+        .await
+    {
+        Ok(Ok(page)) => write_json(StatusCode::OK, &page),
+        Ok(Err(error)) if error.kind() == std::io::ErrorKind::InvalidInput => invalid(),
+        Ok(Err(error)) => {
+            tracing::warn!(run_id, %error, "raw transcript read failed");
+            store_error("transcript read failed")
+        }
+        Err(_) => store_error("transcript read task failed"),
+    }
+}
+
+pub(crate) async fn handle_transcript_download(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    Path(id): Path<String>,
+) -> Response {
+    transcript_download(method, provider, id, false).await
+}
+
+pub(crate) async fn handle_stderr_download(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    Path(id): Path<String>,
+) -> Response {
+    transcript_download(method, provider, id, true).await
+}
+
+async fn transcript_download(
+    method: Method,
+    provider: Arc<dyn StateProvider>,
+    id: String,
+    stderr: bool,
+) -> Response {
+    use axum::body::Body;
+    use axum::http::header::{CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_TYPE};
+    use tokio::io::AsyncReadExt;
+    if let Some(resp) = require_get(&method) {
+        return resp;
+    }
+    let run_id = match parse_run_id(&id) {
+        Ok(id) => id,
+        Err(resp) => return *resp,
+    };
+    let (key, file) = match open_run_transcript(provider, run_id, stderr).await {
+        Ok(result) => result,
+        Err(resp) => return *resp,
+    };
+    let Some(file) = file else {
+        return write_json(
+            StatusCode::OK,
+            &serde_json::json!({"run_id":run_id, "lines":[], "missing":true}),
+        );
+    };
+    let file = tokio::fs::File::from_std(file);
+    let size = match file.metadata().await {
+        Ok(metadata) => metadata.len(),
+        Err(_) => return store_error("transcript metadata failed"),
+    };
+    // Backpressure bounds memory to two 64 KiB chunks, regardless of file size. Pin the download
+    // to this size; a live writer can keep appending without extending this request forever.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Vec<u8>, std::io::Error>>(2);
+    tokio::spawn(async move {
+        let mut file = file.take(size);
+        loop {
+            let mut chunk = vec![0; 64 << 10];
+            match file.read(&mut chunk).await {
+                Ok(0) => break,
+                Ok(n) => {
+                    chunk.truncate(n);
+                    if tx.send(Ok(chunk)).await.is_err() {
+                        break;
+                    }
+                }
+                Err(error) => {
+                    let _ = tx.send(Err(error)).await;
+                    break;
+                }
+            }
+        }
+    });
+    let key: String = key
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let suffix = if stderr { "stderr.log" } else { "jsonl" };
+    let mut response = Response::new(Body::from_stream(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+    ));
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        axum::http::HeaderValue::from_static(if stderr {
+            "text/plain; charset=utf-8"
+        } else {
+            "application/x-ndjson"
+        }),
+    );
+    let disposition = format!("attachment; filename=\"{key}-run{run_id}.{suffix}\"");
+    let disposition = match disposition.parse() {
+        Ok(header) => header,
+        Err(_) => return store_error("transcript filename header failed"),
+    };
+    response
+        .headers_mut()
+        .insert(CONTENT_DISPOSITION, disposition);
+    let length = match size.to_string().parse() {
+        Ok(header) => header,
+        Err(_) => return store_error("transcript length header failed"),
+    };
+    response.headers_mut().insert(CONTENT_LENGTH, length);
+    response
 }
 
 /// The current instant as an RFC3339 (UTC, seconds precision) string — the `generated_at` stamp. Go's
@@ -4428,6 +4658,206 @@ mod tests {
     }
 
     // ---- run transcript (mirrors run_transcript_test.go) ----
+
+    struct TranscriptDir(std::path::PathBuf);
+
+    #[tokio::test]
+    async fn transcript_reports_drop_only_when_capped() {
+        let entries = vec![
+            LogEntry {
+                kind: "text".into(),
+                text: "synthetic".into(),
+                ..Default::default()
+            };
+            1000
+        ];
+        let base = spawn(
+            FakeProvider::ok(empty_snapshot())
+                .with_transcript(Some(entries.clone()))
+                .with_transcript_total(1003),
+        )
+        .await;
+        let (_, body) = get_json(&format!("{base}/api/v1/runs/1/transcript")).await;
+        assert_eq!(body["total_entries"], 1003);
+        assert_eq!(body["dropped"], 3);
+        assert_eq!(body["entries"].as_array().unwrap().len(), 1000);
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_transcript(Some(entries))).await;
+        let (_, body) = get_json(&format!("{base}/api/v1/runs/1/transcript")).await;
+        assert!(body.get("total_entries").is_none());
+        assert!(body.get("dropped").is_none());
+    }
+
+    impl TranscriptDir {
+        fn new() -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "rhapsody-raw-transcript-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TranscriptDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn transcript_download_emits_bounded_chunks_and_pins_live_size() {
+        use tokio_stream::StreamExt;
+        let dir = TranscriptDir::new();
+        let path = dir.0.join("run.jsonl");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(5 * (64 << 10)).unwrap();
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let id = store
+            .start_run(RunStart {
+                issue_identifier: "TEST-STREAM".into(),
+                transcript_path: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        let provider = FakeProvider::ok(empty_snapshot())
+            .with_history(store)
+            .with_transcript_log_dir(&dir.0);
+        let response = super::transcript_download(
+            axum::http::Method::GET,
+            Arc::new(provider),
+            id.to_string(),
+            false,
+        )
+        .await;
+        assert_eq!(
+            response.headers()["content-length"],
+            (5 * (64 << 10)).to_string()
+        );
+        let mut stream = response.into_body().into_data_stream();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(
+            first.len(),
+            64 << 10,
+            "a whole-file buffered body would emit one large chunk"
+        );
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"appended after download began")
+            .unwrap();
+        let mut count = first.len();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.unwrap();
+            assert!(chunk.len() <= 64 << 10);
+            assert!(chunk.iter().all(|byte| *byte == 0));
+            count += chunk.len();
+        }
+        assert_eq!(count, 5 * (64 << 10));
+    }
+
+    #[tokio::test]
+    async fn raw_transcript_and_downloads_use_confined_run_file() {
+        let dir = TranscriptDir::new();
+        let root = dir.0.join("logs");
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("run.jsonl");
+        let bytes = b"{\"type\":\"system\"}\n{\"type\":\"result\"}";
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::write(root.join("run.stderr.log"), b"stderr\n").unwrap();
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let id = store
+            .start_run(RunStart {
+                issue_identifier: "TEST-1".into(),
+                transcript_path: path.to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        let provider = FakeProvider::ok(empty_snapshot())
+            .with_history(store.clone())
+            .with_transcript_log_dir(&root);
+        let base = spawn(provider).await;
+        let (status, body) =
+            get_json(&format!("{base}/api/v1/runs/{id}/transcript/raw?limit=1")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["lines"][0]["text"], "{\"type\":\"result\"}");
+        assert_eq!(body["prev_cursor"], 18);
+        assert_eq!(body["at_end"], true);
+        for query in [
+            "cursor=1&dir=forward",
+            "cursor=-1",
+            "cursor=999",
+            "dir=wrong",
+            "limit=0",
+        ] {
+            assert_eq!(
+                get_json(&format!("{base}/api/v1/runs/{id}/transcript/raw?{query}"))
+                    .await
+                    .0,
+                400
+            );
+        }
+        for suffix in ["transcript/raw", "transcript.jsonl", "stderr.log"] {
+            assert_eq!(
+                post_status(&format!("{base}/api/v1/runs/{id}/{suffix}")).await,
+                405
+            );
+            assert_eq!(
+                get_json(&format!("{base}/api/v1/runs/999/{suffix}"))
+                    .await
+                    .0,
+                404
+            );
+        }
+        for (endpoint, content_type, expected) in [
+            ("transcript.jsonl", "application/x-ndjson", bytes.as_slice()),
+            (
+                "stderr.log",
+                "text/plain; charset=utf-8",
+                b"stderr\n".as_slice(),
+            ),
+        ] {
+            let response = reqwest::get(format!("{base}/api/v1/runs/{id}/{endpoint}"))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            assert_eq!(response.headers()["content-type"], content_type);
+            let filename = if endpoint == "transcript.jsonl" {
+                "jsonl"
+            } else {
+                "stderr.log"
+            };
+            assert_eq!(
+                response.headers()["content-disposition"],
+                format!("attachment; filename=\"TEST-1-run{id}.{filename}\"")
+            );
+            assert_eq!(response.bytes().await.unwrap().as_ref(), expected);
+        }
+        std::fs::remove_file(&path).unwrap();
+        let (status, body) = get_json(&format!("{base}/api/v1/runs/{id}/transcript/raw")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["missing"], true);
+        assert_eq!(body["lines"], json!([]));
+        let outside = dir.0.join("outside.jsonl");
+        std::fs::write(&outside, "private").unwrap();
+        let outside_id = store
+            .start_run(RunStart {
+                transcript_path: outside.to_string_lossy().into_owned(),
+                ..Default::default()
+            })
+            .unwrap();
+        for suffix in ["transcript/raw", "transcript.jsonl", "stderr.log"] {
+            assert_eq!(
+                get_json(&format!("{base}/api/v1/runs/{outside_id}/{suffix}"))
+                    .await
+                    .0,
+                404
+            );
+        }
+    }
 
     #[tokio::test]
     async fn run_transcript_omits_absent_timing_and_preserves_known_zero_duration() {

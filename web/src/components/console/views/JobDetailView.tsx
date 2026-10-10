@@ -22,6 +22,7 @@ import {
   Timestamp,
 } from "@/components/console";
 import { handleTablistKeyDown } from "@/components/shell/tabs";
+import { RawTranscript } from "./RawTranscript";
 import { teammateColor } from "@/theme/teammates";
 import {
   useIssueHistory,
@@ -128,7 +129,6 @@ import {
 } from "@/lib/trace-model";
 import type {
   BreakerHold,
-  LogEntry,
   MergeReceipt,
   ResumeHoldResult,
   RunProvenance,
@@ -154,8 +154,8 @@ import { JobLimitChips } from "./LimitChips";
 // inspector; a FAILED one gains a "jump to failing step" out of its banner; and a ticket whose
 // work relayed across attempts gains a handoff baton either side of the attempt being read.
 //
-// Plus the escape hatch §4 calls mandatory: a "Raw transcript" toggle that drops to the flat
-// oldest→newest `LogEntry` list. The folding is a documented heuristic — a debugger is never
+// Plus the escape hatch §4 calls mandatory: a "Raw transcript" toggle that opens the paged file.
+// The folding is a documented heuristic — a debugger is never
 // trapped inside it.
 //
 // Slice 4 (STUDIO-745) adds §3C's watch-tabs rail — Diff / Review / Room / Memory / Messages,
@@ -344,7 +344,9 @@ function RunTrace({
   const fidelity = harnessFidelity(provenance.data);
   const live = liveRunRow(run, detail.data);
   const inFlight = live.outcome === OUTCOME_RUNNING;
-  const transcript = useTranscript(run.id, inFlight);
+  const [raw, setRaw] = useState(false);
+  // Raw pages do not need a full-file humanizer scan on every live poll.
+  const transcript = useTranscript(run.id, inFlight, !raw);
   const entries = useMemo(() => transcript.data?.entries ?? [], [transcript.data]);
   const trace = useMemo(() => buildTrace(entries), [entries]);
   const result = useMemo(() => buildResult(entries, live), [entries, live]);
@@ -390,7 +392,6 @@ function RunTrace({
   // "what <who> did" can never disagree about whose run this is — they did while only the header
   // knew about a review key.
   const who = runTeammate(run, identities, assignee);
-  const [raw, setRaw] = useState(false);
   // The rail's selection, and the draft in its composer. Both live HERE rather than in the panel
   // so that reading the room, then coming back, does not silently discard a half-written
   // instruction — only the panel that is showing is mounted, and its own state dies with it.
@@ -476,9 +477,15 @@ function RunTrace({
       </div>
 
       {raw ? (
-        <RawTranscript entries={entries} pending={transcript.isPending} />
+        <RawTranscript key={run.id} runId={run.id} inFlight={inFlight} />
       ) : (
         <>
+          {(transcript.data?.dropped ?? 0) > 0 ? (
+            <div className="trraw-notice">
+              Showing the last {entries.length} of {transcript.data?.total_entries} entries ·{" "}
+              <button type="button" onClick={() => setRaw(true)}>Open Raw transcript</button>
+            </div>
+          ) : null}
           <ResultCardZone
             run={live}
             ticket={originTicket === "" ? issue : originTicket}
@@ -2230,31 +2237,6 @@ function Said({ said, who }: { said: readonly SaidBlock[]; who: string }) {
   );
 }
 
-// --- the raw-transcript escape hatch (§4) --------------------------------------------------
-
-/**
- * Today's flat oldest→newest `LogEntry` list. The folding above is a documented heuristic over a
- * transcript that carries no structured tool metadata, so the design record makes this hatch
- * mandatory: the text is printed VERBATIM here, markdown and all, because this is the view whose
- * job is to show what the daemon actually served.
- */
-function RawTranscript({ entries, pending }: { entries: readonly LogEntry[]; pending: boolean }) {
-  return (
-    <div className="trraw">
-      {entries.map((entry) => (
-        <div className="rawline" key={entry.seq} tabIndex={0}>
-          <span className="rk">{entry.kind}</span>
-          {entry.tool === "" ? "" : ` ${entry.tool}`} {entry.text}
-        </div>
-      ))}
-      {entries.length === 0 ? (
-        <div className="empty">
-          {pending ? "Loading transcript…" : "No transcript recorded for this run."}
-        </div>
-      ) : null}
-    </div>
-  );
-}
 
 
 // --- (C, continued) the watch-tabs rail (§3C, slice 4) --------------------------------------

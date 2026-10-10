@@ -82,6 +82,25 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Lossless transcript paging and downloads (STUDIO-1155)
+
+Three additive GET endpoints serve the persisted run file rather than the humanizer's summaries:
+`/api/v1/runs/{id}/transcript/raw?cursor=<byte-offset>&dir=forward|backward&limit=<lines>`,
+`/api/v1/runs/{id}/transcript.jsonl`, and `/api/v1/runs/{id}/stderr.log`. Raw pages open at the tail
+when the cursor is absent, retain original line endings (including an unterminated final line),
+and contain at most 500 lines or 4 MiB; one oversized line is returned alone and whole. Cursors
+are line-boundary byte offsets, not entry numbers; pages list lines in file order in either direction.
+Downloads stream a size-pinned file snapshot with bounded backpressure, never a whole-file buffer.
+All reads use only the run row's path, confined to the configured log directory after canonicalization
+and opened descriptor-relative without following replacement symlinks. Escapes return 404;
+missing/pruned files return 200 with `missing: true`. These GETs share the transcript read access gate.
+
+The humanized `/transcript` keeps its last-1000 cap, but adds `total_entries` and `dropped` only
+when that cap actually drops entries. Below the cap both fields are omitted, preserving the H2
+golden byte-for-byte. Trace states that boundary and links to Raw. Raw renders only loaded pages,
+with byte offsets, local line timestamps, explicit 200-character previews, full expandable JSON
+(or verbatim non-JSON), download links and live-tail polling. The humanizer's text clamps are unchanged.
+
 ### Source transcript timing (STUDIO-1154)
 
 Humanized transcript entries add optional `at` (the source line's RFC3339 UTC instant, with
