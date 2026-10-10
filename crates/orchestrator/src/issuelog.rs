@@ -66,6 +66,26 @@ impl Orchestrator {
 }
 
 impl ControlHandle {
+    pub fn transcript_log_dir(&self) -> std::path::PathBuf {
+        self.reads
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .log_dir
+            .clone()
+    }
+
+    /// Count and read on the HTTP blocking pool; no control-task round trip.
+    pub fn run_transcript_summary(&self, run_id: i64) -> Option<(Vec<agent::LogEntry>, usize)> {
+        match self.store().get_run(run_id) {
+            Ok(Some(run)) => Some(humanize_transcript_summary(&run.transcript_path)),
+            Ok(None) => None,
+            Err(e) => {
+                tracing::error!(run_id, error = %e, "run transcript lookup failed");
+                None
+            }
+        }
+    }
+
     /// The daemon's off-loop `GET /api/v1/runs/{id}/transcript` surface — the [`ControlHandle`]
     /// mirror of [`Orchestrator::run_transcript`], reading the run row + humanizing its recorded
     /// transcript through the shared store OFF the control loop (so a multi-MB read never blocks
@@ -95,31 +115,40 @@ impl ControlHandle {
 /// non-nil, possibly empty slice (so callers never panic on nil and "no transcript" reads as no
 /// entries). Mirrors Go `humanizeTranscriptFile`.
 pub(crate) fn humanize_transcript_file(path: &str) -> Vec<agent::LogEntry> {
+    humanize_transcript_summary(path).0
+}
+
+fn humanize_transcript_summary(path: &str) -> (Vec<agent::LogEntry>, usize) {
     if path.is_empty() {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
     let file = match File::open(path) {
         Ok(f) => f,
-        Err(_) => return Vec::new(),
+        Err(_) => return (Vec::new(), 0),
     };
     // claude can emit multi-MB lines, so read through a 1 MiB `BufReader` + `read_until` (no
     // `Scanner`-style 64 KiB cap; Rust's `read_until` grows the buffer to the full line).
     let mut reader = BufReader::with_capacity(1 << 20, file);
-    let mut out: Vec<agent::LogEntry> = Vec::with_capacity(256);
+    let mut out = std::collections::VecDeque::with_capacity(MAX_LOG_ENTRIES);
+    let mut total = 0;
     let mut line: Vec<u8> = Vec::new();
     loop {
         line.clear();
         match reader.read_until(b'\n', &mut line) {
             Ok(0) => break, // EOF (a final unterminated line was already processed the prior pass).
-            Ok(_) => out.extend(humanize_stream_line(&line)),
+            Ok(_) => {
+                for entry in humanize_stream_line(&line) {
+                    total += 1;
+                    if out.len() == MAX_LOG_ENTRIES {
+                        out.pop_front();
+                    }
+                    out.push_back(entry);
+                }
+            }
             Err(_) => break,
         }
     }
-    // Cap to the last MAX_LOG_ENTRIES (Seq assignment happens in the HTTP layer).
-    if out.len() > MAX_LOG_ENTRIES {
-        out.drain(..out.len() - MAX_LOG_ENTRIES);
-    }
-    out
+    (out.into_iter().collect(), total)
 }
 
 #[cfg(test)]
@@ -186,6 +215,18 @@ mod tests {
         let dir = TempDir::new();
         let missing = dir.child("nope.jsonl");
         assert!(humanize_transcript_file(&missing).is_empty());
+    }
+
+    #[test]
+    fn humanized_summary_counts_entries_before_tail_cap() {
+        let dir = TempDir::new();
+        let line = r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hello"}]}}"#;
+        let path = write_jsonl(&dir, &vec![line; 1003]);
+        let (entries, total) = humanize_transcript_summary(&path);
+        assert_eq!(entries.len(), 1000);
+        assert_eq!(total, 1003);
+        let path = write_jsonl(&dir, &[line]);
+        assert_eq!(humanize_transcript_summary(&path).1, 1);
     }
 
     // Mirrors Go `TestHumanizeTranscriptFileHugeAndPartial`: proves the buffered-reader path (no

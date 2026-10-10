@@ -55,6 +55,8 @@ impl FakeResumeHoldError {
 /// fake. The history store defaults to a [`Noop`] (Go's `fakeProvider.Store()` returns `store.Noop()`
 /// when `hist == nil`), so an endpoint that reads history without a seeded store still degrades to `[]`.
 pub(crate) struct FakeProvider {
+    transcript_log_dir: std::path::PathBuf,
+    transcript_total: Option<usize>,
     notification_store: Option<Arc<dyn rhapsody_store::Store + Send + Sync>>,
     lead_reports: Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>>,
     snap: Snapshot,
@@ -185,6 +187,14 @@ pub(crate) struct FakeProvider {
 }
 
 impl FakeProvider {
+    pub(crate) fn with_transcript_total(mut self, total: usize) -> Self {
+        self.transcript_total = Some(total);
+        self
+    }
+    pub(crate) fn with_transcript_log_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.transcript_log_dir = dir.into();
+        self
+    }
     pub(crate) fn with_notification_store(
         mut self,
         store: Arc<dyn rhapsody_store::Store + Send + Sync>,
@@ -210,6 +220,8 @@ impl FakeProvider {
     /// A provider that returns `snap` from every `snapshot()` call, with an empty (Noop) history store.
     pub(crate) fn ok(snap: Snapshot) -> Self {
         Self {
+            transcript_log_dir: std::path::PathBuf::new(),
+            transcript_total: None,
             snap,
             snap_err: None,
             drain: rhapsody_orchestrator::drain::DrainSignal::new(),
@@ -740,6 +752,17 @@ impl StateProvider for FakeProvider {
     fn run_transcript(&self, _run_id: i64) -> Option<Vec<LogEntry>> {
         self.touch();
         self.transcript.clone()
+    }
+
+    fn transcript_log_dir(&self) -> std::path::PathBuf {
+        self.transcript_log_dir.clone()
+    }
+
+    fn run_transcript_summary(&self, run_id: i64) -> Option<(Vec<LogEntry>, usize)> {
+        self.run_transcript(run_id).map(|entries| {
+            let total = self.transcript_total.unwrap_or(entries.len());
+            (entries, total)
+        })
     }
 
     async fn list_linear_projects(&self) -> Result<Vec<Project>, ReadsError> {

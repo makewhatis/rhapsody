@@ -86,6 +86,7 @@ pub mod providerprep;
 pub mod providerreload;
 pub mod prstate;
 pub mod quorum;
+pub mod rawtranscript;
 pub mod reads;
 pub mod reconcile;
 pub mod reconcile_run;
