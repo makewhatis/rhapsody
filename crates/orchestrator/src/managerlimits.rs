@@ -47,6 +47,9 @@ async fn reassign_ticket(plan: &ReassignPlan) -> Result<rhapsody_core::Issue, St
         return Err("not a reassignment".into());
     };
     let id = &plan.old.issue.id;
+    if crate::review::is_non_tracker_key(id) {
+        return Err("ticket no longer exists".into());
+    }
     let mut current = plan
         .tracker
         .fetch_parked_issue(id)

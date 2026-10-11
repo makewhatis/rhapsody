@@ -372,8 +372,7 @@ impl Orchestrator {
         if engine.is_none() && attempt.is_some() {
             engine = self.limit_policy.pinned_engines.get(&iss.id).cloned();
         }
-        if !crate::review::is_review_key(&iss.id)
-            && !crate::managerrun::is_manager_key(&iss.id)
+        if !crate::review::is_non_tracker_key(&iss.id)
             && self.subject_parked(&iss.identifier, "author")
         {
             self.claimed.remove(&iss.id);
@@ -1647,6 +1646,9 @@ impl Orchestrator {
         last: Issue,
         terminal: &HashSet<String>,
     ) -> Result<Recheck, TrackerError> {
+        if crate::review::is_non_tracker_key(id) {
+            return Ok(Recheck::Gone);
+        }
         let ids = [id.to_string()];
         let states = tr.fetch_issue_states_by_ids(&ids).await?;
         let Some(cur) = find_by_id(&states, id) else {

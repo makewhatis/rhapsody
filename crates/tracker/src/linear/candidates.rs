@@ -118,7 +118,7 @@ pub(super) async fn fetch_parked_issue(
     c: &Client,
     id: &str,
 ) -> Result<Option<Issue>, TrackerError> {
-    if id.is_empty() {
+    if !super::issue_id::valid(id) {
         return Ok(None);
     }
     let viewer = super::client::resolve_viewer(c).await?;

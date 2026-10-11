@@ -914,6 +914,8 @@ impl Orchestrator {
                     return;
                 }
             }
+        } else if crate::review::is_non_tracker_key(id) {
+            None
         } else {
             match tracker.fetch_parked_issue(id).await {
                 Ok(c) => c,

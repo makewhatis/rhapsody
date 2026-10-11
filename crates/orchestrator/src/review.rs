@@ -240,6 +240,33 @@ pub fn is_review_key(id: &str) -> bool {
     id.starts_with(REVIEW_KEY_PREFIX)
 }
 
+/// A local run key that no tracker can resolve: ticketless review, manager or lead work.
+/// Use at run-row/subject lookup boundaries; keep role-specific rendering predicates separate.
+pub fn is_non_tracker_key(id: &str) -> bool {
+    // Subject ledgers canonicalize ticket-like strings to uppercase; role rendering still uses
+    // the original, case-sensitive key predicates, but lookup exclusion must survive that fold.
+    let id = id.to_ascii_lowercase();
+    is_review_key(&id) || crate::managerrun::is_manager_key(&id)
+}
+
+#[cfg(test)]
+mod non_tracker_tests {
+    #[test]
+    fn non_tracker_keys_survive_subject_canonicalization() {
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ] {
+            assert!(super::is_non_tracker_key(key));
+            assert!(super::is_non_tracker_key(&key.to_ascii_uppercase()));
+        }
+        for key in ["STUDIO-123", "00000000-0000-4000-8000-000000000001", ""] {
+            assert!(!super::is_non_tracker_key(key));
+        }
+    }
+}
+
 /// The first 7 characters of a SHA, for the synthetic issue's human-readable title only.
 fn short_sha(sha: &str) -> &str {
     sha.get(..7).unwrap_or(sha)

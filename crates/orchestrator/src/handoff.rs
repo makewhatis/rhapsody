@@ -564,6 +564,9 @@ impl ControlHandle {
     /// reached. Resolves the tracker exactly like [`Self::move_issue_state`] (the `control()`-time
     /// snapshot, else the shared reads tracker) and never holds the reads guard across the await.
     async fn fresh_ticket_state(&self, issue_id: &str) -> Option<String> {
+        if crate::review::is_non_tracker_key(issue_id) {
+            return None;
+        }
         let tracker = self.tracker.clone().or_else(|| {
             self.reads
                 .read()
@@ -601,6 +604,12 @@ impl ControlHandle {
         team_id: &str,
         state_name: &str,
     ) -> Result<(), rhapsody_tracker::TrackerError> {
+        if crate::review::is_non_tracker_key(issue_id) {
+            tracing::debug!(issue_id, "refusing tracker move for a local run key");
+            return Err(rhapsody_tracker::TrackerError::Other(
+                "local run has no tracker issue".into(),
+            ));
+        }
         let tracker = self.tracker.clone().or_else(|| {
             self.reads
                 .read()
@@ -625,6 +634,9 @@ impl ControlHandle {
     /// never holds the reads guard across the await. `None` means the state could not be read — the
     /// caller treats that as UNCONFIRMED, the fail-closed direction.
     pub(crate) async fn read_issue_state(&self, issue_id: &str) -> Option<String> {
+        if crate::review::is_non_tracker_key(issue_id) {
+            return None;
+        }
         let tracker = self.tracker.clone().or_else(|| {
             self.reads
                 .read()
@@ -732,6 +744,77 @@ mod tests {
         let mut i = issue(id, ident, state);
         i.team_id = team.to_string();
         i
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_tracker_handoff_refuses_a_ticket_move_without_ending_the_run() {
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "LIMIT:ACCOUNT@MANAGER",
+            "pr:example/repo#1@reviewer",
+        ] {
+            let tr = Arc::new(Fake::new());
+            let (mut o, env) = handoff_orch(tr.clone(), &["In Review"]);
+            if crate::review::is_review_key(key) {
+                o.pending_review.insert(
+                    key.into(),
+                    crate::review::ReviewRun {
+                        owner: "example".into(),
+                        repo: "repo".into(),
+                        number: 1,
+                        reviewer: "reviewer".into(),
+                        head_sha: "head".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+            o.dispatch_issue(
+                issue_team(key, key, "In Progress", "TEAM-1"),
+                None,
+                None,
+                String::new(),
+            );
+            let run_id = o.running[key].run_id;
+            let (task, handle) = start(o, &env.signal);
+            let res = handle.handoff_run(CancelWait::default(), run_id).await;
+            let cancelled_before_shutdown =
+                env.cancelled.lock().expect("cancelled")[key].is_cancelled();
+            let outcome = handle.store.get_run(run_id).unwrap().unwrap().outcome;
+            env.signal.cancel();
+            let _ = task.await.expect("loop task");
+            let res = res.expect("handoff");
+            assert!(tr.move_calls().is_empty(), "synthetic move: {key}");
+            assert_eq!(res.identifier, key);
+            assert!(!res.not_running && !res.not_configured && !res.already_done);
+            assert!(res.moved_to.is_empty());
+            assert!(!res.move_err.is_empty(), "must not report a landed move");
+            assert!(!cancelled_before_shutdown, "handoff must not kill the run");
+            assert_eq!(outcome, rhapsody_store::OUTCOME_RUNNING);
+        }
+    }
+
+    #[tokio::test]
+    async fn non_tracker_common_named_move_refuses_without_a_tracker_call() {
+        let tr = Arc::new(Fake::new());
+        let (o, _env) = handoff_orch(tr.clone(), &["In Review"]);
+        let handle = o.control();
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "LIMIT:ACCOUNT@MANAGER",
+            "pr:example/repo#1@reviewer",
+        ] {
+            let error = handle
+                .move_issue_state(key, "TEAM-1", "Done")
+                .await
+                .expect_err("local run has no ticket");
+            assert!(
+                !move_is_transient(&error),
+                "a local refusal cannot self-heal"
+            );
+        }
+        assert!(tr.move_calls().is_empty());
     }
 
     // ── the Rhapsody Teams review quorum (STUDIO-659, T7; design record §0.6, §0.12) ────────────

@@ -79,7 +79,7 @@ pub(super) async fn fetch_issue_branch_by_id(
     c: &Client,
     id: &str,
 ) -> Result<(String, i64), TrackerError> {
-    if id.is_empty() {
+    if !super::issue_id::valid(id) {
         return Ok((String::new(), 0));
     }
     traced(crate::tracker_span!("fetch_issue_branch"), async move {
@@ -213,7 +213,7 @@ mod tests {
             )
         })
         .await;
-        let (branch, pr) = c.fetch_issue_branch_by_id("a1").await.expect("branch");
+        let (branch, pr) = c.fetch_issue_branch_by_id("MT-1").await.expect("branch");
         assert!(
             ok.load(Ordering::SeqCst),
             "branch query must declare ids [ID!] and select branchName"
@@ -240,10 +240,7 @@ mod tests {
             "empty id should make no call"
         );
         // A not-found id returns ("", 0).
-        let (branch, pr) = c
-            .fetch_issue_branch_by_id("missing")
-            .await
-            .expect("missing");
+        let (branch, pr) = c.fetch_issue_branch_by_id("MT-404").await.expect("missing");
         assert_eq!((branch.as_str(), pr), ("", 0));
     }
 }

@@ -1042,6 +1042,7 @@ pub async fn run_agent_attempt(
         // than silently omitting the section.
         let origin = match rev.origin_ticket.as_deref() {
             None => None,
+            Some(identifier) if crate::review::is_non_tracker_key(identifier) => None,
             Some(identifier) => match deps
                 .tracker
                 .fetch_issue_description_by_identifier(identifier)
@@ -1317,6 +1318,9 @@ impl WorkerDeps {
     /// blocking the park on a tracker blip is a worse trade than one late move the next tick's
     /// auto-done re-does. The `None` fail-open case is the only one that reaches the move.
     async fn inactive_ticket_state(&self, issue_id: &str) -> Option<String> {
+        if crate::review::is_non_tracker_key(issue_id) {
+            return None;
+        }
         let ids = [issue_id.to_string()];
         match self.tracker.fetch_issue_states_by_ids(&ids).await {
             // Empty (the issue was not found) is "unknown", not inactive — never a refusal.
@@ -1507,6 +1511,9 @@ impl WorkerDeps {
                 }
                 turn += 1;
                 continue;
+            }
+            if crate::review::is_non_tracker_key(&issue.id) {
+                return (issue.state.clone(), last_result, None);
             }
             // Handoff auto-park (TRA-240 loop fix): when the agent declares a HANDOFF but the ticket
             // is still active, the daemon moves it to the configured review state on the agent's
@@ -2453,6 +2460,40 @@ fi
             0,
             "with no origin ticket the tracker must not be asked"
         );
+    }
+
+    #[tokio::test]
+    async fn non_tracker_origin_descriptions_never_reach_the_tracker() {
+        let (origin, head) = review_git_origin();
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ] {
+            let ag = fake_agent(vec![succeeded_turn()]);
+            let tr = Arc::new(trackerfake::Fake::new());
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let mut deps = make_deps(ws, ag.clone(), tr.clone() as Arc<dyn Tracker>, "p", 1);
+            deps.repo_url = origin.path.clone();
+            deps.review = Some(crate::review::ReviewCheckout {
+                pr_number: 12,
+                head_sha: head.clone(),
+                delta: None,
+                origin_ticket: Some(key.into()),
+            });
+            let (_, _, err) = run_agent_attempt(
+                &mut deps,
+                issue("pr:o/r#12@alice", "pr:o/r#12@alice", "In Progress"),
+                None,
+                None,
+                &noop_event(),
+                None,
+            )
+            .await;
+            assert!(err.is_none(), "{err:?}");
+            assert!(ag.last_prompt().contains("No ticket available"));
+            assert_eq!(tr.description_by_identifier_calls(), 0);
+        }
     }
 
     /// STUDIO-1034: a tracker read that FAILS does not fail the run; the prompt says no ticket is
@@ -3450,6 +3491,39 @@ fi
         assert_eq!(moves[0].team_id, "team-1");
         assert_eq!(moves[0].state_name, "in review");
         assert_eq!(last, "in review", "returned state reflects the park");
+    }
+
+    #[tokio::test]
+    async fn non_tracker_worker_fallback_never_auto_parks_a_local_run() {
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ] {
+            let ag = fake_agent(vec![agentfake::TurnScript {
+                result: TurnResult {
+                    status: TURN_SUCCEEDED.into(),
+                    result_text: "HANDOFF: in-review".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }]);
+            let tracker = Arc::new(trackerfake::Fake::new());
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let mut deps = make_deps(ws, ag, tracker.clone() as Arc<dyn Tracker>, "do it", 1);
+            deps.review_handoff_state = Some("In Review".into());
+            deps.review_done_state = Some("Done".into());
+            let run = Issue {
+                team_id: "team-1".into(),
+                ..issue(key, key, "In Progress")
+            };
+            let (state, _, err) =
+                run_agent_attempt(&mut deps, run, None, None, &noop_event(), None).await;
+            assert!(err.is_none(), "{err:?}");
+            assert!(tracker.move_calls().is_empty(), "no synthetic ticket move");
+            assert_eq!(tracker.by_id_calls(), 0);
+            assert_eq!(state, "In Progress");
+        }
     }
 
     // Mirrors Go `TestWorkerReturnsLastKnownState` (still-active at max turns).

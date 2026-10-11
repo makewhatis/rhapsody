@@ -87,6 +87,9 @@ impl Orchestrator {
         // in the "" group, handled by the top-level tracker/sets.
         let mut groups: HashMap<String, Vec<String>> = HashMap::new();
         for (id, re) in &self.running {
+            if crate::review::is_non_tracker_key(id) {
+                continue;
+            }
             groups
                 .entry(re.project_slug.clone())
                 .or_default()

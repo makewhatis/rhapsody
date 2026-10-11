@@ -584,6 +584,11 @@ impl ControlHandle {
         moved_to: &mut String,
         move_err: &mut String,
     ) {
+        if crate::review::is_non_tracker_key(issue_id) {
+            tracing::debug!(issue_id, "refusing tracker move for a local run key");
+            *move_err = "local run has no tracker issue".into();
+            return;
+        }
         // Prefer the `control()`-time snapshot (set when tests build the handle after `eff`); fall
         // back to the live shared reads tracker (the SAME top-level tracker the reload path publishes)
         // so the daemon — which builds the handle before the first reload, leaving the snapshot `None`
@@ -804,6 +809,65 @@ mod tests {
 
     fn now_rfc3339() -> String {
         Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_tracker_stop_kills_locally_and_resume_never_moves_a_ticket() {
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "LIMIT:ACCOUNT@MANAGER",
+            "pr:example/repo#1@reviewer",
+        ] {
+            let mut fake = Fake::new();
+            fake.move_to_type_name = "Backlog".into();
+            let tr = Arc::new(fake);
+            let (mut o, env) = stop_orch(tr.clone());
+            if crate::review::is_review_key(key) {
+                o.pending_review.insert(
+                    key.into(),
+                    crate::review::ReviewRun {
+                        owner: "example".into(),
+                        repo: "repo".into(),
+                        number: 1,
+                        reviewer: "reviewer".into(),
+                        head_sha: "head".into(),
+                        ..Default::default()
+                    },
+                );
+            }
+            o.dispatch_issue(
+                issue_team(key, key, "In Progress", "TEAM-1"),
+                None,
+                None,
+                String::new(),
+            );
+            let run_id = o.running[key].run_id;
+            let (task, handle) = start(o, &env.signal);
+            let stopped = handle.stop_run(CancelWait::default(), run_id).await;
+            let cancelled_before_shutdown =
+                env.cancelled.lock().expect("cancelled")[key].is_cancelled();
+            let resumed = handle.resume_run(CancelWait::default(), run_id).await;
+            env.signal.cancel();
+            let o = task.await.expect("loop task");
+            assert!(tr.move_to_type_calls().is_empty(), "synthetic move: {key}");
+            let stopped = stopped.expect("stop");
+            assert!(!stopped.not_running && !stopped.kill_undeliverable);
+            assert!(stopped.moved_to.is_empty() && !stopped.move_err.is_empty());
+            assert!(
+                cancelled_before_shutdown,
+                "stop must deliver the local kill"
+            );
+            assert_eq!(
+                env.store.get_run(run_id).unwrap().unwrap().outcome,
+                OUTCOME_STOPPED
+            );
+            let resumed = resumed.expect("resume");
+            assert!(!resumed.not_found && !resumed.no_team && !resumed.not_stopped);
+            assert!(!resumed.live_run && !resumed.superseded);
+            assert!(resumed.moved_to.is_empty() && !resumed.move_err.is_empty());
+            assert!(o.claimed.contains(key), "no move can clear suppression");
+        }
     }
 
     /// Seeds a run row, returning its id.

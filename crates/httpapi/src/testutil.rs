@@ -50,6 +50,12 @@ impl FakeResumeHoldError {
     }
 }
 
+struct TrackerDecorations {
+    cache: rhapsody_orchestrator::lifecycle::LifecycleCache,
+    tracker: Arc<dyn rhapsody_tracker::Tracker>,
+    store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+}
+
 /// A canned [`StateProvider`]: a fixed snapshot (or snapshot error) plus a read-only history store.
 /// Mirrors Go `fakeProvider` (`server_test.go`), grown across the H-lane exactly as Go grows its one
 /// fake. The history store defaults to a [`Noop`] (Go's `fakeProvider.Store()` returns `store.Noop()`
@@ -126,6 +132,7 @@ pub(crate) struct FakeProvider {
     /// with no tracker yet reports. `issue_lifecycles_asked` records the ids the handler forwarded,
     /// so a test can assert it asked about exactly the page it served.
     issue_lifecycles: HashMap<String, IssueLifecycleRow>,
+    tracker_decorations: Option<TrackerDecorations>,
     issue_lifecycles_asked: Mutex<Vec<String>>,
     /// The canned durable assignees the issue listing is decorated with (STUDIO-735), keyed by
     /// tracker issue id. `issue_assignees_asked` records the KEYS the handler forwarded, which is
@@ -273,6 +280,7 @@ impl FakeProvider {
             notification_store: None,
             teams_config_path: String::new(),
             issue_lifecycles: HashMap::new(),
+            tracker_decorations: None,
             issue_lifecycles_asked: Mutex::new(Vec::new()),
             review_tickets: HashSet::new(),
             review_tickets_asked: Mutex::new(Vec::new()),
@@ -358,6 +366,19 @@ impl FakeProvider {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
+    }
+
+    pub(crate) fn with_tracker_decorations(
+        mut self,
+        tracker: Arc<dyn rhapsody_tracker::Tracker>,
+        store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+    ) -> Self {
+        self.tracker_decorations = Some(TrackerDecorations {
+            cache: Default::default(),
+            tracker,
+            store,
+        });
+        self
     }
 
     pub(crate) fn with_history(mut self, store: Arc<dyn HistoryStore>) -> Self {
@@ -718,6 +739,21 @@ impl StateProvider for FakeProvider {
     }
 
     async fn issue_lifecycles(&self, ids: &[String]) -> HashMap<String, IssueLifecycleRow> {
+        if let Some(TrackerDecorations { cache, tracker, .. }) = &self.tracker_decorations {
+            return cache
+                .resolve(
+                    ids,
+                    Some((
+                        tracker.clone(),
+                        rhapsody_orchestrator::DispatchStates {
+                            terminal: HashSet::from(["done".into()]),
+                            ..Default::default()
+                        },
+                    )),
+                    std::time::Instant::now(),
+                )
+                .await;
+        }
         self.touch();
         *self
             .issue_lifecycles_asked
@@ -733,6 +769,11 @@ impl StateProvider for FakeProvider {
     }
 
     async fn review_tickets(&self, ids: &[String]) -> HashSet<String> {
+        if let Some(TrackerDecorations { cache, tracker, .. }) = &self.tracker_decorations {
+            return cache
+                .resolve_reviews(ids, Some(tracker.clone()), std::time::Instant::now())
+                .await;
+        }
         self.touch();
         *self
             .review_tickets_asked
@@ -745,6 +786,21 @@ impl StateProvider for FakeProvider {
     }
 
     async fn issue_assignees(&self, keys: &[IssueKey]) -> HashMap<String, String> {
+        if let Some(TrackerDecorations {
+            cache,
+            tracker,
+            store,
+        }) = &self.tracker_decorations
+        {
+            return cache
+                .resolve_assignees(
+                    keys,
+                    store,
+                    Some(tracker.clone()),
+                    std::time::Instant::now(),
+                )
+                .await;
+        }
         self.touch();
         *self
             .issue_assignees_asked

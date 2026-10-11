@@ -543,7 +543,9 @@ pub async fn perform_report(
                     tracing::warn!(%ticket, %error, "limit: room handoff could not be posted");
                 }
             }
-            if let Some(tracker) = tracker {
+            if let Some(tracker) = tracker
+                && !crate::review::is_non_tracker_key(&issue_id)
+            {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(15),
                     tracker.create_comment(&issue_id, &body),
@@ -674,5 +676,38 @@ mod tests {
         let calls = comments.0.lock().unwrap();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].contains("resumes"));
+    }
+
+    #[tokio::test]
+    async fn non_tracker_limit_handoff_never_comments_on_a_synthetic_ticket() {
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let comments = Comments::default();
+        for key in [
+            "lead:owner/repo#0:1@manager",
+            "limit:account@manager",
+            "LIMIT:ACCOUNT@MANAGER",
+            "pr:owner/repo#7@alice",
+        ] {
+            perform_report(
+                Report::Handoff {
+                    ticket: key.into(),
+                    issue_id: key.into(),
+                    body: "handoff".into(),
+                    at: Utc::now(),
+                    tracker: Some(tracker.clone()),
+                    pr: crate::teamsknow::parse_pr_ref(key),
+                },
+                None,
+                &[],
+                Some(&comments),
+            )
+            .await;
+        }
+        assert!(tracker.create_comment_calls().is_empty());
+        assert_eq!(
+            comments.0.lock().unwrap().len(),
+            1,
+            "PR delivery is preserved"
+        );
     }
 }

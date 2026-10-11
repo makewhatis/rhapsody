@@ -392,12 +392,38 @@ impl<TF> TrackerHoldSink<TF> {
     }
 }
 
+#[cfg(test)]
+mod tracker_hold_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn non_tracker_breaker_hold_never_labels_a_synthetic_ticket() {
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let sink = TrackerHoldSink::new(|| Some(tracker.clone() as Arc<dyn Tracker>));
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "LIMIT:ACCOUNT@MANAGER",
+            "pr:example/repo#1@reviewer",
+        ] {
+            sink.hold(key, key, "TEAM-1").await;
+        }
+        assert!(tracker.add_label_calls().is_empty());
+        sink.hold("STUDIO-123", "ID-1", "TEAM-1").await;
+        assert_eq!(tracker.add_label_calls().len(), 1);
+    }
+}
+
 #[async_trait::async_trait]
 impl<TF> BreakerHoldSink for TrackerHoldSink<TF>
 where
     TF: Fn() -> Option<Arc<dyn Tracker>> + Send + Sync,
 {
     async fn hold(&self, ticket: &str, issue_id: &str, team_id: &str) {
+        if crate::review::is_non_tracker_key(issue_id) {
+            tracing::debug!(issue_id, "skipping tracker hold for a local run key");
+            return;
+        }
         let Some(tracker) = (self.tracker)() else {
             tracing::warn!(
                 ticket,

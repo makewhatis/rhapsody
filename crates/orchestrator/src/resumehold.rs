@@ -344,6 +344,9 @@ impl ControlHandle {
         tracker: &std::sync::Arc<dyn Tracker>,
         issue_id: &str,
     ) -> Result<bool, ResumeHoldError> {
+        if crate::review::is_non_tracker_key(issue_id) {
+            return Ok(false);
+        }
         let want = rhapsody_core::normalize_state(HUMAN_LABEL);
         let rows = tracker
             .fetch_issue_labels_by_ids(std::slice::from_ref(&issue_id.to_string()))

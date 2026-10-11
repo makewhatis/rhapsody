@@ -300,7 +300,9 @@ impl Orchestrator {
         let mut holds = match self.store().load_subject_observations() {
             Ok(holds) => holds
                 .into_iter()
-                .filter(|h| !h.subject.contains('#'))
+                .filter(|h| {
+                    !h.subject.contains('#') && !crate::review::is_non_tracker_key(&h.subject)
+                })
                 .collect::<Vec<_>>(),
             Err(error) => {
                 tracing::warn!(%error, "parked state ledger unreadable; keeping holds");
@@ -975,6 +977,33 @@ mod tests {
             o.store().load_subject_holds().unwrap().is_empty(),
             "the next batch reaches the remaining hold"
         );
+    }
+
+    #[tokio::test]
+    async fn non_tracker_park_observations_never_read_local_run_subjects() {
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let mut o = orch(true);
+        o.eff = Some(crate::testsupport::empty_effective(tracker.clone()));
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ] {
+            o.store()
+                .park_subject(&rhapsody_store::SubjectHold {
+                    subject: key.into(),
+                    kind: "blocked".into(),
+                    ..Default::default()
+                })
+                .expect("park");
+        }
+        o.reconcile_parked_subject_states().await;
+        assert!(
+            tracker.by_identifier_calls().is_empty(),
+            "{:?}",
+            tracker.by_identifier_calls()
+        );
+        assert_eq!(o.store().load_subject_holds().expect("holds").len(), 3);
     }
 
     fn orch(enabled: bool) -> Orchestrator {

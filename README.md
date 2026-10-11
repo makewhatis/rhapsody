@@ -82,6 +82,22 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Linear issue-id input guards (STUDIO-1172)
+
+Linear reads now validate issue inputs locally as a canonical UUID or an ASCII `TEAM-123`
+identifier (team keys begin with a letter; casing is preserved). By-id batches omit invalid entries
+and skip HTTP entirely when none remain; single-issue reads return their existing not-found value.
+Issue mutations refuse invalid inputs with `linear_api_request` before any lookup or write. Dropped
+inputs are logged at debug level. Go forwards these inputs and receives a validation error; this
+deliberate difference prevents local synthetic run keys or malformed subjects from spending quota
+and refusing a whole batch. Valid inputs, payload shapes, lifecycle TTLs and refusal-isolation budgets
+are unchanged.
+The listing and run/subject tracker boundaries independently exclude ticketless review, manager and
+lead keys, including run-control moves, breaker labels and limit-report comments. Run-control moves
+return their existing move-error shape rather than reporting a ticket move that never happened;
+local routing-ledger attribution and existing role labelling remain intact. These keys
+have no frozen Go counterpart. No fixtures are changed.
+
 ### Blocked-work circuit breaker and subject parks (STUDIO-1156)
 
 Lead enablement no longer replaces a breaker hold: a crossing always persists and applies the

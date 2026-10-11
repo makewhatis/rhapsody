@@ -36,7 +36,7 @@ pub(super) async fn fetch_issue_by_identifier(
         #[serde(rename = "slugId", deserialize_with = "super::decode::null_to_empty")]
         slug: String,
     }
-    if identifier.trim().is_empty() {
+    if !super::issue_id::valid(identifier) {
         return Ok(None);
     }
     let page: Page = c.do_graphql("query LeadIssue($id: String!) { issue(id: $id) { id identifier title description url updatedAt state { name } team { id } project { slugId } labels { nodes { name } } attachments(first: 100) { nodes { sourceType metadata } } } }", Some(serde_json::json!({"id":identifier}))).await?;
@@ -95,6 +95,7 @@ pub(super) async fn fetch_issue_states_by_ids(
     c: &Client,
     ids: &[String],
 ) -> Result<Vec<Issue>, TrackerError> {
+    let ids: Vec<&String> = ids.iter().filter(|id| super::issue_id::valid(id)).collect();
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -123,6 +124,7 @@ pub(super) async fn fetch_issue_labels_by_ids(
     c: &Client,
     ids: &[String],
 ) -> Result<Vec<Issue>, TrackerError> {
+    let ids: Vec<&String> = ids.iter().filter(|id| super::issue_id::valid(id)).collect();
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -180,8 +182,7 @@ pub(super) async fn fetch_issue_description_by_identifier(
     c: &Client,
     identifier: &str,
 ) -> Result<Option<String>, TrackerError> {
-    let identifier = identifier.trim();
-    if identifier.is_empty() {
+    if !super::issue_id::valid(identifier) {
         return Ok(None);
     }
     super::client::traced(
@@ -207,6 +208,156 @@ mod tests {
     use crate::linear::testutil::{MockResp, new_test_client};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
+
+    fn invalid_ids() -> Vec<String> {
+        let mut ids: Vec<String> = (1..=30)
+            .map(|n| format!("lead:example/repo#0:{n}@manager"))
+            .chain((1..=5).map(|n| format!("limit:account:{n}@manager")))
+            .chain((1..=3).map(|n| format!("pr:example/repo#{n}@reviewer")))
+            .collect();
+        ids.extend(
+            [
+                "",
+                "not-an-id",
+                "STUDIO-",
+                "STUDIO-12x",
+                "STUDIO--123",
+                "123-456",
+                "1STUDIO-123",
+                " STUDIO-123",
+                "团队-123",
+                "00000000-0000-4000-8000-00000000000z",
+            ]
+            .into_iter()
+            .map(String::from),
+        );
+        ids
+    }
+
+    #[tokio::test]
+    async fn non_tracker_adapter_batches_filter_invalid_ids_before_http() {
+        for labels in [false, true] {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let capture = seen.clone();
+            let (c, _server) = new_test_client(move |req| {
+                capture
+                    .lock()
+                    .expect("requests")
+                    .push(req.variables.clone());
+                MockResp::ok(r#"{"data":{"issues":{"nodes":[]}}}"#)
+            })
+            .await;
+            let valid = vec![
+                "00000000-0000-4000-8000-000000000001".to_string(),
+                "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE".into(),
+                "STUDIO-123".into(),
+                "studio-456".into(),
+                "S49-789".into(),
+            ];
+            let mut mixed = invalid_ids();
+            mixed.extend(valid.clone());
+            let got = if labels {
+                c.fetch_issue_labels_by_ids(&mixed).await
+            } else {
+                c.fetch_issue_states_by_ids(&mixed).await
+            };
+            assert!(got.expect("mixed batch").is_empty());
+            assert_eq!(
+                *seen.lock().expect("requests"),
+                vec![serde_json::json!({"ids":valid,"first":5})]
+            );
+            let got = if labels {
+                c.fetch_issue_labels_by_ids(&invalid_ids()).await
+            } else {
+                c.fetch_issue_states_by_ids(&invalid_ids()).await
+            };
+            assert!(got.expect("invalid batch").is_empty());
+            assert_eq!(
+                seen.lock().expect("requests").len(),
+                1,
+                "all-invalid makes no request"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn non_tracker_adapter_single_reads_make_no_http_request() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let capture = calls.clone();
+        let server = crate::linear::testutil::MockServer::start(move |_| {
+            capture.fetch_add(1, Ordering::SeqCst);
+            MockResp::ok(r#"{"data":{"viewer":{"id":"viewer"},"issue":null,"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":""}}}}"#)
+        })
+        .await;
+        let c = crate::linear::new(crate::linear::Config {
+            endpoint: server.url(),
+            api_key: "test".into(),
+            project_slug: "proj".into(),
+            ..Default::default()
+        });
+        for id in invalid_ids() {
+            assert_eq!(
+                c.fetch_issue_description_by_identifier(&id)
+                    .await
+                    .expect("description"),
+                None
+            );
+            assert_eq!(c.fetch_issue_assignee(&id).await.expect("assignee"), "");
+            assert_eq!(
+                c.fetch_issue_branch_by_id(&id).await.expect("branch"),
+                (String::new(), 0)
+            );
+            assert!(
+                c.fetch_issue_by_identifier(&id)
+                    .await
+                    .expect("issue")
+                    .is_none()
+            );
+            assert!(c.fetch_parked_issue(&id).await.expect("parked").is_none());
+            assert!(c.list_comments(&id).await.expect("comments").is_empty());
+            assert!(c.fetch_documents(Some(&id), "", false).await.is_err());
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "no request for {id:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn non_tracker_adapter_single_writes_refuse_before_any_http_request() {
+        use std::sync::atomic::AtomicUsize;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let capture = calls.clone();
+        let server = crate::linear::testutil::MockServer::start(move |_| {
+            capture.fetch_add(1, Ordering::SeqCst);
+            MockResp::ok(r#"{"data":{}}"#)
+        })
+        .await;
+        let c = crate::linear::new(crate::linear::Config {
+            endpoint: server.url(),
+            api_key: "test".into(),
+            ..Default::default()
+        });
+        for id in invalid_ids() {
+            let results = [
+                c.update_issue_description(&id, "body").await,
+                c.move_issue_state(&id, "team", "Todo").await,
+                c.move_issue_to_type(&id, "team", "unstarted")
+                    .await
+                    .map(|_| ()),
+                c.assign_issue(&id, "user").await,
+                c.create_comment(&id, "body").await.map(|_| ()),
+                c.add_issue_label(&id, "team", "label").await,
+                c.remove_issue_label(&id, "team", "label").await,
+                c.link_pull_request(&id, "https://github.com/example/repo/pull/1")
+                    .await,
+            ];
+            for result in results {
+                assert!(
+                    matches!(result, Err(crate::TrackerError::Linear(e)) if e.kind == crate::linear::LinearErrorKind::ApiRequest)
+                );
+            }
+            assert_eq!(calls.load(Ordering::SeqCst), 0, "no request for {id:?}");
+        }
+    }
 
     #[tokio::test]
     async fn lead_issue_read_is_project_scoped_and_normalizes_nulls() {
@@ -302,13 +453,13 @@ mod tests {
         })
         .await;
         let got = c
-            .fetch_issue_states_by_ids(&["a".into(), "b".into()])
+            .fetch_issue_states_by_ids(&["MT-1".into(), "MT-2".into()])
             .await
             .expect("by ids");
         let seen = seen.lock().expect("seen");
         let (has_id_type, ids) = seen.as_ref().expect("request seen");
         assert!(has_id_type, "query must declare ids as [ID!]");
-        assert_eq!(ids, &["a".to_string(), "b".to_string()], "ids var");
+        assert_eq!(ids, &["MT-1".to_string(), "MT-2".to_string()], "ids var");
         assert_eq!(got.len(), 2);
         assert_eq!(got[0].id, "a");
         assert_eq!(got[0].state, "Done");
@@ -334,7 +485,7 @@ mod tests {
         .await;
 
         let got = c
-            .fetch_issue_labels_by_ids(&["a".into(), "b".into()])
+            .fetch_issue_labels_by_ids(&["MT-1".into(), "MT-2".into()])
             .await
             .expect("labels by ids");
 

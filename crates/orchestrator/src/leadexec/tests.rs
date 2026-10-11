@@ -1425,6 +1425,63 @@ async fn real_tracker_writes_and_findings_use_only_the_scoped_subject() {
     task.abort();
 }
 
+#[tokio::test]
+async fn non_tracker_lead_subjects_never_reach_the_tracker() {
+    let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+    let (store, _, _) = setup("local subject");
+    let o = crate::Orchestrator::new("WORKFLOW.md");
+    let mut control = o.control();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    control.events = tx;
+    let task = tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if let crate::Event::LeadAllowed { reply, .. } = event {
+                let _ = reply.send(true);
+            }
+        }
+    });
+    let project = LeadProject {
+        tracker: tracker.clone(),
+        repo_url: "https://github.com/o/r.git".into(),
+        terminal_states: Default::default(),
+        summon_token: "custom".into(),
+    };
+    let runtime = LeadRuntime {
+        control,
+        store: store.clone(),
+        projects: vec![project.clone()],
+        teams: rhapsody_config::teams::Teams::disabled(),
+        prs: Arc::new(crate::ghsummons::GH::new("", None)),
+        comments: None,
+        room: None,
+        memory: None,
+        operator_memory: None,
+        findings_dir: None,
+    };
+    for key in [
+        "lead:example/repo#0:1@manager",
+        "limit:account@manager",
+        "pr:example/repo#1@reviewer",
+    ] {
+        let mut item = store.load_lead_items().expect("items").remove(0);
+        item.subject = key.into();
+        item.trigger = LeadTrigger::BlockedHandoff {
+            ticket: key.into(),
+            question: "local subject".into(),
+        };
+        assert!(runtime.prepare(item).await.is_err());
+        let host = RuntimeHost {
+            runtime: &runtime,
+            project: &project,
+            ticket: key.into(),
+            pr: None,
+        };
+        assert!(host.subject().await.is_err());
+    }
+    assert!(tracker.by_identifier_calls().is_empty());
+    task.abort();
+}
+
 #[derive(Default)]
 struct RecordingComments {
     calls: Mutex<Vec<(String, String, i64, String)>>,

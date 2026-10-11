@@ -953,17 +953,23 @@ pub(crate) fn routed_identity(
 /// covered with no label, and that distinction is what lets the caller cache "nobody" without
 /// also caching it over a chunk that simply failed.
 ///
-/// Every key here is passed through unfiltered, including a ticketless review run's synthetic `pr:`
-/// key, and that is deliberate rather than an oversight of STUDIO-831: this is the FALLBACK source,
-/// reached only for a run whose own routing ledger was silent, and a review run is routed under its
-/// reviewer's identity like any other dispatch — so in practice it answers from the store and never
-/// arrives here at all. If one ever does, [`fetch_by_ids`] isolates it instead of losing the batch.
+/// Synthetic run keys can still resolve from the local ledger, but never from a tracker label.
+/// Mark those absences covered so a silent ledger does not repeatedly retry an impossible read.
 async fn label_identities(
     tracker: &dyn Tracker,
     keys: &[IssueKey],
 ) -> (Vec<(String, String)>, HashSet<String>, bool) {
-    let ids: Vec<String> = keys.iter().map(|k| k.id.clone()).collect();
-    let fetched = fetch_by_ids(tracker, ByIds::Labels, &ids, LOOKUP_ASSIGNEES).await;
+    let ids: Vec<String> = keys
+        .iter()
+        .map(|k| k.id.clone())
+        .filter(|id| !crate::review::is_non_tracker_key(id))
+        .collect();
+    let mut fetched = fetch_by_ids(tracker, ByIds::Labels, &ids, LOOKUP_ASSIGNEES).await;
+    fetched.covered.extend(
+        keys.iter()
+            .filter(|k| crate::review::is_non_tracker_key(&k.id))
+            .map(|k| k.id.clone()),
+    );
     let out = fetched
         .issues
         .iter()
@@ -1343,6 +1349,30 @@ mod tests {
     use rhapsody_core::Issue;
     use rhapsody_tracker::fake::Fake;
 
+    #[tokio::test]
+    async fn non_tracker_assignee_fallback_never_asks_the_tracker() {
+        let tracker = Arc::new(Fake::default());
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> = Arc::new(rhapsody_store::Noop);
+        let keys: Vec<IssueKey> = [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ]
+        .into_iter()
+        .map(|id| IssueKey {
+            id: id.into(),
+            run_id: 0,
+        })
+        .collect();
+        let cache = LifecycleCache::default();
+        assert!(
+            cache
+                .resolve_assignees(&keys, &store, Some(tracker.clone()), Instant::now())
+                .await
+                .is_empty()
+        );
+        assert_eq!(tracker.labels_by_id_calls(), 0);
+    }
     fn states() -> DispatchStates {
         DispatchStates {
             active: set_of(&["todo", "in progress"]),

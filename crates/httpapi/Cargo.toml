@@ -83,6 +83,8 @@ tokio-stream = "0.1"
 rhapsody-provider-status = { path = "../provider-status" }
 
 [dev-dependencies]
+# Counting tracker behind the real lifecycle cache in history-listing regressions.
+rhapsody-tracker = { path = "../tracker" }
 # harness-fixtures (test-only): the H1 state golden — the served `GET /api/v1/state` body,
 # normalized, must byte-match the committed `api/state.json` fixture. Same golden pattern the config
 # crate's `tests/golden.rs` and the orchestrator's `snapshot_json` test use. Already in Cargo.lock.

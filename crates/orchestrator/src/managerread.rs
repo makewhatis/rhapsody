@@ -251,6 +251,9 @@ impl crate::ControlHandle {
                 "name exactly one configured project slug or issue identifier; query at most 4000 bytes",
             ));
         }
+        if crate::review::is_non_tracker_key(issue) {
+            return Err(ManagerReadError::Docs("not_found"));
+        }
         let trackers = self.evidence_trackers(run_id, project).await?;
         for p in trackers {
             if !issue.is_empty()
@@ -281,6 +284,9 @@ impl crate::ControlHandle {
 
     /// Additive manager ticket view. Ordinary workers keep the Go run-history payload verbatim.
     pub async fn manager_ticket(&self, run_id: i64, identifier: &str) -> ManagerReadOutcome {
+        if crate::review::is_non_tracker_key(identifier) {
+            return Err(ManagerReadError::Docs("not_found"));
+        }
         if identifier.is_empty() || identifier.len() > 128 {
             return Err(ManagerReadError::Invalid(
                 "issue identifier required (at most 128 bytes)",

@@ -193,6 +193,9 @@ impl LeadRuntime {
         } else {
             item.subject.clone()
         };
+        if crate::review::is_non_tracker_key(&ticket) {
+            return Err("lead subject is a local run key".into());
+        }
         for project in &self.projects {
             let Some((owner, repo)) = crate::ghsummons::parse_repo(&project.repo_url) else {
                 continue;
@@ -373,6 +376,9 @@ impl LeadHost for RuntimeHost<'_> {
         }
     }
     async fn subject(&self) -> Result<LeadSubject, String> {
+        if crate::review::is_non_tracker_key(&self.ticket) {
+            return Err("lead subject is a local run key".into());
+        }
         if !self
             .runtime
             .control

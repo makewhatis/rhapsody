@@ -1682,6 +1682,7 @@ dependencies = [
  "rhapsody-orchestrator",
  "rhapsody-provider-status",
  "rhapsody-store",
+ "rhapsody-tracker",
  "rust-embed",
  "serde",
  "serde_json",
