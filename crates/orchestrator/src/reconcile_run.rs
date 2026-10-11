@@ -81,7 +81,6 @@ fn sample_cpu(
             }
         }
         Some((ticks, hz)) => {
-            re.cpu_failure_since = None;
             let elapsed = now - re.last_cpu_sample_at;
             if re.cpu_sampled
                 && ticks >= re.last_cpu_ticks
@@ -90,12 +89,18 @@ fn sample_cpu(
                 return; // accumulate ticks and wall time until a stable interval is available
             }
             if re.cpu_sampled
-                && ticks > re.last_cpu_ticks
+                && ticks >= re.last_cpu_ticks
                 && elapsed >= chrono::Duration::seconds(1)
-                && (ticks - re.last_cpu_ticks) as f64 / hz as f64
-                    > elapsed.num_milliseconds() as f64 / 1000.0 * threshold
             {
-                re.last_cpu_active_at = now;
+                // A recovery baseline cannot measure work: retain the original bounded grace
+                // until a full interval is available, without crediting unmeasured CPU activity.
+                re.cpu_failure_since = None;
+                if ticks > re.last_cpu_ticks
+                    && (ticks - re.last_cpu_ticks) as f64 / hz as f64
+                        > elapsed.num_milliseconds() as f64 / 1000.0 * threshold
+                {
+                    re.last_cpu_active_at = now;
+                }
             }
             re.last_cpu_ticks = ticks;
             re.last_cpu_sample_at = now;
@@ -827,7 +832,11 @@ mod tests {
             Some(cpu.as_ref()),
             0.05,
         );
-        assert_eq!(re.cpu_failure_since, None);
+        assert_eq!(
+            re.cpu_failure_since,
+            Some(base + chrono::Duration::seconds(2)),
+            "baseline-only recovery preserves the existing failure grace"
+        );
         assert_eq!(
             re.last_cpu_active_at, one_second,
             "recovery must not credit unmeasured CPU"
@@ -839,6 +848,7 @@ mod tests {
             0.05,
         );
         assert_eq!(re.last_cpu_active_at, base + chrono::Duration::seconds(5));
+        assert_eq!(re.cpu_failure_since, None);
     }
 
     // STUDIO-1177: idle event-loop ticks are not evidence of useful work.
@@ -897,6 +907,110 @@ mod tests {
         assert!(
             !o.running.contains_key("1"),
             "unreadable CPU cannot grant perpetual liveness"
+        );
+        assert_eq!(o.retry_attempts["1"].err, "stalled");
+    }
+
+    #[tokio::test]
+    async fn recovery_baseline_keeps_failure_grace_until_cpu_can_be_measured() {
+        let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+        o.eff.as_mut().unwrap().cpu_sampler = sampler(false, &[]);
+        let base = utc(2026, 5, 29, 12, 0, 0);
+        let clock = install_clock(&mut o, base);
+        add_running(
+            &mut o,
+            "1",
+            "MT-1",
+            "In Progress",
+            base - chrono::Duration::hours(1),
+        );
+        o.running.get_mut("1").unwrap().pgid = 42;
+        o.reconcile_stalled(); // failed sample starts the bounded grace
+        assert!(o.running.contains_key("1"));
+
+        o.eff.as_mut().unwrap().cpu_sampler =
+            sampler(true, &[(42, &[100, 150, 200, 30_200, 60_200])]);
+        advance(&clock, chrono::Duration::seconds(1));
+        o.reconcile_stalled(); // recovery baseline cannot measure CPU activity yet
+        assert!(
+            o.running.contains_key("1"),
+            "a recovery baseline must not discard the still-active failure grace"
+        );
+        advance(&clock, chrono::Duration::milliseconds(500));
+        o.reconcile_stalled(); // still accumulating the minimum measurement interval
+        assert!(
+            o.running.contains_key("1"),
+            "subsecond recovery samples must preserve the failure grace"
+        );
+        advance(&clock, chrono::Duration::milliseconds(500));
+        o.reconcile_stalled(); // now measures 100% of a core
+        assert!(o.running.contains_key("1"));
+        for _ in 0..2 {
+            advance(&clock, chrono::Duration::seconds(300));
+            o.reconcile_stalled();
+            assert!(
+                o.running.contains_key("1"),
+                "measured CPU work must survive beyond the original failure grace"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_baselines_cannot_renew_failure_grace() {
+        let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+        let base = utc(2026, 5, 29, 12, 0, 0);
+        let clock = install_clock(&mut o, base);
+        add_running(
+            &mut o,
+            "1",
+            "MT-1",
+            "In Progress",
+            base - chrono::Duration::hours(1),
+        );
+        o.running.get_mut("1").unwrap().pgid = 42;
+        // Alternate failures and baseline-only samples, never measuring any work.
+        for ok in [false, true, false, true] {
+            o.eff.as_mut().unwrap().cpu_sampler = sampler(ok, &[(42, &[100])]);
+            o.reconcile_stalled();
+            assert!(
+                o.running.contains_key("1"),
+                "recovery must retain the original grace window"
+            );
+            advance(&clock, chrono::Duration::seconds(100));
+        }
+        o.eff.as_mut().unwrap().cpu_sampler = sampler(false, &[]);
+        o.reconcile_stalled();
+        assert!(
+            !o.running.contains_key("1"),
+            "baseline-only recovery must not restart the failure grace"
+        );
+        assert_eq!(o.retry_attempts["1"].err, "stalled");
+    }
+
+    #[tokio::test]
+    async fn recovery_with_idle_cpu_does_not_credit_liveness() {
+        let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+        o.eff.as_mut().unwrap().cpu_sampler = sampler(false, &[]);
+        let base = utc(2026, 5, 29, 12, 0, 0);
+        let clock = install_clock(&mut o, base);
+        add_running(
+            &mut o,
+            "1",
+            "MT-1",
+            "In Progress",
+            base - chrono::Duration::hours(1),
+        );
+        o.running.get_mut("1").unwrap().pgid = 42;
+        o.reconcile_stalled();
+        o.eff.as_mut().unwrap().cpu_sampler = sampler(true, &[(42, &[100, 101])]);
+        advance(&clock, chrono::Duration::seconds(1));
+        o.reconcile_stalled();
+        assert!(o.running.contains_key("1"), "baseline keeps the grace");
+        advance(&clock, chrono::Duration::seconds(2));
+        o.reconcile_stalled(); // measured 0.5% CPU is idle, despite successful sampling
+        assert!(
+            !o.running.contains_key("1"),
+            "a measured idle recovery must not count as CPU liveness"
         );
         assert_eq!(o.retry_attempts["1"].err, "stalled");
     }

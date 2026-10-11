@@ -92,8 +92,10 @@ which let idle event-loop ticks keep a dead network wait alive forever.
 
 A failed sampler logs once per run and grants one stall window from the first failed sample.
 Persistent failure then uses stream events alone, rather than Go's perpetual assume-alive rule.
-Recovery/new process groups establish fresh baselines. The existing `/proc` sampler is unavailable
-on macOS, so that platform uses this bounded event-only fallback, including for silent local builds.
+Recovery establishes a fresh baseline, retaining the original bounded failure grace until a full
+CPU interval can be measured; new process groups also establish fresh baselines. The existing `/proc`
+sampler is unavailable on macOS, so that platform uses this bounded event-only fallback, including
+for silent local builds.
 Event timestamps, disabled stall detection, persisted `failed` / `stalled` taxonomy and exponential
 failure retries are unchanged. The threshold round-trips through config encode/decode but is omitted
 from the Go-owned config JSON view; schemas, payload goldens and fixtures are untouched.
