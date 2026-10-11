@@ -92,9 +92,21 @@ jobs:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show
+      # STUDIO-1174: install-action downloads, checksums and extracts in a FIXED, user-global
+      # scratch dir (`main.sh`: install_action_dir="${HOME}/.install-action", tmp_dir=.../tmp,
+      # `curl -o tmp`, `sha256sum -c ... *tmp`, then `rm -rf "${tmp_dir}"`, no locking). Every
+      # self-hosted Mac runner runs as the same user on the same host, so two jobs that both use
+      # install-action at the same instant (test + desktop on a push to main) share that one
+      # directory: one job's download or its trailing `rm -rf` clobbers the other's in-flight
+      # `tmp`, and the checksum verify dies seconds in (`sha256sum: *tmp: No such file or
+      # directory`, or `1 computed checksum did NOT match`). A job-private HOME gives the action
+      # its own scratch dir; it then installs nextest into that HOME and appends it to
+      # $GITHUB_PATH, so the later `cargo nextest` steps still resolve it.
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.100
+        env:
+          HOME: ${{ runner.temp }}/install-action-home
       - run: python3 harness/ci/check-process-leaks.py snapshot "$RUNNER_TEMP/process-baseline.json"
       # `--no-fail-fast` (STUDIO-1028): cargo stops at the first failing CRATE by default, so one
       # crates/* failure hides every later crate's result. The full set must surface in one run —
@@ -190,9 +202,14 @@ jobs:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: rustup show   # installs the toolchain pinned by the shared repo-root rust-toolchain.toml
+      # STUDIO-1174: job-private HOME so install-action's fixed `${HOME}/.install-action/tmp`
+      # scratch dir cannot be clobbered by the concurrent `test` job on a sibling runner — see the
+      # long note on the `test` job's install-action step for the full race.
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.100
+        env:
+          HOME: ${{ runner.temp }}/install-action-home
       - run: python3 harness/ci/check-process-leaks.py snapshot "$RUNNER_TEMP/process-baseline.json"
       - uses: actions/setup-node@v4
         with:

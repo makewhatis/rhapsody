@@ -38,7 +38,14 @@ with tempfile.TemporaryDirectory(prefix="process-scan-", dir=ROOT / "target") as
         leaked.wait(timeout=5)
         assert old.poll() is None and neighbor.poll() is None, "cleanup killed a protected child"
         assert scan("check").returncode == 0, "cleanup must remove the newly leaked child"
-        print("process leak scan mutation checks: PASS (leak named/killed; older and neighbor preserved)")
+        # A vanished baseline (the snapshot step was skipped, or the job's `_temp` cleared) must be
+        # a warning, not a second traceback failure, and must never run --cleanup off no baseline.
+        (work / "baseline.json").unlink()
+        missing = scan("check", "--cleanup")
+        assert missing.returncode == 0 and "no baseline" in missing.stdout, missing
+        assert old.poll() is None and neighbor.poll() is None, "missing baseline must not clean up"
+        print("process leak scan mutation checks: PASS (leak named/killed; older and neighbor "
+              "preserved; missing baseline warns)")
     finally:
         for child in children:
             if child.poll() is None:
