@@ -564,6 +564,9 @@ impl ControlHandle {
     /// reached. Resolves the tracker exactly like [`Self::move_issue_state`] (the `control()`-time
     /// snapshot, else the shared reads tracker) and never holds the reads guard across the await.
     async fn fresh_ticket_state(&self, issue_id: &str) -> Option<String> {
+        if crate::review::is_non_tracker_key(issue_id) {
+            return None;
+        }
         let tracker = self.tracker.clone().or_else(|| {
             self.reads
                 .read()
@@ -625,6 +628,9 @@ impl ControlHandle {
     /// never holds the reads guard across the await. `None` means the state could not be read — the
     /// caller treats that as UNCONFIRMED, the fail-closed direction.
     pub(crate) async fn read_issue_state(&self, issue_id: &str) -> Option<String> {
+        if crate::review::is_non_tracker_key(issue_id) {
+            return None;
+        }
         let tracker = self.tracker.clone().or_else(|| {
             self.reads
                 .read()

@@ -102,15 +102,15 @@ pub(crate) async fn handle_issue_runs(
     // console can say "reviewing" where it would otherwise say "in review".
     //
     // The two that reach the tracker BY ID are asked only about the rows a TRACKER can answer for
-    // (STUDIO-831). A ticketless review run is dispatched under a synthetic
-    // `pr:<owner>/<repo>#<n>@<reviewer>` key, which is neither a UUID nor an issue identifier, and
+    // (STUDIO-831, STUDIO-1172). Review, manager and lead runs use synthetic
+    // `pr:…` or `…@manager` keys, which are neither UUIDs nor issue identifiers, and
     // Linear validates `id: { in: … }` before it serves it — so ONE such id failed the whole
     // request and every ordinary ticket on the page lost its lifecycle with it. Those rows have no
-    // lifecycle and no ticket label to look up in the first place; `review_run` is what colours
-    // them, and it is read off the row itself (STUDIO-826).
+    // lifecycle and no ticket label to look up in the first place; role labelling is read off the
+    // row itself, never fetched from the tracker (STUDIO-826).
     //
     // The filter lives HERE, in the listing, because the listing is the layer that knows a row is a
-    // review run — it already serves that fact. Filtering inside `LifecycleCache`, which sees only
+    // local run — it already serves that fact. Filtering inside `LifecycleCache`, which sees only
     // a `&[String]`, would make a run-id FORMAT into a contract of the lifecycle layer; that is the
     // objection STUDIO-826 weighed when it chose a serialized field over sniffing the prefix, and
     // it holds here too. (The lifecycle layer still degrades per-id if an unexpected shape ever
@@ -118,7 +118,7 @@ pub(crate) async fn handle_issue_runs(
     let ids: Vec<String> = runs
         .iter()
         .map(|r| r.issue_id.clone())
-        .filter(|id| !review::is_review_key(id))
+        .filter(|id| !review::is_non_tracker_key(id))
         .collect();
     // The assignee lookup is deliberately NOT filtered: its FIRST source is the daemon's own
     // routing ledger, keyed by run id, which answers for a review run — routed under the reviewer's
@@ -339,7 +339,7 @@ pub(crate) async fn handle_history_costs(
 /// listing already serves, grouped. The client multiplies its own rule over the buckets.
 ///
 /// The lifecycle lookup is asked only about the ids a TRACKER can answer for, filtered by
-/// [`review::is_review_key`] exactly as the listing filters them (STUDIO-831): a ticketless review
+/// [`review::is_non_tracker_key`] exactly as the listing filters them (STUDIO-831, STUDIO-1172): a local
 /// run is dispatched under a synthetic `pr:<owner>/<repo>#<n>@<reviewer>` key, Linear validates
 /// `id: { in: … }` before serving it, and ONE such id used to fail the whole batch. That failure is
 /// silent — an empty result, not an error a console could show — which is why the filter is pinned
@@ -472,7 +472,7 @@ pub(crate) async fn handle_issue_counts(
     let ids: Vec<String> = runs
         .iter()
         .map(|r| r.issue_id.clone())
-        .filter(|id| !review::is_review_key(id))
+        .filter(|id| !review::is_non_tracker_key(id))
         .collect();
     // Review-run key -> the TICKET each review is OF (STUDIO-965), through the same watch-set join
     // the listing's `review_of` and the cost ledger use. The tally counts the board's unit — the
@@ -2277,6 +2277,97 @@ mod tests {
         assert_eq!(by_ident["MT-2"]["lifecycle"], "done");
     }
 
+    // STUDIO-1172: drive the listing through the real cache and a counting fake tracker, so the
+    // instance guard is tested independently of the Linear adapter's input validation.
+    #[tokio::test]
+    async fn non_tracker_listing_makes_one_clean_batch_per_decoration() {
+        use rhapsody_core::Issue;
+        use rhapsody_tracker::fake::Fake;
+
+        let store = Arc::new(mem_store());
+        let valid: Vec<String> = (1..=60)
+            .map(|n| format!("00000000-0000-4000-8000-{n:012x}"))
+            .collect();
+        let synthetic: Vec<String> = (1..=30)
+            .map(|n| format!("lead:example/repo#0:{n}@manager"))
+            .chain((1..=5).map(|n| format!("limit:account:{n}@manager")))
+            .chain((1..=3).map(|n| format!("pr:example/repo#{n}@reviewer")))
+            .collect();
+        for (n, id) in valid.iter().chain(&synthetic).enumerate() {
+            let ident = if n < valid.len() {
+                format!("STUDIO-{}", n + 1)
+            } else {
+                id.clone()
+            };
+            let run = seed_run_for(id, &ident, "2026-08-01T00:00:00Z", &store);
+            // All attribution is local, as on a normally routed installation.
+            store
+                .append_events(
+                    run,
+                    &[rhapsody_store::EventRow {
+                        seq: 1,
+                        kind: "teams.route".into(),
+                        text: "identity=jerry reason=label".into(),
+                        ..Default::default()
+                    }],
+                )
+                .expect("route event");
+        }
+        let states_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let labels_seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut fake = Fake::default();
+        let seen = states_seen.clone();
+        fake.states_by_ids_func = Some(Box::new(move |ids| {
+            seen.lock().expect("states").push(ids.to_vec());
+            Ok(ids
+                .iter()
+                .map(|id| Issue {
+                    id: id.clone(),
+                    state: "Done".into(),
+                    ..Default::default()
+                })
+                .collect())
+        }));
+        let seen = labels_seen.clone();
+        fake.labels_by_ids_func = Some(Box::new(move |ids| {
+            seen.lock().expect("labels").push(ids.to_vec());
+            Ok(Vec::new())
+        }));
+        let provider = Arc::new(
+            FakeProvider::ok(empty_snapshot())
+                .with_history(store.clone())
+                .with_tracker_decorations(Arc::new(fake), store),
+        );
+        let base = spawn_arc(provider as Arc<dyn StateProvider>).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues?limit=100")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["issues"].as_array().expect("rows").len(), 98);
+        for calls in [&states_seen, &labels_seen] {
+            let calls = calls.lock().expect("calls");
+            assert_eq!(calls.len(), 1, "one call, no isolation");
+            let mut ids = calls[0].clone();
+            ids.sort();
+            assert_eq!(ids, valid, "only the 60 ticket UUIDs reach the tracker");
+        }
+        for row in body["issues"].as_array().expect("rows") {
+            assert_eq!(row["assignee"], "jerry", "local attribution survives");
+            assert_eq!(
+                row.get("review_run").is_some(),
+                row["issue_id"].as_str().expect("id").starts_with("pr:"),
+                "existing role labelling survives"
+            );
+            if synthetic.contains(&row["issue_id"].as_str().expect("id").to_string()) {
+                assert!(row.get("lifecycle").is_none(), "synthetic lifecycle: {row}");
+                assert!(
+                    row.get("review_ticket").is_none(),
+                    "synthetic ticket label: {row}"
+                );
+            } else {
+                assert_eq!(row["lifecycle"], "done");
+            }
+        }
+    }
+
     // ---- STUDIO-834: which ticket a review row is reviewing ----
 
     /// Seed one watch row for `owner/repo#number@reviewer` with `introduced_by` as its origin.
@@ -2853,6 +2944,24 @@ mod tests {
             body["issues"], 1,
             "the tally covers the card the board draws: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn non_tracker_counts_exclude_manager_ids_from_lifecycle_reads() {
+        let store = mem_store();
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ] {
+            seed_run_for(key, key, "2026-08-01T00:00:00Z", &store);
+        }
+        seed_run_for("ticket-id", "STUDIO-123", "2026-08-01T00:01:00Z", &store);
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(provider.clone() as Arc<dyn StateProvider>).await;
+        let (status, _) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(provider.issue_lifecycles_asked(), ["ticket-id"]);
     }
 
     // STUDIO-965 — an UNATTRIBUTED run (`issue_identifier == ""`) is not a card: the console groups

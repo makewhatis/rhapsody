@@ -252,7 +252,10 @@ impl Orchestrator {
         if blockers.len() > 1 {
             tracing::warn!(issue_identifier = %iss.identifier, blocker_count = blockers.len(), "auto-promote: graphite dependent has >1 blocker; stacking on the first by declaration");
         }
-        let pred_id = pred.id.as_deref().filter(|s| !s.is_empty())?;
+        let pred_id = pred
+            .id
+            .as_deref()
+            .filter(|s| !s.is_empty() && !crate::review::is_non_tracker_key(s))?;
         let (branch, pr_number) = match tracker.fetch_issue_branch_by_id(pred_id).await {
             Ok(bp) => bp,
             Err(e) => {
@@ -483,6 +486,26 @@ mod tests {
             assert_eq!(tr.move_to_type_calls().len(), 0, "mode={mode:?}");
             assert_eq!(dispatched_len(&dispatched), 0, "mode={mode:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn non_tracker_predecessor_has_no_branch_lookup() {
+        let tracker = Arc::new(Fake::new());
+        let (o, _) = new_promote_orch(tracker.clone(), "graphite");
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ] {
+            let mut issue = backlog_dep("Done");
+            issue.blocked_by.as_mut().expect("blockers")[0].id = Some(key.into());
+            assert!(
+                o.stack_context_for(&issue, &(tracker.clone() as Arc<dyn Tracker>), "graphite")
+                    .await
+                    .is_none()
+            );
+        }
+        assert_eq!(tracker.branch_by_id_calls(), 0);
     }
 
     // graphite: an In-Review blocker clears → Backlog→Todo move + a stashed STACK ON hint carrying the

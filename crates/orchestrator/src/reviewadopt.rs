@@ -271,7 +271,10 @@ impl Orchestrator {
         load: &std::collections::HashMap<String, i64>,
         now: Instant,
     ) -> Verdict {
-        if iss.identifier.is_empty() {
+        if iss.identifier.is_empty()
+            || crate::review::is_non_tracker_key(&iss.id)
+            || crate::review::is_non_tracker_key(&iss.identifier)
+        {
             return Verdict::Skip;
         }
         // Human-only gate (STUDIO-949). This predicate is the structural sibling of
@@ -592,6 +595,27 @@ mod tests {
             sweep(&mut o, &issues, now).planned.is_empty(),
             "reuse the existing probe pace"
         );
+    }
+
+    #[test]
+    fn non_tracker_run_rows_are_not_review_adoption_subjects() {
+        let mut teams = teams_with(true, ReviewMode::Ticketless, &[]);
+        teams.manager.lead.enabled = true;
+        let mut o = orch(teams);
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ] {
+            let mut row = parked("STUDIO-123");
+            row.id = key.into();
+            assert!(sweep(&mut o, &[row], Instant::now()).planned.is_empty());
+            assert!(
+                sweep(&mut o, &[parked(key)], Instant::now())
+                    .planned
+                    .is_empty()
+            );
+        }
     }
 
     /// Records that `identity`'s run of `identifier` happened and ended — this daemon's own ledger,

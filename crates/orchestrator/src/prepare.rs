@@ -1393,6 +1393,9 @@ impl Orchestrator {
                 reopen,
                 ..
             } => {
+                if crate::review::is_non_tracker_key(&issue.id) {
+                    return PreparedValidity::Stale;
+                }
                 let Some(eff) = self.eff.as_ref() else {
                     // No config: nothing to revalidate against. Dispatch would not resolve a route
                     // either; allow it so a config-less unit test behaves as before.
@@ -2531,6 +2534,35 @@ mod tests {
             o.preparing.is_empty(),
             "the reservation is consumed exactly once"
         );
+    }
+
+    #[tokio::test]
+    async fn non_tracker_ticket_completion_is_stale_without_tracker_reads() {
+        let (mut o, _, _) = orch_with_resolver(Scripted::Ready);
+        let tracker = Arc::new(Fake::new());
+        o.eff.as_mut().expect("effective").tracker = tracker.clone();
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ] {
+            let mut target = ticket_target("Todo");
+            if let PreparedTarget::Ticket { issue, .. } = &mut target {
+                issue.id = key.into();
+            }
+            assert!(matches!(
+                o.begin_preparation(target, false),
+                BeginPreparation::Started(_)
+            ));
+            let entry = o.preparing.get(key).expect("entry");
+            assert_eq!(
+                o.prepared_target_still_current(entry).await,
+                PreparedValidity::Stale
+            );
+        }
+        assert_eq!(tracker.by_id_calls(), 0);
+        assert_eq!(tracker.labels_by_id_calls(), 0);
+        o.cancel_all_preparations();
     }
 
     // --- accepted refusal: a zero-turn row, no claim/run/workspace --------------------------------

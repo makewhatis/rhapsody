@@ -491,6 +491,11 @@ pub(crate) async fn ticket_not_waiting_in_review(
     plan: &MergePlan,
 ) -> Option<MergeControlOutcome> {
     let gate = plan.review_gate.as_ref()?;
+    if crate::review::is_non_tracker_key(&gate.issue_id) {
+        return Some(MergeControlOutcome::Refused(
+            "this run has no tracker ticket",
+        ));
+    }
     let Some(tr) = tracker else {
         // Before the first config load there is no tracker to ask. Transient, and it says so.
         return Some(MergeControlOutcome::Refused(

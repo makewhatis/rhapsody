@@ -249,6 +249,7 @@ struct Inner {
     branch_by_id_calls: usize,
     /// STUDIO-1034.
     description_by_identifier_calls: usize,
+    by_identifier_calls: Vec<String>,
 
     /// `comment_seq` generates unique, monotonically-ordered comment IDs so a tie on `created_at`
     /// resolves deterministically (smaller id = earlier caller).
@@ -307,6 +308,10 @@ impl Fake {
     /// Number of `fetch_issue_description_by_identifier` calls (STUDIO-1034).
     pub fn description_by_identifier_calls(&self) -> usize {
         self.lock().description_by_identifier_calls
+    }
+
+    pub fn by_identifier_calls(&self) -> Vec<String> {
+        self.lock().by_identifier_calls.clone()
     }
     /// Number of `list_comments` calls.
     pub fn list_comments_calls(&self) -> usize {
@@ -401,6 +406,7 @@ impl Tracker for Fake {
         &self,
         identifier: &str,
     ) -> Result<Option<Issue>, TrackerError> {
+        self.lock().by_identifier_calls.push(identifier.to_string());
         if let Some(error) = &self.by_identifier_err {
             return Err(error.clone());
         }
