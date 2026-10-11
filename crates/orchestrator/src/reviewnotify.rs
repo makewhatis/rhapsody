@@ -1174,6 +1174,109 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn solo_findings_post_move_and_redispatch_without_an_identity() {
+        let tracker = Arc::new(Fake::new());
+        let mut o = orch(true, ReviewMode::Ticketless, "@symphony");
+        o.spawn = Some(Box::new(|_, _, _| {}));
+        o.teams.as_mut().expect("teams").review.changes_state = "In Progress".into();
+        let mut ticket = Issue {
+            id: "solo-id".into(),
+            identifier: "STUDIO-1173".into(),
+            title: "Solo implementation".into(),
+            team_id: "team-1".into(),
+            state: "Todo".into(),
+            labels: Some(vec!["rhapsody:solo".into()]),
+            ..Default::default()
+        };
+        let eff = o.eff.as_mut().expect("effective");
+        eff.max_concurrent = 10;
+        eff.projects[0].max_concurrent = 10;
+        eff.tracker = tracker.clone();
+        eff.projects[0].tracker = tracker.clone();
+        eff.projects[0].active_states = crate::testsupport::set_of(&["in progress"]);
+        eff.projects[0].review_states = crate::testsupport::set_of(&["in review"]);
+        o.dispatch_issue(ticket.clone(), None, None, String::new());
+        let author_run = o.running.remove(&ticket.id).expect("solo author run");
+        assert!(author_run.identity.is_empty());
+        o.claimed.clear();
+        o.store()
+            .end_run(author_run.run_id, rhapsody_store::RunEnd::default())
+            .expect("end author run");
+        let review = ReviewRun {
+            author: String::new(),
+            introduced_by: "handoff:STUDIO-1173".into(),
+            ..run()
+        };
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: review.watch_key(),
+                author: String::new(),
+                introduced_by: review.introduced_by.clone(),
+                requested_sha: HEAD.into(),
+                status: rhapsody_store::REVIEW_STATUS_IN_FLIGHT.into(),
+                open: true,
+                ..Default::default()
+            })
+            .expect("watch row");
+        let completion = o
+            .plan_review_notify(&review, false)
+            .expect("findings notify");
+        assert_eq!(
+            completion.changes.as_ref().expect("route back").state,
+            "In Progress"
+        );
+        let comments = RecordingSink::new(false);
+        drain(
+            ReviewNotifyDeps {
+                comments: Some(comments.clone()),
+                tickets: Some(Arc::new(crate::reviewchanges::ControlChangesSink::new(
+                    o.control(),
+                ))),
+            },
+            vec![completion],
+        )
+        .await;
+        let posted = comments.taken();
+        assert_eq!(posted.len(), 1);
+        assert!(summons_author(&posted[0].2, "@symphony"));
+        let moved = tracker.move_calls();
+        assert_eq!(moved.len(), 1);
+        assert_eq!(moved[0].issue_id, ticket.id);
+        assert_eq!(moved[0].state_name, "In Progress");
+
+        // The next poll observes the fake tracker's moved ticket. Selection and dispatch are real;
+        // only the worker callback is inert, so this spends no model turn or network call.
+        ticket.state = moved[0].state_name.clone();
+        ticket.linked_prs = author_issue().linked_prs;
+        let at = utc(2030, 1, 1, 0, 0);
+        let gh = gh_serving_comment(&posted[0].2, at);
+        let summons = gh
+            .summons_since("makewhatis", "rhapsody", at - chrono::Duration::hours(1))
+            .await
+            .expect("fake completion summons");
+        ticket = apply_github_summons(
+            vec![ticket],
+            &summons,
+            "makewhatis",
+            "rhapsody",
+            &DaemonPrLinks::default(),
+        )
+        .issues
+        .remove(0);
+        assert_eq!(ticket.latest_summon_at, Some(at));
+        let mut next = Fake::new();
+        next.candidates = vec![ticket.clone()];
+        let next = Arc::new(next);
+        o.eff.as_mut().expect("effective").projects[0].tracker = next.clone();
+        o.validate().expect("valid dispatch config");
+        o.on_tick().await;
+        assert!(next.candidate_calls() > 0, "poll read the moved ticket");
+        let redispatched = o.running.get(&ticket.id).expect("solo fix run dispatched");
+        assert!(redispatched.identity.is_empty());
+        assert!(redispatched.teammate_section.is_empty());
+    }
+
     /// STUDIO-961: a CONFLICT route-back posts a comment naming the conflict and what to fix, and
     /// moves the same ticket through the same perform a findings verdict uses.
     ///

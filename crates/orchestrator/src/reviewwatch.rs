@@ -5720,6 +5720,28 @@ mod tests {
         assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_B);
     }
 
+    #[test]
+    fn a_solo_head_advance_fires_exactly_one_re_review() {
+        let (mut o, dispatched) = orch(ticketless(&["alice"]));
+        let mut solo = row(12, "alice");
+        solo.author.clear();
+        introduce(&o, solo);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        assert!(
+            o.running
+                .values()
+                .find_map(|re| re.review.as_ref())
+                .expect("review run")
+                .author
+                .is_empty()
+        );
+        complete(&mut o, 12, "alice", HEAD_A);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 1);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 0);
+        assert_eq!(dispatched.lock().expect("dispatches").len(), 2);
+    }
+
     // --- STUDIO-1025: a push from a still-running author run --------------------------------
 
     /// Acceptance, the PR 223 replay: an author run is live and pushes a merge-only head, then the
@@ -7387,6 +7409,28 @@ mod tests {
             }]
         );
         assert_eq!(report.dispatched, 0, "and no review round is dispatched");
+    }
+
+    #[test]
+    fn a_solo_approval_uses_the_existing_auto_merge_gate() {
+        for enabled in [false, true] {
+            let mut teams = ticketless(&["alice"]);
+            teams.review.auto_merge = enabled;
+            let (mut o, _d) = orch(teams);
+            let mut approved = approved_row(64, "alice", HEAD_A);
+            approved.author.clear();
+            introduce(&o, approved);
+            let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+            assert_eq!(report.dispatched, 0);
+            if enabled {
+                assert_eq!(report.merge.len(), 1);
+                assert_eq!(report.merge[0].pr, coord(64));
+                assert_eq!(report.merge[0].head, HEAD_A);
+                assert_eq!(report.merge[0].approved_by, ["alice"]);
+            } else {
+                assert!(report.merge.is_empty());
+            }
+        }
     }
 
     // --- watch-set reconciliation against the live config (STUDIO-1022) -----------------------
