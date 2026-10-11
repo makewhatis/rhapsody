@@ -9,12 +9,18 @@ test:
 # paths must resolve to real plugin directories, and no shipped file may carry a private hostname,
 # a person's name or a tracker workspace name — with that scan's own patterns pinned by
 # check-plugin_test.sh, which reintroduces each leak and asserts the scan reds on it.
+# The install-action HOME check (STUDIO-1174) reads ci.yml and pins the job-private `env.HOME` on
+# each `taiki-e/install-action` step — the wiring that stops the concurrent Mac jobs clobbering the
+# action's one shared `${HOME}/.install-action/tmp`; its own mutation test proves it reds when an
+# override is dropped. Like the other checks it is bash/python-only, so it rides this gate.
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 	harness/prompt/prompt_test.sh
 	.github/scripts/check-plugin.sh
 	.github/scripts/check-plugin_test.sh
+	python3 harness/ci/check-install-action-home.py
+	python3 harness/ci/check-install-action-home_test.py
 	python3 harness/ci/check-process-leaks_test.py
 
 # Recapture golden fixtures from the reference Go daemon (operator machine only; see harness/capture/)

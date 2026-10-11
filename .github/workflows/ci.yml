@@ -75,6 +75,13 @@ jobs:
       # stays green on an older entry and a non-`rhapsody-` one). Bash-only, so it rides `lint`.
       - run: harness/ci/check-tmp-leaks_test.sh
       - run: python3 harness/ci/check-process-leaks_test.py
+      # STUDIO-1174: the job-private `env.HOME` on each `taiki-e/install-action` step is what keeps
+      # the action's fixed `${HOME}/.install-action/tmp` scratch per-job; without it the concurrent
+      # `test`/`desktop` jobs on one Mac host clobber each other's checksum verify. The check reads
+      # ci.yml; its mutation test proves it reds when either override is dropped. Python-only, so it
+      # rides `lint` rather than adding a branch-protection context.
+      - run: python3 harness/ci/check-install-action-home.py
+      - run: python3 harness/ci/check-install-action-home_test.py
 
   test:
     timeout-minutes: 45
