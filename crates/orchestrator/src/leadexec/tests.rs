@@ -303,7 +303,7 @@ async fn replay_blocked_author_same_head_findings_parks_and_resumes_once() {
             last_state: "Todo".into(),
             declared_handoff: true,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
@@ -342,7 +342,7 @@ async fn replay_blocked_author_same_head_findings_parks_and_resumes_once() {
         last_state: crate::review::REVIEW_STATE_FINDINGS.into(),
         declared_handoff: true,
         review_verdict: None,
-        manager_text: None,
+        verdict_text: None,
         refused: false,
         auth_needed: false,
     });
@@ -1176,7 +1176,7 @@ fn lead_launch_reuses_selftest_ordered_fallback_and_generation_budget() {
             last_state: String::new(),
             declared_handoff: false,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
         });
         if daily_cap {

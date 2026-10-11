@@ -1176,7 +1176,7 @@ impl Orchestrator {
         }
         // A `launching`/`running` row the exit names but that produced no text is a failed attempt,
         // exactly as a lease expiry is.
-        let Some(text) = e.manager_text.as_deref() else {
+        let Some(text) = e.verdict_text.as_deref() else {
             self.record_manager_failed_attempt(&row, "manager run produced no result text");
             return;
         };
@@ -2122,7 +2122,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: false,
             review_verdict: None,
-            manager_text: Some(result.result_text),
+            verdict_text: Some(result.result_text),
             refused: false,
             auth_needed,
         });
@@ -2907,7 +2907,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: true,
             review_verdict: None,
-            manager_text: text.map(str::to_string),
+            verdict_text: text.map(str::to_string),
             refused: false,
             auth_needed: false,
         }

@@ -2407,7 +2407,7 @@ mod tests {
             err_msg: String::new(),
             declared_handoff: true,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
@@ -2761,7 +2761,7 @@ mod tests {
             last_state: "Todo".into(),
             declared_handoff: false,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
@@ -2799,7 +2799,7 @@ mod tests {
             last_state: "Todo".into(),
             declared_handoff: false,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });

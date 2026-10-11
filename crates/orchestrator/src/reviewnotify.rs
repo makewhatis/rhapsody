@@ -112,6 +112,9 @@ pub struct ReviewCompletion {
     /// Whether the reviewer declared `HANDOFF: approved`. It is the whole of the token decision:
     /// approved ⇒ tokenless, findings ⇒ token-bearing.
     pub approved: bool,
+    /// The review run's final verdict text, including its prose and machine-readable block.
+    /// Empty when no final text is available; the existing completion note is then the fallback.
+    pub verdict_text: String,
     /// Whether the daemon must NOT summon the author even though this round left findings
     /// (STUDIO-1012; §7.8 path 4). Set in `act` mode after the round threshold: the automatic
     /// route-back is suppressed, so its summon must be too — the comment becomes a record of the
@@ -196,6 +199,70 @@ pub fn re_engage_comment(c: &ReviewCompletion) -> String {
     if c.reason == CompletionReason::Conflict {
         return conflict_comment(c);
     }
+    let mut note = completion_note(c);
+    if c.verdict_text.is_empty() {
+        return note;
+    }
+    let note_len = note.len();
+    note.push_str("\n## Reviewer's verdict\n\n");
+    let text = c.verdict_text.as_str();
+    if note.len() + text.len() <= REVIEW_COMMENT_MAX_BYTES {
+        note.push_str(text);
+    } else {
+        let budget = REVIEW_COMMENT_MAX_BYTES - VERDICT_TRUNCATION.len();
+        if note.len() > budget {
+            let mut end = budget;
+            while !note.is_char_boundary(end) {
+                end -= 1;
+            }
+            note.truncate(end);
+        } else {
+            let mut end = budget - note.len();
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            note.push_str(&text[..end]);
+        }
+        note.push_str(VERDICT_TRUNCATION);
+    }
+    // Approval and manager-suppressed findings cannot inherit a summons from the agent's prose.
+    // Clipping `@botX` after the token creates a mention too, so strip AFTER the cut. The existing
+    // note stays untouched and this pass only ever copies a bounded appendix.
+    if !c.wants_summons() && note.len() >= note_len {
+        let appendix = tokenless_verdict(&note[note_len..], &c.summon_token);
+        note.truncate(note_len);
+        note.push_str(&appendix);
+    }
+    note
+}
+
+/// GitHub permits 65,536 characters. A conservative byte ceiling also bounds multibyte verdicts,
+/// including the host note, heading and cut marker; the leading findings token is never clipped.
+const REVIEW_COMMENT_MAX_BYTES: usize = 60_000;
+const VERDICT_TRUNCATION: &str = "\n\n[Review verdict truncated to fit GitHub's comment limit.]\n";
+
+fn tokenless_verdict(text: &str, token: &str) -> String {
+    if token.trim().is_empty() {
+        tracing::warn!("empty verdict summon token; omitting verdict text");
+        return String::new();
+    }
+    let matcher = match compile_summon_matcher(token) {
+        Ok(matcher) => matcher,
+        Err(error) => {
+            tracing::warn!(err = %error, "could not remove verdict summons; omitting verdict text");
+            return String::new();
+        }
+    };
+    let mut text = text.to_string();
+    // Matches consume both boundaries, so adjacent tokens may need another pass. A space avoids
+    // joining the surrounding words into a new custom summons after removal.
+    while matcher.is_match(&text) {
+        text = matcher.replace_all(&text, " ").into_owned();
+    }
+    text
+}
+
+fn completion_note(c: &ReviewCompletion) -> String {
     let ReviewCompletion {
         reviewer,
         author,
@@ -203,9 +270,7 @@ pub fn re_engage_comment(c: &ReviewCompletion) -> String {
         ..
     } = c;
     let head = short_sha(head_sha);
-    // `ReviewRun::author` documents empty as "unknown", and while the selection path fails closed on
-    // it, this template must not render `": read the review comments"` if one ever arrives. The
-    // address degrades to a role rather than to a blank.
+    // Solo/adopted PRs have no teammate author. Address the role rather than rendering a blank.
     let who = if author.is_empty() {
         "The author"
     } else {
@@ -305,11 +370,10 @@ pub struct ReviewNotifyDeps {
 /// reason: the `gh` call blocks, so concurrency here would occupy several runtime workers and
 /// multiply the rate-limit pressure of a subsystem nobody is waiting on.
 ///
-/// There is no back-off and no retry. A failed post costs the author one re-engagement — they still
-/// have the reviewer's own comments on the pull request, and the review itself is already recorded
-/// — whereas a retry loop would re-post a comment GitHub may well have accepted before failing, and
-/// a duplicated summons is worse than a missed one: it reopens the author's run twice for one
-/// round.
+/// There is no back-off and no retry. A failed post costs the author one re-engagement and may leave
+/// the verdict only in the recorded review run. A retry loop would re-post a comment GitHub may
+/// well have accepted before failing, and a duplicated summons is worse than a missed one: it
+/// reopens the author's run twice for one round.
 pub async fn run_review_notify_task(
     mut ctx: CancelWait,
     deps: ReviewNotifyDeps,
@@ -479,6 +543,7 @@ impl Orchestrator {
         &self,
         run: &ReviewRun,
         approved: bool,
+        verdict_text: &str,
     ) -> Option<ReviewCompletion> {
         if !self.review_ticketless_enabled() {
             return None;
@@ -502,6 +567,7 @@ impl Orchestrator {
             author: run.author.clone(),
             head_sha: run.head_sha.clone(),
             approved,
+            verdict_text: verdict_text.to_string(),
             suppress_summons,
             summon_token: self.review_summon_token(),
             changes: self.plan_review_changes(run, approved),
@@ -574,6 +640,7 @@ mod tests {
             author: "alice".to_string(),
             head_sha: HEAD.to_string(),
             approved,
+            verdict_text: String::new(),
             suppress_summons: false,
             summon_token: token.to_string(),
             changes: None,
@@ -826,6 +893,138 @@ mod tests {
         run_review_notify_task(crate::control_loop::CancelSignal::new().wait(), deps, rx).await;
     }
 
+    #[tokio::test]
+    async fn a_findings_completion_posts_the_verdict_verbatim_once() {
+        let sink = RecordingSink::new(false);
+        let tickets = RecordingTickets::new();
+        let verdict = "## Request changes\n\nB1: Missing schema migration.\nB2: CI omits the image build.\n\nHANDOFF: findings";
+        let c = ReviewCompletion {
+            verdict_text: verdict.into(),
+            ..completion_moving(false, SUMMON_TOKEN_SYMPHONY)
+        };
+        assert!(c.wants_summons());
+        drain(deps(&sink, &tickets), vec![c]).await;
+        let posted = sink.taken();
+        assert_eq!(posted.len(), 1);
+        assert!(
+            posted[0].2.contains(verdict),
+            "the author must receive the actual findings"
+        );
+        assert!(summons_author(&posted[0].2, SUMMON_TOKEN_SYMPHONY));
+        assert!(
+            tickets.taken()[0].1,
+            "the move must still report re-engagement"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_approval_completion_posts_the_verdict_without_summoning() {
+        let sink = RecordingSink::new(false);
+        let verdict = "Approve. The schema and CI meet the ticket.\nHANDOFF: approved";
+        drain(
+            ReviewNotifyDeps {
+                comments: Some(sink.clone()),
+                tickets: None,
+            },
+            vec![ReviewCompletion {
+                verdict_text: verdict.into(),
+                ..completion(true, SUMMON_TOKEN_SYMPHONY)
+            }],
+        )
+        .await;
+        let posted = sink.taken();
+        assert_eq!(posted.len(), 1);
+        assert!(posted[0].2.contains(verdict));
+        assert!(!summons_author(&posted[0].2, SUMMON_TOKEN_SYMPHONY));
+    }
+
+    #[test]
+    fn tokenless_completions_cannot_inherit_summons_from_the_verdict() {
+        for token in [SUMMON_TOKEN_SYMPHONY, "@bot", "@a|b"] {
+            for approved in [true, false] {
+                let mut c = completion(approved, token);
+                c.suppress_summons = !approved;
+                c.verdict_text = format!(
+                    "Verdict: {token} {token} please read.\n{} uppercase alias.\nDone.",
+                    rhapsody_core::SUMMON_TOKEN_RHAPSODY.to_ascii_uppercase()
+                );
+                let body = re_engage_comment(&c);
+                assert!(body.contains("Done."));
+                assert!(!summons_author(&body, token), "{body}");
+            }
+        }
+    }
+
+    #[test]
+    fn truncating_an_approval_cannot_turn_a_word_into_a_summons() {
+        let mut c = completion(true, "@bot");
+        let heading = "\n## Reviewer's verdict\n\n";
+        let kept = 60_000 - completion_note(&c).len() - heading.len() - VERDICT_TRUNCATION.len();
+        // Before clipping this is an identifier, not a mention. The cut removes its suffix.
+        c.verdict_text = format!("{} @botX{}", "x".repeat(kept - 5), "x".repeat(10_000));
+        assert!(!summons_author(&c.verdict_text, "@bot"));
+        let body = re_engage_comment(&c);
+        assert!(body.contains("[Review verdict truncated"));
+        assert!(
+            !summons_author(&body, "@bot"),
+            "clipping must not create a summon"
+        );
+    }
+
+    #[test]
+    fn an_empty_verdict_keeps_the_existing_completion_note() {
+        let c = completion(false, SUMMON_TOKEN_SYMPHONY);
+        assert_eq!(
+            re_engage_comment(&c),
+            format!(
+                "{} **bob** reviewed this pull request at `aaaaaaa` and left findings on it.\n\n\
+             alice: read the review comments on this pull request, then push your fixes to this \
+             branch. Pushing is the whole of it — the daemon watches this pull request's head and arms \
+             a fresh review of whatever lands, so there is no re-review to request and nobody to \
+             notify.\n\nReviewed, not merged — alice owns the merge.\n",
+                SUMMON_TOKEN_SYMPHONY
+            )
+        );
+        assert_eq!(
+            re_engage_comment(&completion(true, SUMMON_TOKEN_SYMPHONY)),
+            "**bob** reviewed this pull request at `aaaaaaa` and found nothing to raise.\n\n\
+             No changes are requested, so nothing is being asked of alice and this comment \
+             deliberately carries no summon. Pushing to this branch arms one more review of the \
+             new commits.\n\nReviewed, not merged — alice owns the merge.\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_oversized_verdict_is_marked_and_keeps_the_leading_summons() {
+        for text in ["x".repeat(70_000), "🦀".repeat(20_000)] {
+            let sink = RecordingSink::new(false);
+            drain(
+                ReviewNotifyDeps {
+                    comments: Some(sink.clone()),
+                    tickets: None,
+                },
+                vec![ReviewCompletion {
+                    verdict_text: text,
+                    ..completion(false, SUMMON_TOKEN_SYMPHONY)
+                }],
+            )
+            .await;
+            let posted = sink.taken();
+            assert_eq!(posted.len(), 1);
+            let body = &posted[0].2;
+            assert!(
+                body.len() <= 60_000,
+                "the entire comment must fit below GitHub's limit"
+            );
+            assert!(
+                body.contains("[Review verdict truncated"),
+                "the cut must be explicit"
+            );
+            assert!(body.starts_with(SUMMON_TOKEN_SYMPHONY));
+            assert!(summons_author(body, SUMMON_TOKEN_SYMPHONY));
+        }
+    }
+
     /// The task posts the host-composed body at the completion's own coordinates.
     #[tokio::test]
     async fn the_task_posts_the_composed_comment_on_the_reviewed_pull_request() {
@@ -944,7 +1143,7 @@ mod tests {
         for (enabled, mode, want) in cases {
             let o = orch(enabled, mode, "@symphony");
             assert_eq!(
-                o.plan_review_notify(&run(), false).is_some(),
+                o.plan_review_notify(&run(), false, "").is_some(),
                 want,
                 "teams_enabled={enabled} mode={mode:?}"
             );
@@ -957,14 +1156,14 @@ mod tests {
     fn the_plan_resolves_the_configured_summon_token_and_defaults_when_empty() {
         let o = orch(true, ReviewMode::Ticketless, "@bot");
         let c = o
-            .plan_review_notify(&run(), false)
+            .plan_review_notify(&run(), false, "")
             .expect("the ticketless daemon plans a comment");
         assert_eq!(c.summon_token, "@bot");
         assert!(summons_author(&re_engage_comment(&c), "@bot"));
 
         let o = orch(true, ReviewMode::Ticketless, "   ");
         let c = o
-            .plan_review_notify(&run(), false)
+            .plan_review_notify(&run(), false, "")
             .expect("the ticketless daemon plans a comment");
         assert_eq!(c.summon_token, rhapsody_core::SUMMON_TOKEN_SYMPHONY);
     }
@@ -981,7 +1180,7 @@ mod tests {
         ] {
             let mut r = run();
             mutate(&mut r);
-            assert!(o.plan_review_notify(&r, false).is_none(), "{r:?}");
+            assert!(o.plan_review_notify(&r, false, "").is_none(), "{r:?}");
         }
     }
 
@@ -991,7 +1190,7 @@ mod tests {
     fn the_comment_names_the_pinned_head_not_a_later_one() {
         let o = orch(true, ReviewMode::Ticketless, "@symphony");
         let c = o
-            .plan_review_notify(&run(), false)
+            .plan_review_notify(&run(), false, "")
             .expect("the ticketless daemon plans a comment");
         assert_eq!(c.head_sha, HEAD);
         assert!(re_engage_comment(&c).contains(&HEAD[..7]));
@@ -1023,7 +1222,7 @@ mod tests {
             );
 
             let c = o
-                .plan_review_notify(&run(), false)
+                .plan_review_notify(&run(), false, "")
                 .expect("a completion is still planned");
             let wants = c.wants_summons();
             assert_eq!(
@@ -1219,8 +1418,9 @@ mod tests {
                 ..Default::default()
             })
             .expect("watch row");
+        let verdict = "B1: Add the missing schema migration.\nHANDOFF: findings";
         let completion = o
-            .plan_review_notify(&review, false)
+            .plan_review_notify(&review, false, verdict)
             .expect("findings notify");
         assert_eq!(
             completion.changes.as_ref().expect("route back").state,
@@ -1239,6 +1439,8 @@ mod tests {
         .await;
         let posted = comments.taken();
         assert_eq!(posted.len(), 1);
+        assert!(posted[0].2.contains(verdict));
+        assert!(posted[0].2.contains("The author: read the review comments"));
         assert!(summons_author(&posted[0].2, "@symphony"));
         let moved = tracker.move_calls();
         assert_eq!(moved.len(), 1);
