@@ -146,11 +146,9 @@ pub struct WorkerDeclaration {
     /// every non-review run and on any review whose block is absent, ambiguous or unparseable —
     /// which is the unstructured fallback the review path records.
     pub review_verdict: Option<ReviewVerdictBlock>,
-    /// A MANAGER run's final result text, carried verbatim so the exit path can parse the
-    /// `rhapsody-manager-decision` block against the daemon's finding ledger (STUDIO-1015, §6.1).
-    /// `None` on every non-manager run. Carried rather than re-read: the worker still holds the
-    /// final text when it builds this, exactly as `review_verdict` is.
-    pub manager_text: Option<String>,
+    /// A REVIEW or MANAGER run's final result text, carried verbatim for the completion comment
+    /// or decision parser. `None` on ordinary runs; the exit path never re-reads a transcript.
+    pub verdict_text: Option<String>,
     /// A ticket run's decision request, detected off-loop only when the tech lead is enabled.
     pub blocked_question: Option<String>,
 }
@@ -621,7 +619,7 @@ async fn run_manager_attempt(
             review_verdict: None,
             // The manager's final text is parsed at the exit path, where the finding ledger is in
             // hand: the decision's dismissals name finding revisions only the daemon knows.
-            manager_text: Some(result_text),
+            verdict_text: Some(result_text),
             blocked_question: None,
         },
         loop_err,
@@ -1284,7 +1282,7 @@ pub async fn run_agent_attempt(
         WorkerDeclaration {
             declared_handoff: has_handoff_marker(&result_text),
             review_verdict,
-            manager_text: None,
+            verdict_text: deps.review.as_ref().map(|_| result_text),
             blocked_question,
         },
         loop_err,
@@ -2235,13 +2233,13 @@ fi
 
         // The review turn ends with a structured verdict block (STUDIO-1008); the exit declaration
         // below must carry it, which is what makes the worker the place the block is read.
+        let verdict_text = "posted 1 finding\n\n```rhapsody-review-verdict\n\
+                     {\"approve\": false, \"findings\": [{\"id\": \"B8\", \"blocking\": true, \
+                     \"summary\": \"abort bypasses cancellation\"}]}\n```\n\nHANDOFF: findings";
         let ag = fake_agent(vec![agentfake::TurnScript {
             result: TurnResult {
                 status: TURN_SUCCEEDED.to_string(),
-                result_text: "posted 1 finding\n\n```rhapsody-review-verdict\n\
-                     {\"approve\": false, \"findings\": [{\"id\": \"B8\", \"blocking\": true, \
-                     \"summary\": \"abort bypasses cancellation\"}]}\n```\n\nHANDOFF: findings"
-                    .to_string(),
+                result_text: verdict_text.into(),
                 ..Default::default()
             },
             ..Default::default()
@@ -2266,6 +2264,7 @@ fi
             run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
         assert!(err.is_none(), "expected normal exit, got {err:?}");
 
+        assert_eq!(declaration.verdict_text.as_deref(), Some(verdict_text));
         let block = declaration
             .review_verdict
             .expect("the worker parses the review run's verdict block");

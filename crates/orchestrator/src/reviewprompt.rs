@@ -559,6 +559,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_ticketless_prompt_explicitly_posts_reviews_without_a_teammate_author() {
+        let synthetic = Issue {
+            identifier: "pr:example/repo#1@alice".into(),
+            title: "Review example/repo#1 at abc1234".into(),
+            ..Default::default()
+        };
+        let rendered = prompt::render(REVIEW_BASE_PROMPT, &synthetic, None).expect("render");
+        assert!(rendered.contains("gh pr comment"));
+        assert!(rendered.contains("solo or adopted pull request"));
+        assert!(rendered.contains("full verdict in your final message"));
+    }
+
     // ── STUDIO-959: delta rounds ─────────────────────────────────────────────────────────────────
 
     const HEAD: &str = "def5678def5678def5678def5678def5678def5";

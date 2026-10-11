@@ -3900,6 +3900,7 @@ impl Orchestrator {
             author: mine[0].author.clone(),
             head_sha: head.to_string(),
             approved: false,
+            verdict_text: String::new(),
             // The conflict route-back is a separate trigger from the findings completion, and
             // STUDIO-1012 scopes its suppression to the findings verdict alone; this stays a
             // summoning comment.
@@ -5592,7 +5593,7 @@ mod tests {
                 declared_handoff: true,
                 last_state: crate::review::REVIEW_STATE_FINDINGS.to_string(),
                 review_verdict: None,
-                manager_text: None,
+                verdict_text: None,
                 refused: false,
                 auth_needed: false,
             });
@@ -5620,7 +5621,7 @@ mod tests {
                 declared_handoff: true,
                 last_state: crate::review::REVIEW_STATE_APPROVED.to_string(),
                 review_verdict: None,
-                manager_text: None,
+                verdict_text: None,
                 refused: false,
                 auth_needed: false,
             });
@@ -5647,7 +5648,7 @@ mod tests {
             declared_handoff: false,
             last_state: String::new(),
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
@@ -10022,7 +10023,7 @@ mod tests {
                 // The max_turns backstop, not a declared hand-off.
                 declared_handoff: false,
                 review_verdict: None,
-                manager_text: None,
+                verdict_text: None,
                 refused: false,
                 auth_needed: false,
             },
@@ -10079,7 +10080,7 @@ mod tests {
                 last_state: crate::review::REVIEW_STATE_FINDINGS.to_string(),
                 declared_handoff: true,
                 review_verdict: None,
-                manager_text: None,
+                verdict_text: None,
                 refused: false,
                 auth_needed: false,
             },
@@ -10452,7 +10453,7 @@ mod tests {
             declared_handoff: verdict.is_some(),
             last_state: verdict.unwrap_or_default().to_string(),
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
@@ -12265,7 +12266,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: false,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });

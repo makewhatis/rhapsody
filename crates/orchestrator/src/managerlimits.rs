@@ -211,7 +211,7 @@ impl Orchestrator {
                     refused: false,
                     declared_handoff: false,
                     review_verdict: None,
-                    manager_text: None,
+                    verdict_text: None,
                 },
             );
         }
@@ -342,7 +342,7 @@ impl Orchestrator {
         let parsed = if exit.failed {
             Err("manager turn failed".into())
         } else {
-            parse_limit_decision(exit.manager_text.as_deref().unwrap_or_default())
+            parse_limit_decision(exit.verdict_text.as_deref().unwrap_or_default())
         };
         match parsed {
             Ok(decision)
@@ -897,7 +897,7 @@ mod tests {
             o.manager_review_authority(),
             rhapsody_config::teams::ReviewAuthority::Off
         );
-        o.on_worker_exit(crate::retry::EvWorkerExit {issue_id:key,started_at:re.started_at,last_state:String::new(),failed:false,err_msg:String::new(),auth_needed:false,refused:false,declared_handoff:false,review_verdict:None,manager_text:Some("```rhapsody-manager-decision\n{\"kind\":\"limit\",\"account\":\"claude-subscription\",\"ticket\":\"MT-1\",\"action\":\"wait\",\"rationale\":\"reset is preferable\"}\n```".into())});
+        o.on_worker_exit(crate::retry::EvWorkerExit {issue_id:key,started_at:re.started_at,last_state:String::new(),failed:false,err_msg:String::new(),auth_needed:false,refused:false,declared_handoff:false,review_verdict:None,verdict_text:Some("```rhapsody-manager-decision\n{\"kind\":\"limit\",\"account\":\"claude-subscription\",\"ticket\":\"MT-1\",\"action\":\"wait\",\"rationale\":\"reset is preferable\"}\n```".into())});
         o.pump_limit_decisions().await;
         assert!(matches!(
             o.limit_policy.suspended["1"].outcome,

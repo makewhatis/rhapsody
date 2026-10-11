@@ -1486,7 +1486,7 @@ mod tests {
                 last_state: "Done".to_string(),
                 declared_handoff: true,
                 review_verdict: None,
-                manager_text: None,
+                verdict_text: None,
                 refused: false,
                 auth_needed: false,
             }))

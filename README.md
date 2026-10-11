@@ -2023,6 +2023,16 @@ instruction. A round that left *findings* posts a token-bearing one. Both are ju
 matcher (`reviewnotify::summons_author`) rather than a substring test, and the task logs which way
 each comment went.
 
+The completion comment also carries the review run's final verdict text (STUDIO-1175), so a
+solo/adopted PR whose reviewer posted no separate comment still receives the actual findings.
+An empty verdict retains the existing note. The full comment has a conservative 60,000-byte
+ceiling, with an explicit truncation marker and space reserved for the note and leading summons.
+Approvals and manager-suppressed findings remove summons from the appended verdict using the
+same configured matcher (including brand aliases); ordinary findings retain the verdict verbatim
+when it fits. A separate reviewer comment may duplicate this body for now. The compiled review
+prompt explicitly instructs every reviewer to post a plain PR comment, including solo/adopted PRs,
+and to include the full verdict in its final message even when posting fails.
+
 **Off is still off.** The comment is planned only when `teams.enabled` and `review.mode:
 ticketless`, and the task that posts it is spawned on the same condition — so on every other
 installation a review exit cannot represent a comment, let alone post one. The failed and

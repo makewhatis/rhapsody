@@ -904,9 +904,11 @@ impl Orchestrator {
             // never waited on; the two branches above deliberately notify NOBODY — a crashed round
             // read nothing, and a truncated one is re-armed at the same head rather than reported
             // as a review the author should act on.
-            self.request_review_notify(
-                self.plan_review_notify(run, status == REVIEW_STATUS_APPROVED),
-            );
+            self.request_review_notify(self.plan_review_notify(
+                run,
+                status == REVIEW_STATUS_APPROVED,
+                e.verdict_text.as_deref().unwrap_or_default(),
+            ));
             (store::OUTCOME_COMPLETED, "")
         };
         self.persist_end_run(re, outcome, reason);
@@ -2671,7 +2673,7 @@ mod tests {
             // The unstructured fallback: these tests predate the structured contract and emit no
             // block (STUDIO-1008). `exit_review_with_verdict` below carries a parsed one.
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
@@ -2696,7 +2698,7 @@ mod tests {
             last_state: last_state.to_string(),
             declared_handoff: true,
             review_verdict: Some(verdict),
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
@@ -2714,6 +2716,41 @@ mod tests {
             out.push((c.to_string(), c.approved));
         }
         out
+    }
+
+    #[test]
+    fn a_completed_solo_review_carries_final_text_to_the_notification_task() {
+        for state in [REVIEW_STATE_APPROVED, REVIEW_STATE_FINDINGS] {
+            let (mut o, _d) = orch_with_review(true);
+            let mut rx = o.open_review_notify_channel();
+            let run = ReviewRun {
+                author: String::new(),
+                ..review_run("alice", HEAD_A)
+            };
+            assert_eq!(
+                o.dispatch_review(run.clone()),
+                ReviewDispatchOutcome::Dispatched
+            );
+            let re = o.running.get(&run.key()).expect("running");
+            let text = "The review's complete final verdict, including its evidence.";
+            o.on_worker_exit(EvWorkerExit {
+                issue_id: run.key(),
+                started_at: re.started_at,
+                failed: false,
+                err_msg: String::new(),
+                last_state: state.into(),
+                declared_handoff: true,
+                review_verdict: None,
+                verdict_text: Some(text.into()),
+                refused: false,
+                auth_needed: false,
+            });
+            let c = rx.try_recv().expect("completion");
+            assert_eq!(c.verdict_text, text);
+            assert!(c.author.is_empty());
+            assert_eq!(c.approved, state == REVIEW_STATE_APPROVED);
+            assert!(rx.try_recv().is_err(), "only one completion per verdict");
+        }
     }
 
     /// STUDIO-723, the acceptance wiring: a DECLARED review completion queues exactly one
@@ -3578,7 +3615,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: true,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
@@ -3749,7 +3786,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });

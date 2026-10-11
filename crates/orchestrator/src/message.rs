@@ -591,7 +591,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
@@ -648,7 +648,7 @@ mod tests {
             last_state: "In Progress".into(),
             declared_handoff: false,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });

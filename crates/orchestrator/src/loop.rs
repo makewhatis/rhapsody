@@ -2206,7 +2206,7 @@ impl Orchestrator {
                 last_state: final_state,
                 declared_handoff: declared.declared_handoff,
                 review_verdict: declared.review_verdict,
-                manager_text: declared.manager_text,
+                verdict_text: declared.verdict_text,
                 refused,
                 auth_needed,
             };
@@ -2692,7 +2692,7 @@ mod tests {
                 last_state: String::new(),
                 declared_handoff: false,
                 review_verdict: None,
-                manager_text: None,
+                verdict_text: None,
                 refused: false,
                 auth_needed: false,
             }));

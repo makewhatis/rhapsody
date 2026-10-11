@@ -85,7 +85,19 @@ already posted before you post anything, and add only what is missing: a second
 copy of a finding you have already made costs the author time and tells them
 nothing new.
 
-When your findings are posted you are done. End your final message with the
+Post your review **on the pull request** with `gh pr comment <number> --repo
+<owner>/<repo> --body <review>`, using the coordinates above. This applies equally
+to a solo or adopted pull request with no teammate author. Use a plain comment:
+GitHub may refuse a formal review from the account that opened the pull request.
+For ticketless reviews (the identifier starts with `pr:`), do not add a summon
+token to that comment; the daemon owns the completion summons. A quorum review
+ticket follows its description's posting instructions.
+If posting fails, say so and still include your full verdict in your final message.
+Include that full verdict in your final message even when posting succeeds: the
+daemon publishes ticketless verdicts with the completion note so the author gets
+the findings even when you could not post them yourself.
+
+When your review is complete you are done. End your final message with the
 `rhapsody-review-verdict` block above, then a `HANDOFF:` line — `HANDOFF: approved`
 when you found nothing that needs changing, otherwise `HANDOFF: findings`. The block
 and the line must agree; when they do not, the daemon records the conservative

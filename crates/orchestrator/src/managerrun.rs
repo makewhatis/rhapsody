@@ -506,7 +506,7 @@ impl Orchestrator {
         let text = if exit.failed {
             "```rhapsody-lead-decision\n{\"actions\":[{\"action\":\"escalate\",\"need\":\"Lead harness infrastructure failed and no fallback can run; inspect the run.\"}]}\n```".into()
         } else {
-            exit.manager_text.clone().unwrap_or_default()
+            exit.verdict_text.clone().unwrap_or_default()
         };
         self.submit_lead_execution(
             case,
@@ -1657,7 +1657,7 @@ mod tests {
             refused: false,
             declared_handoff: false,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
         });
         o.pump_manager_interventions();
         assert_eq!(
@@ -1857,7 +1857,7 @@ mod tests {
             last_state: String::new(),
             declared_handoff: true,
             review_verdict: None,
-            manager_text: None,
+            verdict_text: None,
             refused: false,
             auth_needed: false,
         });
