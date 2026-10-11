@@ -39,9 +39,9 @@
 //! * **The repository** comes from the ticket's own resolved project — that is, from CONFIG, which
 //!   is where the allowlist itself lives and is strictly less reachable than a run's binding.
 //! * **The author** comes from this daemon's OWN event ledger: the newest run of the ticket, and
-//!   the `teams.route` row that run recorded ([`crate::lifecycle::run_identity`]). A ticket no
-//!   teammate ran is not adopted at all, because there is then no author to exclude — and
-//!   "the author is not the reviewer" is a guard, not a nicety.
+//!   the `teams.route` row that run recorded, or `teams.unrouted reason=solo` for a solo dispatch.
+//!   Solo has no roster author to exclude. A ticket this daemon never ran, or whose newest run
+//!   has no such dispatch evidence, is not adopted at all.
 //! * **The reviewers** are ranked by [`crate::quorum::rank_reviewers`] over a live
 //!   [`LoadSnapshot`](crate::teams::LoadSnapshot), exactly as `plan_review_intro` ranks them.
 //!
@@ -336,11 +336,11 @@ impl Orchestrator {
         {
             return Verdict::Skip;
         }
-        // Gate: a teammate of this daemon's own ran it. Without an author there is nobody to
-        // EXCLUDE, and "the author is not the reviewer" is a guard rather than a nicety — so a
-        // ticket parked in review that this daemon never ran as a teammate is not adopted at all.
-        // `plan_review_intro` refuses the same case as `re.identity.is_empty()`.
-        let author = match self.adopt_author(&iss.identifier) {
+        // Gate: this daemon's newest run recorded a teammate or an explicit solo dispatch.
+        // Some("") is proven solo, not missing provenance; it excludes nobody from the roster.
+        let recorded_author = self.adopt_author(&iss.identifier);
+        let adoptable = self.review_ticketless_enabled() && recorded_author.is_some();
+        let author = match recorded_author {
             Some(author) if self.review_ticketless_enabled() => author,
             _ if self.lead_enabled() => String::new(),
             _ => return Verdict::Considered,
@@ -367,10 +367,10 @@ impl Orchestrator {
         // Lead-only probes have no reviewer and can never introduce a watch row. They reuse the
         // existing bounded lookup and pace to detect an In Review ticket with no PR, even if this
         // daemon never ran it or ticketless review is off.
-        let mut reviewers = if author.is_empty() {
-            Vec::new()
-        } else {
+        let mut reviewers = if adoptable {
             crate::quorum::rank_reviewers(teams, &author, load, &self.reviewer_exclusions(teams))
+        } else {
+            Vec::new()
         };
         reviewers.truncate(teams.review.effective_reviewers());
         if reviewers.is_empty() && !self.lead_enabled() {
@@ -413,8 +413,8 @@ impl Orchestrator {
         }
     }
 
-    /// The teammate whose run authored `identifier`'s pull request, from this daemon's OWN event
-    /// ledger: the newest run of the ticket, and the `teams.route` row that run recorded.
+    /// The teammate whose run authored `identifier`'s pull request, or an empty author for a proven
+    /// solo dispatch, from this daemon's OWN event ledger on the newest run of the ticket.
     ///
     /// The ticket's `rhapsody:@<name>` LABEL is deliberately not consulted, though it is free and
     /// already on the polled issue. The label is who the ticket is assigned to TODAY; the route row
@@ -438,7 +438,27 @@ impl Orchestrator {
                 )
             })
             .ok()?;
-        crate::lifecycle::routed_identity(self.store.as_ref(), runs.first()?.id)
+        let run = runs.first()?.id;
+        if let Some(identity) = crate::lifecycle::routed_identity(self.store.as_ref(), run) {
+            return Some(identity);
+        }
+        // Exact dispatch reason, not today's label or an arbitrary identity-less run. The event
+        // may carry model/effort suffixes, so compare the first token rather than the whole text.
+        self.store()
+            .search_events(rhapsody_store::EventQuery {
+                run,
+                kind: crate::teams::EVENT_UNROUTED.to_string(),
+                limit: 1,
+                ..Default::default()
+            })
+            .inspect_err(|e| {
+                tracing::warn!(issue = %identifier, run, err = %e,
+                    "ticketless review: solo dispatch ledger unreadable; nothing is adopted")
+            })
+            .ok()?
+            .first()
+            .filter(|hit| hit.text.split_whitespace().next() == Some("reason=solo"))
+            .map(|_| String::new())
     }
 
     /// The project group an adoption's advisory is filed under — [`crate::warnings`]'s key.
@@ -475,7 +495,7 @@ enum Verdict {
     /// not paced.
     Skip,
     /// Considered at COST — the store was read — and found not adoptable, but not faulty either:
-    /// this daemon simply never ran the ticket as a teammate. Paced exactly like an adoption, so a
+    /// this daemon has no trusted teammate/solo dispatch for the newest run. Paced like an adoption, so a
     /// review column full of tickets somebody else parked does not re-read the run ledger on every
     /// poll tick forever.
     Considered,
@@ -578,7 +598,7 @@ mod tests {
 
     #[test]
     fn lead_probes_an_in_review_ticket_even_without_an_author_or_reviewer() {
-        let mut teams = teams_with(true, ReviewMode::Ticketless, &[]);
+        let mut teams = teams_with(true, ReviewMode::Ticketless, &["alice"]);
         teams.manager.lead.enabled = true;
         let mut o = orch(teams);
         let issues = [parked("STUDIO-1123")];
@@ -610,9 +630,17 @@ mod tests {
                 &[rhapsody_store::EventRow {
                     seq: 1,
                     at: "2026-09-10T00:00:00Z".into(),
-                    kind: crate::teams::EVENT_ROUTE.into(),
+                    kind: if identity.is_empty() {
+                        crate::teams::EVENT_UNROUTED.into()
+                    } else {
+                        crate::teams::EVENT_ROUTE.into()
+                    },
                     tool: String::new(),
-                    text: format!("identity={identity} reason=label"),
+                    text: if identity.is_empty() {
+                        "reason=solo".into()
+                    } else {
+                        format!("identity={identity} reason=label")
+                    },
                 }],
             )
             .expect("append route event");
@@ -637,6 +665,15 @@ mod tests {
     /// asked from a test.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_orphaned_pull_request_ends_with_a_watch_row_and_no_re_dispatch() {
+        orphaned_pull_request("alice", "bob").await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_orphaned_solo_pull_request_ends_with_one_watch_row() {
+        orphaned_pull_request("", "alice").await;
+    }
+
+    async fn orphaned_pull_request(author: &str, reviewer: &str) {
         let mut tr = Fake::new();
         tr.candidates = vec![parked("STUDIO-836")];
         let mut o = orch_with_tracker(
@@ -644,7 +681,11 @@ mod tests {
             Arc::new(tr),
         );
         let store = Arc::clone(&o.store);
-        record_run(&o, "STUDIO-836", "alice");
+        record_run(&o, "STUDIO-836", author);
+        let plan = sweep(&mut o, &[parked("STUDIO-836")], Instant::now());
+        assert_eq!(plan.planned.len(), 1);
+        assert!(plan.planned[0].only_if_unwatched);
+        o.review_adopt_probed.clear();
         assert!(
             store.load_review_watch().expect("read").is_empty(),
             "the fixture must start orphaned"
@@ -688,8 +729,8 @@ mod tests {
 
         assert_eq!(rows.len(), 1, "one row, one reviewer: {rows:?}");
         assert_eq!(rows[0].key.number, 144);
-        assert_eq!(rows[0].key.reviewer, "bob");
-        assert_eq!(rows[0].author, "alice");
+        assert_eq!(rows[0].key.reviewer, reviewer);
+        assert_eq!(rows[0].author, author);
         assert_eq!(
             rows[0].introduced_by,
             format!("{REVIEW_ORIGIN_ADOPT}:STUDIO-836")
@@ -1212,17 +1253,78 @@ mod tests {
         );
     }
 
-    /// Gate 5. No teammate is recorded as having run this ticket, so there is no author to exclude
-    /// — and "the author is not the reviewer" is a guard. A ticket parked in review that this
-    /// daemon never ran as a teammate is simply not this mechanism's business.
+    /// No local run means no trusted provenance, even if today's label says solo.
     #[test]
     fn a_ticket_no_teammate_ran_is_not_adopted() {
         let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
         // No run at all in the ledger.
+        let mut ticket = parked("STUDIO-836");
+        ticket.labels = Some(vec!["rhapsody:solo".into()]);
         assert_eq!(
-            sweep(&mut o, &[parked("STUDIO-836")], Instant::now()),
+            sweep(&mut o, &[ticket], Instant::now()),
             AdoptSweep::default()
         );
+    }
+
+    #[test]
+    fn solo_adoption_uses_the_newest_dispatch_not_current_labels_or_an_older_author() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice"]));
+        record_run(&o, "STUDIO-836", "alice");
+        record_run(&o, "STUDIO-836", "");
+        let mut ticket = parked("STUDIO-836");
+        ticket.labels = Some(vec!["rhapsody:@alice".into()]);
+        let out = sweep(&mut o, &[ticket], Instant::now());
+        assert_eq!(out.planned.len(), 1);
+        assert!(out.planned[0].author.is_empty());
+        assert_eq!(out.planned[0].reviewers, ["alice"]);
+    }
+
+    #[test]
+    fn a_silent_newest_run_does_not_inherit_an_older_solo_dispatch() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice"]));
+        record_run(&o, "STUDIO-836", "");
+        o.store()
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: "STUDIO-836".into(),
+                ..Default::default()
+            })
+            .expect("silent run");
+        assert!(
+            sweep(&mut o, &[parked("STUDIO-836")], Instant::now())
+                .planned
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn only_an_explicit_solo_dispatch_is_adoptable_without_an_identity() {
+        for reason in ["no_match", "off", "solo-impostor", "unknown reason=solo"] {
+            let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice"]));
+            let run = o
+                .store()
+                .start_run(rhapsody_store::RunStart {
+                    issue_identifier: "STUDIO-836".into(),
+                    ..Default::default()
+                })
+                .expect("unrouted run");
+            o.store()
+                .append_events(
+                    run,
+                    &[rhapsody_store::EventRow {
+                        seq: 1,
+                        kind: crate::teams::EVENT_UNROUTED.into(),
+                        text: format!("reason={reason}"),
+                        ..Default::default()
+                    }],
+                )
+                .expect("dispatch event");
+            let mut ticket = parked("STUDIO-836");
+            ticket.labels = Some(vec!["rhapsody:solo".into()]);
+            assert!(
+                sweep(&mut o, &[ticket], Instant::now()).planned.is_empty(),
+                "{reason}"
+            );
+        }
     }
 
     /// Gate 6. The roster holds nobody but the author, so every candidate reviewer IS the author.

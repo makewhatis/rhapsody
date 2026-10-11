@@ -1237,6 +1237,11 @@ nothing and a daemon with Teams off never even asks the question.
 immediately as a plain identity-less run — for daemon-debugging work, or anything you want vanilla.
 Triage never reads it, never labels it and never posts about it; routing leaves it unrouted and
 records `reason=solo`, so a deliberate opt-out stays countable and is never confused with a misroute.
+Under `review.mode: ticketless`, solo PRs are reviewed by any eligible roster reviewer, ranked by
+the usual reviewer selection. No teammate author is excluded, so a roster of one is sufficient.
+Handoff introduces the same watch row and re-review loop; findings move the ticket to
+`review.changes_state` and its next dispatch stays solo, while approval uses `review.auto_merge`
+as usual (STUDIO-1173).
 Skipping the team is the thing that requires a label; it is never the accident that happens by
 default. With Teams **off**, or `manager.mode: off`, nothing is ever held and dispatch is exactly
 what it always was.
@@ -3254,7 +3259,9 @@ comes from the ticket's own resolved project — config, which is where the allo
 and the author from the daemon's own `teams.route` ledger rather than from the ticket's
 `rhapsody:@<name>` label. The label is who the ticket is assigned to TODAY; a re-assignment would
 leave the real author eligible to be picked as their own reviewer, which is the one error this
-lookup must not make. A ticket no teammate of this daemon ran is not adopted at all.
+lookup must not make. A newest run recording `teams.unrouted reason=solo` is also adoptable, with
+no author to exclude (STUDIO-1173). A ticket this daemon never ran, or whose newest run has no
+teammate/solo dispatch evidence, is not adopted at all; today's solo label is not proof of a run.
 
 **Bounded, and free in the steady state.** The candidate set is the poll tick's own fetch, which is
 already active ∪ review, so learning that a ticket is parked costs no tracker call. A ticket whose

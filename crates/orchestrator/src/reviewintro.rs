@@ -18,7 +18,7 @@
 //! So a pull-request coordinate is trusted because of WHERE IT CAME FROM, never because of what a
 //! post says about it. Exactly two origins may introduce one (§15-a, §15-e):
 //!
-//! 1. **A teammate's handoff**, using the run's OWN resolved repository binding — `project_repo`,
+//! 1. **A worker's handoff**, including a solo run, using its OWN resolved repository binding — `project_repo`,
 //!    falling back to the top-level `repo` — which is the same trusted value the quorum's
 //!    `plan_quorum` has always used and which no room text can reach. `plan_review_intro` builds it
 //!    at `handle_handoff_run`, the site the quorum already hooks.
@@ -445,12 +445,11 @@ impl Orchestrator {
     /// The gates:
     ///
     /// 1. Teams is on AND `review.mode: ticketless` (§16).
-    /// 2. The run was dispatched AS a roster identity — there is otherwise no author to exclude and
-    ///    no teammate to ask.
-    /// 3. The run's own repository binding parses to an `owner/repo`.
-    /// 4. **That repository is one this daemon is configured for** — the allowlist, and the F-SEC
+    /// 2. The run's own repository binding parses to an `owner/repo`.
+    /// 3. **That repository is one this daemon is configured for** — the allowlist, and the F-SEC
     ///    anchor restated where the coordinate is born.
-    /// 5. The roster holds somebody other than the author.
+    /// 4. The roster holds an eligible reviewer other than the author. A solo run has no roster
+    ///    author to exclude, so every roster reviewer is eligible.
     ///
     /// A ticket's team id is deliberately NOT a gate, unlike `plan_quorum`'s: that gate exists
     /// because `create_issue` needs a team to create in, and a ticketless review creates nothing.
@@ -458,7 +457,7 @@ impl Orchestrator {
         &self,
         re: &crate::orchestrator::RunningEntry,
     ) -> Option<ReviewIntroRequest> {
-        if !self.review_ticketless_enabled() || re.identity.is_empty() {
+        if !self.review_ticketless_enabled() {
             return None;
         }
         // THE trusted origin: the remote this run's worktree pushed to, with `bind_teams_run`'s
@@ -1304,16 +1303,11 @@ mod tests {
         }
     }
 
-    /// The other plan-time gates: a run wearing no roster identity has no author to exclude and no
-    /// teammate to ask, a binding that names no GitHub repository has no pull request to find, and a
+    /// The other plan-time gates: a binding that names no GitHub repository has no pull request to find, and a
     /// roster holding only the author has nobody to ask.
     #[test]
     fn a_handoff_that_cannot_name_a_reviewable_pull_request_plans_nothing() {
         let o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
-        assert!(
-            o.plan_review_intro(&teammate_run("", REPO_URL)).is_none(),
-            "no identity ⇒ no introduction"
-        );
         assert!(
             o.plan_review_intro(&teammate_run("alice", "")).is_none(),
             "no resolvable repository ⇒ no introduction"
@@ -1325,6 +1319,59 @@ mod tests {
                 .is_none(),
             "a roster of one has nobody but the author to ask"
         );
+    }
+
+    #[tokio::test]
+    async fn a_solo_handoff_introduces_the_top_ranked_roster_reviewer() {
+        solo_handoff(&["alice", "jimmy"], Some("alice"), "jimmy").await;
+    }
+
+    #[tokio::test]
+    async fn a_solo_handoff_needs_only_one_roster_reviewer() {
+        solo_handoff(&["alice"], None, "alice").await;
+    }
+
+    async fn solo_handoff(names: &[&str], busy: Option<&str>, expected: &str) {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, names));
+        if let Some(busy) = busy {
+            o.running
+                .insert("busy".into(), teammate_run(busy, REPO_URL));
+        }
+        let req = o
+            .plan_review_intro(&teammate_run("", REPO_URL))
+            .expect("a solo handoff introduces its own PR");
+        assert_eq!(req.reviewers, [expected]);
+        assert!(req.author.is_empty());
+        assert!(!req.only_if_unwatched);
+        let store = Arc::clone(&o.store);
+        let mut rx = o.open_review_intro_channel();
+        let signal = crate::control_loop::CancelSignal::new();
+        o.ctx = Some(signal.wait());
+        let handle = o.control();
+        let loop_ctx = signal.wait();
+        let looped = tokio::spawn(async move { o.run_loaded(loop_ctx).await });
+        let (tx, task_rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(req).expect("send handoff");
+        drop(tx);
+        run_review_intro_task(
+            signal.wait(),
+            ReviewIntroDeps {
+                pr_source: Some(Arc::new(FakeOpenPr(Box::new(resolved_pr)))),
+                sink: Arc::new(ControlIntroSink::new(handle)),
+                linker: None,
+            },
+            task_rx,
+        )
+        .await;
+        let rows = store.load_review_watch().expect("watch rows");
+        signal.cancel();
+        looped.await.expect("control loop");
+        assert!(rx.try_recv().is_err(), "no adoption or second introduction");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].key.reviewer, expected);
+        assert!(rows[0].author.is_empty());
+        assert_eq!(rows[0].introduced_by, "handoff:STUDIO-720");
+        assert_eq!(rows[0].status, REVIEW_STATUS_REQUESTED);
     }
 
     /// **F-SEC at the plan.** A run bound to a repository no ENABLED project owns introduces
