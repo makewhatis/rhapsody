@@ -55,6 +55,14 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     let r: Raw = serde_yaml_ng::from_str(&bytes).map_err(|e| ConfigError::Parse(e.to_string()))?;
     let limits = r.limits.clone().unwrap_or_default();
     limits.validate().map_err(ConfigError::Parse)?;
+    let stall_cpu_threshold = r.agent.stall_cpu_threshold.unwrap_or(0.05);
+    if !stall_cpu_threshold.is_finite()
+        || !(0.0 < stall_cpu_threshold && stall_cpu_threshold <= 1.0)
+    {
+        return Err(ConfigError::Parse(
+            "agent.stall_cpu_threshold: must be finite and in (0, 1]".into(),
+        ));
+    }
     for (model, price) in &r.prices {
         if !model
             .split_once('/')
@@ -170,6 +178,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         // STUDIO-967: `0 = unlimited`, matching `max_concurrent_agents`' idiom — an unset or
         // non-positive key must bound nothing, so the reader only acts on `> 0`.
         max_run_tokens: or_int(r.agent.max_run_tokens, 0),
+        stall_cpu_threshold,
         max_turns: or_int(r.agent.max_turns, 20),
         max_retry_backoff_ms: or_int(r.agent.max_retry_backoff_ms, 300000),
         max_concurrent_agents_by_state: normalize_state_map(r.agent.max_concurrent_agents_by_state),
@@ -876,6 +885,26 @@ mod tests {
             negative.agent.max_run_tokens, -5,
             "decode is verbatim; the reader treats a non-positive value as unlimited"
         );
+    }
+
+    #[test]
+    fn decode_stall_cpu_threshold_defaults_and_rejects_invalid_fractions() {
+        assert_eq!(decode_yaml("", "body").agent.stall_cpu_threshold, 0.05);
+        for value in ["0.2", "1"] {
+            let yaml = format!("agent:\n  stall_cpu_threshold: {value}\n");
+            assert_eq!(
+                decode_yaml(&yaml, "body").agent.stall_cpu_threshold,
+                value.parse::<f64>().unwrap()
+            );
+        }
+        for value in ["0", "-0.1", "1.01", ".nan", ".inf"] {
+            let yaml = format!("agent:\n  stall_cpu_threshold: {value}\n");
+            let err = try_decode_yaml(&yaml, "body").unwrap_err();
+            assert!(
+                err.to_string().contains("agent.stall_cpu_threshold"),
+                "{value}: {err}"
+            );
+        }
     }
 
     // STUDIO-974: the PR-state watcher's clock is a Rhapsody-only key beside `polling.interval_ms`.

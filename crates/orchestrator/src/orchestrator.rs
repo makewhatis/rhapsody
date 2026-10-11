@@ -183,11 +183,14 @@ pub struct RunningEntry {
     /// Liveness probe state (CPU-based stall detection). `pgid` is the process-group id (== agent
     /// pid; 0 until the first PID event). `last_cpu_ticks` is the last observed cumulative group CPU;
     /// `cpu_sampled` whether it holds a prior sample; `last_cpu_active_at` the last time group CPU
-    /// changed (or last assume-alive).
+    /// exceeded the configured CPU/wall-time fraction.
     pub pgid: i32,
     pub last_cpu_ticks: u64,
     pub cpu_sampled: bool,
     pub last_cpu_active_at: DateTime<Utc>,
+    pub last_cpu_sample_at: DateTime<Utc>,
+    pub cpu_failure_since: Option<DateTime<Utc>>,
+    pub cpu_failure_logged: bool,
 
     pub recent_events: Vec<EventRecord>,
 
@@ -267,6 +270,9 @@ impl RunningEntry {
             last_cpu_ticks: 0,
             cpu_sampled: false,
             last_cpu_active_at: zero_time(),
+            last_cpu_sample_at: zero_time(),
+            cpu_failure_since: None,
+            cpu_failure_logged: false,
             recent_events: Vec::new(),
         }
     }

@@ -21,7 +21,7 @@
 use rhapsody_agent as agent;
 use rhapsody_store as store;
 
-use crate::orchestrator::{EventRecord, Orchestrator};
+use crate::orchestrator::{EventRecord, Orchestrator, zero_time};
 
 /// The bounded size of a running entry's `recent_events` ring surfaced in the API snapshot. Mirrors
 /// Go `maxRecentEvents` (defined in Go's `orchestrator.go`; `onAgentUpdate` is its sole consumer, so
@@ -94,6 +94,8 @@ impl Orchestrator {
             re.last_cpu_active_at = re.last_event_at;
             re.cpu_sampled = false;
             re.last_cpu_ticks = 0;
+            re.last_cpu_sample_at = zero_time();
+            re.cpu_failure_since = None;
         }
 
         re.recent_events.push(EventRecord {
@@ -745,6 +747,8 @@ mod tests {
         if let Some(re) = o.running.get_mut("1") {
             re.cpu_sampled = true;
             re.last_cpu_ticks = 999;
+            re.last_cpu_sample_at = fixed;
+            re.cpu_failure_since = Some(fixed);
         }
         update(
             &mut o,
@@ -758,6 +762,8 @@ mod tests {
         let re = &o.running["1"];
         assert_eq!(re.pgid, 5555, "new turn pid must be tracked");
         assert!(!re.cpu_sampled, "cpu_sampled must reset on pgid change");
+        assert_eq!(re.last_cpu_sample_at, zero_time());
+        assert_eq!(re.cpu_failure_since, None);
         assert_eq!(
             re.last_cpu_ticks, 0,
             "last_cpu_ticks must reset on pgid change"
