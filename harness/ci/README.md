@@ -28,6 +28,22 @@ The guards themselves live beside each helper: a `TempDir` guard removes its dir
 names it with pid + a per-process counter + a nanosecond nonce (so a recycled pid never adopts an
 earlier run's name), and skips removal only when `RHAPSODY_KEEP_TEST_DIRS` is set for debugging.
 
+## 1b. The install-action HOME gate — `check-install-action-home.py`
+
+`taiki-e/install-action` downloads, checksums and extracts in a FIXED, user-global scratch dir
+(`${HOME}/.install-action/tmp`, no locking). Every self-hosted Mac runner is a separate runner
+instance on ONE host, all as the same user, so the concurrent `test` and `desktop` jobs on a push to
+main shared that one directory — one job's download or its trailing `rm -rf` deleted the other's
+in-flight `tmp` and the checksum verify died seconds in (`sha256sum: *tmp: No such file or
+directory`). Each such step now sets a job-private `HOME: ${{ runner.temp }}/install-action-home`,
+which this check pins: it reads `.github/workflows/ci.yml` and fails if any `taiki-e/install-action`
+step lacks a job-private `env.HOME`, or points it at a shared path.
+
+`check-install-action-home_test.py` pins the scan by making it fire: it drops the override from one
+or both steps (the exact regression), sets a shared literal HOME, and asserts the scan reds and names
+the step — while a step that is not `install-action` stays ignored. Both run in the `lint` CI job
+(python3-only, like the other gates).
+
 ## 2. The Mac runner pruner — `prune-tmp-rhapsody.sh`
 
 Even with guards, a killed test process can leave a directory behind. This deletes `rhapsody-*`

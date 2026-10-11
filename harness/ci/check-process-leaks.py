@@ -52,6 +52,15 @@ def main():
     if args.mode == "snapshot":
         args.baseline.write_text(json.dumps(current))
         return 0
+    if not args.baseline.exists():
+        # The snapshot step writes this at job start; if it is gone the snapshot step was skipped
+        # (an earlier step already failed the job) or the job's `_temp` was cleared under it. Either
+        # way the job is already red, so a second traceback here only buries the real failure — name
+        # the vanished baseline and move on. Without a baseline there is nothing to compare against,
+        # so never run --cleanup from here.
+        print(f"::warning::process leak check: no baseline at {args.baseline}; "
+              "the snapshot step did not run or its temp dir vanished, cannot compare")
+        return 0
     baseline = json.loads(args.baseline.read_text())
     leaked = {key: value for key, value in current.items() if key not in baseline}
     if not leaked:
