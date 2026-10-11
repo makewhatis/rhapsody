@@ -222,6 +222,8 @@ mod tests {
                 "STUDIO-",
                 "STUDIO-12x",
                 "STUDIO--123",
+                "123-456",
+                "1STUDIO-123",
                 " STUDIO-123",
                 "团队-123",
                 "00000000-0000-4000-8000-00000000000z",
@@ -250,6 +252,7 @@ mod tests {
                 "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE".into(),
                 "STUDIO-123".into(),
                 "studio-456".into(),
+                "S49-789".into(),
             ];
             let mut mixed = invalid_ids();
             mixed.extend(valid.clone());
@@ -261,7 +264,7 @@ mod tests {
             assert!(got.expect("mixed batch").is_empty());
             assert_eq!(
                 *seen.lock().expect("requests"),
-                vec![serde_json::json!({"ids":valid,"first":4})]
+                vec![serde_json::json!({"ids":valid,"first":5})]
             );
             let got = if labels {
                 c.fetch_issue_labels_by_ids(&invalid_ids()).await
