@@ -8,8 +8,8 @@
 //! `sampler_stub.go` is the `!linux` no-op. This Rust port keeps ONE always-compiled `/proc` reader
 //! ([`group_cpu`] / [`parse_stat`]): on a host without a readable `/proc` (macOS — the CI/target
 //! platform — has none) it returns `None`, byte-for-byte the same observable behavior as Go's
-//! `!linux` `stubSampler` (`GroupCPU → (0, false)`), so the orchestrator still degrades to "assume
-//! alive". Compiling the reader on every target (rather than build-tag-gating it like Go) lets the
+//! `!linux` `stubSampler` (`GroupCPU → (0, false)`). STUDIO-1177 bounds that fallback to one stall
+//! window, then uses events alone. Compiling the reader on every target lets the
 //! `/proc`-parsing parity tests (`sampler_linux_test.go`) run under the macOS CI via a synthetic
 //! proc root — exactly as Go's linux tests override `procRoot` — instead of being skipped.
 
@@ -24,11 +24,13 @@ const PROC_ROOT: &str = "/proc";
 pub trait Sampler: Send + Sync {
     /// Returns the summed user+system CPU time, in clock ticks, of every process whose
     /// process-group id equals `pgid`. `None` when the value cannot be read (e.g. no readable
-    /// `/proc` on this OS, or `/proc` is unreadable), so the orchestrator degrades to "assume
-    /// alive". A readable group with no live members returns `Some(0)`. Mirrors Go
+    /// `/proc` on this OS, or `/proc` is unreadable). A readable group with no live members
+    /// returns `Some(0)`. Mirrors Go
     /// `GroupCPU(pgid int) (ticks uint64, ok bool)` — the `(u64, bool)` tuple collapses to
     /// `Option<u64>`.
     fn group_cpu(&self, pgid: i32) -> Option<u64>;
+    /// Clock-tick frequency for converting the cumulative counter to CPU seconds.
+    fn ticks_per_second(&self) -> Option<u64>;
 }
 
 /// The `/proc`-backed sampler. Mirrors Go `linuxSampler` (and, where `/proc` is absent, Go's
@@ -36,6 +38,12 @@ pub trait Sampler: Send + Sync {
 struct ProcSampler;
 
 impl Sampler for ProcSampler {
+    fn ticks_per_second(&self) -> Option<u64> {
+        // SAFETY: sysconf takes no pointers and reads a process-independent OS constant.
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        u64::try_from(hz).ok().filter(|hz| *hz > 0)
+    }
+
     fn group_cpu(&self, pgid: i32) -> Option<u64> {
         group_cpu(Path::new(PROC_ROOT), pgid)
     }
@@ -140,7 +148,7 @@ mod tests {
     }
 
     // Mirrors Go `TestGroupCPUUnreadableRoot`: a missing/unreadable `/proc` yields `None`
-    // (`ok=false`) so callers degrade to "assume alive".
+    // (`ok=false`) so callers use the bounded event-only fallback.
     #[test]
     fn group_cpu_unreadable_root() {
         let dir = TempDir::new();
@@ -173,11 +181,11 @@ mod tests {
     }
 
     // The default platform sampler on a host without `/proc` (macOS — the CI/target) reports
-    // unreadable, so stall detection degrades to "assume alive" — the parity mirror of Go's `!linux`
+    // unreadable, so stall detection falls back to events — the sampler still mirrors Go's `!linux`
     // `stubSampler` selection. Gated off Linux, where `/proc` exists and the sampler reads it.
     #[cfg(not(target_os = "linux"))]
     #[test]
-    fn new_sampler_assumes_alive_without_proc() {
+    fn new_sampler_reports_unavailable_without_proc() {
         let s = new_sampler();
         assert_eq!(s.group_cpu(std::process::id() as i32), None);
         assert_eq!(s.group_cpu(1), None);

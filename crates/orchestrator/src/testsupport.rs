@@ -451,6 +451,9 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         last_cpu_ticks: 0,
         cpu_sampled: false,
         last_cpu_active_at: epoch,
+        last_cpu_sample_at: epoch,
+        cpu_failure_since: None,
+        cpu_failure_logged: false,
         recent_events: Vec::new(),
     }
 }
@@ -738,6 +741,10 @@ impl FakeSampler {
 }
 
 impl Sampler for FakeSampler {
+    fn ticks_per_second(&self) -> Option<u64> {
+        Some(100)
+    }
+
     fn group_cpu(&self, pgid: i32) -> Option<u64> {
         if !self.ok {
             return None;

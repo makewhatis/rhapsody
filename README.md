@@ -82,6 +82,22 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Bounded CPU-based stall liveness (STUDIO-1177)
+
+Silent workers now renew CPU liveness only when positive process-group CPU time exceeds
+`agent.stall_cpu_threshold` of elapsed wall time (default `0.05`, 5% of one core; valid range
+`0 < value <= 1`). Samples accumulate over at least one second; an initial sample or a decreasing
+group total establishes a baseline without crediting work. This replaces Go's any-change rule,
+which let idle event-loop ticks keep a dead network wait alive forever.
+
+A failed sampler logs once per run and grants one stall window from the first failed sample.
+Persistent failure then uses stream events alone, rather than Go's perpetual assume-alive rule.
+Recovery/new process groups establish fresh baselines. The existing `/proc` sampler is unavailable
+on macOS, so that platform uses this bounded event-only fallback, including for silent local builds.
+Event timestamps, disabled stall detection, persisted `failed` / `stalled` taxonomy and exponential
+failure retries are unchanged. The threshold round-trips through config encode/decode but is omitted
+from the Go-owned config JSON view; schemas, payload goldens and fixtures are untouched.
+
 ### Linear issue-id input guards (STUDIO-1172)
 
 Linear reads now validate issue inputs locally as a canonical UUID or an ASCII `TEAM-123`

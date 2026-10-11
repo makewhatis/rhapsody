@@ -126,6 +126,9 @@ fn raw_from_config(c: &Config) -> Raw {
     if c.agent.max_run_tokens != 0 {
         r.agent.max_run_tokens = Some(c.agent.max_run_tokens);
     }
+    if c.agent.stall_cpu_threshold != 0.05 {
+        r.agent.stall_cpu_threshold = Some(c.agent.stall_cpu_threshold);
+    }
     r.agent.max_turns = Some(c.agent.max_turns);
     r.agent.max_retry_backoff_ms = Some(c.agent.max_retry_backoff_ms);
     r.agent.handoff_drain_grace_ms = Some(c.agent.handoff_drain_grace_ms);
@@ -807,6 +810,22 @@ mod tests {
             "an unset key must not be materialized"
         );
         assert_eq!(re_encode_decode(&absent).agent.max_run_tokens, 0);
+    }
+
+    #[test]
+    fn stall_cpu_threshold_round_trips_without_materializing_the_default() {
+        let configured = decode_map("agent:\n  stall_cpu_threshold: 0.2\n", "body");
+        assert_eq!(re_encode_decode(&configured).agent.stall_cpu_threshold, 0.2);
+        let default = decode_map("", "body");
+        assert_eq!(
+            nested(
+                &encode(&default).unwrap().config,
+                "agent",
+                "stall_cpu_threshold"
+            ),
+            None
+        );
+        assert_eq!(re_encode_decode(&default).agent.stall_cpu_threshold, 0.05);
     }
 
     /// Look up a nested `config[outer][inner]` value in an encoded front-matter map.
