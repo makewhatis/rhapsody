@@ -1512,6 +1512,9 @@ impl WorkerDeps {
                 turn += 1;
                 continue;
             }
+            if crate::review::is_non_tracker_key(&issue.id) {
+                return (issue.state.clone(), last_result, None);
+            }
             // Handoff auto-park (TRA-240 loop fix): when the agent declares a HANDOFF but the ticket
             // is still active, the daemon moves it to the configured review state on the agent's
             // behalf (dispatched agents have no Linear-write MCP) and ENDS the loop here — otherwise
@@ -1564,9 +1567,6 @@ impl WorkerDeps {
                 // further turns are pointless. On a successful move the ticket is now non-active
                 // (caller classifies completed, no re-dispatch); on failure the run still ends
                 // cleanly instead of burning the whole turn budget.
-                return (issue.state.clone(), last_result, None);
-            }
-            if crate::review::is_non_tracker_key(&issue.id) {
                 return (issue.state.clone(), last_result, None);
             }
             let ids = [issue.id.clone()];
@@ -3491,6 +3491,39 @@ fi
         assert_eq!(moves[0].team_id, "team-1");
         assert_eq!(moves[0].state_name, "in review");
         assert_eq!(last, "in review", "returned state reflects the park");
+    }
+
+    #[tokio::test]
+    async fn non_tracker_worker_fallback_never_auto_parks_a_local_run() {
+        for key in [
+            "lead:example/repo#0:1@manager",
+            "limit:account@manager",
+            "pr:example/repo#1@reviewer",
+        ] {
+            let ag = fake_agent(vec![agentfake::TurnScript {
+                result: TurnResult {
+                    status: TURN_SUCCEEDED.into(),
+                    result_text: "HANDOFF: in-review".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }]);
+            let tracker = Arc::new(trackerfake::Fake::new());
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let mut deps = make_deps(ws, ag, tracker.clone() as Arc<dyn Tracker>, "do it", 1);
+            deps.review_handoff_state = Some("In Review".into());
+            deps.review_done_state = Some("Done".into());
+            let run = Issue {
+                team_id: "team-1".into(),
+                ..issue(key, key, "In Progress")
+            };
+            let (state, _, err) =
+                run_agent_attempt(&mut deps, run, None, None, &noop_event(), None).await;
+            assert!(err.is_none(), "{err:?}");
+            assert!(tracker.move_calls().is_empty(), "no synthetic ticket move");
+            assert_eq!(tracker.by_id_calls(), 0);
+            assert_eq!(state, "In Progress");
+        }
     }
 
     // Mirrors Go `TestWorkerReturnsLastKnownState` (still-active at max turns).
