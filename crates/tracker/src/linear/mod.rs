@@ -18,6 +18,7 @@ mod create;
 mod decode;
 mod documents;
 mod errors;
+mod issue_id;
 mod labels;
 mod move_state;
 mod normalize;
@@ -71,6 +72,7 @@ impl crate::Tracker for Client {
         id: &str,
         description: &str,
     ) -> Result<(), TrackerError> {
+        issue_id::require(id)?;
         by_ids::update_issue_description(self, id, description).await
     }
     async fn fetch_parked_issue(&self, id: &str) -> Result<Option<Issue>, TrackerError> {
@@ -106,6 +108,7 @@ impl crate::Tracker for Client {
         team_id: &str,
         state_name: &str,
     ) -> Result<(), TrackerError> {
+        issue_id::require(issue_id)?;
         move_state::move_issue_state(self, issue_id, team_id, state_name).await
     }
     async fn move_issue_to_type(
@@ -114,6 +117,7 @@ impl crate::Tracker for Client {
         team_id: &str,
         state_type: &str,
     ) -> Result<String, TrackerError> {
+        issue_id::require(issue_id)?;
         move_state::move_issue_to_type(self, issue_id, team_id, state_type).await
     }
     async fn resolve_viewer(&self) -> Result<Viewer, TrackerError> {
@@ -123,12 +127,14 @@ impl crate::Tracker for Client {
         projects::list_projects(self).await
     }
     async fn assign_issue(&self, issue_id: &str, assignee_id: &str) -> Result<(), TrackerError> {
+        issue_id::require(issue_id)?;
         claim::assign_issue(self, issue_id, assignee_id).await
     }
     async fn fetch_issue_assignee(&self, issue_id: &str) -> Result<String, TrackerError> {
         claim::fetch_issue_assignee(self, issue_id).await
     }
     async fn create_comment(&self, issue_id: &str, body: &str) -> Result<String, TrackerError> {
+        issue_id::require(issue_id)?;
         claim::create_comment(self, issue_id, body).await
     }
     async fn list_comments(&self, issue_id: &str) -> Result<Vec<Comment>, TrackerError> {
@@ -143,6 +149,7 @@ impl crate::Tracker for Client {
         team_id: &str,
         label_name: &str,
     ) -> Result<(), TrackerError> {
+        issue_id::require(issue_id)?;
         labels::add_issue_label(self, issue_id, team_id, label_name).await
     }
     async fn remove_issue_label(
@@ -151,6 +158,7 @@ impl crate::Tracker for Client {
         team_id: &str,
         label_name: &str,
     ) -> Result<(), TrackerError> {
+        issue_id::require(issue_id)?;
         labels::remove_issue_label(self, issue_id, team_id, label_name).await
     }
     async fn fetch_open_issues_by_labels(
@@ -163,6 +171,7 @@ impl crate::Tracker for Client {
         create::create_issue(self, spec).await
     }
     async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError> {
+        issue_id::require(issue_id)?;
         attach::link_pull_request(self, issue_id, url).await
     }
 }

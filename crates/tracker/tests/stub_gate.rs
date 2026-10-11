@@ -13,7 +13,7 @@
 //! member) triggers the one-off build fallback in [`stub_binary`].
 
 use std::io::{BufRead, BufReader};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 use rhapsody_tracker::Tracker;
@@ -69,11 +69,44 @@ fn scenario_path() -> PathBuf {
     workspace_root().join("harness/stubs/linear-stub/testdata/basic.json")
 }
 
+const ISSUE_ID: &str = "00000000-0000-4000-8000-000000000001";
+
+/// The shared stub uses opaque placeholder ids. Exercise the real adapter with a valid UUID in
+/// a private copy, preserving every other scenario value and leaving the capture input untouched.
+struct AdapterScenario(PathBuf);
+
+impl AdapterScenario {
+    fn new() -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let scenario = Self(std::env::temp_dir().join(format!(
+            "rhapsody-tracker-stub-{}-{nonce}.json",
+            std::process::id()
+        )));
+        let basic = std::fs::read_to_string(scenario_path()).expect("basic scenario");
+        assert!(basic.contains("\"iss_1\""), "scenario issue id changed");
+        std::fs::write(
+            &scenario.0,
+            basic.replace("\"iss_1\"", &format!("\"{ISSUE_ID}\"")),
+        )
+        .expect("adapter scenario");
+        scenario
+    }
+}
+
+impl Drop for AdapterScenario {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Spawn the stub on an ephemeral port and read the `LISTENING <port>` line it prints once bound.
-fn spawn_stub() -> (StubProcess, u16) {
+fn spawn_stub(scenario: &Path) -> (StubProcess, u16) {
     let mut child = Command::new(stub_binary())
         .arg("--scenario")
-        .arg(scenario_path())
+        .arg(scenario)
         .args(["--port", "0"])
         .stdout(Stdio::piped())
         .spawn()
@@ -94,7 +127,8 @@ fn spawn_stub() -> (StubProcess, u16) {
 
 #[test]
 fn stub_gate_drives_full_read_surface_and_a_move() {
-    let (_stub, port) = spawn_stub();
+    let scenario = AdapterScenario::new();
+    let (_stub, port) = spawn_stub(&scenario.0);
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -118,7 +152,7 @@ fn stub_gate_drives_full_read_surface_and_a_move() {
         let candidates = c.fetch_candidate_issues().await.expect("fetch_candidate_issues");
         assert_eq!(candidates.len(), 1, "one candidate in the basic scenario");
         let iss = &candidates[0];
-        assert_eq!(iss.id, "iss_1");
+        assert_eq!(iss.id, ISSUE_ID);
         assert_eq!(iss.identifier, "RHA-1");
         assert_eq!(iss.title, "Smoke issue");
         assert_eq!(iss.description.as_deref(), Some("Do nothing, successfully."));
@@ -144,20 +178,20 @@ fn stub_gate_drives_full_read_surface_and_a_move() {
         );
 
         let by_ids = c
-            .fetch_issue_states_by_ids(&["iss_1".into()])
+            .fetch_issue_states_by_ids(&[ISSUE_ID.into()])
             .await
             .expect("fetch_issue_states_by_ids");
         assert_eq!(by_ids.len(), 1);
-        assert_eq!(by_ids[0].id, "iss_1");
+        assert_eq!(by_ids[0].id, ISSUE_ID);
         assert_eq!(by_ids[0].state, "Todo");
 
         // The labels read answers for the SAME ids, in any state, with labels instead of state.
         let labels = c
-            .fetch_issue_labels_by_ids(&["iss_1".into()])
+            .fetch_issue_labels_by_ids(&[ISSUE_ID.into()])
             .await
             .expect("fetch_issue_labels_by_ids");
         assert_eq!(labels.len(), 1);
-        assert_eq!(labels[0].id, "iss_1");
+        assert_eq!(labels[0].id, ISSUE_ID);
         assert_eq!(labels[0].identifier, "RHA-1");
         assert!(labels[0].state.is_empty(), "the labels read carries no state");
 
@@ -170,7 +204,7 @@ fn stub_gate_drives_full_read_surface_and_a_move() {
             "no Backlog-state issue in the basic scenario"
         );
         let (branch, pr) = c
-            .fetch_issue_branch_by_id("iss_1")
+            .fetch_issue_branch_by_id(ISSUE_ID)
             .await
             .expect("fetch_issue_branch_by_id");
         assert_eq!((branch.as_str(), pr), ("", 0), "no branch/PR -> advisory empty");
@@ -183,11 +217,11 @@ fn stub_gate_drives_full_read_surface_and_a_move() {
         assert_eq!(projects[0].slug, "558008ab185c");
 
         // ── the WRITE: move RHA-1 (Todo) to In Progress, then read the post-move state back ──
-        c.move_issue_state("iss_1", "team_stub", "In Progress")
+        c.move_issue_state(ISSUE_ID, "team_stub", "In Progress")
             .await
             .expect("move_issue_state");
         let after = c
-            .fetch_issue_states_by_ids(&["iss_1".into()])
+            .fetch_issue_states_by_ids(&[ISSUE_ID.into()])
             .await
             .expect("fetch_issue_states_by_ids after move");
         assert_eq!(after.len(), 1);

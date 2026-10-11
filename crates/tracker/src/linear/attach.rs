@@ -219,7 +219,7 @@ mod tests {
         .await;
 
         client_at(server.url())
-            .link_pull_request("iss-uuid", PR_URL)
+            .link_pull_request("STUDIO-123", PR_URL)
             .await
             .expect("link_pull_request");
 
@@ -228,7 +228,7 @@ mod tests {
             doc.contains("attachmentLinkGitHubPR("),
             "the GitHub-PR mutation is what stamps sourceType github, got {doc}"
         );
-        assert_eq!(vars["issueId"], "iss-uuid");
+        assert_eq!(vars["issueId"], "STUDIO-123");
         assert_eq!(vars["url"], PR_URL);
     }
 
@@ -243,7 +243,7 @@ mod tests {
         })
         .await;
         let err = client_at(server.url())
-            .link_pull_request("iss-uuid", PR_URL)
+            .link_pull_request("STUDIO-123", PR_URL)
             .await
             .expect_err("a refused link must error");
         assert!(is_kind(&err, LinearErrorKind::MoveRejected), "got {err:?}");
@@ -260,7 +260,7 @@ mod tests {
         })
         .await;
         let err = client_at(server.url())
-            .link_pull_request("iss-uuid", PR_URL)
+            .link_pull_request("STUDIO-123", PR_URL)
             .await
             .expect_err("an empty attachment id must error");
         assert!(is_kind(&err, LinearErrorKind::MoveRejected), "got {err:?}");
@@ -290,7 +290,7 @@ mod tests {
         })
         .await;
         client_at(server.url())
-            .link_pull_request("iss-uuid", PR_URL)
+            .link_pull_request("STUDIO-123", PR_URL)
             .await
             .expect("a duplicate means the link landed");
     }
@@ -312,7 +312,7 @@ mod tests {
         })
         .await;
         let err = client_at(server.url())
-            .link_pull_request("iss-uuid", PR_URL)
+            .link_pull_request("STUDIO-123", PR_URL)
             .await
             .expect_err("a non-duplicate refusal must error");
         assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");
@@ -341,7 +341,7 @@ mod tests {
         })
         .await;
         let err = client_at(server.url())
-            .link_pull_request("iss-uuid", "not-a-pull-request-url")
+            .link_pull_request("STUDIO-123", "not-a-pull-request-url")
             .await
             .expect_err("a non-duplicate user error must error");
         assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");
@@ -362,7 +362,7 @@ mod tests {
         })
         .await;
         let err = client_at(server.url())
-            .link_pull_request("iss-uuid", PR_URL)
+            .link_pull_request("STUDIO-123", PR_URL)
             .await
             .expect_err("the shape, not the sentence, decides");
         assert!(is_kind(&err, LinearErrorKind::GraphqlErrors), "got {err:?}");

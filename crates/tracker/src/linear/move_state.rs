@@ -292,7 +292,7 @@ mod tests {
         let c = client_at(server.url());
 
         for _ in 0..3 {
-            c.move_issue_state("iss", "t", "In Progress")
+            c.move_issue_state("STUDIO-123", "t", "In Progress")
                 .await
                 .expect("move");
         }
@@ -324,7 +324,7 @@ mod tests {
         let c = client_at(server.url());
 
         let err = c
-            .move_issue_state("iss", "team", "Ghost State")
+            .move_issue_state("STUDIO-123", "team", "Ghost State")
             .await
             .expect_err("no state -> error");
         assert!(
@@ -354,7 +354,7 @@ mod tests {
         let c = client_at(server.url());
 
         let err = c
-            .move_issue_state("iss", "team", "In Progress")
+            .move_issue_state("STUDIO-123", "team", "In Progress")
             .await
             .expect_err("success:false -> error");
         assert!(
@@ -383,7 +383,7 @@ mod tests {
         .await;
         let c = client_at(server.url());
 
-        c.move_issue_state("iss", "team", "in progress")
+        c.move_issue_state("STUDIO-123", "team", "in progress")
             .await
             .expect("MoveIssueState (lowercase config)");
         assert_eq!(
@@ -420,7 +420,7 @@ mod tests {
         let c = client_at(server.url());
 
         let name = c
-            .move_issue_to_type("ISSUE", "TEAM", "backlog")
+            .move_issue_to_type("STUDIO-123", "TEAM", "backlog")
             .await
             .expect("MoveIssueToType");
         assert_eq!(name, "Backlog", "resolved state name");
@@ -454,7 +454,7 @@ mod tests {
         let c = client_at(server.url());
 
         let err = c
-            .move_issue_to_type("ISSUE", "TEAM", "backlog")
+            .move_issue_to_type("STUDIO-123", "TEAM", "backlog")
             .await
             .expect_err("no state of type -> error");
         assert!(

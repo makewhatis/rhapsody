@@ -163,12 +163,8 @@ pub(super) async fn fetch_issue_assignee(
     issue_id: &str,
 ) -> Result<String, TrackerError> {
     traced(crate::tracker_span!("fetch_issue_assignee"), async move {
-        if issue_id.is_empty() {
-            return Err(LinearError::new(
-                LinearErrorKind::ApiRequest,
-                "assignee read requires issueID",
-            )
-            .into());
+        if !super::issue_id::valid(issue_id) {
+            return Ok(String::new());
         }
         let resp: AssigneeResp = c
             .do_graphql(query::QUERY_ISSUE_ASSIGNEE, Some(json!({ "id": issue_id })))
@@ -232,11 +228,8 @@ pub(super) async fn list_comments(
     issue_id: &str,
 ) -> Result<Vec<Comment>, TrackerError> {
     traced(crate::tracker_span!("list_comments"), async move {
-        if issue_id.is_empty() {
-            return Err(
-                LinearError::new(LinearErrorKind::ApiRequest, "list comments requires issueID")
-                    .into(),
-            );
+        if !super::issue_id::valid(issue_id) {
+            return Ok(Vec::new());
         }
         let mut out: Vec<Comment> = Vec::new();
         let mut after: Option<String> = None;
