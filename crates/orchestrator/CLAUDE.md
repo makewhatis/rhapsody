@@ -103,8 +103,9 @@ the `Orchestrator` struct itself. Concretely:
     outside the log", which that module's doc still states and this read does not weaken.
 
   - `dispatch.rs`'s `HumanHoldLedger` (`Orchestrator::human_holds: Arc<HumanHoldLedger>`,
-    STUDIO-949) — a `Mutex`-guarded handle over three sets behind a `&self`-callable API: the ticket
-    identifiers already ANNOUNCED (the once-per-ticket log dedupe), the CURRENT `rhapsody:human`
+    STUDIO-949) — a `Mutex`-guarded handle over four sets behind a `&self`-callable API: the ticket
+    identifiers already ANNOUNCED (the once-per-ticket log dedupe), non-live claim diagnostics
+    announced by ticket/cause (STUDIO-1200), the CURRENT `rhapsody:human`
     **reported**-hold set the console reads (`held`, unworked tickets only), and the CURRENT-**label**
     set (`labelled`, every candidate the last pass saw wearing the label, live runs included) that
     the decision gates read — the handoff review quorum, the ticketless watcher, auto-merge and the

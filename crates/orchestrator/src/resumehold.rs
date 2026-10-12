@@ -75,8 +75,8 @@ impl BreakerHold {
 pub struct ResumeHoldResult {
     /// No run row has this id ⇒ 404 `run_not_found`.
     pub not_found: bool,
-    /// The run's ticket does NOT wear `rhapsody:human` ⇒ 409 `not_held`. The action is refused on a
-    /// ticket that is not held, exactly as the console's button only shows on one that is.
+    /// Neither a current `rhapsody:human` label nor a non-live rejected-login claim exists
+    /// ⇒ 409 `not_held`.
     pub not_held: bool,
     /// Human ticket id, e.g. `"STUDIO-1050"`.
     pub identifier: String,
@@ -123,14 +123,28 @@ pub enum ResumeHoldError {
 pub struct RunHoldView {
     /// No run row has this id ⇒ 404.
     pub not_found: bool,
-    /// The ticket currently wears `rhapsody:human`.
+    /// The ticket currently wears `rhapsody:human` or retains a rejected-login hold claim.
     pub held: bool,
     pub identifier: String,
     /// The crossed limit, when the durable crossing row names one.
     pub breaker: Option<BreakerHold>,
 }
 
+/// The loop admits an unlabeled resume and seeds its note atomically, or refuses a stale action.
+pub enum ResumeNoteSeed {
+    NotHeld,
+    Seeded(Option<(DateTime<Utc>, String)>),
+}
+
 impl Orchestrator {
+    pub(crate) fn auth_claim_held(&self, issue_id: &str) -> bool {
+        self.auth_hold_claims.contains(issue_id)
+            && self.claimed.contains(issue_id)
+            && !self.running.contains_key(issue_id)
+            && !self.retry_attempts.contains_key(issue_id)
+            && !self.preparing.contains(issue_id)
+    }
+
     /// Runs ON the control task for `evSeedResumeNote`: records the operator's note for the next
     /// run and clears the in-memory suppression so the ticket is a candidate again.
     ///
@@ -148,6 +162,7 @@ impl Orchestrator {
         at: DateTime<Utc>,
     ) -> Option<(DateTime<Utc>, String)> {
         self.claimed.remove(issue_id);
+        self.auth_hold_claims.remove(issue_id);
         let prior = self
             .pending_reopen_summons
             .insert(issue_id.to_string(), (at, note.to_string()));
@@ -184,8 +199,8 @@ impl Orchestrator {
 
 impl ControlHandle {
     /// Whether this run's ticket is held for a human, and — when the durable crossing row names one
-    /// — the breaker limit that was crossed. Read-only, so no control round-trip: the tracker read
-    /// is the authority (it sees a label the daemon's own ledger may never have primed).
+    /// — the breaker limit that was crossed. Read-only: the tracker sees labels the ledger may
+    /// never have primed; the control task also recognizes an unlabeled rejected-login claim.
     pub async fn run_hold(&self, run_id: i64) -> Result<RunHoldView, ResumeHoldError> {
         let run = match self.store.get_run(run_id)? {
             Some(r) => r,
@@ -199,7 +214,8 @@ impl ControlHandle {
         let Some(tracker) = self.effective_tracker() else {
             return Err(ResumeHoldError::Tracker("no effective tracker".into()));
         };
-        let held = self.is_held(&tracker, &run.issue_id).await?;
+        let held = self.is_held(&tracker, &run.issue_id).await?
+            || self.auth_hold_claim(&run.issue_id).await?;
         Ok(RunHoldView {
             not_found: false,
             held,
@@ -211,11 +227,10 @@ impl ControlHandle {
     /// The operator's "Human step done → resume" action (STUDIO-1053): remove `rhapsody:human`,
     /// record the operator's note for the next run, and requeue the ticket.
     ///
-    /// The order is deliberate. The label removal runs FIRST because it is the one step the tracker
-    /// can refuse, and a refusal must leave nothing half-done: the response then reports a failure
-    /// and the note was never seeded. Once the label is gone, the note seed and the requeue land;
-    /// a requeue MOVE the tracker rejects is a reported partial failure (`queued: false` plus
-    /// `move_err`), never a silent success.
+    /// The note is seeded before label removal so a racing tick finds it. A refused removal undoes
+    /// that seed. Without a label, the loop admits only a non-live rejected-login claim and clears
+    /// it atomically with the seed; an ordinary suppression is still `not_held` (STUDIO-1200).
+    /// A refused requeue move is a reported partial failure, never a silent success.
     pub async fn resume_hold(
         &self,
         req_ctx: CancelWait,
@@ -238,7 +253,8 @@ impl ControlHandle {
         let Some(tracker) = self.effective_tracker() else {
             return Err(ResumeHoldError::Tracker("no effective tracker".into()));
         };
-        if !self.is_held(&tracker, &run.issue_id).await? {
+        let label_present = self.is_held(&tracker, &run.issue_id).await?;
+        if !label_present && !self.auth_hold_claim(&run.issue_id).await? {
             return Ok(ResumeHoldResult {
                 not_held: true,
                 identifier: run.issue_identifier,
@@ -273,16 +289,27 @@ impl ControlHandle {
         //    dispatch candidate, and a tick racing the label removal must find the note waiting for
         //    it. Seeding after the removal would let that run start without it.
         let at = Utc::now();
-        let prior = match self.seed_resume_note(&run.issue_id, note, at).await {
-            Some(prior) => prior,
+        let prior = match self
+            .seed_resume_note(&run.issue_id, note, at, !label_present)
+            .await
+        {
+            Some(ResumeNoteSeed::Seeded(prior)) => prior,
+            Some(ResumeNoteSeed::NotHeld) => {
+                return Ok(ResumeHoldResult {
+                    not_held: true,
+                    identifier: run.issue_identifier,
+                    ..Default::default()
+                });
+            }
             None => return Err(ResumeHoldError::Canceled),
         };
         // 2. Remove the label. A refusal here undoes the seed (restoring any seed it replaced), so
         //    nothing is left committed and the response reports a failure rather than a partial
         //    success.
-        if let Err(e) = tracker
-            .remove_issue_label(&run.issue_id, &run.team_id, HUMAN_LABEL)
-            .await
+        if label_present
+            && let Err(e) = tracker
+                .remove_issue_label(&run.issue_id, &run.team_id, HUMAN_LABEL)
+                .await
         {
             let _ = self.clear_resume_note(&run.issue_id, prior).await;
             tracing::error!(
@@ -298,7 +325,7 @@ impl ControlHandle {
         let mut res = ResumeHoldResult {
             identifier: run.issue_identifier.clone(),
             note_recorded: true,
-            label_removed: true,
+            label_removed: label_present,
             queued: true,
             breaker: self.breaker_hold(&run.issue_identifier),
             ..Default::default()
@@ -334,6 +361,21 @@ impl ControlHandle {
                 .tracker
                 .clone()
         })
+    }
+
+    async fn auth_hold_claim(&self, issue_id: &str) -> Result<bool, ResumeHoldError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.events
+            .send(Event::AuthHoldClaim {
+                issue_id: issue_id.to_string(),
+                reply: tx,
+            })
+            .map_err(|_| ResumeHoldError::Canceled)?;
+        let mut lifetime = self.ctx.clone();
+        tokio::select! {
+            answer = rx => answer.map_err(|_| ResumeHoldError::Canceled),
+            _ = lifetime.cancelled() => Err(ResumeHoldError::Canceled),
+        }
     }
 
     /// Whether `issue_id` currently wears `rhapsody:human`, read from the tracker (not the
@@ -383,12 +425,14 @@ impl ControlHandle {
         issue_id: &str,
         note: &str,
         at: DateTime<Utc>,
-    ) -> Option<Option<(DateTime<Utc>, String)>> {
+        auth_hold_only: bool,
+    ) -> Option<ResumeNoteSeed> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let ev = Event::SeedResumeNote {
             issue_id: issue_id.to_string(),
             note: note.to_string(),
             at,
+            auth_hold_only,
             reply: tx,
         };
         if self.events.send(ev).is_err() {
@@ -509,6 +553,10 @@ mod tests {
     /// labels and states reads, a disabled poll interval, and a live control loop whose task yields
     /// the orchestrator back so a test can drive `dispatch_issue` race-free after the action.
     async fn start(fake: Fake, iss: &Issue) -> (Harness, i64) {
+        start_with_auth_hold(fake, iss, false).await
+    }
+
+    async fn start_with_auth_hold(fake: Fake, iss: &Issue, auth_hold: bool) -> (Harness, i64) {
         let store = store();
         let tracker = Arc::new(fake);
         let mut eff = empty_effective(Arc::clone(&tracker) as Arc<dyn Tracker>);
@@ -520,7 +568,7 @@ mod tests {
         let mut proj = empty_resolved_project("rhapsody", Arc::clone(&tracker) as Arc<dyn Tracker>);
         proj.repo = "git@github.com:makewhatis/rhapsody.git".into();
         eff.projects = vec![proj];
-        let run_id = seed_run(&store, iss);
+        let run_id;
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
         o.set_store(Arc::clone(&store));
@@ -535,7 +583,28 @@ mod tests {
             ..Default::default()
         };
         o.spawn = Some(Box::new(|_iss, _attempt, _re| {}));
-        o.claimed.insert(iss.id.clone());
+        if auth_hold {
+            o.dispatch_issue(iss.clone(), None, None, String::new());
+            let re = &o.running[&iss.id];
+            run_id = re.run_id;
+            o.on_worker_exit(crate::retry::EvWorkerExit {
+                issue_id: iss.id.clone(),
+                started_at: re.started_at,
+                failed: true,
+                auth_needed: true,
+                err_msg: "opencode_auth_needed: rejected login".into(),
+                last_state: iss.state.clone(),
+                declared_handoff: false,
+                review_verdict: None,
+                verdict_text: None,
+                refused: false,
+            });
+            assert!(o.claimed.contains(&iss.id));
+            assert!(!o.running.contains_key(&iss.id));
+        } else {
+            run_id = seed_run(&store, iss);
+            o.claimed.insert(iss.id.clone());
+        }
         let signal = CancelSignal::new();
         o.set_ctx(signal.wait());
         let handle = o.control();
@@ -634,6 +703,93 @@ mod tests {
         assert!(
             got.contains("added the secrets"),
             "note body missing: {got}"
+        );
+    }
+
+    /// STUDIO-1200: resume a real auth-needed exit after an operator removes the label.
+    /// The fake's candidates/by-id inputs describe the post-removal board (label mutations
+    /// intentionally do not rewrite those programmed inputs). Mutating resume to retain the
+    /// claim must make the next-tick dispatch assertion fail.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_auth_hold_resumes_after_manual_label_removal_and_dispatches_next_tick() {
+        for label_present in [false, true] {
+            let held = held_issue("iss-1", "STUDIO-1200", "Todo");
+            let current = if label_present {
+                held.clone()
+            } else {
+                plain_issue("iss-1", "STUDIO-1200", "Todo")
+            };
+            let mut fake = fake_for(&current);
+            // The next tick sees the unheld candidate after either manual or API removal.
+            fake.candidates = vec![plain_issue("iss-1", "STUDIO-1200", "Todo")];
+            let (h, run_id) = start_with_auth_hold(fake, &held, true).await;
+            if !label_present {
+                h.tracker
+                    .remove_issue_label("iss-1", "TEAM-1", HUMAN_LABEL)
+                    .await
+                    .expect("operator removes the label");
+                assert!(
+                    h.handle.run_hold(run_id).await.expect("hold view").held,
+                    "the job page must still offer resume for the unlabeled claim"
+                );
+            }
+            let res = h
+                .handle
+                .resume_hold(CancelWait::default(), run_id, "login fixed")
+                .await
+                .expect("resume auth hold");
+            if !label_present {
+                assert!(
+                    !h.handle.run_hold(run_id).await.expect("hold view").held,
+                    "the resumed claim must no longer show as held"
+                );
+            }
+            // Shut the loop down even if the regression assertion fails.
+            let mut o = finish(h).await;
+            assert!(
+                !res.not_held,
+                "a rejected-login claim remains resumable: {res:?}"
+            );
+            assert!(res.note_recorded && res.queued);
+            assert_eq!(res.label_removed, label_present);
+            assert!(
+                !o.auth_hold_claims.contains("iss-1"),
+                "resume retires the auth provenance"
+            );
+            let eff = o.eff.as_mut().expect("eff");
+            eff.projects[0].active_states = eff.active_states.clone();
+            eff.projects[0].terminal_states = eff.terminal_states.clone();
+            eff.projects[0].max_concurrent = 10;
+            o.on_tick().await;
+            assert!(
+                o.running.contains_key("iss-1"),
+                "the next tick must dispatch without a restart"
+            );
+            assert!(
+                o.mailbox_try_recv("iss-1")
+                    .expect("operator note")
+                    .contains("login fixed")
+            );
+        }
+    }
+
+    #[test]
+    fn an_auth_resume_requires_its_original_non_live_claim() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.auth_hold_claims.insert("iss-1".into());
+        assert!(
+            !o.auth_claim_held("iss-1"),
+            "provenance alone is not a claim"
+        );
+        o.claimed.insert("iss-1".into());
+        assert!(o.auth_claim_held("iss-1"));
+        o.running.insert(
+            "iss-1".into(),
+            crate::testsupport::running_entry(plain_issue("iss-1", "STUDIO-1200", "Todo"), "", ""),
+        );
+        assert!(
+            !o.auth_claim_held("iss-1"),
+            "resume must not clear a newer live claim"
         );
     }
 
