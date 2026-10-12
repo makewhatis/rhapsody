@@ -96,6 +96,7 @@ impl Orchestrator {
             re.last_cpu_ticks = 0;
             re.last_cpu_sample_at = zero_time();
             re.cpu_failure_since = None;
+            re.last_tool_active_at = zero_time();
         }
 
         re.recent_events.push(EventRecord {
@@ -749,6 +750,7 @@ mod tests {
             re.last_cpu_ticks = 999;
             re.last_cpu_sample_at = fixed;
             re.cpu_failure_since = Some(fixed);
+            re.last_tool_active_at = fixed;
         }
         update(
             &mut o,
@@ -764,6 +766,7 @@ mod tests {
         assert!(!re.cpu_sampled, "cpu_sampled must reset on pgid change");
         assert_eq!(re.last_cpu_sample_at, zero_time());
         assert_eq!(re.cpu_failure_since, None);
+        assert_eq!(re.last_tool_active_at, zero_time());
         assert_eq!(
             re.last_cpu_ticks, 0,
             "last_cpu_ticks must reset on pgid change"

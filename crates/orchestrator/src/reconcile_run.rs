@@ -8,8 +8,8 @@
 //! releases the claim; a non-terminal move only refreshes the in-memory snapshot (INF-266 — the
 //! worker keeps running and its exit is classified by [`Orchestrator::on_worker_exit`]).
 //!
-//! Intentional liveness divergence (STUDIO-1177): thresholded CPU activity and bounded sampling
-//! failure grace replace Go's any-change / assume-alive rules; see README Divergences.
+//! Intentional liveness divergences (STUDIO-1177 / STUDIO-1208): thresholded CPU activity, tool-child
+//! presence and bounded sampling failure grace replace Go's rules; see README Divergences.
 //!
 //! Other deviations from the Go source, all behavior-preserving:
 //!   * `reconcile` snapshots each group's reconcile inputs (slug tracker, canceled/terminal sets,
@@ -52,8 +52,8 @@ struct GroupInputs {
     workspace: Arc<Manager>,
 }
 
-/// Measures positive CPU work over at least one second (STUDIO-1177). Baselines and child exits
-/// grant no liveness. Failed sampling gets one bounded grace window, never a refreshed CPU clock.
+/// Measures CPU work over at least one second (STUDIO-1177) and renews independent tool-child
+/// liveness (STUDIO-1208). Failed sampling keeps the existing bounded CPU/event fallback.
 fn sample_cpu(
     re: &mut RunningEntry,
     now: DateTime<Utc>,
@@ -66,8 +66,21 @@ fn sample_cpu(
     let Some(sampler) = sampler else {
         return;
     };
-    match sampler
-        .group_cpu(re.pgid)
+    let sample = sampler.sample_group(re.pgid);
+    if let Some(sample) = &sample {
+        match sample.has_tool_child {
+            Some(true) => re.last_tool_active_at = now,
+            Some(false) => {}
+            None if !re.tool_failure_logged => {
+                tracing::warn!(run_id = re.run_id, issue_identifier = %re.issue.identifier,
+                    pgid = re.pgid, "tool-child enumeration unavailable; falling back to CPU and events");
+                re.tool_failure_logged = true;
+            }
+            None => {}
+        }
+    }
+    match sample
+        .map(|sample| sample.ticks)
         .zip(sampler.ticks_per_second())
         .filter(|(_, hz)| *hz > 0)
     {
@@ -76,7 +89,7 @@ fn sample_cpu(
             re.cpu_sampled = false;
             if !re.cpu_failure_logged {
                 tracing::warn!(run_id = re.run_id, issue_identifier = %re.issue.identifier,
-                    pgid = re.pgid, "CPU sampler unavailable; falling back to events after one stall window");
+                    pgid = re.pgid, "CPU sampler unavailable; falling back to events after one stall window (tool children may be unavailable)");
                 re.cpu_failure_logged = true;
             }
         }
@@ -239,7 +252,7 @@ impl Orchestrator {
     }
 
     /// Terminates workers that show no liveness — neither a recent stream event nor recent
-    /// process-group CPU activity — and retries them (upstream §8.5 Part A). The stall timeout is read
+    /// process-group CPU activity or a tool child — and retries them (upstream §8.5 Part A). The stall timeout is read
     /// per running entry from its owning project (falling back to the top-level); an entry whose
     /// effective stall timeout is `<= 0` is skipped. Mirrors Go `reconcileStalled`.
     pub(crate) fn reconcile_stalled(&mut self) {
@@ -277,6 +290,9 @@ impl Orchestrator {
             let stall = chrono::Duration::from_std(stall).unwrap_or(chrono::Duration::MAX);
             if re.cpu_failure_since.is_none() && re.last_cpu_active_at > last {
                 last = re.last_cpu_active_at;
+            }
+            if re.last_tool_active_at > last {
+                last = re.last_tool_active_at;
             }
             if let Some(since) = re.cpu_failure_since
                 && now - since <= stall
@@ -851,7 +867,106 @@ mod tests {
         assert_eq!(re.cpu_failure_since, None);
     }
 
-    // STUDIO-1177: idle event-loop ticks are not evidence of useful work.
+    // STUDIO-1208: a sleeping foreground tool is liveness even without stream events or CPU work.
+    #[tokio::test]
+    async fn reconcile_liveness_silent_tool_child_survives_then_stalls_after_exit() {
+        let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+        let mut cpu = FakeSampler::new(true, HashMap::from([(42, vec![100, 101, 102, 103])]));
+        cpu.has_tool_child = Some(true);
+        o.eff.as_mut().unwrap().cpu_sampler = Arc::new(cpu);
+        let base = utc(2026, 5, 29, 12, 0, 0);
+        let clock = install_clock(&mut o, base);
+        add_running(&mut o, "1", "MT-1", "In Progress", base);
+        o.running.get_mut("1").unwrap().pgid = 42;
+        o.reconcile_stalled();
+        for _ in 0..3 {
+            advance(&clock, chrono::Duration::seconds(301));
+            o.reconcile_stalled();
+            assert!(
+                o.running.contains_key("1"),
+                "a silent near-zero-CPU tool wait must survive beyond the stall window"
+            );
+            assert!(!o.retry_attempts.contains_key("1"));
+        }
+
+        o.eff.as_mut().unwrap().cpu_sampler = sampler(true, &[(42, &[103])]);
+        advance(&clock, chrono::Duration::seconds(300));
+        o.reconcile_stalled();
+        assert!(
+            o.running.contains_key("1"),
+            "last tool observation gets a full window"
+        );
+        advance(&clock, chrono::Duration::seconds(1));
+        o.reconcile_stalled();
+        assert!(
+            !o.running.contains_key("1"),
+            "tool exit must not mask a subsequent hang"
+        );
+        assert_eq!(o.retry_attempts["1"].err, "stalled");
+        assert_eq!(o.retry_attempts["1"].attempt, 1);
+    }
+
+    #[test]
+    fn tool_child_renews_liveness_before_cpu_interval_or_when_cpu_frequency_is_unavailable() {
+        let base = utc(2026, 5, 29, 12, 0, 0);
+        for hz in [Some(100), None] {
+            let mut cpu = FakeSampler::new(true, HashMap::from([(42, vec![100])]));
+            cpu.has_tool_child = Some(true);
+            cpu.hz = hz;
+            let mut re = running_entry(issue("1", "MT-1", "In Progress"), "", "");
+            re.pgid = 42;
+            re.cpu_failure_since = Some(base - chrono::Duration::hours(1));
+            sample_cpu(&mut re, base, Some(&cpu), 0.05);
+            assert_eq!(
+                re.last_tool_active_at, base,
+                "the baseline can observe a tool"
+            );
+            let next = base + chrono::Duration::milliseconds(10);
+            sample_cpu(&mut re, next, Some(&cpu), 0.05);
+            assert_eq!(
+                re.last_tool_active_at, next,
+                "tool evidence is not CPU-gated"
+            );
+            assert_eq!(re.last_cpu_active_at, zero_time());
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_liveness_unknown_children_keeps_cpu_fallback_and_logs_once() {
+        let _serial = TRACING_TEST_LOCK.lock().await;
+        let (events, subscriber) = recording_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+        let mut cpu = FakeSampler::new(true, HashMap::from([(42, vec![100, 101, 102])]));
+        cpu.has_tool_child = None;
+        o.eff.as_mut().unwrap().cpu_sampler = Arc::new(cpu);
+        let base = utc(2026, 5, 29, 12, 0, 0);
+        let clock = install_clock(&mut o, base);
+        add_running(&mut o, "1", "MT-1", "In Progress", base);
+        o.running.get_mut("1").unwrap().pgid = 42;
+        o.reconcile_stalled();
+        advance(&clock, chrono::Duration::seconds(150));
+        o.reconcile_stalled();
+        advance(&clock, chrono::Duration::seconds(151));
+        o.reconcile_stalled();
+        assert!(
+            !o.running.contains_key("1"),
+            "unknown children must not renew liveness"
+        );
+        assert_eq!(o.retry_attempts["1"].err, "stalled");
+        assert_eq!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.message.contains("tool-child enumeration unavailable"))
+                .count(),
+            1
+        );
+    }
+
+    // STUDIO-1177: idle event-loop ticks without a tool are not evidence of useful work.
     #[tokio::test]
     async fn reconcile_liveness_tiny_cpu_deltas_stall() {
         let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));

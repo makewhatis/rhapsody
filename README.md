@@ -126,7 +126,7 @@ watch rows stay dismissed. Lead/manager suppression and ticket stop/resume's mov
 are unchanged. This review-only behavior has no frozen Go counterpart; API shapes, schema and
 goldens are unchanged.
 
-### Bounded CPU-based stall liveness (STUDIO-1177)
+### Bounded CPU-based stall liveness and tool waits (STUDIO-1177, STUDIO-1208)
 
 Silent workers now renew CPU liveness only when positive process-group CPU time exceeds
 `agent.stall_cpu_threshold` of elapsed wall time (default `0.05`, 5% of one core; valid range
@@ -134,12 +134,23 @@ Silent workers now renew CPU liveness only when positive process-group CPU time 
 group total establishes a baseline without crediting work. This replaces Go's any-change rule,
 which let idle event-loop ticks keep a dead network wait alive forever.
 
+A live tool child renews an independent liveness clock regardless of CPU use: silent foreground
+CI watches, builds and pulls remain alive while the agent waits. The same `/proc` scan detects
+non-leader group members and follows parent links for tool shells that create their own process
+groups; zombies do not count. Once the child exits, the last tool observation grants only the
+usual stall window. An idle agent alone still stalls below the CPU threshold. The turn timeout
+continues to bound tool waits; outcomes, reason strings and retries are unchanged.
+
+Once STUDIO-1208 ships, the operator can restore `stall_timeout_ms` to `300000` from the temporary
+`2700000` mitigation in WORKFLOW.md. This change does not rewrite that operator-owned configuration.
+
 A failed sampler logs once per run and grants one stall window from the first failed sample.
 Persistent failure then uses stream events alone, rather than Go's perpetual assume-alive rule.
 Recovery establishes a fresh baseline, retaining the original bounded failure grace until a full
 CPU interval can be measured; new process groups also establish fresh baselines. The existing `/proc`
 sampler is unavailable on macOS, so that platform uses this bounded event-only fallback, including
-for silent local builds.
+for silent local builds. Unavailable child enumeration logs once per run and retains the existing
+CPU/event-only behavior; it does not grant extra grace or perpetual liveness.
 Event timestamps, disabled stall detection, persisted `failed` / `stalled` taxonomy and exponential
 failure retries are unchanged. The threshold round-trips through config encode/decode but is omitted
 from the Go-owned config JSON view; schemas, payload goldens and fixtures are untouched.
