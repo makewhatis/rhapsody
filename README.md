@@ -82,6 +82,18 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Run-scoped, replaceable lead answers (STUDIO-1207)
+
+Lead description writes own one `rhapsody:lead-answer` HTML-comment block, keyed by lead item and
+scope. A later answer replaces that block while preserving every byte of the author's surrounding
+description. Historical unmarked `## Lead answer` text is untouched. Commission instructions state
+that diagnosis-only restrictions apply for this run and expire once findings are published.
+Accepting an author commission's findings, or resolving its lead item, replaces its still-owned
+commission block with a closing note and the findings path, restoring the ticket's own scope.
+Closing an older item cannot overwrite a newer answer. A normal document-only resolution with no
+marked commission still makes no description write. These lead-only extensions have no frozen Go
+counterpart; schemas, API payloads and golden fixtures are unchanged.
+
 ### Credential-scoped rejected-login holds (STUDIO-1199)
 
 A typed agent login rejection holds new work on its dispatch-time harness/account, including other
