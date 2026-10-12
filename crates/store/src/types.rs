@@ -205,6 +205,8 @@ pub const CLAIM_RETRY_QUEUED: &str = "retry_queued";
 
 /// queued onto the run's mailbox, not yet written to the agent
 pub const RUN_MESSAGE_SENT: &str = "sent";
+/// Durably pending for the ticket's next turn, possibly in a later run (STUDIO-1209).
+pub const RUN_MESSAGE_QUEUED_NEXT_TURN: &str = "queued_next_turn";
 /// actually written to the agent's stdin (delivered_turn set)
 pub const RUN_MESSAGE_DELIVERED: &str = "delivered";
 /// run ended before the message was written
@@ -594,8 +596,8 @@ pub struct DayTotals {
 
 /// RunMessage is one operator message sent to a run's agent (INF-250). `body` is the operator's
 /// ORIGINAL text; the prompt-side labeled wrapper is applied at admission and is NOT stored.
-/// `status` is sent | delivered | expired; `delivered_turn` is set only once the runner actually
-/// writes the message to the live turn's stdin.
+/// `status` is sent | queued_next_turn | delivered | expired. `delivered_turn` names the turn
+/// receiving the message; `delivered_run_id` is present only when that is a different run.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RunMessage {
     pub id: i64,
@@ -604,6 +606,14 @@ pub struct RunMessage {
     pub created_at_ms: i64,
     pub status: String,
     pub delivered_turn: Option<i64>,
+    pub delivered_run_id: Option<i64>,
+}
+
+/// A pending prompt block; its id identifies the original run-message history row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedRunMessage {
+    pub id: i64,
+    pub prompt: String,
 }
 
 // --- ticketless review watch set (STUDIO-703 / STUDIO-711) -----------------------------------

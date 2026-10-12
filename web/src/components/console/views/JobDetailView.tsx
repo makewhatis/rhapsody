@@ -2907,7 +2907,7 @@ function MessagesPanel({
           <textarea
             ref={box}
             aria-label="Message the running agent"
-            placeholder="The agent picks this up at its next step…"
+            placeholder="Delivered live or queued for the next turn, depending on the harness…"
             maxLength={4000}
             rows={2}
             value={draft}

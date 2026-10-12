@@ -7,6 +7,9 @@
 //! rejects with `backlog_full`), and persists the ORIGINAL (unwrapped) text as a "sent" row. The
 //! mailbox carries the WRAPPED text ([`operator_wrap`]) so the agent treats it as authoritative
 //! updated guidance; the store keeps the operator's original words.
+//! A dispatch-time non-live steering capability instead records a bounded durable next-turn
+//! queue. Those rows never enter stdin, never expire at teardown, and are consumed by the worker
+//! when a later turn starts (STUDIO-1209; README Divergences).
 //!
 //! [`Orchestrator::deliver_mid_run_summons`] reuses that one admission path for the poll-side mid-run
 //! summons router (INF-448): a summons newer than a run's start (and not already delivered) is routed
@@ -103,9 +106,62 @@ pub struct RunMessageResult {
     pub id: i64,
     /// Human ticket id, e.g. `"INF-250"`.
     pub identifier: String,
+    /// Accepted durably for a later turn rather than sent to live stdin.
+    pub queued_next_turn: bool,
+    /// Persistence unavailable/failed; no admission happened.
+    pub queue_failed: bool,
 }
 
 impl Orchestrator {
+    pub(crate) fn messages_next_turn_for(&self, re: &RunningEntry) -> bool {
+        let Some(eff) = &self.eff else {
+            return false;
+        };
+        let project = eff.project_by_slug(&re.project_slug);
+        let pool = project.map_or(&eff.agents, |p| &p.agents);
+        let default = project.map_or(&eff.agent, |p| &p.agent);
+        let runner = if re.harness.is_empty() {
+            default
+        } else {
+            pool.get(&re.harness).unwrap_or(default)
+        };
+        runner.capabilities().steering != rhapsody_agent::Steering::Live
+    }
+
+    fn queue_next_turn(&self, re: &RunningEntry, wrapped: &str, body: &str) -> RunMessageResult {
+        let mut result = RunMessageResult {
+            identifier: re.issue.identifier.clone(),
+            ..Default::default()
+        };
+        let queued = if re.run_id == 0 {
+            Err(rhapsody_store::StoreError::Disabled)
+        } else {
+            self.store().queue_run_message(
+                re.run_id,
+                &re.issue.identifier,
+                body,
+                wrapped,
+                (self.now)().timestamp_millis(),
+                OPERATOR_MAILBOX_CAP,
+            )
+        };
+        match queued {
+            Ok(Some(id)) if id > 0 => {
+                result.id = id;
+                result.queued_next_turn = true;
+                tracing::info!(issue = %re.issue.identifier, run_id = re.run_id, message_id = id,
+                    "operator message queued durably for the next turn or dispatch");
+            }
+            Ok(None) => result.full = true,
+            Ok(Some(_)) => result.queue_failed = true,
+            Err(error) => {
+                tracing::warn!(%error, issue = %re.issue.identifier, "next-turn message queue failed; message refused");
+                result.queue_failed = true;
+            }
+        }
+        result
+    }
+
     /// Queues an operator message for a live run's agent (INF-250). Admission is loop-confined (the
     /// single mutator of `running`/mailboxes). Mirrors Go `SendRunMessage` — see the module docs for
     /// the control-event-channel deviation (O7 re-routes this through `o.events`).
@@ -156,6 +212,17 @@ impl Orchestrator {
             }
         };
         let identifier = re.issue.identifier.clone();
+        if re.messages_next_turn {
+            let result = self.queue_next_turn(re, &operator_wrap(text), text);
+            if result.queued_next_turn
+                && let Err(error) = self
+                    .store()
+                    .release_subject(&identifier, "operator queued a message")
+            {
+                tracing::warn!(%error, "message queued but subject release failed");
+            }
+            return result;
+        }
         let (row_id, ok) = self.deliver_to_mailbox(re, text);
         if !ok {
             return RunMessageResult {
@@ -205,12 +272,17 @@ impl Orchestrator {
     /// Split out of `deliver_to_mailbox` so the wrapper is the CALLER's choice while
     /// [`OPERATOR_MAILBOX_CAP`] stays the single bound both paths honour. Mirrors Go
     /// `deliverToMailbox`, whose operator-only behaviour is unchanged.
+    /// Non-live harnesses queue the same wrapper durably instead of admitting it to stdin.
     pub(crate) fn admit_to_mailbox(
         &self,
         re: &RunningEntry,
         wrapped: &str,
         persist_as: &str,
     ) -> (i64, bool) {
+        if re.messages_next_turn {
+            let result = self.queue_next_turn(re, wrapped, persist_as);
+            return (result.id, result.queued_next_turn);
+        }
         let sent = {
             let mailboxes = self
                 .mailboxes
@@ -445,6 +517,64 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn non_steerable_message_is_durable_instead_of_dropped_at_run_end() {
+        let (mut o, st) = message_orch();
+        let mut fake = agent::fake::Fake::new();
+        fake.capabilities.steering = agent::Steering::BetweenTurns;
+        o.eff.as_mut().unwrap().agent = Arc::new(fake);
+        o.dispatch_issue(
+            issue("ID-1", "MT-1", "In Progress"),
+            None,
+            None,
+            String::new(),
+        );
+        let re = o.running["ID-1"].clone();
+        let result = o.send_run_message(re.run_id, "correct the scope");
+        assert!(result.queued_next_turn);
+        assert!(result.id > 0 && !result.full && !result.not_running);
+        let messages = st.list_run_messages(re.run_id).unwrap();
+        assert_eq!(messages[0].status, "queued_next_turn");
+        assert!(
+            o.mailbox_try_recv("ID-1").is_none(),
+            "must not reach OpenCode's discard path"
+        );
+        o.persist_end_run(&re, rhapsody_store::OUTCOME_COMPLETED, "");
+        assert_eq!(
+            st.list_run_messages(re.run_id).unwrap()[0].status,
+            "queued_next_turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn non_steerable_queue_is_bounded_and_refuses_unavailable_storage() {
+        let (mut o, st) = message_orch();
+        let mut fake = agent::fake::Fake::new();
+        fake.capabilities.steering = agent::Steering::BetweenTurns;
+        o.eff.as_mut().unwrap().agent = Arc::new(fake);
+        o.dispatch_issue(
+            issue("ID-1", "MT-1", "In Progress"),
+            None,
+            None,
+            String::new(),
+        );
+        let re = o.running["ID-1"].clone();
+        // A reload selecting a live-steerable default must not reclassify this in-flight run.
+        o.eff.as_mut().unwrap().agent = Arc::new(agent::fake::Fake::new());
+        for _ in 0..OPERATOR_MAILBOX_CAP {
+            assert!(o.send_run_message(re.run_id, "scope").queued_next_turn);
+        }
+        assert!(o.send_run_message(re.run_id, "overflow").full);
+        assert_eq!(
+            st.list_run_messages(re.run_id).unwrap().len(),
+            OPERATOR_MAILBOX_CAP
+        );
+        o.set_store(Arc::new(rhapsody_store::Noop));
+        let res = o.send_run_message(re.run_id, "no durable store");
+        assert!(res.queue_failed && !res.queued_next_turn && res.id == 0);
+        assert!(o.mailbox_try_recv("ID-1").is_none());
+    }
+
     // TestSendRunMessage_AcceptsWrapsAndPersists: a message to a live run is accepted, the WRAPPED text
     // lands on the mailbox, and a run_messages row is persisted with the ORIGINAL (unwrapped) body and
     // status "sent" (INF-250).
@@ -460,6 +590,7 @@ mod tests {
         let run_id = o.running.get("ID-1").expect("running").run_id;
 
         let res = o.send_run_message(run_id, "watch the branch");
+        assert!(!res.queued_next_turn && !res.queue_failed);
         assert!(
             !res.not_running && !res.full,
             "unexpected rejection: {res:?}"

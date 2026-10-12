@@ -84,14 +84,14 @@ export function useTranscript(
 
 // useRunMessages fetches a run's operator messages (GET /api/v1/runs/{id}/messages). It piggybacks
 // the in-flight cadence (polls @2s while running so a sent→delivered chip flip shows promptly) and
-// freezes once terminal, firing one final refetch on the running→finished edge to capture any
-// last-moment delivery/expiry — mirrors useTranscript (INF-250).
+// keeps polling a finished run while a next-turn message awaits a later dispatch. Otherwise it
+// freezes once terminal, with one final refetch on the running→finished edge (INF-250).
 export function useRunMessages(runId: number, inFlight: boolean, enabled = true) {
   const query = useQuery<RunMessage[]>({
     queryKey: ["run-messages", runId],
     queryFn: () => fetchRunMessages(runId),
     enabled: enabled && runId > 0,
-    refetchInterval: inFlight ? 2000 : false,
+    refetchInterval: (q) => inFlight || q.state.data?.some((m) => m.status === "queued_next_turn") ? 2000 : false,
     staleTime: inFlight ? 0 : Infinity,
     refetchOnWindowFocus: false,
   });

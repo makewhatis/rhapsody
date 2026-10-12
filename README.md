@@ -82,6 +82,20 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Durable next-turn operator messages (STUDIO-1209)
+
+Harnesses without live steering accept operator messages as `queued_next_turn`, rather than
+reporting `sent` and discarding them. Migration **37** adds `rhapsody_queued_run_messages`,
+holding the ticket identifier, prompt wrapper and destination run, with the
+`rhapsody_queued_run_messages_pending` index. The bounded queue is committed
+before acceptance; unavailable persistence returns 503 `message_queue_unavailable`. Pending
+messages survive run end, restart and history pruning. The next eligible turn (including the
+ticket's next dispatch, even on another harness) prepends each message once and marks its exact row
+delivered when the harness announces that turn's session. Failed startup leaves it pending.
+Messages do not themselves dispatch tickets. Original and destination run pages show the history;
+the console labels queued rows pending until delivered. Claude's live `sent`/stdin behavior and
+the Go-owned schema/goldens are unchanged.
+
 ### Credential-scoped rejected-login holds (STUDIO-1199)
 
 A typed agent login rejection holds new work on its dispatch-time harness/account, including other

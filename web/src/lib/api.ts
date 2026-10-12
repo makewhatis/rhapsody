@@ -1106,8 +1106,9 @@ export interface RunMessage {
   run_id: number;
   body: string;
   created_at_ms: number;
-  status: "sent" | "delivered" | "expired";
+  status: "sent" | "queued_next_turn" | "delivered" | "expired";
   delivered_turn?: number;
+  delivered_run_id?: number;
 }
 
 // sendRunMessage POSTs an operator message to a live run's agent (INF-250). It parses the daemon's
