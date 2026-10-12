@@ -1639,7 +1639,7 @@ impl Store for Sqlite {
                  ON CONFLICT(source) WHERE active = 1 DO UPDATE SET
                  kind = excluded.kind, notice_group = excluded.notice_group,
                   subject = excluded.subject, summary = excluded.summary, href = excluded.href,
-                  at = CASE WHEN excluded.source LIKE 'lead-park:%' THEN excluded.at ELSE at END",
+                   at = CASE WHEN excluded.source LIKE 'lead-park:%' OR excluded.kind = 'credential_rejected' THEN excluded.at ELSE at END",
                 params![row.source, row.kind, row.group, row.subject, row.summary, row.href, row.at, row.transient],
             )?;
         }

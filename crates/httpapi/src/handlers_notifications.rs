@@ -73,11 +73,19 @@ impl Kind {
     }
 }
 fn compact(text: &str) -> String {
+    compact_to(text, 140)
+}
+fn compact_to(text: &str, limit: usize) -> String {
     let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    if line.chars().count() <= 140 {
+    if line.chars().count() <= limit {
         line
     } else {
-        format!("{}…", line.chars().take(139).collect::<String>())
+        format!(
+            "{}…",
+            line.chars()
+                .take(limit.saturating_sub(1))
+                .collect::<String>()
+        )
     }
 }
 fn notice(
@@ -94,7 +102,12 @@ fn notice(
         kind: kind.name().into(),
         group: kind.group().into(),
         subject: compact(subject),
-        summary: compact(summary),
+        // Keep the automatic cadence and complete operator-clear command on credential notices.
+        summary: if kind == Kind::CredentialRejected {
+            compact_to(summary, 512)
+        } else {
+            compact(summary)
+        },
         href,
         at: at.into(),
         transient,
@@ -317,13 +330,16 @@ async fn observe(
             .filter(|p| p.held && p.reason.starts_with("login rejected"))
             .collect();
         for probe in &rejected {
+            let rejected_at = chrono::DateTime::from_timestamp(probe.checked_at_s, 0)
+                .map(rhapsody_store::format_summon_at)
+                .unwrap_or_else(|| at.clone());
             rows.push(notice(
                 Kind::CredentialRejected,
                 format!("credential:{}:{}", probe.harness, account.account),
                 &account.account,
                 &format!("{}: {}", account.account, probe.reason),
                 "#accounts".into(),
-                &at,
+                &rejected_at,
                 true,
             ));
         }
@@ -564,9 +580,9 @@ mod tests {
             "account": "fireworks-ai", "windows": [], "status": "credential_held",
             "using_credits": false, "last_seen_s": 0, "source": "", "stale": false,
             "detection": "inactive", "level": "stop_new",
-            "probe_reason": "login rejected — run `opencode auth login` as the daemon's user",
+            "probe_reason": "login rejected — run `opencode auth login` as the daemon's user; retries automatically every 30 minutes; clear now with POST /api/v1/accounts/fireworks-ai/credentials/opencode/clear",
             "credential_probes": [{"account":"fireworks-ai", "harness":"opencode", "held":true,
-                "reason":"login rejected — run `opencode auth login` as the daemon's user", "checked_at_s":1}]
+                "reason":"login rejected — run `opencode auth login` as the daemon's user; retries automatically every 30 minutes; clear now with POST /api/v1/accounts/fireworks-ai/credentials/opencode/clear", "checked_at_s":1}]
         })).unwrap();
         let mut snapshot = empty_snapshot();
         snapshot
@@ -578,7 +594,10 @@ mod tests {
                 ..Default::default()
             });
         for at in ["2026-10-12T05:14:18Z", "2026-10-12T05:32:25Z"] {
-            account.credential_probes[0].checked_at_s += 1;
+            snapshot.generated_at = chrono::DateTime::parse_from_rfc3339(at)
+                .unwrap()
+                .with_timezone(&chrono::Utc);
+            account.credential_probes[0].checked_at_s = snapshot.generated_at.timestamp();
             let rows = observe(
                 &FakeProvider::ok(snapshot.clone()).with_accounts(vec![account.clone()]),
                 None,
@@ -593,6 +612,16 @@ mod tests {
             assert_eq!(rows[0].kind, "credential_rejected");
             assert_eq!(rows[0].group, "needs_you");
             assert!(
+                rows[0]
+                    .summary
+                    .contains("retries automatically every 30 minutes")
+            );
+            assert!(
+                rows[0]
+                    .summary
+                    .contains("POST /api/v1/accounts/fireworks-ai/credentials/opencode/clear")
+            );
+            assert!(
                 rows[0].summary.contains("fireworks-ai")
                     && rows[0].summary.contains("opencode auth login")
             );
@@ -602,6 +631,10 @@ mod tests {
         assert_eq!(rows.len(), 1, "repeated rejection updates the same notice");
         let id = rows[0].id;
         assert!(rows[0].active && rows[0].read_at.is_none());
+        assert_eq!(
+            rows[0].at,
+            rhapsody_store::format_summon_at(snapshot.generated_at)
+        );
         let recovered = observe(&FakeProvider::ok(empty_snapshot()), None)
             .await
             .unwrap();

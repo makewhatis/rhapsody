@@ -107,8 +107,17 @@ engines or reassigning teammates. Other credentials and live runs remain indepen
 per harness/account, updated in place on repeats and deactivated on recovery. A successful run on
 that credential, a healthy existing Claude credential or ChatGPT usage probe, or operator-guarded
 `POST /api/v1/accounts/{account}/credentials/{harness}/clear` releases the rejection. Unknown probes
-cannot erase a confirmed run failure. Providers without an existing probe require an operator
-clear (or success from an already-live run); no new provider calls are introduced. Holds and author
+cannot erase a confirmed run failure. Providers without an existing probe automatically admit one
+oldest eligible waiting ticket on the same routed credential every
+`agent.credential_canary_interval_ms` (positive milliseconds, default `1800000`, 30 minutes;
+STUDIO-1211). Due canaries walk oldest-first before ordinary priority-ordered work and still respect
+eligibility, capacity and budget gates. Final admission consumes the interval, shared across projects
+and prepared dispatches; another canary cannot overlap a still-live run on that credential. A rejected
+canary records one failed run without a human label or timed ticket retry, updates the same notice and
+keeps the hold; success releases it. The notice names the automatic cadence and operator-clear path.
+Claude and ChatGPT credentials keep their existing probes, without canary admission or new provider
+probe calls. Non-default canary intervals survive config saves but stay out of the Go-owned config
+JSON view. Holds and author
 resume admissions share the existing process-local credential-cache lifetime. No frozen Go schema,
 payload golden, normalization rule or credential file changes.
 

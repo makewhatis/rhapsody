@@ -733,6 +733,14 @@ impl Orchestrator {
             }
             return;
         }
+        // Freeze the admission credential: a brokered model's prefix need not name its provider.
+        let canary_account = prepared_account.unwrap_or_else(|| {
+            self.run_pricing_for(&re.harness, &re.model_override, &re.project_slug)
+                .account
+        });
+        let canary = self
+            .credential_canary_due(&re, &canary_account)
+            .then(|| (self.effective_harness(&re.harness), canary_account));
         if prepared.is_some() && !re.brokered {
             prepared = None;
         }
@@ -826,6 +834,10 @@ impl Orchestrator {
         self.claimed.insert(id.clone());
         self.clear_retry(&id);
         self.persist_start_run(&mut re, attempt_norm);
+        // Consume only after all admission gates, using the same credential as final preflight.
+        if let Some(key) = canary {
+            self.credential_canaries.insert(key, (self.now)());
+        }
         self.credential_resume.remove(&iss.id);
         // AFTER the run row exists: the decision is a row ON a run, so it cannot be written before
         // one (§3.1 — the router has no store and can persist no intention). A zero `run_id` (store

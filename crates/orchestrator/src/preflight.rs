@@ -397,6 +397,90 @@ impl Orchestrator {
             .map(|hold| hold.reason.as_str())
     }
 
+    fn credential_canary_interval_ms(&self) -> i64 {
+        self.eff
+            .as_ref()
+            .map_or(1_800_000, |e| e.cfg.agent.credential_canary_interval_ms)
+    }
+
+    /// Existing Claude liveness and ChatGPT usage probes own recovery for their credentials.
+    fn credential_has_recovery_probe(harness: &str, account: &str) -> bool {
+        backend_has_probe(harness) || (harness == "opencode" && account == "chatgpt-subscription")
+    }
+
+    pub(crate) fn credential_canary_due(&self, run: &crate::RunningEntry, account: &str) -> bool {
+        let harness = self.effective_harness(&run.harness);
+        if crate::review::is_non_tracker_key(&run.issue.id)
+            || Self::credential_has_recovery_probe(&harness, account)
+            || self.rejected_credential_reason(&harness, account).is_none()
+        {
+            return false;
+        }
+        let Some(last) = self
+            .credential_canaries
+            .get(&(harness.clone(), account.into()))
+        else {
+            return false;
+        };
+        (self.now)().signed_duration_since(*last).num_milliseconds()
+            >= self.credential_canary_interval_ms()
+            && !self
+                .running
+                .values()
+                .any(|r| r.credential_harness == harness && r.pricing.account == account)
+    }
+
+    /// Selection is read-only; reserve only in its pass-local set. Final admission consumes time.
+    pub(crate) fn issue_credential_canary(
+        &self,
+        issue: &rhapsody_core::Issue,
+        project: &str,
+    ) -> Option<(String, String)> {
+        if self.credential_rejections.is_empty() {
+            return None;
+        }
+        let run = self.limit_projection(issue, project);
+        let pricing = self.run_pricing_for(&run.harness, &run.model_override, project);
+        let account = if run.pricing.account.is_empty() {
+            &pricing.account
+        } else {
+            &run.pricing.account
+        };
+        self.credential_canary_due(&run, account)
+            .then(|| (self.effective_harness(&run.harness), account.clone()))
+    }
+
+    pub(crate) fn select_credential_canary(
+        &self,
+        issue: &rhapsody_core::Issue,
+        project: &str,
+        selected: &mut BTreeSet<(String, String)>,
+    ) -> bool {
+        self.issue_credential_canary(issue, project)
+            .is_none_or(|key| selected.insert(key))
+    }
+
+    /// Due canaries get an oldest-first walk; other work retains the normal dispatch ordering.
+    pub(crate) fn credential_canary_cmp(
+        a: &rhapsody_core::Issue,
+        b: &rhapsody_core::Issue,
+        a_due: bool,
+        b_due: bool,
+    ) -> std::cmp::Ordering {
+        b_due.cmp(&a_due).then_with(|| {
+            if a_due && b_due {
+                // Missing ages sort last, as in the normal dispatcher.
+                a.created_at
+                    .is_none()
+                    .cmp(&b.created_at.is_none())
+                    .then_with(|| a.created_at.cmp(&b.created_at))
+                    .then_with(|| a.identifier.cmp(&b.identifier))
+            } else {
+                crate::dispatch::dispatch_cmp(a, b)
+            }
+        })
+    }
+
     pub(crate) fn projected_credential_rejection(&self, run: &crate::RunningEntry) -> Option<&str> {
         let account = if run.pricing.account.is_empty() {
             self.run_pricing_for(&run.harness, &run.model_override, &run.project_slug)
@@ -448,13 +532,21 @@ impl Orchestrator {
                 cached.cache.healthy = false;
             }
         }
+        self.credential_canaries
+            .insert((harness.clone(), account.clone()), (self.now)());
+        let retry = if Self::credential_has_recovery_probe(&harness, &account) {
+            String::new()
+        } else {
+            let minutes = self.credential_canary_interval_ms() as f64 / 60_000.0;
+            format!("; retries automatically every {minutes} minutes")
+        };
         self.credential_rejections.insert(
             (harness.clone(), account.clone()),
             crate::accounts::CredentialView {
-                account,
-                harness,
+                account: account.clone(),
+                harness: harness.clone(),
                 held: true,
-                reason: format!("login rejected — run `{command}` as the daemon's user"),
+                reason: format!("login rejected — run `{command}` as the daemon's user{retry}; clear now with POST /api/v1/accounts/{account}/credentials/{harness}/clear"),
                 checked_at_s: (self.now)().timestamp(),
             },
         );
@@ -467,6 +559,8 @@ impl Orchestrator {
             .remove(&(harness.into(), account.into()))
             .is_some();
         if removed {
+            self.credential_canaries
+                .remove(&(harness.into(), account.into()));
             // Drop only this credential's display holds, never an independent quota/budget hold.
             for held in self.budget_ledger.held(self.budget_hold_ttl()) {
                 if held.provider == account && held.reason.contains("login rejected") {
@@ -763,6 +857,206 @@ mod tests {
             declared_handoff: false,
             review_verdict: None,
             verdict_text: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_canary_retries_oldest_once_per_interval_and_recovers() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        for multi in [false, true] {
+            let (mut o, sink, _) = orch_with_probe(false, FakeKind::Healthy);
+            let store = Arc::new(
+                rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).unwrap(),
+            );
+            o.store = store.clone();
+            o.cred_probe = None;
+            o.now = Box::new(fixed_now);
+            let eff = o.eff.as_mut().unwrap();
+            let tracker = Arc::new(Fake::new());
+            eff.tracker = tracker.clone();
+            eff.cfg.agent.backend = "opencode".into();
+            eff.cfg.opencode.model = "fireworks-ai/test-model".into();
+            if multi {
+                let mut p = empty_resolved_project("p", tracker.clone());
+                p.mcfg = eff.cfg.clone();
+                p.active_states = eff.active_states.clone();
+                p.terminal_states = eff.terminal_states.clone();
+                p.max_concurrent = 10;
+                let mut other = empty_resolved_project("other", tracker.clone());
+                other.mcfg = p.mcfg.clone();
+                other.active_states = p.active_states.clone();
+                other.terminal_states = p.terminal_states.clone();
+                other.max_concurrent = 10;
+                eff.projects.push(p);
+                eff.projects.push(other);
+            }
+            let mut oldest = issue("old", "TEST-1", "Todo");
+            oldest.created_at = Some(fixed_now() - chrono::Duration::days(2));
+            oldest.priority = Some(4);
+            let mut newer = issue("new", "TEST-2", "Todo");
+            newer.created_at = Some(fixed_now() - chrono::Duration::days(1));
+            newer.priority = Some(1); // canaries choose age rather than priority
+            o.dispatch_issue(oldest.clone(), None, None, String::new());
+            o.on_worker_exit(credential_exit(&o, "old", true));
+            let reason = &o.credential_rejections.values().next().unwrap().reason;
+            assert!(reason.contains("retries automatically every 30 minutes"));
+            assert!(
+                reason.contains("POST /api/v1/accounts/fireworks-ai/credentials/opencode/clear")
+            );
+            let select = |o: &Orchestrator| {
+                let candidates = vec![newer.clone(), oldest.clone()];
+                if multi {
+                    o.select_dispatch_multi(
+                        candidates
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, iss)| crate::select::TaggedIssue { iss, proj: Some(i) })
+                            .collect(),
+                    )
+                    .into_iter()
+                    .map(|t| t.iss)
+                    .collect::<Vec<_>>()
+                } else {
+                    o.select_dispatch(candidates)
+                }
+            };
+            o.now = Box::new(|| fixed_now() + chrono::Duration::milliseconds(1_799_999));
+            assert!(select(&o).is_empty(), "no early admission");
+            o.now = Box::new(|| fixed_now() + chrono::Duration::minutes(30));
+            let picks = select(&o);
+            assert_eq!(picks.len(), 1, "one due canary, even with spare slots");
+            assert_eq!(picks[0].id, "old", "oldest waiting ticket wins");
+            o.dispatch_issue(picks[0].clone(), None, None, String::new());
+            o.dispatch_issue(newer.clone(), None, None, String::new());
+            assert_eq!(o.running.len(), 1, "final gate cannot over-admit");
+            assert!(select(&o).is_empty());
+            o.on_worker_exit(credential_exit(&o, "old", true));
+            assert_eq!(o.credential_rejections.len(), 1);
+            assert_eq!(
+                o.credential_rejections
+                    .values()
+                    .next()
+                    .unwrap()
+                    .checked_at_s,
+                (fixed_now() + chrono::Duration::minutes(30)).timestamp()
+            );
+            assert!(o.retry_attempts.is_empty() && o.claimed.is_empty());
+            assert!(o.human_holds.held().is_empty());
+            o.now = Box::new(|| fixed_now() + chrono::Duration::minutes(60));
+            let picks = select(&o);
+            assert_eq!(picks.len(), 1);
+            o.dispatch_issue(picks[0].clone(), None, None, String::new());
+            o.on_worker_exit(credential_exit(&o, "old", false));
+            assert!(o.credential_rejections.is_empty(), "success releases hold");
+            assert!(
+                o.accounts
+                    .snapshot((o.now)().timestamp())
+                    .iter()
+                    .all(|a| a.credential_probes.iter().all(|p| !p.held))
+            );
+            assert_eq!(
+                sink.lock().unwrap().len(),
+                3,
+                "initial failure, rejected canary, successful canary"
+            );
+            use rhapsody_store::Store;
+            let runs = store
+                .list_runs(rhapsody_store::RunFilter {
+                    issue: "TEST-1".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(runs.len(), 3);
+            assert_eq!(
+                runs.iter()
+                    .filter(|r| r.outcome == rhapsody_store::OUTCOME_FAILED)
+                    .count(),
+                2,
+                "one row per rejected attempt"
+            );
+            assert!(
+                tracker.add_label_calls().is_empty(),
+                "no human label on either rejection"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_canary_is_routed_and_prepared_admission_shares_the_interval() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (mut o, _, _) = orch_with_probe(false, FakeKind::Healthy);
+        o.cred_probe = None;
+        o.now = Box::new(fixed_now);
+        o.eff
+            .as_mut()
+            .unwrap()
+            .cfg
+            .agent
+            .credential_canary_interval_ms = 60_000;
+        let dir = crate::testsupport::TempDir::new();
+        std::fs::write(
+            dir.child("worker.md"),
+            "---\nextends: swe\nharness: opencode\nmodel: fireworks-ai/test-model\n---\nWorker.\n",
+        )
+        .unwrap();
+        let mut teams = rhapsody_config::teams::Teams::disabled();
+        teams.enabled = true;
+        teams.roster.push(rhapsody_config::teams::Identity {
+            name: "worker".into(),
+            profile: "worker".into(),
+            ..Default::default()
+        });
+        o.teams = Some(teams);
+        o.teams_profiles_dir = Some(dir.child("").into());
+        let mut a = issue("a", "TEST-1", "Todo");
+        a.labels = Some(vec!["rhapsody:@worker".into()]);
+        o.dispatch_issue(a.clone(), None, None, String::new());
+        o.on_worker_exit(credential_exit(&o, "a", true));
+        o.now = Box::new(|| fixed_now() + chrono::Duration::milliseconds(59_999));
+        assert!(o.select_dispatch(vec![a.clone()]).is_empty());
+        o.now = Box::new(|| fixed_now() + chrono::Duration::seconds(60));
+        assert_eq!(o.select_dispatch(vec![a.clone()]).len(), 1);
+        let mut prepared = o.limit_projection(&a, "");
+        assert!(
+            o.gate_limit_dispatch(&mut prepared, &mut None, Some("fireworks-ai")),
+            "prepared spec's explicit provider uses same canary"
+        );
+        o.dispatch_issue(a, None, None, String::new());
+        assert_eq!(o.running["a"].identity, "worker");
+        assert_eq!(o.running["a"].credential_harness, "opencode");
+        assert!(!o.gate_limit_dispatch(&mut prepared, &mut None, Some("fireworks-ai")));
+        o.now = Box::new(|| fixed_now() + chrono::Duration::hours(2));
+        assert!(
+            !o.gate_limit_dispatch(&mut prepared, &mut None, Some("fireworks-ai")),
+            "never overlap an unfinished canary"
+        );
+        o.running.remove("a");
+        assert!(o.credential_canary_due(&prepared, "fireworks-ai"));
+        prepared.issue.id = "pr:o/r#1@worker".into();
+        assert!(!o.credential_canary_due(&prepared, "fireworks-ai"));
+    }
+
+    #[tokio::test]
+    async fn credential_canary_never_bypasses_existing_probes() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        for (harness, account, model) in [
+            ("claude", "claude-subscription", ""),
+            ("opencode", "chatgpt-subscription", "openai/gpt-test"),
+        ] {
+            let (mut o, _, _) = orch_with_probe(false, FakeKind::Healthy);
+            o.cred_probe = None;
+            o.now = Box::new(fixed_now);
+            let eff = o.eff.as_mut().unwrap();
+            eff.cfg.agent.backend = harness.into();
+            eff.cfg.opencode.model = model.into();
+            let a = issue("a", "TEST-1", "Todo");
+            o.dispatch_issue(a.clone(), None, None, String::new());
+            assert_eq!(o.running["a"].pricing.account, account);
+            o.on_worker_exit(credential_exit(&o, "a", true));
+            o.now = Box::new(|| fixed_now() + chrono::Duration::days(1));
+            assert!(o.select_dispatch(vec![a.clone()]).is_empty());
+            o.dispatch_issue(a, None, None, String::new());
+            assert!(o.running.is_empty(), "probe credentials stay held");
         }
     }
 
