@@ -79,12 +79,40 @@ impl LeadHost for RecordingHost {
         }
         Ok(self.subject.lock().expect("subject").clone())
     }
-    async fn prepend(&self, ticket: &Issue, text: &str) -> Result<(), String> {
+    async fn write_answer(
+        &self,
+        ticket: &Issue,
+        item: i64,
+        text: &str,
+        commission: bool,
+    ) -> Result<(), String> {
         self.record(format!("prepend:{}:{text}", ticket.identifier));
         if self.action_err {
             return Err("uncertain description write".into());
         }
+        let mut subject = self.subject.lock().expect("subject");
+        subject.ticket.description = Some(write_lead_answer(
+            subject.ticket.description.as_deref().unwrap_or_default(),
+            item,
+            text,
+            commission,
+        )?);
+        drop(subject);
         self.after_effect("prepend:");
+        Ok(())
+    }
+    async fn close_commission(&self, _ticket: &Issue, item: i64) -> Result<(), String> {
+        let mut subject = self.subject.lock().expect("subject");
+        if let Some(description) = close_lead_answer(
+            subject.ticket.description.as_deref().unwrap_or_default(),
+            item,
+            &subject.ticket.identifier,
+        )? {
+            if self.action_err {
+                return Err("uncertain description write".into());
+            }
+            subject.ticket.description = Some(description);
+        }
         Ok(())
     }
     async fn todo(&self, ticket: &Issue) -> Result<(), String> {
@@ -577,6 +605,17 @@ async fn replay_297_route_back_with_credential_rule() {
     assert!(calls.iter().any(|s| s.contains("refresh: \"\"")));
     assert!(calls.iter().any(|s| s == "todo:TEST-100"));
     assert!(calls.iter().any(|s| s == "clear:o/r#290"));
+    let description = host
+        .subject
+        .lock()
+        .unwrap()
+        .ticket
+        .description
+        .clone()
+        .unwrap();
+    assert!(description.contains("refresh: \"\""));
+    assert!(description.contains("LimitObs"));
+    assert_eq!(description.matches(ANSWER_BEGIN).count(), 1);
 }
 
 #[tokio::test]
@@ -1005,6 +1044,275 @@ async fn commission_author_does_not_consume_a_second_route_back() {
     );
 }
 
+const AUTHOR_DESCRIPTION: &str =
+    "## Fix\r\nAuthor's café acceptance.\n\n## Lead answer\nHistorical note stays.\n";
+
+fn with_author_description(host: &RecordingHost, case: &mut LeadCase) {
+    case.subject.ticket.description = Some(AUTHOR_DESCRIPTION.into());
+    *host.subject.lock().unwrap() = case.subject.clone();
+}
+
+fn assert_one_lead_block(description: &str) {
+    assert_eq!(
+        description
+            .matches("<!-- rhapsody:lead-answer:begin id=")
+            .count(),
+        1
+    );
+    assert_eq!(
+        description
+            .matches("<!-- rhapsody:lead-answer:end -->")
+            .count(),
+        1
+    );
+    let start = description
+        .find("<!-- rhapsody:lead-answer:begin id=")
+        .unwrap();
+    let end = description
+        .find("<!-- rhapsody:lead-answer:end -->")
+        .unwrap()
+        + "<!-- rhapsody:lead-answer:end -->".len();
+    assert_eq!(
+        format!("{}{}", &description[..start], &description[end..]),
+        AUTHOR_DESCRIPTION
+    );
+}
+
+async fn author_commission(store: &(dyn Store + Sync), host: &RecordingHost, case: &LeadCase) {
+    let result = replay(
+        store,
+        host,
+        case,
+        serde_json::json!([{
+            "action":"commission", "kind":"author",
+            "question":"Diagnose and report only: do not fix the blocker.",
+            "hypothesis":"cold cache"
+        }]),
+    )
+    .await;
+    assert_eq!(result.state, "parked");
+    assert!(result.escalation.is_none());
+}
+
+#[tokio::test]
+async fn commission_answer_is_marked_run_scoped_and_replaced() {
+    let (store, host, mut case) = setup("diagnose blocker");
+    with_author_description(&host, &mut case);
+    author_commission(store.as_ref(), &host, &case).await;
+    let description = host.subject().await.unwrap().ticket.description.unwrap();
+    assert_one_lead_block(&description);
+    assert!(description.contains("for this run"));
+    assert!(
+        description
+            .contains("once findings are published, the ticket's own implementation scope applies")
+    );
+    case.subject = host.subject().await.unwrap();
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([{
+            "action":"route_back", "ticket":"TEST-100", "answer":"Implement the verified fix."
+        }]),
+    )
+    .await;
+    assert!(result.escalation.is_none());
+    let description = host.subject().await.unwrap().ticket.description.unwrap();
+    assert_one_lead_block(&description);
+    assert!(description.contains("Implement the verified fix."));
+    assert!(!description.contains("do not fix"));
+    assert!(!description.contains("cold cache"));
+}
+
+#[tokio::test]
+async fn resolve_closes_commission_description_scope() {
+    let (store, host, mut case) = setup("diagnose blocker");
+    with_author_description(&host, &mut case);
+    author_commission(store.as_ref(), &host, &case).await;
+    case.subject = host.subject().await.unwrap();
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([{
+            "action":"resolve", "reason":"The commissioned diagnosis is complete and published."
+        }]),
+    )
+    .await;
+    assert!(result.escalation.is_none());
+    let description = host.subject().await.unwrap().ticket.description.unwrap();
+    assert!(
+        !description.contains("do not fix"),
+        "resolved diagnosis must not restrict later dispatches: {description}"
+    );
+    assert_one_lead_block(&description);
+    assert!(description.contains("TEST-100-findings.md"));
+    assert!(description.contains("Proceed with the ticket's own scope."));
+}
+
+#[tokio::test]
+async fn accepted_findings_close_author_scope_before_clearing_linkage() {
+    let (store, host, mut case) = setup("diagnose blocker");
+    with_author_description(&host, &mut case);
+    author_commission(store.as_ref(), &host, &case).await;
+    *host.findings.lock().unwrap() = Some("Verified the cold cache blocker.".into());
+    assert!(
+        resume_on_findings(store.as_ref(), &host, case.item.id)
+            .await
+            .unwrap()
+    );
+    let description = host.subject().await.unwrap().ticket.description.unwrap();
+    assert!(!description.contains("do not fix"));
+    assert_one_lead_block(&description);
+    assert!(
+        store
+            .lead_execution(case.item.id)
+            .unwrap()
+            .unwrap()
+            .commission_ticket
+            .is_empty()
+    );
+}
+
+#[test]
+fn lead_answer_replacement_preserves_prefix_suffix_and_closes_only_its_own_scope() {
+    let description = "prefix café\r\n<!-- rhapsody:lead-answer:begin id=7 scope=commission -->\nDiagnose, do not fix.\n<!-- rhapsody:lead-answer:end -->\r\n## Author's suffix\n";
+    let replacement = write_lead_answer(description, 8, "Implement now.", false).unwrap();
+    let expected = "prefix café\r\n<!-- rhapsody:lead-answer:begin id=8 scope=answer -->\n\n## Lead answer\nImplement now.\n\n<!-- rhapsody:lead-answer:end -->\r\n## Author's suffix\n";
+    assert_eq!(replacement, expected);
+    assert!(
+        close_lead_answer(description, 8, "TEST-100")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        close_lead_answer(&replacement, 8, "TEST-100")
+            .unwrap()
+            .is_none()
+    );
+    let closed = close_lead_answer(description, 7, "TEST-100")
+        .unwrap()
+        .unwrap();
+    assert!(closed.starts_with("prefix café\r\n"));
+    assert!(closed.ends_with("\r\n## Author's suffix\n"));
+    assert!(!closed.contains("do not fix"));
+    assert!(
+        close_lead_answer(AUTHOR_DESCRIPTION, 7, "TEST-100")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn malformed_or_embedded_lead_markers_refuse_description_writes() {
+    for malformed in [
+        "<!-- rhapsody:lead-answer:begin id=7 scope=commission -->author text",
+        "author text<!-- rhapsody:lead-answer:end -->",
+        "<!-- rhapsody:lead-answer:begin id=oops scope=commission --><!-- rhapsody:lead-answer:end -->",
+        "<!-- rhapsody:lead-answer:begin id=7 scope=unknown --><!-- rhapsody:lead-answer:end -->",
+        "<!-- rhapsody:lead-answer:begin id=7 scope=commission --><!-- rhapsody:lead-answer:end --><!-- rhapsody:lead-answer:end -->",
+    ] {
+        assert!(
+            write_lead_answer(malformed, 7, "new answer", false).is_err(),
+            "{malformed}"
+        );
+        assert!(
+            close_lead_answer(malformed, 7, "TEST-100").is_err(),
+            "{malformed}"
+        );
+    }
+    for marker in [ANSWER_BEGIN, ANSWER_END] {
+        assert!(write_lead_answer("Author's text", 7, marker, false).is_err());
+    }
+}
+
+#[tokio::test]
+async fn failed_scope_closure_keeps_findings_linkage_and_resolve_escalates() {
+    let (store, mut host, mut case) = setup("diagnose blocker");
+    with_author_description(&host, &mut case);
+    author_commission(store.as_ref(), &host, &case).await;
+    host.action_err = true;
+    *host.findings.lock().unwrap() = Some("Verified diagnosis.".into());
+    assert!(
+        resume_on_findings(store.as_ref(), &host, case.item.id)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .lead_execution(case.item.id)
+            .unwrap()
+            .unwrap()
+            .commission_ticket,
+        "TEST-100"
+    );
+    assert_eq!(store.load_lead_items().unwrap()[0].state, "parked");
+    case.subject = host.subject().await.unwrap();
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([{
+            "action":"resolve", "reason":"Findings published."
+        }]),
+    )
+    .await;
+    assert!(
+        result
+            .escalation
+            .as_deref()
+            .unwrap()
+            .contains("uncertain description write")
+    );
+}
+
+#[tokio::test]
+async fn dedicated_commission_text_has_exit_condition() {
+    let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+    let (store, _, case) = setup("diagnosis ticket");
+    let project = LeadProject {
+        tracker: tracker.clone(),
+        repo_url: "https://github.com/o/r.git".into(),
+        terminal_states: Default::default(),
+        summon_token: String::new(),
+    };
+    let mut teams = rhapsody_config::teams::Teams::disabled();
+    teams.roster.push(rhapsody_config::teams::Identity {
+        name: "jerry".into(),
+        ..Default::default()
+    });
+    let runtime = LeadRuntime {
+        control: crate::Orchestrator::new("WORKFLOW.md").control(),
+        store,
+        projects: vec![project.clone()],
+        teams,
+        prs: Arc::new(crate::ghsummons::GH::new("", None)),
+        comments: None,
+        room: None,
+        memory: None,
+        operator_memory: None,
+        findings_dir: None,
+    };
+    let host = RuntimeHost {
+        runtime: &runtime,
+        project: &project,
+        ticket: "TEST-100".into(),
+        pr: None,
+    };
+    host.commission(&case.subject.ticket, "diagnose blocker", "cold cache")
+        .await
+        .unwrap();
+    let calls = tracker.create_issue_calls();
+    assert_eq!(calls.len(), 1);
+    assert!(calls[0].spec.description.contains("for this run"));
+    assert!(
+        calls[0]
+            .spec
+            .description
+            .contains("once findings are published, the ticket's own implementation scope applies")
+    );
+}
+
 #[tokio::test]
 async fn reassignment_and_fireworks_authorization_have_only_the_named_effects() {
     let (store, host, case) = setup("healthy engine needed");
@@ -1341,7 +1649,7 @@ async fn real_tracker_writes_and_findings_use_only_the_scoped_subject() {
         pr: None,
     };
     let snapshot = host.subject().await.expect("fresh snapshot");
-    host.prepend(&snapshot.ticket, "Answer @custom-bot")
+    host.write_answer(&snapshot.ticket, 1, "Answer @custom-bot", false)
         .await
         .expect("prepend");
     host.reassign(&snapshot.ticket, "alice")
@@ -1357,8 +1665,28 @@ async fn real_tracker_writes_and_findings_use_only_the_scoped_subject() {
     assert_eq!(issue.labels, Some(vec!["rhapsody:@alice".into()]));
     assert_eq!(
         issue.description.as_deref(),
-        Some("## Lead answer\nAnswer \n\nOriginal acceptance.")
+        Some(
+            "Original acceptance.<!-- rhapsody:lead-answer:begin id=1 scope=answer -->\n\n## Lead answer\nAnswer \n\n<!-- rhapsody:lead-answer:end -->"
+        )
     );
+    host.write_answer(&issue, 2, "Diagnose, do not fix for this run.", true)
+        .await
+        .unwrap();
+    let commissioned = host.subject().await.unwrap().ticket.description.unwrap();
+    assert_eq!(commissioned.matches(ANSWER_BEGIN).count(), 1);
+    assert!(commissioned.starts_with("Original acceptance."));
+    assert!(!commissioned.contains("Answer "));
+    host.close_commission(&issue, 1).await.unwrap();
+    assert_eq!(
+        host.subject().await.unwrap().ticket.description.as_deref(),
+        Some(commissioned.as_str())
+    );
+    host.close_commission(&issue, 2).await.unwrap();
+    let closed = host.subject().await.unwrap().ticket.description.unwrap();
+    assert_eq!(closed.matches(ANSWER_BEGIN).count(), 1);
+    assert!(closed.starts_with("Original acceptance."));
+    assert!(!closed.contains("do not fix"));
+    assert!(closed.contains("Proceed with the ticket's own scope."));
     assert_eq!(
         tracker
             .fetch_issue_by_identifier("TEST-101")
