@@ -557,6 +557,8 @@ mod tests {
         std::fs::write(&src,json!({"openai":{"type":"oauth","access":"synthetic","refresh":"synthetic-refresh","expires":4102444800000_i64},"other":{"key":"synthetic-other"}}).to_string()).unwrap();
         let code=r#"#!/usr/bin/env python3
 import os, sys, json, pathlib, time
+if len(sys.argv)>1 and sys.argv[1]=='serve':
+    os.execvp('python3', ['python3', BRIDGE, sys.argv[0], *sys.argv[1:]])
 mode=MODE
 log=LOG
 env=dict(os.environ)
@@ -599,7 +601,7 @@ else:
         print(json.dumps({'type':'tool_use','part':{'tool':'symphony_symphony_state','state':{'status':'completed','output':'{"status":"ok"}'}}}))
         print(json.dumps({'type':'text','part':{'text':'All forbidden attempts refused.'}}))
         print(json.dumps({'type':'step_finish','part':{'reason':'stop'}}))
-"#.replace("MODE",&json!(mode).to_string()).replace("LOG",&json!(log).to_string());
+"#.replace("MODE",&json!(mode).to_string()).replace("LOG",&json!(log).to_string()).replace("BRIDGE",&json!(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harness/stubs/fake-opencode-server.py")).to_string());
         std::fs::write(&script, code).unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let root = d.0.join("runs");

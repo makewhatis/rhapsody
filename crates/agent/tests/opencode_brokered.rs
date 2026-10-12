@@ -86,7 +86,17 @@ fn scratch_calls_with_the_same_tag_are_independent() {
 }
 
 fn write_executable(path: &Path, body: &str) {
-    std::fs::write(path, body).expect("write script");
+    let bridge =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../harness/stubs/fake-opencode-server.py");
+    let body = body.strip_prefix("#!/bin/sh\n").unwrap_or(body);
+    std::fs::write(
+        path,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = serve ]; then exec python3 '{}' \"$0\" \"$@\"; fi\n{body}",
+            bridge.display()
+        ),
+    )
+    .expect("write script");
     let mut perms = std::fs::metadata(path).expect("stat script").permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(path, perms).expect("chmod script");

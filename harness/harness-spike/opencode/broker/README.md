@@ -1,5 +1,13 @@
 # Managed OpenCode broker request fixtures (STUDIO-995 / PB0)
 
+STUDIO-1208 amends the STUDIO-1001 execution contract: these `run --format json`
+captures remain historical request-schema evidence, not today's subprocess argv.
+The adapter now owns one authenticated private `serve --pure` executor per turn,
+subscribes before prompting and controls session/model/agent/approval over HTTP.
+The provider/auth restrictions and this exact compatibility row remain required.
+The credential-free `pinned_server_compatibility_canary` test qualifies the current
+adapter against the real pinned binary and loopback fake provider (see root README).
+
 The committed evidence behind the managed-OpenCode compatibility row and the closed request schema
 in `~/.rhapsody/docs/provider-broker-design.md` §9.1 / §5.3. Every request here was **measured** —
 captured from the real pinned `opencode` talking to the loopback fake provider in this directory —

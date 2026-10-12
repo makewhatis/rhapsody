@@ -339,6 +339,7 @@ fn spawn_fake_owner(
 /// then issues a REAL HTTP request through the broker with the capability, writing the raw response
 /// body it received to `resp.log` before emitting a normal successful stream-json turn.
 const OPENCODE_SCRIPT: &str = r#"#!/bin/sh
+if [ "$1" = serve ]; then exec python3 "__BRIDGE__" "$0" "$@"; fi
 if [ "$1" = "--version" ]; then echo 1.18.30; exit 0; fi
 printf '%s\n' "$*" >> "__ARGV__"
 env | grep -E '^(OPENCODE_|XDG_DATA_HOME=)' > "__ENV__"
@@ -403,6 +404,13 @@ async fn the_brokered_daemon_chain_is_canary_clean_at_every_boundary() {
     write_executable(
         &script,
         &OPENCODE_SCRIPT
+            .replace(
+                "__BRIDGE__",
+                &Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../harness/stubs/fake-opencode-server.py")
+                    .display()
+                    .to_string(),
+            )
             .replace("__ARGV__", &argv_log.display().to_string())
             .replace("__ENV__", &env_log.display().to_string())
             .replace("__BOUNDARY__", &boundary_log.display().to_string())

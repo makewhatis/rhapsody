@@ -388,7 +388,9 @@ async fn file_tracker_opencode_wall_flow_uses_actual_api_auth_and_releases_on_fa
     );
     let script = dir.child("wall.sh");
     // Source-shaped 429, not a recorded capture; no provider request or credential involved.
-    std::fs::write(&script, "printf '%s\\n' '{\"type\":\"error\",\"error\":{\"name\":\"APIError\",\"data\":{\"message\":\"rate limited\",\"statusCode\":429,\"isRetryable\":true}}}'\nexit 1\n").unwrap();
+    let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../harness/stubs/fake-opencode-server.py");
+    std::fs::write(&script, format!("if [ \"$1\" = serve ]; then exec python3 '{}' \"$0\" \"$@\"; fi\nprintf '%s\\n' '{{\"type\":\"error\",\"error\":{{\"name\":\"APIError\",\"data\":{{\"message\":\"rate limited\",\"statusCode\":429,\"isRetryable\":true}}}}}}'\nexit 1\n",bridge.display())).unwrap();
     let auth = dir.child("auth.json");
     std::fs::write(&auth, br#"{"openai":{"type":"api","key":"test-only-key"}}"#).unwrap();
     let mut ft = build_file_tracker_orch(&src, "");
