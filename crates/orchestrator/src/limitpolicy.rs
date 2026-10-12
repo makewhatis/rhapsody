@@ -146,9 +146,18 @@ pub(crate) struct LimitPolicy {
     pub credit_approvals: HashMap<String, (String, i64)>,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ParkReason {
+    #[default]
+    Account,
+    Scheduled,
+}
+
 pub(crate) struct Suspended {
     pub run: RunningEntry,
     pub outcome: HandoffOutcome,
+    pub park_reason: ParkReason,
     pub note: Option<PathBuf>,
     pub worker_finished: bool,
     pub account: Option<crate::accounts::AccountView>,
@@ -172,6 +181,9 @@ struct ResumeRecord {
     stack_context: String,
     review: Option<crate::review::ReviewRun>,
     outcome: HandoffOutcome,
+    // Legacy records have no reason; treat them as account-driven for recovery.
+    #[serde(default)]
+    park_reason: ParkReason,
     note: Option<PathBuf>,
     account: Option<crate::accounts::AccountView>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -820,6 +832,7 @@ impl Orchestrator {
             Suspended {
                 run: re,
                 outcome,
+                park_reason: ParkReason::Account,
                 note,
                 worker_finished,
                 account: self
@@ -897,8 +910,19 @@ impl Orchestrator {
         if !suspended.worker_finished {
             return;
         }
+        let old = &suspended.run;
+        let primary = EngineSpec {
+            harness: self.effective_harness(&old.harness),
+            model: old.model.clone(),
+            effort: old.model_override.effort.clone(),
+        };
+        // A policy reset is a prediction; an explicit scheduling decision still owns its time.
         match suspended.outcome {
-            HandoffOutcome::Park { resume_at_s } if (self.now)().timestamp() < resume_at_s => {
+            HandoffOutcome::Park { resume_at_s }
+                if (self.now)().timestamp() < resume_at_s
+                    && (suspended.park_reason != ParkReason::Account
+                        || !self.engine_usable(&primary, &old.project_slug)) =>
+            {
                 return;
             }
             HandoffOutcome::ManagerItem(_) => return,
@@ -907,7 +931,7 @@ impl Orchestrator {
         if self.drain.is_draining() {
             return;
         }
-        let old = suspended.run.clone();
+        let old = old.clone();
         let Some(eff) = &self.eff else {
             return;
         };
@@ -994,11 +1018,6 @@ impl Orchestrator {
         }
         let Some(suspended) = self.limit_policy.suspended.remove(id) else {
             return;
-        };
-        let primary = EngineSpec {
-            harness: self.effective_harness(&old.harness),
-            model: old.model.clone(),
-            effort: old.model_override.effort.clone(),
         };
         let list = self.engine_list(&old.identity, primary.clone());
         let (index, spec, resume) = match suspended.outcome {
@@ -1111,6 +1130,7 @@ impl Orchestrator {
             stack_context: r.stack_context.clone(),
             review: r.review.clone(),
             outcome: s.outcome.clone(),
+            park_reason: s.park_reason,
             note: s.note.clone(),
             account: s.account.clone(),
             credit_approval: self.limit_policy.credit_approvals.get(id).cloned(),
@@ -1211,6 +1231,7 @@ impl Orchestrator {
                     Suspended {
                         run,
                         outcome: record.outcome,
+                        park_reason: record.park_reason,
                         note: record.note,
                         worker_finished: true,
                         account: record.account,
@@ -1464,6 +1485,7 @@ impl Orchestrator {
         if let Some(outcome) = outcome {
             if let Some(s) = self.limit_policy.suspended.get_mut(id) {
                 s.outcome = outcome;
+                s.park_reason = ParkReason::Scheduled;
             }
             self.remove_limit_item_ticket(&run.issue.identifier);
             self.persist_limit_resume(id);
@@ -2108,6 +2130,276 @@ mod tests {
         assert_eq!(recovered.credit_spent("claude-subscription", tomorrow), 0.0);
     }
 
+    fn set_token_budget(o: &mut Orchestrator, cap: i64) {
+        o.eff.as_mut().unwrap().cfg.budgets.insert(
+            "fireworks-ai".into(),
+            rhapsody_config::ProviderBudget {
+                daily_tokens: cap,
+                ..Default::default()
+            },
+        );
+        o.feed_budget_windows();
+    }
+
+    fn budget_park() -> (
+        Orchestrator,
+        Arc<dyn Store + Send + Sync>,
+        Arc<AtomicI64>,
+        TempDir,
+    ) {
+        let (mut o, store, clock, dir) = setup(false);
+        clock.store(1791870000, Ordering::SeqCst);
+        std::fs::write(
+            dir.child("worker.md"),
+            "---\nharness: opencode\nmodel: fireworks-ai/model\n---\nWorker\n",
+        )
+        .unwrap();
+        let mut iss = issue("1", "MT-1", "Todo");
+        iss.labels = Some(vec!["rhapsody:@alice".into()]);
+        o.dispatch_issue(iss, Some(2), None, String::new());
+        let run = o.running.get_mut("1").unwrap();
+        run.thread_id = "session-before-limit".into();
+        run.total_tokens = 100;
+        let run = run.clone();
+        o.persist_progress(&run);
+        o.eff.as_mut().unwrap().cfg.limits.wait_max_minutes = 1440;
+        set_token_budget(&mut o, 100);
+        o.enforce_limits();
+        assert!(o.running.is_empty());
+        assert!(matches!(
+            o.limit_policy.suspended["1"].outcome,
+            HandoffOutcome::Park { .. }
+        ));
+        assert_eq!(
+            o.accounts.snapshot((o.now)().timestamp())[0].source,
+            "budget"
+        );
+        assert!(!o.account_usable("fireworks-ai"));
+        // Pin the predicted resume an hour ahead, independently of the host's day boundary.
+        o.limit_policy.suspended.get_mut("1").unwrap().outcome = HandoffOutcome::Park {
+            resume_at_s: (o.now)().timestamp() + 3600,
+        };
+        o.persist_limit_resume("1");
+        (o, store, clock, dir)
+    }
+
+    #[tokio::test]
+    async fn limit_park_production_shape_wakes_after_budget_raise() {
+        use crate::managerlimits::{LimitAction, LimitDecision};
+        use chrono::TimeZone;
+
+        for restart in [false, true] {
+            let (mut o, store, clock, dir) = setup(false);
+            // Local noon keeps the daily reset well beyond the default 30-minute wait.
+            let now = chrono::Local
+                .with_ymd_and_hms(2026, 10, 12, 12, 0, 0)
+                .single()
+                .unwrap()
+                .timestamp();
+            clock.store(now, Ordering::SeqCst);
+            let profile = "---\nharness: opencode\nmodel: fireworks-ai/model\n---\nWorker\n";
+            std::fs::write(dir.child("worker.md"), profile).unwrap();
+            let mut iss = issue("1", "MT-1", "Todo");
+            iss.labels = Some(vec!["rhapsody:@alice".into()]);
+            o.dispatch_issue(iss, Some(2), None, String::new());
+            let run = o.running.get_mut("1").unwrap();
+            run.thread_id = "session-before-limit".into();
+            run.total_tokens = 100;
+            let run = run.clone();
+            o.persist_progress(&run);
+            assert_eq!(o.limits_config().wait_max_minutes, 30);
+            set_token_budget(&mut o, 100);
+            let reset = o
+                .accounts
+                .tightest("fireworks-ai", now)
+                .unwrap()
+                .resets_at_s;
+            assert!(reset - now > 30 * 60);
+            assert!(!o.account_usable("fireworks-ai"));
+            o.enforce_limits();
+            assert!(o.running.is_empty());
+            assert!(matches!(
+                &o.limit_policy.suspended["1"].outcome,
+                HandoffOutcome::ManagerItem(item) if item.account == "fireworks-ai"
+            ));
+            o.apply_limit_decision(LimitDecision {
+                account: "fireworks-ai".into(),
+                ticket: "MT-1".into(),
+                action: LimitAction::Wait,
+                rationale: "wait for the account to recover".into(),
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                o.limit_policy.suspended["1"].outcome,
+                HandoffOutcome::Park {
+                    resume_at_s: reset + 120
+                }
+            );
+            o.resume_due_limits().await;
+            assert!(o.running.is_empty());
+            assert!(o.claimed.contains("1"));
+            let retry = store.load_recovery().unwrap().retries.remove(0);
+            set_token_budget(&mut o, 300);
+            assert!(o.account_usable("fireworks-ai"));
+
+            let _recovered_dir;
+            if restart {
+                drop(o);
+                let (mut recovered, _, recovered_clock, recovered_dir) = setup(false);
+                recovered_clock.store(now, Ordering::SeqCst);
+                std::fs::write(recovered_dir.child("worker.md"), profile).unwrap();
+                recovered.set_store(store.clone());
+                set_token_budget(&mut recovered, 300);
+                recovered
+                    .recover_limit_retry(&retry.identifier, &retry.error)
+                    .await;
+                o = recovered;
+                _recovered_dir = recovered_dir;
+            } else {
+                o.resume_due_limits().await;
+            }
+            let run = o.running.get("1").unwrap_or_else(|| {
+                panic!("manager Wait must wake after the budget raise; restart={restart}")
+            });
+            assert_eq!(run.resume_session, "session-before-limit");
+            assert_eq!(run.retry_attempt, 2);
+            assert_eq!(run.model, "fireworks-ai/model");
+            assert!(!o.limit_policy.suspended.contains_key("1"));
+            assert_eq!(store.issue_history("MT-1", "", 10).unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_park_wakes_early_when_account_becomes_usable() {
+        let (mut o, store, _, _dir) = budget_park();
+        set_token_budget(&mut o, 300);
+        assert!(o.account_usable("fireworks-ai"));
+        o.resume_due_limits().await;
+        let run = o
+            .running
+            .get("1")
+            .expect("healthy park dispatches this pass");
+        assert_eq!(run.resume_session, "session-before-limit");
+        assert_eq!(run.retry_attempt, 2);
+        assert_eq!(run.model, "fireworks-ai/model");
+        assert!(!o.limit_policy.suspended.contains_key("1"));
+        assert_eq!(store.issue_history("MT-1", "", 10).unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn limit_park_stays_parked_while_account_still_unusable() {
+        let (mut o, store, _, _dir) = budget_park();
+        o.resume_due_limits().await;
+        assert!(o.running.is_empty());
+        assert!(o.limit_policy.suspended.contains_key("1"));
+        assert!(o.claimed.contains("1"));
+        assert_eq!(store.load_recovery().unwrap().retries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn limit_park_early_wake_preserves_dispatch_gates() {
+        for gate in ["drain", "capacity", "worker"] {
+            let (mut o, _, _, _dir) = budget_park();
+            set_token_budget(&mut o, 300);
+            match gate {
+                "drain" => {
+                    o.drain.arm((o.now)(), crate::drain::DrainReason::Operator);
+                }
+                "capacity" => o.eff.as_mut().unwrap().max_concurrent = 0,
+                _ => {
+                    o.limit_policy
+                        .suspended
+                        .get_mut("1")
+                        .unwrap()
+                        .worker_finished = false
+                }
+            }
+            o.resume_due_limits().await;
+            assert!(o.running.is_empty(), "{gate}");
+            assert!(o.limit_policy.suspended.contains_key("1"), "{gate}");
+            assert!(o.claimed.contains("1"), "{gate}");
+        }
+    }
+
+    #[tokio::test]
+    async fn limit_park_early_wake_survives_restart() {
+        let (o, store, clock, _dir) = budget_park();
+        let retry = store.load_recovery().unwrap().retries.remove(0);
+        let now = clock.load(Ordering::SeqCst);
+        drop(o);
+        let (mut recovered, _, recovered_clock, dir) = setup(false);
+        recovered_clock.store(now, Ordering::SeqCst);
+        std::fs::write(
+            dir.child("worker.md"),
+            "---\nharness: opencode\nmodel: fireworks-ai/model\n---\nWorker\n",
+        )
+        .unwrap();
+        recovered.set_store(store);
+        set_token_budget(&mut recovered, 300);
+        recovered
+            .recover_limit_retry(&retry.identifier, &retry.error)
+            .await;
+        let run = recovered
+            .running
+            .get("1")
+            .expect("restart uses the raised cap");
+        assert_eq!(run.resume_session, "session-before-limit");
+        assert_eq!(run.retry_attempt, 2);
+        assert!(!recovered.claimed.contains("MT-1"));
+        assert!(!recovered.limit_policy.suspended.contains_key("1"));
+    }
+
+    #[tokio::test]
+    async fn limit_park_early_wake_still_drops_on_identity_change() {
+        let (mut o, store, _, _dir) = budget_park();
+        set_token_budget(&mut o, 300);
+        o.teams
+            .as_mut()
+            .unwrap()
+            .roster
+            .push(rhapsody_config::teams::Identity {
+                name: "bob".into(),
+                profile: "worker".into(),
+                ..Default::default()
+            });
+        let mut iss = issue("1", "MT-1", "Todo");
+        iss.labels = Some(vec!["rhapsody:@bob".into()]);
+        let mut tracker = Fake::new();
+        tracker.candidates = vec![iss.clone()];
+        o.eff.as_mut().unwrap().tracker = Arc::new(tracker);
+        o.resume_due_limits().await;
+        assert!(o.running.is_empty());
+        assert!(!o.limit_policy.suspended.contains_key("1"));
+        assert!(!o.claimed.contains("1"));
+        let recovery = store.load_recovery().unwrap();
+        assert!(recovery.claims.is_empty());
+        assert!(recovery.retries.is_empty());
+        let selected = o.select_dispatch(vec![iss]);
+        assert_eq!(selected.len(), 1);
+        o.dispatch_issue(selected[0].clone(), None, None, String::new());
+        assert_eq!(o.running["1"].identity, "bob");
+        assert!(o.running["1"].resume_session.is_empty());
+    }
+
+    #[tokio::test]
+    async fn old_limit_resume_record_defaults_to_account_driven() {
+        let (o, store, _, _dir) = budget_park();
+        let retry = store.load_recovery().unwrap().retries.remove(0);
+        let mut record: serde_json::Value =
+            serde_json::from_str(retry.error.strip_prefix(RETRY_LIMIT_PREFIX).unwrap()).unwrap();
+        record.as_object_mut().unwrap().remove("park_reason");
+        let old = format!("{RETRY_LIMIT_PREFIX}{record}");
+        let parsed: ResumeRecord = serde_json::from_value(record).unwrap();
+        assert_eq!(parsed.park_reason, ParkReason::Account);
+        let (mut recovered, _, clock, _new_dir) = setup(false);
+        clock.store((o.now)().timestamp(), Ordering::SeqCst);
+        recovered.set_store(store);
+        set_token_budget(&mut recovered, 300);
+        recovered.recover_limit_retry(&retry.identifier, &old).await;
+        assert!(recovered.running.contains_key("1"));
+    }
+
     #[tokio::test]
     async fn parked_recovery_restores_the_hold_before_dispatch_and_the_same_session_after_reset() {
         let (mut o, st, _, _dir) = setup(false);
@@ -2495,7 +2787,7 @@ mod tests {
             o.limit_policy.suspended["1"].outcome,
             HandoffOutcome::Park { resume_at_s: 2620 }
         );
-        clock.store(2619, Ordering::SeqCst);
+        clock.store(2499, Ordering::SeqCst);
         o.resume_limit("1").await;
         assert!(o.running.is_empty());
         clock.store(2620, Ordering::SeqCst);
