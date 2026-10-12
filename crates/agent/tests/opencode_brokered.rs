@@ -521,13 +521,15 @@ async fn a_cut_off_brokered_turn_is_resumed_with_a_rotated_capability() {
         "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 1.18.30; exit 0; fi\n\
          printf '%s\\n' \"$*\" >> \"{argv}\"\n\
          printf '{{\"type\":\"step_start\",\"sessionID\":\"ses_cut\"}}\\n'\n\
-         sleep 3\n",
+          sleep 30\n",
         argv = fx.argv_log.display(),
     );
     write_executable(&fx.script, &cut);
 
     let mut cfg = fx.cfg();
-    cfg.turn_timeout = std::time::Duration::from_secs(1);
+    // The deadline now includes re-probe and HTTP startup. Leave room to
+    // establish the session while the fixture's 30s tool still cannot finish.
+    cfg.turn_timeout = std::time::Duration::from_secs(5);
     let sess = start_brokered_session(
         cfg,
         &fx.workspace.to_string_lossy(),
