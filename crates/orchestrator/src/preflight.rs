@@ -1039,6 +1039,10 @@ mod tests {
     #[tokio::test]
     async fn credential_canary_never_bypasses_existing_probes() {
         let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let dir = crate::testsupport::TempDir::new();
+        let auth = dir.child("auth-kind.json");
+        // Billing attribution needs only the kind, never an operator login or token.
+        std::fs::write(&auth, r#"{"openai":{"type":"oauth"}}"#).unwrap();
         for (harness, account, model) in [
             ("claude", "claude-subscription", ""),
             ("opencode", "chatgpt-subscription", "openai/gpt-test"),
@@ -1049,6 +1053,7 @@ mod tests {
             let eff = o.eff.as_mut().unwrap();
             eff.cfg.agent.backend = harness.into();
             eff.cfg.opencode.model = model.into();
+            eff.cfg.opencode.auth_source = auth.clone();
             let a = issue("a", "TEST-1", "Todo");
             o.dispatch_issue(a.clone(), None, None, String::new());
             assert_eq!(o.running["a"].pricing.account, account);
