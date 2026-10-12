@@ -6411,24 +6411,110 @@ mod tests {
         assert!(o.running.contains_key(&review_key(OWNER, REPO, 12, "bob")));
     }
 
-    /// A review an operator STOPPED is not resurrected two minutes later. `stop_run` leaves the
-    /// key in `claimed` when the (impossible for a `pr:` key) tracker move fails, which is exactly
-    /// the "dead this session" suppression the edge trigger already reads — worth pinning, because
-    /// the watcher is the first thing in the daemon that would re-dispatch on its own initiative.
+    /// Stopping ends an unfinished round, so the next watcher tick owes a fresh review at the
+    /// current head, even when the author has not pushed. No restart or operator rerun is needed.
     #[test]
-    fn an_operator_stopped_review_is_not_re_dispatched() {
+    fn an_operator_stopped_review_is_re_dispatched_at_the_current_head() {
+        for head in [HEAD_A, HEAD_B] {
+            let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+            introduce(&o, row(12, "bob"));
+            assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+            let id = review_key(OWNER, REPO, 12, "bob");
+            let old = o.running[&id].clone();
+            assert!(o.handle_stop_run(old.run_id).found);
+            o.handle_stop_finalize(&id, false); // no tracker ticket can move
+
+            // Assert the real redispatch first: keeping the old claim must turn this red.
+            assert_eq!(o.handle_review_sweep(&[open_at(12, head)]).dispatched, 1);
+            let fresh = &o.running[&id];
+            assert!(old.cancel.wait().is_cancelled());
+            assert_ne!(fresh.run_id, old.run_id);
+            assert_eq!(fresh.review.as_ref().expect("review").head_sha, head);
+            assert_eq!(dispatched.lock().expect("lock").len(), 2);
+            assert_eq!(watch_row(&o, 12, "bob").last_reviewed_sha, "");
+            assert_eq!(
+                o.store().get_run(old.run_id).unwrap().unwrap().outcome,
+                rs::OUTCOME_STOPPED
+            );
+            assert_eq!(o.handle_review_sweep(&[open_at(12, head)]).dispatched, 0);
+        }
+    }
+
+    #[test]
+    fn an_operator_rerun_after_review_stop_rearms_the_row() {
         let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
         introduce(&o, row(12, "bob"));
         o.handle_review_sweep(&[open_at(12, HEAD_A)]);
-
         let id = review_key(OWNER, REPO, 12, "bob");
-        o.running.remove(&id);
-        o.claimed.insert(id); // what `stop_run` + a failed finalize leave behind
+        let run_id = o.running[&id].run_id;
+        assert!(o.handle_stop_run(run_id).found);
+        assert!(!o.claimed.contains(&id));
+        let stopped = watch_row(&o, 12, "bob");
+        assert_eq!(stopped.status, REVIEW_STATUS_REQUESTED);
+        assert_eq!(stopped.requested_sha, HEAD_A);
+        assert!(review_round_due(&stopped, HEAD_A, false));
+        assert_eq!(
+            o.handle_review_rerun(&coord(12)),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        );
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 1);
+        assert_eq!(dispatched.lock().expect("lock").len(), 2);
+    }
 
-        for _ in 0..3 {
-            assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
-        }
-        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+    #[test]
+    fn resuming_a_stopped_review_releases_legacy_suppression_without_a_verdict() {
+        let (mut o, _) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        approve(&mut o, 12, "bob", HEAD_A);
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        let id = review_key(OWNER, REPO, 12, "bob");
+        let old = o.terminate(&id).expect("live review");
+        o.persist_end_run(&old, rs::OUTCOME_STOPPED, "stopped by user");
+        o.claimed.insert(id.clone()); // a stopped row from the old behavior
+
+        let admitted = o.handle_resume(&id, &id, &old.project_slug, old.run_id);
+        assert!(!admitted.live && !admitted.superseded && admitted.err.is_none());
+        assert!(!o.claimed.contains(&id));
+        let resumed = watch_row(&o, 12, "bob");
+        assert_eq!(resumed.status, REVIEW_STATUS_REQUESTED);
+        assert_eq!(resumed.last_reviewed_sha, HEAD_A);
+        assert_eq!(resumed.requested_sha, HEAD_B);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_B)]).dispatched, 1);
+
+        // Resuming the old run must never disarm its replacement.
+        let before = watch_row(&o, 12, "bob");
+        assert!(
+            o.handle_resume(&id, &id, &old.project_slug, old.run_id)
+                .live
+        );
+        assert!(o.claimed.contains(&id));
+        assert_eq!(watch_row(&o, 12, "bob"), before);
+
+        approve(&mut o, 12, "bob", HEAD_B);
+        let completed = watch_row(&o, 12, "bob");
+        assert!(
+            o.handle_resume(&id, &id, &old.project_slug, old.run_id)
+                .superseded
+        );
+        assert_eq!(watch_row(&o, 12, "bob"), completed);
+    }
+
+    #[test]
+    fn resuming_a_stopped_review_does_not_revive_a_dismissed_watch() {
+        let (mut o, _) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        let id = review_key(OWNER, REPO, 12, "bob");
+        let old = o.terminate(&id).expect("live review");
+        o.persist_end_run(&old, rs::OUTCOME_STOPPED, "stopped by user");
+        o.store()
+            .drop_review_watch(&key(12, "bob"))
+            .expect("dismiss");
+        let before = watch_row(&o, 12, "bob");
+        let admitted = o.handle_resume(&id, &id, &old.project_slug, old.run_id);
+        assert!(!admitted.live && !admitted.superseded && admitted.err.is_none());
+        assert_eq!(watch_row(&o, 12, "bob"), before);
+        assert_eq!(o.handle_review_sweep(&[open_at(12, HEAD_A)]).dispatched, 0);
     }
 
     /// STUDIO-949: a watch row whose ORIGIN ticket is currently held for a human dispatches no
