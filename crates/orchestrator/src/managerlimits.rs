@@ -532,11 +532,8 @@ impl Orchestrator {
         };
         if let Some(s) = self.limit_policy.suspended.get_mut(&id) {
             s.outcome = outcome;
-            s.park_reason = if matches!(decision.action, LimitAction::Wait) {
-                ParkReason::Scheduled
-            } else {
-                ParkReason::Account
-            };
+            // Wait uses the account's predicted reset, not a manager-chosen time.
+            s.park_reason = ParkReason::Account;
         }
         self.persist_limit_resume(&id);
         self.remove_limit_item_ticket(&decision.ticket);
@@ -913,28 +910,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manager_wait_park_is_not_woken_early() {
+    async fn manager_wait_park_wakes_early_when_account_usable() {
         let (mut o, _, _dir) = setup();
         o.apply_limit_decision(decision(LimitAction::Wait))
             .await
             .unwrap();
-        // The real window resets before the manager's chosen reset margin.
+        let retry = o.store.load_recovery().unwrap().retries.remove(0);
+        // The real window resets before the predicted reset margin.
         o.now = Box::new(|| chrono::DateTime::from_timestamp(10001, 0).unwrap());
         assert!(o.account_usable("claude-subscription"));
         o.resume_due_limits().await;
-        assert!(o.running.is_empty());
-        assert!(o.limit_policy.suspended.contains_key("1"));
-        let retry = o.store.load_recovery().unwrap().retries.remove(0);
+        assert!(o.running.contains_key("1"));
+        assert!(!o.limit_policy.suspended.contains_key("1"));
         let (mut recovered, _, _new_dir) = setup();
         recovered.now = Box::new(|| chrono::DateTime::from_timestamp(10001, 0).unwrap());
         recovered
             .recover_limit_retry(&retry.identifier, &retry.error)
             .await;
-        assert!(recovered.running.is_empty());
-        assert!(recovered.limit_policy.suspended.contains_key("1"));
-        recovered.now = Box::new(|| chrono::DateTime::from_timestamp(10120, 0).unwrap());
-        recovered.resume_due_limits().await;
         assert!(recovered.running.contains_key("1"));
+        assert!(!recovered.limit_policy.suspended.contains_key("1"));
     }
 
     #[tokio::test]

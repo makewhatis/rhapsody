@@ -2184,6 +2184,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn limit_park_production_shape_wakes_after_budget_raise() {
+        use crate::managerlimits::{LimitAction, LimitDecision};
+        use chrono::TimeZone;
+
+        for restart in [false, true] {
+            let (mut o, store, clock, dir) = setup(false);
+            // Local noon keeps the daily reset well beyond the default 30-minute wait.
+            let now = chrono::Local
+                .with_ymd_and_hms(2026, 10, 12, 12, 0, 0)
+                .single()
+                .unwrap()
+                .timestamp();
+            clock.store(now, Ordering::SeqCst);
+            let profile = "---\nharness: opencode\nmodel: fireworks-ai/model\n---\nWorker\n";
+            std::fs::write(dir.child("worker.md"), profile).unwrap();
+            let mut iss = issue("1", "MT-1", "Todo");
+            iss.labels = Some(vec!["rhapsody:@alice".into()]);
+            o.dispatch_issue(iss, Some(2), None, String::new());
+            let run = o.running.get_mut("1").unwrap();
+            run.thread_id = "session-before-limit".into();
+            run.total_tokens = 100;
+            let run = run.clone();
+            o.persist_progress(&run);
+            assert_eq!(o.limits_config().wait_max_minutes, 30);
+            set_token_budget(&mut o, 100);
+            let reset = o
+                .accounts
+                .tightest("fireworks-ai", now)
+                .unwrap()
+                .resets_at_s;
+            assert!(reset - now > 30 * 60);
+            assert!(!o.account_usable("fireworks-ai"));
+            o.enforce_limits();
+            assert!(o.running.is_empty());
+            assert!(matches!(
+                &o.limit_policy.suspended["1"].outcome,
+                HandoffOutcome::ManagerItem(item) if item.account == "fireworks-ai"
+            ));
+            o.apply_limit_decision(LimitDecision {
+                account: "fireworks-ai".into(),
+                ticket: "MT-1".into(),
+                action: LimitAction::Wait,
+                rationale: "wait for the account to recover".into(),
+            })
+            .await
+            .unwrap();
+            assert_eq!(
+                o.limit_policy.suspended["1"].outcome,
+                HandoffOutcome::Park {
+                    resume_at_s: reset + 120
+                }
+            );
+            o.resume_due_limits().await;
+            assert!(o.running.is_empty());
+            assert!(o.claimed.contains("1"));
+            let retry = store.load_recovery().unwrap().retries.remove(0);
+            set_token_budget(&mut o, 300);
+            assert!(o.account_usable("fireworks-ai"));
+
+            let _recovered_dir;
+            if restart {
+                drop(o);
+                let (mut recovered, _, recovered_clock, recovered_dir) = setup(false);
+                recovered_clock.store(now, Ordering::SeqCst);
+                std::fs::write(recovered_dir.child("worker.md"), profile).unwrap();
+                recovered.set_store(store.clone());
+                set_token_budget(&mut recovered, 300);
+                recovered
+                    .recover_limit_retry(&retry.identifier, &retry.error)
+                    .await;
+                o = recovered;
+                _recovered_dir = recovered_dir;
+            } else {
+                o.resume_due_limits().await;
+            }
+            let run = o.running.get("1").unwrap_or_else(|| {
+                panic!("manager Wait must wake after the budget raise; restart={restart}")
+            });
+            assert_eq!(run.resume_session, "session-before-limit");
+            assert_eq!(run.retry_attempt, 2);
+            assert_eq!(run.model, "fireworks-ai/model");
+            assert!(!o.limit_policy.suspended.contains_key("1"));
+            assert_eq!(store.issue_history("MT-1", "", 10).unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
     async fn limit_park_wakes_early_when_account_becomes_usable() {
         let (mut o, store, _, _dir) = budget_park();
         set_token_budget(&mut o, 300);
