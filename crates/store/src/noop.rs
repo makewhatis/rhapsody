@@ -501,6 +501,29 @@ impl Store for Noop {
         Ok(Vec::new())
     }
 
+    fn queue_run_message(
+        &self,
+        _run_id: i64,
+        _identifier: &str,
+        _body: &str,
+        _prompt: &str,
+        _created_at_ms: i64,
+        _cap: usize,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(Some(0))
+    }
+    fn pending_run_messages(&self, _identifier: &str) -> Result<Vec<QueuedRunMessage>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn deliver_queued_run_messages(
+        &self,
+        _ids: &[i64],
+        _run_id: i64,
+        _turn: i64,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     // Ticketless review watch set (STUDIO-711). With persistence off there is no watch set to
     // survive a restart, so every write succeeds silently and the set reads back empty — the same
     // guard-free contract every other method here keeps.

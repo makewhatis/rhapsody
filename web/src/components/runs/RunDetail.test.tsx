@@ -298,6 +298,7 @@ describe("RunDetail operator messages (INF-250)", () => {
       { id: 1, run_id: 1, body: "delivered one", created_at_ms: 1, status: "delivered", delivered_turn: 2 },
       { id: 2, run_id: 1, body: "pending one", created_at_ms: 2, status: "sent" },
       { id: 3, run_id: 1, body: "missed one", created_at_ms: 3, status: "expired" },
+      { id: 4, run_id: 1, body: "next-turn one", created_at_ms: 4, status: "queued_next_turn" },
     ]);
     renderDetail();
     expect(await screen.findByText("delivered one")).toBeTruthy();
@@ -306,6 +307,7 @@ describe("RunDetail operator messages (INF-250)", () => {
     expect(screen.getByText("sent")).toBeTruthy();
     expect(screen.getByText("missed one")).toBeTruthy();
     expect(screen.getByText("expired")).toBeTruthy();
+    expect(screen.getByText("pending · next turn or dispatch")).toBeTruthy();
   });
 
   it("surfaces a send error inline (e.g. backlog_full) without clearing the input", async () => {

@@ -82,6 +82,13 @@ function message(over: Partial<RunMessage> = {}): RunMessage {
   };
 }
 
+it("shows next-turn messages as pending, including after the run ends", () => {
+  expect(messageChip(message({ status: "queued_next_turn" as RunMessage["status"] }))).toEqual({
+    tone: "sent",
+    label: "pending · next turn or dispatch",
+  });
+});
+
 describe("the rail", () => {
   // §3C names five, and since STUDIO-749 built the run-branch diff endpoint, none of them is
   // waiting on one. Diff was the last that was; a rail that still marked it would be disowning a

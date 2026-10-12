@@ -253,6 +253,9 @@ pub struct WorkerDeps {
     /// resolve the calling run from that env alone, and the daemon resolves run → identity from the
     /// dispatch-time binding.
     pub run_id: i64,
+    /// The existing Store connection is shared solely for next-turn prompt delivery. It never
+    /// exposes scheduling state to the worker; pending rows outlive cancellation and run teardown.
+    pub message_store: Option<Arc<dyn store::Store + Send + Sync>>,
     /// The review state a declared HANDOFF parks the ticket in (a review-state name; `None` ⇒ the
     /// feature is off, giving Go-identical behavior). Dispatched agents cannot move Linear state
     /// themselves — the runner injects the mcp_config with `--strict-mcp-config`, so only the
@@ -1400,11 +1403,60 @@ impl WorkerDeps {
                 }
                 None => None,
             };
+            let queued = match &self.message_store {
+                Some(store) => match store.pending_run_messages(&issue.identifier) {
+                    Ok(rows) => rows,
+                    Err(error) => {
+                        return (
+                            issue.state.clone(),
+                            last_result,
+                            Some(WorkerError::Agent(agent::AgentError::Other(format!(
+                                "next-turn messages unreadable: {error}"
+                            )))),
+                        );
+                    }
+                },
+                None => Vec::new(),
+            };
+            if !queued.is_empty() && self.run_id == 0 {
+                return (
+                    issue.state.clone(),
+                    last_result,
+                    Some(WorkerError::Agent(agent::AgentError::Other(
+                        "next-turn messages require a persisted destination run".into(),
+                    ))),
+                );
+            }
+            let p = if queued.is_empty() {
+                p
+            } else {
+                format!(
+                    "{}\n\n{p}",
+                    queued
+                        .iter()
+                        .map(|m| m.prompt.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n")
+                )
+            };
+            let delivered = std::sync::atomic::AtomicBool::new(false);
             let (tr, terr) = {
                 // Emit the agent event as a (trace-correlated) log line and forward it. Scoped so the
                 // forwarding closure is dropped before `issue.state` is mutated below.
                 let auth_reported = &auth_reported;
                 let wrapped = move |e: Event| {
+                    if e.event_type == agent::EVENT_SESSION_STARTED
+                        && !delivered.swap(true, std::sync::atomic::Ordering::Relaxed)
+                        && !queued.is_empty()
+                        && let Some(store) = &self.message_store
+                        && let Err(error) = store.deliver_queued_run_messages(
+                            &queued.iter().map(|m| m.id).collect::<Vec<_>>(),
+                            self.run_id,
+                            turn,
+                        )
+                    {
+                        tracing::error!(%error, "next-turn message delivery could not be recorded; rows remain pending");
+                    }
                     if let Some(oauth) = sess.account_oauth()
                         && !auth_reported.swap(true, std::sync::atomic::Ordering::Relaxed)
                     {
@@ -1841,6 +1893,7 @@ fi
             manager_root: String::new(),
             manager_test_credential: Some("fake-manager-access".into()),
             run_id: 0,
+            message_store: None,
             drain: crate::drain::DrainSignal::new(),
             // STUDIO-978: a fully-capable fake, MCP injection on, no pre-decided refusal — the
             // honest default for the pre-978 tests, none of which exercises the refusal path.
@@ -1868,6 +1921,242 @@ fi
         let mut ag = agentfake::Fake::new();
         ag.turns = turns;
         Arc::new(ag)
+    }
+
+    #[tokio::test]
+    async fn queued_message_reaches_the_next_turn_prompt_exactly_once() {
+        use rhapsody_store::{Sqlite, Store, StorePath};
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut fake = agentfake::Fake::new();
+        fake.capabilities.steering = agent::Steering::BetweenTurns;
+        fake.turns = (0..3)
+            .map(|n| agentfake::TurnScript {
+                events: vec![
+                    Event {
+                        event_type: agent::EVENT_SESSION_STARTED.into(),
+                        ..Default::default()
+                    },
+                    Event {
+                        event_type: agent::EVENT_NOTIFICATION.into(),
+                        message: n.to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..succeeded_turn()
+            })
+            .collect();
+        let ag = Arc::new(fake);
+        let tracker = Arc::new(trackerfake::Fake::new());
+        let mut o = crate::Orchestrator::new("WORKFLOW.md");
+        let mut eff = crate::testsupport::empty_effective(tracker.clone());
+        eff.agent = ag.clone();
+        eff.max_concurrent = 10;
+        o.eff = Some(eff);
+        o.set_store(store.clone());
+        o.spawn = Some(Box::new(|_, _, _| {}));
+        let iss = issue("ID-1", "MT-1", "In Progress");
+        o.dispatch_issue(iss.clone(), None, None, String::new());
+        let run_id = o.running["ID-1"].run_id;
+        let o = Mutex::new(o);
+        let prompts = Mutex::new(Vec::new());
+        let mut deps = make_deps(ws, ag.clone(), tracker, "Work", 3);
+        deps.run_id = run_id;
+        deps.message_store = Some(store.clone());
+        let callback = |e: Event| {
+            if e.event_type == agent::EVENT_NOTIFICATION {
+                prompts.lock().unwrap().push(ag.last_prompt());
+                if e.message == "0" {
+                    let res = o
+                        .lock()
+                        .unwrap()
+                        .send_run_message(run_id, "correct the scope");
+                    assert!(res.queued_next_turn && res.id > 0);
+                    assert_eq!(
+                        store.list_run_messages(run_id).unwrap()[0].status,
+                        "queued_next_turn"
+                    );
+                }
+            }
+        };
+        let (_, _, err) = run_agent_attempt(&mut deps, iss, None, None, &callback, None).await;
+        assert!(err.is_none(), "{err:?}");
+        let prompts = prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 3);
+        assert!(!prompts[0].contains("correct the scope"));
+        assert!(prompts[1].starts_with("OPERATOR MESSAGE"));
+        assert_eq!(prompts[1].matches("correct the scope").count(), 1);
+        assert!(!prompts[2].contains("correct the scope"));
+        let messages = store.list_run_messages(run_id).unwrap();
+        assert_eq!(messages[0].status, "delivered");
+        assert_eq!(messages[0].delivered_turn, Some(2));
+    }
+
+    #[tokio::test]
+    async fn queued_message_survives_run_end_and_reaches_the_next_dispatch() {
+        use rhapsody_store::{Sqlite, Store, StorePath};
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let original = store
+            .start_run(store::RunStart {
+                issue_identifier: "MT-1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .queue_run_message(
+                original,
+                "MT-1",
+                "carry the scope",
+                &crate::message::operator_wrap("carry the scope"),
+                1,
+                16,
+            )
+            .unwrap();
+        store
+            .end_run(
+                original,
+                store::RunEnd {
+                    outcome: store::OUTCOME_COMPLETED.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.expire_run_messages(original).unwrap();
+        let (ws, _root) = test_workspace(HookScripts::default());
+        // A later dispatch may use Claude; the queued correction still belongs to its ticket.
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            events: vec![Event {
+                event_type: agent::EVENT_SESSION_STARTED.into(),
+                ..Default::default()
+            }],
+            ..succeeded_turn()
+        }]);
+        let next_run = store
+            .start_run(store::RunStart {
+                issue_identifier: "MT-1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut deps = make_deps(
+            ws,
+            ag.clone(),
+            Arc::new(trackerfake::Fake::new()),
+            "Work",
+            1,
+        );
+        deps.run_id = next_run;
+        deps.message_store = Some(store.clone());
+        let (_, _, err) = run_agent_attempt(
+            &mut deps,
+            issue("ID-1", "MT-1", "In Progress"),
+            None,
+            None,
+            &|_| {},
+            None,
+        )
+        .await;
+        assert!(err.is_none(), "{err:?}");
+        assert!(ag.last_prompt().starts_with("OPERATOR MESSAGE"));
+        assert_eq!(ag.last_prompt().matches("carry the scope").count(), 1);
+        assert_eq!(
+            store.list_run_messages(original).unwrap()[0].status,
+            "delivered"
+        );
+        assert_eq!(
+            store.list_run_messages(next_run).unwrap()[0].delivered_turn,
+            Some(1)
+        );
+        assert!(store.pending_run_messages("MT-1").unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn queued_message_remains_pending_when_turn_startup_fails() {
+        use rhapsody_store::{Sqlite, Store, StorePath};
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        store
+            .queue_run_message(
+                7,
+                "MT-1",
+                "keep me",
+                &crate::message::operator_wrap("keep me"),
+                1,
+                16,
+            )
+            .unwrap();
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            err: Some(agent::AgentError::StartupFailed),
+            ..Default::default()
+        }]);
+        let mut deps = make_deps(ws, ag, Arc::new(trackerfake::Fake::new()), "Work", 1);
+        deps.run_id = 8;
+        deps.message_store = Some(store.clone());
+        let (_, _, err) = run_agent_attempt(
+            &mut deps,
+            issue("ID-1", "MT-1", "In Progress"),
+            None,
+            None,
+            &|_| {},
+            None,
+        )
+        .await;
+        assert!(err.is_some());
+        assert_eq!(
+            store.list_run_messages(7).unwrap()[0].status,
+            "queued_next_turn"
+        );
+        assert_eq!(store.pending_run_messages("MT-1").unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn queued_message_is_not_spent_by_an_unpersisted_destination_run() {
+        use rhapsody_store::{Sqlite, Store, StorePath};
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        store
+            .queue_run_message(
+                7,
+                "MT-1",
+                "scope",
+                &crate::message::operator_wrap("scope"),
+                1,
+                16,
+            )
+            .unwrap();
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            events: vec![Event {
+                event_type: agent::EVENT_SESSION_STARTED.into(),
+                ..Default::default()
+            }],
+            ..succeeded_turn()
+        }]);
+        let mut deps = make_deps(
+            ws,
+            ag.clone(),
+            Arc::new(trackerfake::Fake::new()),
+            "Work",
+            1,
+        );
+        deps.message_store = Some(store.clone());
+        let (_, _, err) = run_agent_attempt(
+            &mut deps,
+            issue("ID-1", "MT-1", "In Progress"),
+            None,
+            None,
+            &|_| {},
+            None,
+        )
+        .await;
+        assert!(
+            err.unwrap()
+                .to_string()
+                .contains("persisted destination run")
+        );
+        assert!(
+            ag.last_prompt().is_empty(),
+            "no turn starts without a delivery record"
+        );
+        assert_eq!(store.pending_run_messages("MT-1").unwrap().len(), 1);
     }
 
     #[tokio::test]
