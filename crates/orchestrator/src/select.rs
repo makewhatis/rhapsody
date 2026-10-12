@@ -79,6 +79,7 @@ impl Orchestrator {
         };
         self.human_holds.begin_pass(true);
         for issue in &issues {
+            self.log_non_live_claim(issue);
             self.observe_parked_issue(issue);
         }
         crate::dispatch::sort_for_dispatch(&mut issues);
@@ -517,6 +518,7 @@ impl Orchestrator {
         // verdict says the board could not be read (STUDIO-949 round 13).
         self.human_holds.begin_pass(read_the_board);
         for issue in &tagged {
+            self.log_non_live_claim(&issue.iss);
             self.observe_parked_issue_in_project(&issue.iss, issue.proj);
         }
         sort_tagged_stable(&mut tagged);
@@ -995,6 +997,126 @@ mod tests {
     }
 
     // --- select_test.go (single-project) ------------------------------------------------------
+
+    /// STUDIO-1200: non-live claims must explain their refusal on both ladders, even at
+    /// capacity, without repeating the same ticket/cause on every poll.
+    #[test]
+    fn a_rejected_login_claim_logs_once_per_ticket_and_cause() {
+        let (_, events) = capture_events(|| {
+            let mut o = orch_for_select(0, HashMap::new(), None);
+            o.spawn = Some(Box::new(|_, _, _| {}));
+            o.dispatch_issue(issue("1", "A-1", "Todo"), None, None, String::new());
+            let started_at = o.running["1"].started_at;
+            o.on_worker_exit(crate::retry::EvWorkerExit {
+                issue_id: "1".into(),
+                started_at,
+                failed: true,
+                auth_needed: true,
+                err_msg: "opencode_auth_needed".into(),
+                last_state: "Todo".into(),
+                declared_handoff: false,
+                review_verdict: None,
+                verdict_text: None,
+                refused: false,
+            });
+            let mut held = issue("1", "A-1", "Todo");
+            held.labels = Some(vec![crate::teams::HUMAN_LABEL.into()]);
+            // Warm the shared callsite before rebuilding tracing's global interest cache.
+            o.select_dispatch(vec![held.clone()]);
+            tracing::callsite::rebuild_interest_cache();
+            let mut other = held.clone();
+            other.id = "2".into();
+            other.identifier = "A-2".into();
+            o.dispatch_issue(other.clone(), None, None, String::new());
+            let started_at = o.running["2"].started_at;
+            o.on_worker_exit(crate::retry::EvWorkerExit {
+                issue_id: "2".into(),
+                started_at,
+                failed: true,
+                auth_needed: true,
+                err_msg: "opencode_auth_needed".into(),
+                last_state: "Todo".into(),
+                declared_handoff: false,
+                review_verdict: None,
+                verdict_text: None,
+                refused: false,
+            });
+            // A third ticket is seen ONLY by the multi-project ladder, so removing that
+            // ladder's diagnostic cannot hide behind the single-project call above.
+            let mut multi_only = other.clone();
+            multi_only.id = "3".into();
+            multi_only.identifier = "A-3".into();
+            o.claimed.insert("3".into());
+            o.auth_hold_claims.insert("3".into());
+            let live = issue("4", "A-4", "Todo");
+            o.dispatch_issue(live.clone(), None, None, String::new());
+            o.eff.as_mut().expect("eff").projects =
+                vec![empty_resolved_project("p", Arc::new(Fake::new()))];
+            for _ in 0..3 {
+                assert!(
+                    o.select_dispatch(vec![held.clone(), other.clone()])
+                        .is_empty()
+                );
+                assert!(
+                    o.select_dispatch_multi(
+                        vec![other.clone(), multi_only.clone(), live.clone()]
+                            .into_iter()
+                            .map(|iss| TaggedIssue { iss, proj: Some(0) })
+                            .collect()
+                    )
+                    .is_empty()
+                );
+            }
+            // Dedupe is per cause, not just ticket; a different claim must be explained too.
+            o.auth_hold_claims.remove("2");
+            o.select_dispatch(vec![other.clone()]);
+            o.select_dispatch(vec![other]);
+        });
+        let skips: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.level == "INFO"
+                    && e.fields.get("issue_identifier").is_some_and(|s| s == "A-2")
+                    && e.fields
+                        .get("cause")
+                        .is_some_and(|s| s == "rejected login human hold")
+                    && e.message
+                        .starts_with("skipping dispatch: claimed with no live run")
+            })
+            .collect();
+        assert_eq!(skips.len(), 1, "one INFO per ticket/cause: {events:?}");
+        assert!(skips[0].fields["action"].contains("resume"));
+        assert_eq!(
+            skips[0].fields.get("cause").map(String::as_str),
+            Some("rejected login human hold")
+        );
+        let claims: Vec<_> = events
+            .iter()
+            .filter(|e| {
+                e.level == "INFO"
+                    && e.message
+                        .starts_with("skipping dispatch: claimed with no live run")
+            })
+            .collect();
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|e| e.fields["issue_identifier"] == "A-3")
+                .count(),
+            1
+        );
+        assert_eq!(
+            claims
+                .iter()
+                .filter(|e| e.fields["issue_identifier"] == "A-2")
+                .count(),
+            2
+        );
+        assert!(
+            !claims.iter().any(|e| e.fields["issue_identifier"] == "A-4"),
+            "live claims are not holds"
+        );
+    }
 
     // Mirrors Go `TestSelectDispatchRespectsGlobalSlots`.
     #[test]

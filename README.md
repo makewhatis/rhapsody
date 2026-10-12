@@ -82,6 +82,19 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Rejected-login holds remain resumable after manual label removal (STUDIO-1200)
+
+Rejected-login exits retain loop-local claim provenance. The existing human-step resume action
+accepts that non-live claim even when an operator already removed `rhapsody:human` by hand; the
+job page's hold read still offers Resume for that claim. Resuming
+clears the claim and seeds the operator's note atomically before the next tick can dispatch.
+Ordinary unlabeled suppressions and claims with live runs, retries or preparation remain refused.
+Label-present resumes still remove the label and clear the claim together. Manual removal alone
+does not resume a rejected-login claim: use the resume-hold action, without re-adding the label.
+Selection reports claims with no live run at INFO once per ticket/cause on both ladders, including
+when capacity is full. These human-hold extensions have no frozen Go counterpart; API shapes,
+schema and golden fixtures are unchanged.
+
 ### Operator stop/resume ends a ticketless review round locally (STUDIO-1182)
 
 Stopping a reviewer releases its synthetic key's claim immediately and re-arms its existing live

@@ -170,6 +170,8 @@ pub struct HumanHoldLedger {
 struct HumanHoldState {
     /// Ticket identifiers already announced this process lifetime (the dedupe).
     announced: HashSet<String>,
+    /// Non-live claim diagnostics, deduped separately by ticket AND cause (STUDIO-1200).
+    claims_announced: HashSet<(String, &'static str)>,
     /// Tickets held by the MOST RECENT selection pass, for the console.
     held: Vec<HeldForHuman>,
     /// Every ticket the most recent selection pass OBSERVED wearing
@@ -224,6 +226,15 @@ impl Default for HumanHoldLedger {
 }
 
 impl HumanHoldLedger {
+    fn claim_is_news(&self, identifier: &str, cause: &'static str) -> bool {
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        let key = (identifier.to_string(), cause);
+        if st.claims_announced.len() >= HUMAN_HOLD_CAPACITY && !st.claims_announced.contains(&key) {
+            st.claims_announced.clear();
+        }
+        st.claims_announced.insert(key)
+    }
+
     /// Starts a fresh selection pass over a board the caller COULD SEE: the CURRENT hold set is
     /// dropped, so a ticket that stopped wearing the label — or left the candidate set — stops being
     /// reported. The announced set is deliberately NOT touched, and the **primed** flag is set: this
@@ -590,6 +601,43 @@ pub(crate) fn blocker_state_name(b: &BlockerRef) -> String {
 }
 
 impl Orchestrator {
+    /// A claim without live work otherwise drops silently before eligibility's human-label gate.
+    /// Run over the entire candidate fetch so capacity truncation cannot hide the explanation.
+    pub(crate) fn log_non_live_claim(&self, iss: &Issue) {
+        if self.running.contains_key(&iss.id) {
+            return;
+        }
+        let key = if self.claimed.contains(&iss.id) {
+            &iss.id
+        } else if self.claimed.contains(&iss.identifier) {
+            &iss.identifier
+        } else {
+            return;
+        };
+        let cause = if self.auth_hold_claims.contains(key) {
+            "rejected login human hold"
+        } else if self.retry_attempts.contains_key(key) {
+            "scheduled retry"
+        } else if self.preparing.contains(key) {
+            "dispatch preparation"
+        } else {
+            "in-memory suppression or claim election"
+        };
+        if self.human_holds.claim_is_news(&iss.identifier, cause) {
+            let action = if self.auth_hold_claims.contains(key) {
+                "resume the human hold from the job page (the label may already be gone)"
+            } else {
+                "waiting for retry, preparation or claim release"
+            };
+            tracing::info!(
+                issue_identifier = %iss.identifier,
+                cause,
+                action,
+                "skipping dispatch: claimed with no live run"
+            );
+        }
+    }
+
     /// Records and reports a `rhapsody:human` hold (STUDIO-949). The refusal itself is
     /// [`eligibility`]'s; this is the otherwise-silent half — one `tracing::info!` line the FIRST
     /// time the ticket is held, and the entry the console reads. A hold that repeats every tick is

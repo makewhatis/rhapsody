@@ -822,6 +822,7 @@ impl Orchestrator {
         // context.WithCancel(o.ctx)` + `re.cancel = cancel`); `terminate` / `shutdown` fire it.
         re.cancel = CancelSignal::new();
         let id = iss.id.clone();
+        self.auth_hold_claims.remove(&id);
         self.claimed.insert(id.clone());
         self.clear_retry(&id);
         self.persist_start_run(&mut re, attempt_norm);
@@ -1156,7 +1157,8 @@ impl Orchestrator {
         // re-dispatched every few minutes for an hour — each attempt 401ing on the same dead copy.
         // Recorded once and held exactly as a refusal is above; the worker labelled the ticket
         // `rhapsody:human`, which keeps it out of selection across a restart too, and resuming it
-        // from the job page clears the claim and the label together.
+        // from the job page clears the claim and the label together, even when the operator
+        // already removed the label by hand (STUDIO-1200).
         if e.auth_needed {
             self.completed.remove(&e.issue_id);
             tracing::warn!(
@@ -1174,6 +1176,7 @@ impl Orchestrator {
             self.persist_complete(&re.issue.identifier);
             self.persist_totals();
             self.claimed.insert(e.issue_id.clone());
+            self.auth_hold_claims.insert(e.issue_id.clone());
             return;
         }
         if self.subject_parked(&re.issue.identifier, "author") {
