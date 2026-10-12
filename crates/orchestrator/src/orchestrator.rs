@@ -193,9 +193,9 @@ pub struct RunningEntry {
     pub last_cpu_sample_at: DateTime<Utc>,
     pub cpu_failure_since: Option<DateTime<Utc>>,
     pub cpu_failure_logged: bool,
-    /// Tool-child liveness is independent of CPU sampling/thresholds (STUDIO-1208).
-    pub last_tool_active_at: DateTime<Utc>,
-    pub tool_failure_logged: bool,
+    /// Open calls in the current turn; never persisted or inherited by a retry.
+    pub open_tool_calls: HashSet<String>,
+    pub tool_turn_finished: bool,
 
     pub recent_events: Vec<EventRecord>,
 
@@ -279,8 +279,8 @@ impl RunningEntry {
             last_cpu_sample_at: zero_time(),
             cpu_failure_since: None,
             cpu_failure_logged: false,
-            last_tool_active_at: zero_time(),
-            tool_failure_logged: false,
+            open_tool_calls: HashSet::new(),
+            tool_turn_finished: true,
             recent_events: Vec::new(),
         }
     }

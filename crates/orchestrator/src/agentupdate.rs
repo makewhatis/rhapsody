@@ -96,7 +96,7 @@ impl Orchestrator {
             re.last_cpu_ticks = 0;
             re.last_cpu_sample_at = zero_time();
             re.cpu_failure_since = None;
-            re.last_tool_active_at = zero_time();
+            re.open_tool_calls.clear();
         }
 
         re.recent_events.push(EventRecord {
@@ -110,11 +110,31 @@ impl Orchestrator {
         }
 
         if e.ev.event_type == agent::EVENT_SESSION_STARTED {
+            re.open_tool_calls.clear();
+            re.tool_turn_finished = false;
             if !e.ev.message.is_empty() {
                 re.thread_id = e.ev.message.clone(); // claude session id carried in the init event
             }
             re.turn_count += 1;
             re.session_id = format!("{}-{}", re.thread_id, re.turn_count);
+        }
+
+        for call in &e.ev.tool_calls {
+            if re.tool_turn_finished || call.session_id != re.thread_id || call.id.is_empty() {
+                continue;
+            }
+            if call.open {
+                re.open_tool_calls.insert(call.id.clone());
+            } else {
+                re.open_tool_calls.remove(&call.id);
+            }
+        }
+        if matches!(
+            e.ev.event_type.as_str(),
+            agent::EVENT_TURN_COMPLETED | agent::EVENT_TURN_FAILED | agent::EVENT_STARTUP_FAILED
+        ) {
+            re.open_tool_calls.clear();
+            re.tool_turn_finished = true;
         }
 
         // Token usage has two sources, distinguished by event type, to keep committed totals
@@ -750,7 +770,6 @@ mod tests {
             re.last_cpu_ticks = 999;
             re.last_cpu_sample_at = fixed;
             re.cpu_failure_since = Some(fixed);
-            re.last_tool_active_at = fixed;
         }
         update(
             &mut o,
@@ -766,7 +785,6 @@ mod tests {
         assert!(!re.cpu_sampled, "cpu_sampled must reset on pgid change");
         assert_eq!(re.last_cpu_sample_at, zero_time());
         assert_eq!(re.cpu_failure_since, None);
-        assert_eq!(re.last_tool_active_at, zero_time());
         assert_eq!(
             re.last_cpu_ticks, 0,
             "last_cpu_ticks must reset on pgid change"

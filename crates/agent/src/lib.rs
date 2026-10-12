@@ -128,6 +128,16 @@ pub struct Event {
     /// Rhapsody-only payload; absent on every existing event.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limit: Option<ratelimit::LimitObs>,
+    /// Portable tool lifecycle, scoped to the harness session and current turn.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ToolCall {
+    pub session_id: String,
+    pub id: String,
+    pub open: bool,
 }
 
 impl Event {

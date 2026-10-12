@@ -8,8 +8,8 @@
 //! releases the claim; a non-terminal move only refreshes the in-memory snapshot (INF-266 — the
 //! worker keeps running and its exit is classified by [`Orchestrator::on_worker_exit`]).
 //!
-//! Intentional liveness divergences (STUDIO-1177 / STUDIO-1208): thresholded CPU activity, tool-child
-//! presence and bounded sampling failure grace replace Go's rules; see README Divergences.
+//! Intentional liveness divergences (STUDIO-1177 / STUDIO-1208): thresholded CPU activity,
+//! portable in-flight tool lifecycle and bounded sampling failure grace; see README Divergences.
 //!
 //! Other deviations from the Go source, all behavior-preserving:
 //!   * `reconcile` snapshots each group's reconcile inputs (slug tracker, canceled/terminal sets,
@@ -52,8 +52,8 @@ struct GroupInputs {
     workspace: Arc<Manager>,
 }
 
-/// Measures CPU work over at least one second (STUDIO-1177) and renews independent tool-child
-/// liveness (STUDIO-1208). Failed sampling keeps the existing bounded CPU/event fallback.
+/// Measures CPU work over at least one second (STUDIO-1177). Failed sampling keeps
+/// the bounded event fallback; tool liveness comes from the harness, not children.
 fn sample_cpu(
     re: &mut RunningEntry,
     now: DateTime<Utc>,
@@ -66,21 +66,10 @@ fn sample_cpu(
     let Some(sampler) = sampler else {
         return;
     };
-    let sample = sampler.sample_group(re.pgid);
-    if let Some(sample) = &sample {
-        match sample.has_tool_child {
-            Some(true) => re.last_tool_active_at = now,
-            Some(false) => {}
-            None if !re.tool_failure_logged => {
-                tracing::warn!(run_id = re.run_id, issue_identifier = %re.issue.identifier,
-                    pgid = re.pgid, "tool-child enumeration unavailable; falling back to CPU and events");
-                re.tool_failure_logged = true;
-            }
-            None => {}
-        }
-    }
-    match sample
-        .map(|sample| sample.ticks)
+    // A descendant is not proof of a tool wait: MCP servers are long-lived even
+    // when the model stream is dead. Only actual tool lifecycle grants that credit.
+    match sampler
+        .group_cpu(re.pgid)
         .zip(sampler.ticks_per_second())
         .filter(|(_, hz)| *hz > 0)
     {
@@ -89,7 +78,7 @@ fn sample_cpu(
             re.cpu_sampled = false;
             if !re.cpu_failure_logged {
                 tracing::warn!(run_id = re.run_id, issue_identifier = %re.issue.identifier,
-                    pgid = re.pgid, "CPU sampler unavailable; falling back to events after one stall window (tool children may be unavailable)");
+                    pgid = re.pgid, "CPU sampler unavailable; falling back to events after one stall window");
                 re.cpu_failure_logged = true;
             }
         }
@@ -252,7 +241,7 @@ impl Orchestrator {
     }
 
     /// Terminates workers that show no liveness — neither a recent stream event nor recent
-    /// process-group CPU activity or a tool child — and retries them (upstream §8.5 Part A). The stall timeout is read
+    /// process-group CPU activity or an open tool call — and retries them (upstream §8.5 Part A). The stall timeout is read
     /// per running entry from its owning project (falling back to the top-level); an entry whose
     /// effective stall timeout is `<= 0` is skipped. Mirrors Go `reconcileStalled`.
     pub(crate) fn reconcile_stalled(&mut self) {
@@ -282,6 +271,11 @@ impl Orchestrator {
                 continue; // stall detection disabled for this entry
             }
             sample_cpu(re, now, sampler.as_deref(), threshold);
+            // Portable lifecycle evidence, independent of /proc and CPU. The
+            // turn deadline still bounds tools that never return.
+            if !re.open_tool_calls.is_empty() {
+                continue;
+            }
 
             let mut last = re.last_event_at;
             if last == zero_time() {
@@ -290,9 +284,6 @@ impl Orchestrator {
             let stall = chrono::Duration::from_std(stall).unwrap_or(chrono::Duration::MAX);
             if re.cpu_failure_since.is_none() && re.last_cpu_active_at > last {
                 last = re.last_cpu_active_at;
-            }
-            if re.last_tool_active_at > last {
-                last = re.last_tool_active_at;
             }
             if let Some(since) = re.cpu_failure_since
                 && now - since <= stall
@@ -769,6 +760,78 @@ mod tests {
         std::sync::Arc::new(FakeSampler::new(ok, map))
     }
 
+    // Both real harness shapes, with /proc explicitly unavailable. The tool has no
+    // event or CPU heartbeat while waiting; its matching result ends the exemption.
+    async fn portable_open_tool_case(harness: &str) {
+        let claude_start = br#"{"type":"assistant","session_id":"ses_x","message":{"content":[{"type":"tool_use","id":"call_x","name":"Bash","input":{"command":"gh pr checks --watch"}}]}}"#;
+        let claude_end = br#"{"type":"user","session_id":"ses_x","message":{"content":[{"type":"tool_result","tool_use_id":"call_x","content":"green"}]}}"#;
+        let opencode_start = br#"{"type":"tool_use","sessionID":"ses_x","part":{"id":"prt_x","callID":"call_x","type":"tool","state":{"status":"running"}}}"#;
+        let opencode_end = br#"{"type":"tool_use","sessionID":"ses_x","part":{"id":"prt_x","callID":"call_x","type":"tool","state":{"status":"completed"}}}"#;
+        for (name, start, end) in [
+            (
+                "claude",
+                agent::claude::classify(claude_start).event,
+                agent::claude::classify(claude_end).event,
+            ),
+            (
+                "opencode",
+                agent::opencode::classify(opencode_start).event,
+                agent::opencode::classify(opencode_end).event,
+            ),
+        ] {
+            if name != harness {
+                continue;
+            }
+            let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+            o.eff.as_mut().unwrap().cpu_sampler = sampler(false, &[]);
+            let base = utc(2026, 5, 29, 12, 0, 0);
+            let clock = install_clock(&mut o, base);
+            add_running(&mut o, "1", "MT-1", "In Progress", base);
+            o.on_agent_update(AgentUpdate {
+                issue_id: "1".into(),
+                ev: agent::Event {
+                    event_type: agent::EVENT_SESSION_STARTED.into(),
+                    pid: 42,
+                    message: "ses_x".into(),
+                    ..Default::default()
+                },
+            });
+            o.on_agent_update(AgentUpdate {
+                issue_id: "1".into(),
+                ev: start,
+            });
+            o.reconcile_stalled();
+            // No optional tool timeout configured: only the runner's turn deadline bounds it.
+            advance(&clock, chrono::Duration::hours(2));
+            o.reconcile_stalled();
+            assert!(
+                o.running.contains_key("1"),
+                "{name}: open tool must survive silence without /proc"
+            );
+            o.on_agent_update(AgentUpdate {
+                issue_id: "1".into(),
+                ev: end,
+            });
+            advance(&clock, chrono::Duration::seconds(301));
+            o.reconcile_stalled();
+            assert!(
+                !o.running.contains_key("1"),
+                "{name}: closed tool must not mask a dead stream"
+            );
+            assert_eq!(o.retry_attempts["1"].err, "stalled");
+        }
+    }
+
+    #[tokio::test]
+    async fn portable_claude_open_tool_survives_then_closed_tool_stalls() {
+        portable_open_tool_case("claude").await;
+    }
+
+    #[tokio::test]
+    async fn portable_opencode_open_tool_survives_then_closed_tool_stalls() {
+        portable_open_tool_case("opencode").await;
+    }
+
     #[tokio::test]
     async fn reconcile_liveness_honors_configured_cpu_threshold() {
         // 10% CPU survives the default 5%, but not a configured 20% or the exact 10% boundary.
@@ -867,103 +930,93 @@ mod tests {
         assert_eq!(re.cpu_failure_since, None);
     }
 
-    // STUDIO-1208: a sleeping foreground tool is liveness even without stream events or CPU work.
+    // Lifecycle ownership is per turn, not one sticky boolean per run.
     #[tokio::test]
-    async fn reconcile_liveness_silent_tool_child_survives_then_stalls_after_exit() {
+    async fn portable_tool_lifecycle_handles_parallel_duplicates_errors_and_turn_resets() {
         let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
-        let mut cpu = FakeSampler::new(true, HashMap::from([(42, vec![100, 101, 102, 103])]));
-        cpu.has_tool_child = Some(true);
-        o.eff.as_mut().unwrap().cpu_sampler = Arc::new(cpu);
+        o.eff.as_mut().unwrap().cpu_sampler = sampler(false, &[]);
         let base = utc(2026, 5, 29, 12, 0, 0);
         let clock = install_clock(&mut o, base);
         add_running(&mut o, "1", "MT-1", "In Progress", base);
-        o.running.get_mut("1").unwrap().pgid = 42;
-        o.reconcile_stalled();
-        for _ in 0..3 {
-            advance(&clock, chrono::Duration::seconds(301));
-            o.reconcile_stalled();
-            assert!(
-                o.running.contains_key("1"),
-                "a silent near-zero-CPU tool wait must survive beyond the stall window"
-            );
-            assert!(!o.retry_attempts.contains_key("1"));
-        }
-
-        o.eff.as_mut().unwrap().cpu_sampler = sampler(true, &[(42, &[103])]);
-        advance(&clock, chrono::Duration::seconds(300));
+        let send = |o: &mut Orchestrator, ev: agent::Event| {
+            o.on_agent_update(AgentUpdate {
+                issue_id: "1".into(),
+                ev,
+            })
+        };
+        let init = || agent::Event {
+            event_type: agent::EVENT_SESSION_STARTED.into(),
+            message: "ses_x".into(),
+            pid: 42,
+            ..Default::default()
+        };
+        send(&mut o, init());
+        let call = |id: &str, open| agent::Event {
+            event_type: agent::EVENT_NOTIFICATION.into(),
+            tool_calls: vec![agent::ToolCall {
+                session_id: "ses_x".into(),
+                id: id.into(),
+                open,
+            }],
+            ..Default::default()
+        };
+        send(&mut o, call("a", true));
+        send(&mut o, call("a", true));
+        send(&mut o, call("b", true));
+        assert_eq!(o.running["1"].open_tool_calls.len(), 2);
+        send(&mut o, call("unknown", false));
+        send(&mut o, call("a", false));
+        advance(&clock, chrono::Duration::hours(2));
         o.reconcile_stalled();
         assert!(
             o.running.contains_key("1"),
-            "last tool observation gets a full window"
+            "one of two tools still running"
         );
-        advance(&clock, chrono::Duration::seconds(1));
-        o.reconcile_stalled();
+        let error = agent::opencode::classify(br#"{"type":"tool_use","sessionID":"ses_x","part":{"id":"b","state":{"status":"error"}}}"#).event;
+        send(&mut o, error);
+        assert!(o.running["1"].open_tool_calls.is_empty());
+        send(&mut o, call("a", true));
+        send(
+            &mut o,
+            agent::Event {
+                event_type: agent::EVENT_TURN_FAILED.into(),
+                ..Default::default()
+            },
+        );
+        send(&mut o, call("late", true));
         assert!(
-            !o.running.contains_key("1"),
-            "tool exit must not mask a subsequent hang"
+            o.running["1"].open_tool_calls.is_empty(),
+            "terminal failure must reject late updates"
         );
-        assert_eq!(o.retry_attempts["1"].err, "stalled");
-        assert_eq!(o.retry_attempts["1"].attempt, 1);
-    }
-
-    #[test]
-    fn tool_child_renews_liveness_before_cpu_interval_or_when_cpu_frequency_is_unavailable() {
-        let base = utc(2026, 5, 29, 12, 0, 0);
-        for hz in [Some(100), None] {
-            let mut cpu = FakeSampler::new(true, HashMap::from([(42, vec![100])]));
-            cpu.has_tool_child = Some(true);
-            cpu.hz = hz;
-            let mut re = running_entry(issue("1", "MT-1", "In Progress"), "", "");
-            re.pgid = 42;
-            re.cpu_failure_since = Some(base - chrono::Duration::hours(1));
-            sample_cpu(&mut re, base, Some(&cpu), 0.05);
-            assert_eq!(
-                re.last_tool_active_at, base,
-                "the baseline can observe a tool"
-            );
-            let next = base + chrono::Duration::milliseconds(10);
-            sample_cpu(&mut re, next, Some(&cpu), 0.05);
-            assert_eq!(
-                re.last_tool_active_at, next,
-                "tool evidence is not CPU-gated"
-            );
-            assert_eq!(re.last_cpu_active_at, zero_time());
-        }
-    }
-
-    #[tokio::test]
-    async fn reconcile_liveness_unknown_children_keeps_cpu_fallback_and_logs_once() {
-        let _serial = TRACING_TEST_LOCK.lock().await;
-        let (events, subscriber) = recording_subscriber();
-        let _guard = tracing::subscriber::set_default(subscriber);
-        tracing::callsite::rebuild_interest_cache();
-        let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
-        let mut cpu = FakeSampler::new(true, HashMap::from([(42, vec![100, 101, 102])]));
-        cpu.has_tool_child = None;
-        o.eff.as_mut().unwrap().cpu_sampler = Arc::new(cpu);
-        let base = utc(2026, 5, 29, 12, 0, 0);
-        let clock = install_clock(&mut o, base);
-        add_running(&mut o, "1", "MT-1", "In Progress", base);
-        o.running.get_mut("1").unwrap().pgid = 42;
-        o.reconcile_stalled();
-        advance(&clock, chrono::Duration::seconds(150));
-        o.reconcile_stalled();
-        advance(&clock, chrono::Duration::seconds(151));
-        o.reconcile_stalled();
+        send(&mut o, init());
+        send(&mut o, call("a", true));
+        send(&mut o, init());
         assert!(
-            !o.running.contains_key("1"),
-            "unknown children must not renew liveness"
+            o.running["1"].open_tool_calls.is_empty(),
+            "continuation is a new tool generation"
         );
-        assert_eq!(o.retry_attempts["1"].err, "stalled");
-        assert_eq!(
-            events
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|e| e.message.contains("tool-child enumeration unavailable"))
-                .count(),
-            1
+        let mut foreign = call("foreign", true);
+        foreign.tool_calls[0].session_id = "another-session".into();
+        send(&mut o, foreign);
+        assert!(o.running["1"].open_tool_calls.is_empty());
+        send(&mut o, call("a", true));
+        send(
+            &mut o,
+            agent::Event {
+                event_type: agent::EVENT_NOTIFICATION.into(),
+                pid: 99,
+                ..Default::default()
+            },
         );
+        assert!(
+            o.running["1"].open_tool_calls.is_empty(),
+            "PID replacement clears tool state"
+        );
+        advance(&clock, chrono::Duration::seconds(301));
+        o.reconcile_stalled();
+        advance(&clock, chrono::Duration::seconds(301));
+        o.reconcile_stalled();
+        assert!(!o.running.contains_key("1"));
     }
 
     // STUDIO-1177: idle event-loop ticks without a tool are not evidence of useful work.

@@ -6,21 +6,17 @@
 //!
 //! Go splits this across build tags: `sampler_linux.go` reads `/proc` (the real sampler),
 //! `sampler_stub.go` is the `!linux` no-op. This Rust port keeps ONE always-compiled `/proc` reader
-//! ([`sample_group`] / [`parse_stat`]): on a host without a readable `/proc` (macOS — the CI/target
+//! ([`group_cpu`] / [`parse_stat`]): on a host without a readable `/proc` (macOS — the CI/target
 //! platform — has none) it returns `None`, byte-for-byte the same observable behavior as Go's
 //! `!linux` `stubSampler` (`GroupCPU → (0, false)`). STUDIO-1177 bounds that fallback to one stall
 //! window, then uses events alone. Compiling the reader on every target lets the
 //! `/proc`-parsing parity tests (`sampler_linux_test.go`) run under the macOS CI via a synthetic
 //! proc root — exactly as Go's linux tests override `procRoot` — instead of being skipped.
-//! STUDIO-1208 also reports live tool children from that scan, including descendants that start
-//! their own process groups. Unknown child evidence retains the existing CPU/event fallback.
-
-use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
 
 /// The `/proc` mount point read by the platform sampler. Mirrors Go's `procRoot` package var; the
-/// parity tests pass their own synthetic root to [`sample_group`] directly (Go overrides the var).
+/// parity tests pass their own synthetic root to [`group_cpu`] directly (Go overrides the var).
 const PROC_ROOT: &str = "/proc";
 
 /// Reports cumulative process-group CPU usage. Mirrors Go `liveness.Sampler`.
@@ -32,22 +28,8 @@ pub trait Sampler: Send + Sync {
     /// `GroupCPU(pgid int) (ticks uint64, ok bool)` — the `(u64, bool)` tuple collapses to
     /// `Option<u64>`.
     fn group_cpu(&self, pgid: i32) -> Option<u64>;
-    /// CPU and tool-child evidence from the same process snapshot. `None` child evidence means
-    /// enumeration is unavailable; callers retain CPU/event-only liveness for that run.
-    fn sample_group(&self, pgid: i32) -> Option<GroupSample> {
-        self.group_cpu(pgid).map(|ticks| GroupSample {
-            ticks,
-            has_tool_child: None,
-        })
-    }
     /// Clock-tick frequency for converting the cumulative counter to CPU seconds.
     fn ticks_per_second(&self) -> Option<u64>;
-}
-
-/// One process snapshot: Go-compatible group CPU plus independent tool-wait evidence.
-pub struct GroupSample {
-    pub ticks: u64,
-    pub has_tool_child: Option<bool>,
 }
 
 /// The `/proc`-backed sampler. Mirrors Go `linuxSampler` (and, where `/proc` is absent, Go's
@@ -62,11 +44,7 @@ impl Sampler for ProcSampler {
     }
 
     fn group_cpu(&self, pgid: i32) -> Option<u64> {
-        self.sample_group(pgid).map(|sample| sample.ticks)
-    }
-
-    fn sample_group(&self, pgid: i32) -> Option<GroupSample> {
-        sample_group(Path::new(PROC_ROOT), pgid)
+        group_cpu(Path::new(PROC_ROOT), pgid)
     }
 }
 
@@ -81,89 +59,30 @@ pub fn new_sampler() -> Arc<dyn Sampler> {
 /// `/proc`-shaped tree rooted at `proc_root`. `None` when the root is unreadable (no `/proc`); a
 /// readable root with no matching members returns `Some(0)`; a process that exits between listing
 /// and reading its `stat` is skipped. Mirrors Go `groupCPU`.
-#[cfg(test)]
 fn group_cpu(proc_root: &Path, pgid: i32) -> Option<u64> {
-    sample_group(proc_root, pgid).map(|sample| sample.ticks)
-}
-
-fn sample_group(proc_root: &Path, pgid: i32) -> Option<GroupSample> {
     let entries = std::fs::read_dir(proc_root).ok()?;
     let mut total: u64 = 0;
-    let mut processes = Vec::new();
-    let mut children_known = true;
-    for e in entries {
-        let Ok(e) = e else {
-            children_known = false;
-            continue;
-        };
+    for e in entries.flatten() {
         // Only `<pid>` directories (Go: `IsDir` + `strconv.Atoi(Name())`).
-        match e.file_type() {
-            Ok(t) if t.is_dir() => {}
-            Ok(_) => continue,
-            Err(err) => {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    children_known = false;
-                }
-                continue;
-            }
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
         }
         let Some(name) = e.file_name().to_str().map(str::to_owned) else {
             continue;
         };
-        let Ok(pid) = name.parse::<i32>() else {
+        if name.parse::<i64>().is_err() {
+            continue;
+        }
+        let Ok(data) = std::fs::read_to_string(e.path().join("stat")) else {
             continue;
         };
-        let data = match std::fs::read_to_string(e.path().join("stat")) {
-            Ok(data) => data,
-            Err(err) => {
-                if err.kind() != std::io::ErrorKind::NotFound {
-                    children_known = false;
-                }
-                continue; // process exited between read_dir and read
-            }
-        };
-        if let Some((grp, utime, stime)) = parse_stat(&data) {
-            total = total.saturating_add(if grp == pgid {
-                utime.saturating_add(stime)
-            } else {
-                0
-            });
-            let rest: Vec<&str> = data[data.rfind(')')? + 1..].split_whitespace().collect();
-            if let Ok(ppid) = rest[1].parse::<i32>() {
-                processes.push((pid, ppid, grp, !matches!(rest[0], "Z" | "X" | "x")));
-            } else {
-                children_known = false;
-            }
-        } else {
-            children_known = false;
+        if let Some((grp, utime, stime)) = parse_stat(&data)
+            && grp == pgid
+        {
+            total += utime + stime;
         }
     }
-    // The leader's PID is the group's ID. Tool shells may switch groups (STUDIO-871), so grow
-    // the descendant closure from this same snapshot rather than looking only at matching pgids.
-    let mut descendants = HashSet::from([pgid]);
-    loop {
-        let before = descendants.len();
-        for &(pid, ppid, _, _) in &processes {
-            if descendants.contains(&ppid) {
-                descendants.insert(pid);
-            }
-        }
-        if descendants.len() == before {
-            break;
-        }
-    }
-    let has_tool_child = pgid > 1
-        && processes.iter().any(|&(pid, _, grp, live)| {
-            pid != pgid && live && (grp == pgid || descendants.contains(&pid))
-        });
-    Some(GroupSample {
-        ticks: total,
-        has_tool_child: if has_tool_child || children_known {
-            Some(has_tool_child)
-        } else {
-            None
-        },
-    })
+    Some(total)
 }
 
 /// Extracts pgrp (field 5), utime (field 14) and stime (field 15) from a `/proc/<pid>/stat` line.
@@ -234,64 +153,6 @@ mod tests {
         let dir = TempDir::new();
         let missing = std::path::Path::new(&dir.path).join("does-not-exist");
         assert_eq!(group_cpu(&missing, 1), None);
-    }
-
-    #[test]
-    fn tool_child_evidence_excludes_leader_zombies_and_unrelated_groups() {
-        let dir = TempDir::new();
-        let root = dir.path.clone();
-        write_stat(&root, 100, "100 (agent) S 1 100 100 0 -1 0 0 0 0 0 10 5\n");
-        write_stat(
-            &root,
-            101,
-            "101 (zombie) Z 100 100 100 0 -1 0 0 0 0 0 0 0\n",
-        );
-        write_stat(&root, 200, "200 (other) S 1 200 200 0 -1 0 0 0 0 0 0 0\n");
-        let p = Path::new(&root);
-        assert_eq!(sample_group(p, 100).unwrap().has_tool_child, Some(false));
-        assert_eq!(sample_group(p, 999).unwrap().has_tool_child, Some(false));
-        write_stat(
-            &root,
-            102,
-            "102 (tool ) name) S 100 100 100 0 -1 0 0 0 0 0 0 0\n",
-        );
-        assert_eq!(sample_group(p, 100).unwrap().has_tool_child, Some(true));
-    }
-
-    #[test]
-    fn tool_children_in_separate_groups_follow_parent_links() {
-        let dir = TempDir::new();
-        let root = dir.path.clone();
-        write_stat(&root, 100, "100 (agent) S 1 100 100 0 -1 0 0 0 0 0 0 0\n");
-        write_stat(&root, 300, "300 (shell) S 100 300 100 0 -1 0 0 0 0 0 0 0\n");
-        write_stat(&root, 200, "200 (gh) S 300 300 100 0 -1 0 0 0 0 0 0 0\n");
-        assert_eq!(
-            sample_group(Path::new(&root), 100).unwrap().has_tool_child,
-            Some(true)
-        );
-        // The intermediate shell can be a zombie while its live grandchild still runs.
-        write_stat(&root, 300, "300 (shell) Z 100 300 100 0 -1 0 0 0 0 0 0 0\n");
-        assert_eq!(
-            sample_group(Path::new(&root), 100).unwrap().has_tool_child,
-            Some(true)
-        );
-        assert_eq!(
-            sample_group(Path::new(&root), 200).unwrap().has_tool_child,
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn malformed_child_metadata_retains_cpu_but_reports_unknown_children() {
-        let dir = TempDir::new();
-        write_stat(
-            &dir.path,
-            100,
-            "100 (agent) S invalid 100 100 0 -1 0 0 0 0 0 10 5\n",
-        );
-        let sample = sample_group(Path::new(&dir.path), 100).unwrap();
-        assert_eq!(sample.ticks, 15);
-        assert_eq!(sample.has_tool_child, None);
     }
 
     // Mirrors Go `TestParseStatFailures`: every malformed line returns `None`.

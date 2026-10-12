@@ -455,8 +455,8 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         last_cpu_sample_at: epoch,
         cpu_failure_since: None,
         cpu_failure_logged: false,
-        last_tool_active_at: epoch,
-        tool_failure_logged: false,
+        open_tool_calls: HashSet::new(),
+        tool_turn_finished: true,
         recent_events: Vec::new(),
     }
 }
@@ -729,7 +729,6 @@ pub(crate) fn retry_entry(issue_id: &str, identifier: &str, attempt: i64) -> Ret
 /// walked and then clamped to its last value.
 pub(crate) struct FakeSampler {
     ok: bool,
-    pub(crate) has_tool_child: Option<bool>,
     pub(crate) hz: Option<u64>,
     seq: HashMap<i32, Vec<u64>>,
     idx: Mutex<HashMap<i32, usize>>,
@@ -739,7 +738,6 @@ impl FakeSampler {
     pub(crate) fn new(ok: bool, seq: HashMap<i32, Vec<u64>>) -> FakeSampler {
         FakeSampler {
             ok,
-            has_tool_child: Some(false),
             hz: Some(100),
             seq,
             idx: Mutex::new(HashMap::new()),
@@ -748,13 +746,6 @@ impl FakeSampler {
 }
 
 impl Sampler for FakeSampler {
-    fn sample_group(&self, pgid: i32) -> Option<liveness::GroupSample> {
-        self.group_cpu(pgid).map(|ticks| liveness::GroupSample {
-            ticks,
-            has_tool_child: self.has_tool_child,
-        })
-    }
-
     fn ticks_per_second(&self) -> Option<u64> {
         self.hz
     }

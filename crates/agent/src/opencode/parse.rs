@@ -55,6 +55,8 @@ pub struct Classified {
     /// correct if opencode ever emits a non-terminal error the way codex does (design §7.1, where
     /// treating codex's non-terminal `error` as terminal "aborts 100% of turns").
     pub failure: Option<Failure>,
+    /// Scoped live delta, not part of the historical CLI transcript vocabulary.
+    pub progress: bool,
 }
 
 /// An in-band `error` event. opencode is the only measured harness that hands the daemon an HTTP
@@ -113,6 +115,8 @@ struct RawLine {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
 struct RawPart {
+    id: String,
+    state: Option<RawToolState>,
     /// `step_finish` only: `"stop"` terminates the turn, `"tool-calls"` does not.
     reason: String,
     /// `text` only.
@@ -121,6 +125,12 @@ struct RawPart {
     tool: String,
     tokens: Option<RawTokens>,
     cost: Option<f64>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawToolState {
+    status: String,
 }
 
 #[derive(Debug, Default, Clone, Copy, Deserialize)]
@@ -173,6 +183,17 @@ pub fn classify(line: &[u8]) -> Classified {
     let part = r.part.unwrap_or_default();
 
     match r.r#type.as_str() {
+        "progress" => Classified {
+            event: Event {
+                event_type: EVENT_NOTIFICATION.into(),
+                timestamp: now,
+                ..Default::default()
+            },
+            session_id: r.session_id,
+            ok: true,
+            progress: true,
+            ..Default::default()
+        },
         "text" => {
             let text = truncate(part.text.trim(), MAX_MESSAGE_LEN);
             // ⚠️ A whitespace-only part contributes NOTHING, including to `text`. The runner keeps
@@ -245,7 +266,31 @@ pub fn classify(line: &[u8]) -> Classified {
                 ..Default::default()
             }
         }
-        // `step_start` and `tool_use` are not surfaced as normalized events: the claude parser
+        "tool_use" => {
+            let status = part.state.map(|s| s.status).unwrap_or_default();
+            let known = matches!(status.as_str(), "running" | "completed" | "error");
+            let calls = if known && !part.id.is_empty() && !r.session_id.is_empty() {
+                vec![crate::ToolCall {
+                    session_id: r.session_id.clone(),
+                    id: part.id,
+                    open: status == "running",
+                }]
+            } else {
+                Vec::new()
+            };
+            Classified {
+                ok: !calls.is_empty(),
+                event: Event {
+                    event_type: EVENT_NOTIFICATION.into(),
+                    timestamp: now,
+                    tool_calls: calls,
+                    ..Default::default()
+                },
+                session_id: r.session_id,
+                ..Default::default()
+            }
+        }
+        // `step_start` is not surfaced as a normalized event: the claude parser
         // likewise surfaces only assistant PROSE and the terminal result, leaving tool-level detail
         // to the transcript humanizer (`crate::humanize`), which reads the raw lines. Their session
         // id still propagates — on the measured captures `step_start` is the FIRST line of every
