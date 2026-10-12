@@ -821,6 +821,7 @@ impl Orchestrator {
         // Arm the worker's cancellation before the spawn observes it (Go `wctx, cancel :=
         // context.WithCancel(o.ctx)` + `re.cancel = cancel`); `terminate` / `shutdown` fire it.
         re.cancel = CancelSignal::new();
+        re.messages_next_turn = self.messages_next_turn_for(&re);
         let id = iss.id.clone();
         self.auth_hold_claims.remove(&id);
         self.claimed.insert(id.clone());

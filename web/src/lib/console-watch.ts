@@ -219,13 +219,17 @@ export function messageChip(message: RunMessage): MessageChip {
   switch (message.status) {
     case "sent":
       return { tone: "sent", label: "sent" };
+    case "queued_next_turn":
+      return { tone: "sent", label: "pending · next turn or dispatch" };
     case "delivered":
       return {
         tone: "delivered",
         label:
-          message.delivered_turn === undefined
-            ? "delivered"
-            : `delivered · turn ${message.delivered_turn}`,
+          message.delivered_run_id !== undefined
+            ? `delivered · run ${message.delivered_run_id} · turn ${message.delivered_turn}`
+            : message.delivered_turn === undefined
+              ? "delivered"
+              : `delivered · turn ${message.delivered_turn}`,
       };
     case "expired":
       return { tone: "expired", label: "expired — the run ended first" };

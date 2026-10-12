@@ -122,6 +122,8 @@ pub struct RunningEntry {
     /// run (this value when the build implements it, else the configured backend) is written to
     /// `rhapsody_run_provenance` beside `harness_origin` and the model.
     pub harness: String,
+    /// Frozen at dispatch from the selected runner, never re-resolved after a workflow reload.
+    pub(crate) messages_next_turn: bool,
     /// Actual dispatch-time harness for credential failure attribution, independent of reloads.
     pub(crate) credential_harness: String,
 
@@ -244,6 +246,7 @@ impl RunningEntry {
             teammate_section: String::new(),
             model_override: rhapsody_agent::ModelOverride::default(),
             harness: String::new(),
+            messages_next_turn: false,
             credential_harness: String::new(),
             harness_origin: String::new(),
             model_origin: String::new(),

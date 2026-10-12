@@ -199,6 +199,9 @@ the `Orchestrator` struct itself. Concretely:
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
   worker code; add an event variant instead.
+  STUDIO-1209 also shares the existing Store connection with that worker solely to read next-turn
+  message blocks and mark their exact IDs delivered on SESSION_STARTED. No scheduling state is
+  shared; the Store's existing connection mutex serializes queue admission, delivery and pruning.
 - A recurring pattern in the on-loop modules (`retry.rs::on_retry`, `reconcile_run.rs::reconcile`):
   before any `.await` or `&mut self` mutation, snapshot the bits of `Effective`/`ResolvedProject`
   you need into owned locals. Go aliases these via raw pointers across the await; Rust's borrow

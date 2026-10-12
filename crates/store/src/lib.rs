@@ -485,6 +485,32 @@ pub trait Store {
     /// Returns all messages for a run ordered by id ASC.
     fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError>;
 
+    /// Atomically records a bounded next-turn message and its original run history. None means
+    /// the ticket backlog is full; Some(0) from Noop means persistence is unavailable.
+    fn queue_run_message(
+        &self,
+        _run_id: i64,
+        _identifier: &str,
+        _body: &str,
+        _prompt: &str,
+        _created_at_ms: i64,
+        _cap: usize,
+    ) -> Result<Option<i64>, StoreError> {
+        Err(StoreError::Disabled)
+    }
+    fn pending_run_messages(&self, _identifier: &str) -> Result<Vec<QueuedRunMessage>, StoreError> {
+        Ok(Vec::new())
+    }
+    /// Marks only the supplied prompt blocks delivered, once the destination turn starts.
+    fn deliver_queued_run_messages(
+        &self,
+        _ids: &[i64],
+        _run_id: i64,
+        _turn: i64,
+    ) -> Result<(), StoreError> {
+        Err(StoreError::Disabled)
+    }
+
     // --- ticketless review watch set (STUDIO-703 / STUDIO-711) ---
     // Additive Rhapsody-only surface with no Go counterpart: the frozen reference has no review
     // feature, so this is new state rather than ported state (README "Divergences"). It is the

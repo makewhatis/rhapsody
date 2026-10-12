@@ -439,8 +439,10 @@ function EstBadge() {
 // sent → neutral "sent", delivered → green "delivered · turn N", expired → muted "expired".
 function operatorMessageChip(m: RunMessage): { status: string; label: string } {
   switch (m.status) {
+    case "queued_next_turn":
+      return { status: "queued", label: "pending · next turn or dispatch" };
     case "delivered":
-      return { status: "completed", label: m.delivered_turn != null ? `delivered · turn ${m.delivered_turn}` : "delivered" };
+      return { status: "completed", label: m.delivered_run_id != null ? `delivered · run ${m.delivered_run_id} · turn ${m.delivered_turn}` : m.delivered_turn != null ? `delivered · turn ${m.delivered_turn}` : "delivered" };
     case "expired":
       return { status: "idle", label: "expired" };
     default:
@@ -482,11 +484,11 @@ function OperatorMessages({
 
   return (
     <Panel style={{ padding: 0 }}>
-      <PanelHeader title="Operator messages" note={inFlight ? "delivered mid-run" : "history"} />
+      <PanelHeader title="Operator messages" note={inFlight ? "delivery status" : "history"} />
       <div style={{ padding: "12px 18px", display: "flex", flexDirection: "column", gap: 10 }}>
         {messages.length === 0 ? (
           <div style={{ color: "var(--faint)", fontSize: 12.5 }}>
-            No messages yet. Send a “btw …” below and the agent picks it up at its next step.
+            No messages yet. Send a “btw …” below. Delivery is live or on the next turn, depending on the harness.
           </div>
         ) : (
           messages.map((m) => {

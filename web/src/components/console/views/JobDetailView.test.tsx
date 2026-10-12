@@ -2750,6 +2750,17 @@ describe("a bounded read never states an unbounded absence", () => {
 
 // Acceptance — "Messages composer posts to /runs/{id}/message and flips sent→delivered."
 describe("Messages — the composer and its timeline (§3C)", () => {
+  it("shows a next-turn correction pending after run end and records its destination on delivery", async () => {
+    h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
+    h.fetchRunMessages.mockResolvedValue([runMessage({ status: "queued_next_turn" })]);
+    mountDetail([run({ id: 547 })]);
+    await settleTrace();
+    await openTab("Messages");
+    await waitFor(() => expect(panel().querySelector(".trmsgs .msg .chip")?.textContent).toBe("pending · next turn or dispatch"));
+    h.fetchRunMessages.mockResolvedValue([runMessage({ status: "delivered", delivered_run_id: 548, delivered_turn: 1 })]);
+    await poll(["run-messages", 547]);
+    await waitFor(() => expect(panel().querySelector(".trmsgs .msg .chip")?.textContent).toBe("delivered · run 548 · turn 1"));
+  });
   it("lists what was sent and flips its chip to delivered when the daemon says so", async () => {
     h.fetchRunTranscript.mockResolvedValue({ run_id: 547, generated_at: "", entries: [] });
     h.fetchRunMessages.mockResolvedValue([runMessage()]);

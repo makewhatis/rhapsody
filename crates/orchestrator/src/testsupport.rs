@@ -409,6 +409,7 @@ pub(crate) fn empty_resolved_project(slug: &str, tracker: Arc<dyn Tracker>) -> R
 pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &str) -> RunningEntry {
     let epoch = DateTime::from_timestamp(0, 0).expect("epoch");
     RunningEntry {
+        messages_next_turn: false,
         engine_index: 0,
         engine: None,
         resume_session: String::new(),
