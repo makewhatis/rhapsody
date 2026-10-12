@@ -822,6 +822,7 @@ impl Orchestrator {
         // context.WithCancel(o.ctx)` + `re.cancel = cancel`); `terminate` / `shutdown` fire it.
         re.cancel = CancelSignal::new();
         let id = iss.id.clone();
+        self.auth_hold_claims.remove(&id);
         self.claimed.insert(id.clone());
         self.clear_retry(&id);
         self.persist_start_run(&mut re, attempt_norm);

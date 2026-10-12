@@ -100,6 +100,21 @@ clear (or success from an already-live run); no new provider calls are introduce
 resume admissions share the existing process-local credential-cache lifetime. No frozen Go schema,
 payload golden, normalization rule or credential file changes.
 
+### Rejected-login holds remain resumable after manual label removal (STUDIO-1200)
+
+The existing human-step resume action accepts a non-live rejected-login claim even when an
+operator already removed `rhapsody:human` by hand; the job page's hold read still offers Resume
+for that claim. Resuming
+clears the claim and seeds the operator's note atomically before the next tick can dispatch.
+Ordinary unlabeled suppressions and claims with live runs, retries or preparation remain refused.
+Label-present resumes still remove the label and clear the claim together. Manual removal alone
+does not resume a rejected-login claim: use the resume-hold action, without re-adding the label.
+Selection reports claims with no live run at INFO once per ticket/cause on both ladders, including
+when capacity is full. These human-hold extensions have no frozen Go counterpart; API shapes,
+schema and golden fixtures are unchanged.
+STUDIO-1199 supersedes creation of per-ticket login claims: new failures wait on the shared
+credential and resume automatically on its recovery, without the human-step action.
+
 ### Operator stop/resume ends a ticketless review round locally (STUDIO-1182)
 
 Stopping a reviewer releases its synthetic key's claim immediately and re-arms its existing live

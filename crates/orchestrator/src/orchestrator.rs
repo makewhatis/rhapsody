@@ -577,6 +577,9 @@ pub struct Orchestrator {
     pub running: HashMap<String, RunningEntry>,
     /// Issue ids currently claimed (dispatched or in a claim election), a set.
     pub claimed: HashSet<String>,
+    /// Claims created by rejected-login exits, so removing the human label by hand does not
+    /// make resume-hold refuse them. Loop-confined; retired on resume or a new dispatch.
+    pub(crate) auth_hold_claims: HashSet<String>,
     /// Scheduled retries, keyed by opaque issue id (or identifier for boot-recovered entries).
     pub retry_attempts: HashMap<String, RetryEntry>,
     /// How many candidates the last selection pass **withheld** for each teammate because that
@@ -1192,6 +1195,7 @@ impl Orchestrator {
             teams_memory: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
+            auth_hold_claims: HashSet::new(),
             retry_attempts: HashMap::new(),
             held_for_capacity: HashMap::new(),
             human_holds: Arc::new(crate::dispatch::HumanHoldLedger::default()),

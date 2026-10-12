@@ -312,6 +312,11 @@ pub enum Event {
         moved: bool,
         reply: oneshot::Sender<()>,
     },
+    /// Read loop-local rejected-login claim provenance for the human-hold view/admission.
+    AuthHoldClaim {
+        issue_id: String,
+        reply: oneshot::Sender<bool>,
+    },
     /// Record the operator's "Human step done" note for the next run and clear the in-memory
     /// suppression (STUDIO-1053; NEW beyond Go v0.4.0). The off-loop action seeds this BEFORE it
     /// removes the `rhapsody:human` label, so a tick racing the tracker round-trip already finds the
@@ -322,7 +327,8 @@ pub enum Event {
         issue_id: String,
         note: String,
         at: chrono::DateTime<chrono::Utc>,
-        reply: oneshot::Sender<Option<(chrono::DateTime<chrono::Utc>, String)>>,
+        auth_hold_only: bool,
+        reply: oneshot::Sender<crate::resumehold::ResumeNoteSeed>,
     },
     /// Undo [`Event::SeedResumeNote`] after a LATER step of the action failed (STUDIO-1053). The
     /// note is seeded BEFORE the label removal, so a dispatch racing the removal still reads it; if
@@ -875,10 +881,18 @@ impl Orchestrator {
                 issue_id,
                 note,
                 at,
+                auth_hold_only,
                 reply,
             } => {
+                if auth_hold_only && !self.auth_claim_held(&issue_id) {
+                    let _ = reply.send(crate::resumehold::ResumeNoteSeed::NotHeld);
+                    return;
+                }
                 let prior = self.handle_seed_resume_note(&issue_id, &note, at);
-                let _ = reply.send(prior);
+                let _ = reply.send(crate::resumehold::ResumeNoteSeed::Seeded(prior));
+            }
+            Event::AuthHoldClaim { issue_id, reply } => {
+                let _ = reply.send(self.auth_claim_held(&issue_id));
             }
             Event::ClearResumeNote {
                 issue_id,
