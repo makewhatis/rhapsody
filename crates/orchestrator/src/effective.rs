@@ -584,7 +584,7 @@ pub fn build_effective_with_runner(
     if !stall.is_zero() && sampler.group_cpu(std::process::id() as i32).is_none() {
         tracing::warn!(
             ?stall,
-            "CPU-based liveness unavailable (no readable /proc); stall detection will not fire"
+            "CPU-based liveness unavailable (no readable /proc); stall detection will use events after one stall window"
         );
     }
 
