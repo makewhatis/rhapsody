@@ -173,6 +173,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return 500, 500
         if scenario == "subagent" and index == 0:
             return 200, _task_tool_call_events()
+        if scenario in ("wait", "mcp-error") and index == 0:
+            return 200, _wait_tool_events(scenario)
         return 200, _text_events()
 
 
@@ -238,6 +240,18 @@ def _task_tool_call_events():
         },
         {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
         {**base, "choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": 5, "total_tokens": 25}},
+    ]
+
+
+def _wait_tool_events(scenario):
+    name = "bash" if scenario == "wait" else "symphony_wait"
+    args = {"command": "sleep 1", "description": "credential-free silent wait", "timeout": 10000} if name == "bash" else {"fail": True}
+    base = _base()
+    return [
+        {**base, "choices": [{"index": 0, "delta": {"role": "assistant", "tool_calls": [{"index": 0, "id": "call_wait", "type": "function", "function": {"name": name, "arguments": ""}}]}, "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "function": {"arguments": json.dumps(args)}}]}, "finish_reason": None}]},
+        {**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]},
+        {**base, "choices": [], "usage": {"prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}},
     ]
 
 

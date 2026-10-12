@@ -226,9 +226,12 @@ fn check_json_size(label: &str, text: &str) -> Result<(), AgentError> {
     Ok(())
 }
 
-/// The pinned brokered argv (`§9.1`/§9.2), matching the PB0 capture byte-for-byte:
+/// The pinned brokered turn knobs (`§9.1`/§9.2), in the historical PB0 argv form:
 /// `run --format json --pure --auto --dir <ws> --agent build -m <provider>/<model> [-s <id>] <prompt>`.
 ///
+/// STUDIO-1208 lowers this intermediate vector into host-issued HTTP session/prompt
+/// requests; it is no longer executed. The executor's argv is owned `serve --pure`
+/// on authenticated private IPv4 loopback. The old PB0 captures stay historical evidence.
 /// `--auto` is always emitted (an explicitly disabled `auto_approve` is refused before this point),
 /// `--agent build` and `--pure` are owned, and no `--variant`/`extra_args` can appear because brokered
 /// v1 refuses them upstream.
@@ -369,6 +372,36 @@ pub struct CapabilityRedactor {
 }
 
 impl CapabilityRedactor {
+    /// Add adapter-owned listener authority/password to the same pre-parse boundary.
+    pub(crate) fn add_control(&mut self, password: &str, url: &str) {
+        self.entries
+            .push((password.as_bytes().to_vec(), CAPABILITY_MARKER));
+        self.entries
+            .push((url.as_bytes().to_vec(), BROKER_URL_MARKER));
+        let mut basic = base64url_unpadded(format!("opencode:{password}").as_bytes())
+            .replace('-', "+")
+            .replace('_', "/");
+        while !basic.len().is_multiple_of(4) {
+            basic.push('=');
+        }
+        self.entries
+            .push((format!("Basic {basic}").into_bytes(), CAPABILITY_MARKER));
+        self.entries.push((basic.into_bytes(), CAPABILITY_MARKER));
+        if let Some(authority) = broker_authority(url) {
+            self.entries
+                .push((authority.as_bytes().to_vec(), BROKER_URL_MARKER));
+        }
+        self.entries
+            .sort_by_key(|entry| std::cmp::Reverse(entry.0.len()));
+    }
+
+    pub(crate) fn fresh(&self) -> Self {
+        Self {
+            entries: self.entries.clone(),
+            pending: Vec::new(),
+            finished: false,
+        }
+    }
     /// Build a redactor for one turn's capability and broker base URL. Empty inputs are ignored (a
     /// broker base URL is always non-empty in practice).
     pub fn new(capability: &str, base_url: &str) -> Self {
@@ -498,6 +531,39 @@ impl fmt::Debug for CapabilityRedactor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listener_password_and_basic_authorization_are_redacted_at_every_split() {
+        let password = "independent-control-password";
+        let url = "http://127.0.0.1:49152";
+        let request = reqwest::Client::new()
+            .get(url)
+            .basic_auth("opencode", Some(password))
+            .build()
+            .unwrap();
+        let authorization = request.headers()[reqwest::header::AUTHORIZATION]
+            .to_str()
+            .unwrap();
+        let raw = format!("password={password} auth={authorization} listener={url}");
+        for split in 0..=raw.len() {
+            let mut r = CapabilityRedactor::new("", "");
+            r.add_control(password, url);
+            let mut out = r.push(&raw.as_bytes()[..split]);
+            out.extend(r.push(&raw.as_bytes()[split..]));
+            out.extend(r.finish());
+            let out = String::from_utf8(out).unwrap();
+            assert!(
+                !out.contains(password)
+                    && !out.contains(authorization)
+                    && !out.contains("127.0.0.1:49152"),
+                "split {split}: {out}"
+            );
+            assert_eq!(
+                out,
+                "password=[redacted-capability] auth=[redacted-capability] listener=[redacted-broker-url]"
+            );
+        }
+    }
 
     fn pid(id: &str) -> InternalProviderId {
         InternalProviderId::parse(id).expect("valid id")

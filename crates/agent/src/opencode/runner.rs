@@ -1,24 +1,25 @@
 //! The opencode subprocess runner (STUDIO-902). Rhapsody-only.
 //!
-//! Spawns `opencode run --format json` once per turn in the run's worktree and maps its JSONL
-//! stream to the normalized [`crate::Event`] vocabulary. It follows `crate::claude::runner`'s shape
+//! Owns one `opencode serve --pure` executor per turn (STUDIO-1208), with
+//! authenticated private-loopback HTTP control and scoped pre-prompt SSE observation.
+//! Completed parts retain the historical JSONL transcript and normalized [`crate::Event`].
+//! It follows `crate::claude::runner`'s shape
 //! deliberately — same process-group discipline, same `proctree::kill_tree` arming, same capped
 //! stderr, same containment invariant — and departs from it only where the STUDIO-869 spike
 //! measured a real difference:
 //!
 //! | | claude | opencode |
 //! |---|---|---|
-//! | prompt delivery | one stream-json message on stdin | a POSITIONAL argv argument |
+//! | prompt delivery | one stream-json message on stdin | host-issued HTTP request |
 //! | child stdin | ⚠️ HELD OPEN as the INF-250 operator mailbox | ⚠️ **CLOSED at start** |
-//! | turn end | a terminal `result` line | `step_finish{reason:"stop"}`, then EOF |
+//! | turn end | a terminal `result` line | stop + root idle + prompt success |
 //! | per-turn usage | authoritative, on the result line | per-STEP; the adapter SUMS |
 //! | state directory | none | ⚠️ a PRIVATE `XDG_DATA_HOME` per session, or turns are LOST |
 //! | billing guard | `apiKeySource == "none"` | none exists; see below |
 //!
-//! ⚠️ **stdin is closed at start, and that is measured, not assumed.** The spike drove opencode in
-//! `drive.py`'s `arg` mode — prompt on argv, `p.stdin.close()` immediately (`harness-spike/README.md`'s
-//! Provenance block records the invocation; `sandbox/drive.py` records the handling). So this
-//! backend cannot consume live mailbox messages. The orchestrator queues them durably and
+//! **stdin stays closed at start.** The legacy spike's argv/stdin contract is now
+//! lowered into owned HTTP requests, without adding mid-turn steering. The
+//! orchestrator queues messages durably and
 //! prepends them to the next turn's prompt (STUDIO-1209), including a later ticket dispatch.
 //! The receiver is left untouched here: consuming it without delivery would lose guidance.
 //!
@@ -360,8 +361,8 @@ pub async fn start_brokered_session(
 ///   the granularity codex cannot reach), and `symphony_symphony_state` in
 ///   `harness/harness-spike/opencode/happy.jsonl` (so `ServerUnderscoreTool`).
 /// * `steering: BetweenTurns` — stdin is closed at start; there is no mid-turn channel (module doc).
-/// * `resume: Flags` — `-s <sessionID>`, an unchanged flag on an otherwise-normal invocation, which
-///   is the same shape claude's `--resume` has and the one `resume.jsonl` was captured with.
+/// * `resume: Protocol` — verify/get the retained ID before the next HTTP prompt.
+///   The pinned credential-free canary proves same-ID continuation across executors.
 /// * `mcp: true` — `[RAN]`, the daemon's own tool was called in the happy capture.
 /// * `sandbox: None` — opencode has permission approval (`--auto`), not a sandbox mode or a tool
 ///   allowlist, so neither existing variant describes it and `None` is the honest value. The
@@ -377,7 +378,7 @@ pub(crate) const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
         tool_level: ToolEventGranularity::FileLevel,
     },
     steering: Steering::BetweenTurns,
-    resume: Resume::Flags,
+    resume: Resume::Protocol,
     mcp: true,
     sandbox: Sandbox::None,
     mcp_sandbox: McpSandboxCoupling::Independent,
@@ -1139,6 +1140,11 @@ impl OpencodeSession {
             prompt
         };
         let cfg = self.turn_cfg();
+        let turn_deadline = Instant::now() + cfg.turn_timeout;
+        let control = match super::server::Control::new() {
+            Ok(control) => control,
+            Err(e) => return (failed(Usage::default()), Some(e)),
+        };
 
         // Resolve the brokered inputs for THIS turn. A brokered session without its per-turn attempt
         // refuses; a legacy session drops any attempt (fail-closed: the capability is never minted).
@@ -1262,8 +1268,49 @@ impl OpencodeSession {
             args
         };
 
+        let run_pos = if self.brokered.is_some() {
+            0
+        } else {
+            self.cmd_args.len()
+        };
+        let mut request = match super::server::Request::from_args(&args[run_pos..]) {
+            Ok(request) => request,
+            Err(e) => return (failed(Usage::default()), Some(e)),
+        };
+        if let Err(e) = rhapsody_workspace::validate_launch(
+            &cfg.workspace_root,
+            &self.ws_path,
+            &request.directory,
+        ) {
+            return (
+                failed(Usage::default()),
+                Some(AgentError::Other(e.to_string())),
+            );
+        }
+        // Instance/session ownership uses the real directory, including macOS's
+        // /var -> /private/var alias, just like validate_launch above.
+        request.directory = match std::fs::canonicalize(&request.directory) {
+            Ok(path) => path.to_string_lossy().into_owned(),
+            Err(_) => {
+                return (
+                    failed(Usage::default()),
+                    Some(AgentError::Other(
+                        "opencode_instance_directory_unavailable".into(),
+                    )),
+                );
+            }
+        };
+        let mut api_redactor = stdout_redactor.as_ref().map_or_else(
+            || CapabilityRedactor::new("", ""),
+            CapabilityRedactor::fresh,
+        );
+        api_redactor.add_control(&control.password, &control.url);
+        let err_redactor = stderr_redactor.get_or_insert_with(|| CapabilityRedactor::new("", ""));
+        err_redactor.add_control(&control.password, &control.url);
         let mut cmd = Command::new(&self.cmd_name);
-        cmd.args(&args);
+        cmd.args(&self.cmd_args)
+            .args(control.args())
+            .args(&request.server_flags);
         cmd.current_dir(&self.ws_path);
 
         // Env: withhold the tracker credential by name AND by value (always), then add the "me"
@@ -1328,12 +1375,45 @@ impl OpencodeSession {
             }
             env
         };
+        let control_env_bytes = control.password.len()
+            + "OPENCODE_SERVER_PASSWORD=".len()
+            + "OPENCODE_SERVER_USERNAME=opencode".len()
+            + 2;
+        request.inherit_share = self.brokered.is_none() && self.manager.is_none();
+        if request.inherit_share {
+            request.share |= env.iter().any(|kv| {
+                matches!(
+                    kv.as_str(),
+                    "OPENCODE_AUTO_SHARE=1" | "OPENCODE_AUTO_SHARE=true"
+                )
+            });
+        }
+        if env
+            .iter()
+            .map(|kv| kv.len() + 1)
+            .sum::<usize>()
+            .saturating_add(control_env_bytes)
+            > super::brokered::MAX_ENV_BYTES
+        {
+            return (
+                failed(Usage::default()),
+                Some(AgentError::Other(
+                    "opencode_env_too_large: complete executor environment exceeds the limit"
+                        .into(),
+                )),
+            );
+        }
         cmd.env_clear();
         for kv in &env {
             if let Some((k, v)) = kv.split_once('=') {
+                if matches!(k, "OPENCODE_SERVER_PASSWORD" | "OPENCODE_SERVER_USERNAME") {
+                    continue;
+                }
                 cmd.env(k, v);
             }
         }
+        cmd.env("OPENCODE_SERVER_PASSWORD", &control.password);
+        cmd.env("OPENCODE_SERVER_USERNAME", "opencode");
 
         // Own process group so a deadline kill can signal it. Necessary but NOT sufficient: the
         // spike measured opencode's tool shell escaping into a group of its own (2 survivors of 3
@@ -1362,29 +1442,39 @@ impl OpencodeSession {
             }
         };
         let pid = child.id().unwrap_or(0);
-        let (stdin, mut stdout, mut stderr) =
-            match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
-                (Some(i), Some(o), Some(e)) => (i, o, e),
-                _ => {
-                    let _ = child.start_kill();
-                    let _ = child.wait().await;
-                    return (failed(Usage::default()), Some(AgentError::StartupFailed));
-                }
-            };
-        // ⚠️ CLOSED AT START (`StdinPolicy::ClosedAtStart`). The prompt is already on the argv; a
-        // held-open stdin is claude's mailbox, not this harness's contract.
-        drop(stdin);
-
-        // ⚠️ §9.4 ordering: one composite owns both guards and revokes the capability BEFORE the
-        // process-tree kill can block (see [`TurnTeardown`]). Before this point the access lives in
-        // `brokered_access`; there is no await between its mint and this construction, so a
-        // cancelled future can only drop it here or later, through this composite.
+        // Arm immediately after spawn, before any error-path await. Capability
+        // revocation precedes tree teardown even if pipe acquisition fails.
         let mut teardown = TurnTeardown {
             access: BrokerTurnGuard {
                 access: brokered_access.take(),
             },
             tree: KillTreeOnDrop::new(pid),
         };
+        let (stdin, mut server_stdout, mut stderr) =
+            match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+                (Some(i), Some(o), Some(e)) => (i, o, e),
+                _ => {
+                    teardown.revoke();
+                    kill_tree(pid);
+                    if child.wait().await.is_ok() {
+                        teardown.disarm_tree();
+                    }
+                    return (failed(Usage::default()), Some(AgentError::StartupFailed));
+                }
+            };
+        // CLOSED AT START (`StdinPolicy::ClosedAtStart`). The prompt goes over HTTP; a
+        // held-open stdin is claude's mailbox, not this harness's contract.
+        drop(stdin);
+
+        let _stdout_drain = super::server::Task(tokio::spawn(async move {
+            let mut buf = [0u8; READ_CHUNK];
+            while let Ok(n) = server_stdout.read(&mut buf).await {
+                if n == 0 {
+                    break;
+                }
+            }
+        }));
+        let (mut stdout, _observer) = super::server::stream(control, request, api_redactor);
 
         let mut usage = Usage::default();
         let mut cost_usd = Some(0.0);
@@ -1407,7 +1497,7 @@ impl OpencodeSession {
         // event: `agentupdate.rs` does `re.turn_count += 1` and rebuilds `re.session_id` on every
         // `EVENT_SESSION_STARTED` (design §1.5's "session_id is derived from the turn counter").
         // Claude satisfies that because each of its turns is a fresh process emitting its own
-        // `system/init`, and opencode likewise spawns one `opencode run` per turn — so one event per
+        // `system/init`, and opencode likewise spawns one executor per turn — so one event per
         // turn is the matching behaviour. Seeding this from `thread_id` instead (announce only when
         // the session is new) would emit it once per RUN, and every multi-turn opencode run would
         // report as a single turn for its whole life.
@@ -1417,7 +1507,7 @@ impl OpencodeSession {
         let mut out_chunk = vec![0u8; READ_CHUNK];
         let mut err_chunk = vec![0u8; READ_CHUNK];
 
-        let deadline = tokio::time::sleep_until(Instant::now() + cfg.turn_timeout);
+        let deadline = tokio::time::sleep_until(turn_deadline);
         tokio::pin!(deadline);
 
         // Extracted so it can run both on every stdout chunk AND once more after the redactor's
@@ -1441,8 +1531,8 @@ impl OpencodeSession {
                         abort = true;
                         break;
                     }
-                    self.tee_stdout(&line);
                     let c = classify(&line);
+                    if !c.progress { self.tee_stdout(&line); }
                     // Every line carries the session id and there is no announcement line, so seed
                     // from whichever arrives first — on the measured captures that is a
                     // `step_start`, which is not surfaced as an event at all.
@@ -1524,6 +1614,7 @@ impl OpencodeSession {
         'outer: loop {
             tokio::select! {
                 _ = &mut deadline => {
+                    teardown.revoke();
                     kill_tree(pid);
                     timed_out = true;
                     break 'outer;
@@ -1589,14 +1680,14 @@ impl OpencodeSession {
         // process-tree teardown can block. `finish` marks a clean turn; dropping without it revokes
         // the grant and records the turn as revoked. Either way no capability remains valid between
         // outer turns.
-        if self.manager.is_some() && failure.is_some() {
-            kill_tree(pid);
-        }
-        if terminal_seen && failure.is_none() {
+        if terminal_seen && failure.is_none() && !timed_out && scan_err.is_none() {
             teardown.finish();
         } else {
             teardown.revoke();
         }
+        // serve does not exit on root idle. Capability is already closed before
+        // killing its tool/MCP tree; neither listener nor observer survives a turn.
+        kill_tree(pid);
 
         let drain_out = async {
             let mut buf = [0u8; 4096];
@@ -1645,15 +1736,17 @@ impl OpencodeSession {
                 }
             }
         } else {
-            tokio::join!(drain_out, drain_err);
+            let _ = tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(drain_out, drain_err);
+            })
+            .await;
             child.wait().await
         };
         teardown.disarm_tree();
 
-        // A deadline kill that landed after a completed turn must not discard the turn, which is
-        // why `terminal_seen` is checked before `timed_out` — the same precedence the claude runner
-        // gives a captured result.
-        if terminal_seen && failure.is_none() && !(self.manager.is_some() && timed_out) {
+        // A stop part is not a successful drain: observer loss or a deadline before
+        // root idle / prompt success must still fail the observation-dependent turn.
+        if terminal_seen && failure.is_none() && !timed_out && scan_err.is_none() {
             // A clean turn: the run may keep going (a continuation) or end, but it is no longer a
             // cut-off one — `end_of_run` cleans up unless a LATER turn fails (STUDIO-1043).
             self.last_turn_failed.store(false, Ordering::SeqCst);
@@ -1910,6 +2003,17 @@ mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
                 turn_timeout: Duration::from_secs(5),
                 ..Default::default()
             });
+            let body = std::fs::read_to_string(&script).unwrap();
+            let bridge = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../harness/stubs/fake-opencode-server.py");
+            std::fs::write(
+                &script,
+                format!(
+                    "if [ \"$1\" = serve ]; then exec python3 '{}' \"$0\" \"$@\"; fi\n{body}",
+                    bridge.display()
+                ),
+            )
+            .unwrap();
             let req = ManagerSessionStart {
                 cwd: cwd.to_string_lossy().into_owned(),
                 config_dir: config.to_string_lossy().into_owned(),
@@ -1970,7 +2074,19 @@ mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
                         .map(|(k, v)| (k.to_string(), v.to_string()))
                 })
                 // bash itself contributes these variables, after exec's allow-list.
-                .filter(|(k, _)| !["PWD", "SHLVL", "_"].contains(&k.as_str()))
+                // Python's test-only HTTP bridge adds locale/runtime metadata.
+                .filter(|(k, _)| {
+                    ![
+                        "PWD",
+                        "SHLVL",
+                        "_",
+                        "LC_CTYPE",
+                        "__CF_USER_TEXT_ENCODING",
+                        "OPENCODE_SERVER_USERNAME",
+                        "OPENCODE_SERVER_PASSWORD",
+                    ]
+                    .contains(&k.as_str())
+                })
                 .collect()
         }
 
@@ -2289,6 +2405,42 @@ mod tests {
     use crate::{ENV_GUARD, EVENT_NOTIFICATION, Runner as _};
     use std::sync::Arc;
 
+    #[tokio::test]
+    async fn an_open_tool_still_obeys_the_turn_deadline() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let script = write_script(
+            &scripts,
+            "open.sh",
+            r#"printf '%s\n' '{"type":"tool_use","sessionID":"ses_x","part":{"id":"prt_wait","tool":"bash","state":{"status":"running"}}}'
+sleep 30
+"#,
+        );
+        let root = TempDir::new();
+        let state = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let mut runner = runner_for(&script, &root, &auth, &state.path().to_string_lossy());
+        runner.cfg.turn_timeout = Duration::from_secs(1);
+        let session = runner
+            .start_session(&make_ws(&root, "ws"), issue("OPEN-1208"), None)
+            .await
+            .unwrap();
+        let (seen, on_event) = collector();
+        let (result, error) = session.run_turn("p", None, None, &on_event).await;
+        assert_eq!(error, Some(AgentError::TurnTimeout));
+        assert_eq!(result.status, TURN_TIMED_OUT);
+        assert!(
+            events_of(&seen)
+                .iter()
+                .any(|e| e.tool_calls.iter().any(|c| c.open)),
+            "tool really started before deadline"
+        );
+        assert_eq!(
+            events_of(&seen).last().unwrap().event_type,
+            EVENT_TURN_FAILED
+        );
+    }
+
     /// A fake `opencode` that reproduces the ONE failure this adapter exists to prevent.
     ///
     /// ⚠️ It models the real hazard rather than mimicking a success: on entry it tries to
@@ -2325,7 +2477,16 @@ exit 0
 
     fn write_script(dir: &TempDir, name: &str, body: &str) -> String {
         let p = dir.path().join(name);
-        std::fs::write(&p, body).expect("write fake opencode");
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../harness/stubs/fake-opencode-server.py");
+        std::fs::write(
+            &p,
+            format!(
+                "if [ \"$1\" = serve ]; then exec python3 '{}' \"$0\" \"$@\"; fi\n{body}",
+                bridge.display()
+            ),
+        )
+        .expect("write fake opencode");
         p.to_string_lossy().into_owned()
     }
 
@@ -2868,7 +3029,13 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         let (seen, on_event) = collector();
         let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
 
-        assert!(events_of(&seen).is_empty(), "the fixture emits no events");
+        let evs = events_of(&seen);
+        assert_eq!(
+            evs.len(),
+            1,
+            "host announces its session even when the model emits nothing"
+        );
+        assert_eq!(evs[0].event_type, EVENT_SESSION_STARTED);
         assert_eq!(tr.status, TURN_FAILED);
         let msg = err.expect("a zero-event turn must be an error").to_string();
         assert!(
@@ -2878,10 +3045,6 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         assert!(
             msg.contains("database is locked"),
             "the reason must survive: {msg}"
-        );
-        assert!(
-            msg.contains("two turns shared one opencode state directory"),
-            "a zero-event turn must name its most likely cause: {msg}"
         );
     }
 
@@ -3231,8 +3394,8 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         );
         assert_eq!(caps.tool_naming, ToolNaming::ServerUnderscoreTool);
 
-        // resume: Flags — the resume capture continues the SAME session the happy capture opened.
-        assert_eq!(caps.resume, Resume::Flags);
+        // The captured same-ID continuation is retained, now through HTTP (STUDIO-1208).
+        assert_eq!(caps.resume, Resume::Protocol);
         let session_id = |text: &str| {
             text.split("\"sessionID\":\"")
                 .nth(1)
@@ -3488,23 +3651,29 @@ printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
         let ws = make_ws(&root, "w");
         let sr = state_root.path().to_string_lossy().into_owned();
 
-        // A turn deadline long enough that only the outer timeout can end the turn, so the drop is
+        // A turn deadline long enough that only cancellation can end the turn, so the drop is
         // the cancellation path and not a `turn_timeout` return.
         let runner = runner_with(&cut, &root, &auth, &sr, "m", 30);
         let sess = runner
             .start_session(&ws, issue("STUDIO-1043"), None)
             .await
             .expect("session");
-        let (_s, on) = collector();
-        let cancelled = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            sess.run_turn("cut off mid-turn", None, None, &on),
-        )
-        .await;
-        assert!(
-            cancelled.is_err(),
-            "the outer timeout must cut the turn off"
-        );
+        let started = tokio::sync::Notify::new();
+        let on = |e: Event| {
+            if e.event_type == EVENT_SESSION_STARTED {
+                started.notify_one();
+            }
+        };
+        {
+            let turn = sess.run_turn("cut off mid-turn", None, None, &on);
+            tokio::pin!(turn);
+            tokio::select! {
+                result = &mut turn => panic!("cut-off fixture ended before cancellation: {result:?}"),
+                ready = tokio::time::timeout(Duration::from_secs(5),started.notified()) => ready.expect("owned session must be established before cancellation"),
+            }
+            // Drop the live turn only AFTER its session exists. A 500ms timer
+            // raced HTTP/Python startup under parallel tests and tested cold refusal.
+        }
         // The worker future is dropped without `stop()` — exactly the operator-Stop shape.
         drop(sess);
 

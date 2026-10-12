@@ -456,6 +456,8 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         last_cpu_sample_at: epoch,
         cpu_failure_since: None,
         cpu_failure_logged: false,
+        open_tool_calls: HashSet::new(),
+        tool_turn_finished: true,
         recent_events: Vec::new(),
     }
 }

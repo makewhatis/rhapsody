@@ -1,7 +1,8 @@
 //! CLI argument construction for the opencode backend (STUDIO-902). Rhapsody-only.
 //!
-//! [`Config`] is the backend's configuration and [`build_args`] assembles the per-turn `opencode
-//! run` argv. The managed flag set is the one the STUDIO-869 spike actually ran — recorded verbatim
+//! [`Config`] is the backend's configuration and [`build_args`] preserves the historical per-turn
+//! `run` knob precedence. STUDIO-1208 lowers this intermediate vector into HTTP controls;
+//! it is not the executor's argv. The flag set is the one the STUDIO-869 spike ran — recorded verbatim
 //! in `harness/harness-spike/README.md`'s Provenance section:
 //!
 //! ```text

@@ -87,6 +87,8 @@ struct RawContentBlock {
     #[serde(rename = "type")]
     r#type: String,
     text: String,
+    id: String,
+    tool_use_id: String,
 }
 
 /// Maps one stream-json line to a normalized event (Go `classify`/`classifyWithAPIKeySource`).
@@ -140,6 +142,7 @@ pub fn classify(line: &[u8]) -> Classified {
                 event_type: EVENT_NOTIFICATION.to_string(),
                 timestamp: now,
                 message: text,
+                tool_calls: tool_calls(&r, true),
                 ..Default::default()
             };
             if let Some(u) = usage {
@@ -192,11 +195,47 @@ pub fn classify(line: &[u8]) -> Classified {
                 ..Default::default()
             }
         }
+        "user" => {
+            let calls = tool_calls(&r, false);
+            Classified {
+                ok: !calls.is_empty(),
+                event: Event {
+                    event_type: EVENT_NOTIFICATION.into(),
+                    timestamp: now,
+                    tool_calls: calls,
+                    ..Default::default()
+                },
+                session_id: r.session_id,
+                ..Default::default()
+            }
+        }
         _ => Classified {
             session_id: r.session_id,
             ..Default::default()
         },
     }
+}
+
+fn tool_calls(r: &RawLine, open: bool) -> Vec<crate::ToolCall> {
+    r.message
+        .iter()
+        .flat_map(|m| &m.content)
+        .filter_map(|c| {
+            let id = match (open, c.r#type.as_str()) {
+                (true, "tool_use") => &c.id,
+                (false, "tool_result") => &c.tool_use_id,
+                _ => return None,
+            };
+            if id.is_empty() || r.session_id.is_empty() {
+                return None;
+            }
+            Some(crate::ToolCall {
+                session_id: r.session_id.clone(),
+                id: id.clone(),
+                open,
+            })
+        })
+        .collect()
 }
 
 /// Converts a stream-json usage object into the normalized [`Usage`]. `input`/`output` stay the
@@ -265,6 +304,35 @@ fn truncate_tail(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn captured_bash_and_mcp_results_close_the_actual_call_ids() {
+        let lines: Vec<_> = include_str!("../../../../harness/harness-spike/claude/happy.jsonl")
+            .lines()
+            .collect();
+        for (start, end, id) in [
+            (20, 21, "toolu_018kCsxF6qNFg98AYDV7HPXw"),
+            (28, 29, "toolu_01E9DFCvw6vP1mdP2TLnBk2H"),
+        ] {
+            let start = super::classify(lines[start - 1].as_bytes());
+            let end = super::classify(lines[end - 1].as_bytes());
+            assert!(
+                start.ok && end.ok,
+                "result-only events must reach the runner"
+            );
+            assert_eq!(start.event.tool_calls[0].id, id);
+            assert_eq!(end.event.tool_calls[0].id, id);
+            assert!(start.event.tool_calls[0].open);
+            assert!(!end.event.tool_calls[0].open);
+            assert_eq!(
+                start.event.tool_calls[0].session_id,
+                end.event.tool_calls[0].session_id
+            );
+            assert!(
+                end.event.usage.is_none(),
+                "tool results are not model usage"
+            );
+        }
+    }
     #[test]
     fn extracts_result_dollars_without_inventing_missing_cost() {
         let priced = super::classify(

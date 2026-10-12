@@ -1,8 +1,9 @@
 //! opencode — the opencode CLI agent backend (STUDIO-902). Rhapsody-only; the frozen Go reference
 //! runs exactly one backend, so nothing here is a parity port.
 //!
-//! Rhapsody drives `opencode run --format json` headlessly as a subprocess and maps its JSONL
-//! output to the same normalized [`crate`] agent events the claude backend produces. The module
+//! Rhapsody owns a turn-scoped `opencode serve --pure` executor, observes scoped SSE and
+//! issues authenticated host HTTP prompts (STUDIO-1208). Completed parts retain the historical
+//! JSONL transcript shape and normalized [`crate`] events. The module
 //! split mirrors [`crate::claude`]'s so the two read the same way:
 //!
 //! * [`args`] — [`Config`] plus argv construction ([`build_args`]).
@@ -63,6 +64,7 @@ pub mod parse;
 pub mod probe;
 pub mod resume;
 pub mod runner;
+mod server;
 pub mod state;
 
 pub use args::{Config, auto_approve_enabled, build_args};
