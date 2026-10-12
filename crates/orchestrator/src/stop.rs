@@ -348,7 +348,16 @@ impl Orchestrator {
         self.persist_totals();
         self.persist_complete(&re.issue.identifier); // drop persistent retry/claim rows (boot-recovery)
         self.completed.remove(&id);
-        self.claimed.insert(id); // in-memory suppression for the off-loop move window
+        if is_local_review(&id) {
+            // There is no tracker move window for a review. End this unfinished round locally,
+            // without leaving it claimed forever or charging crash backoff on the next sweep.
+            self.claimed.remove(&id);
+            if let Err(error) = self.rearm_stopped_review(&id) {
+                tracing::warn!(review = %id, err = %error, "stop: re-arming the unfinished review failed");
+            }
+        } else {
+            self.claimed.insert(id); // in-memory suppression for the off-loop move window
+        }
         plan
     }
 
@@ -364,9 +373,10 @@ impl Orchestrator {
     /// currently executing (`live`) OR has already FINISHED non-stopped (`superseded`). The supersession
     /// scan reads `issue_history` HERE, on the loop, so it serializes against `persist_end_run` (also
     /// on the loop) — closing the off-loop race where a run finishing between an off-loop read and
-    /// admission would slip through. Never clears `o.claimed`. Mirrors Go `handleResume`.
+    /// admission would slip through. Ticket suppression clears only after the move; reviews end
+    /// locally after admission, because they have no tracker ticket. Mirrors Go `handleResume`.
     pub(crate) fn handle_resume(
-        &self,
+        &mut self,
         issue_id: &str,
         identifier: &str,
         project: &str,
@@ -408,7 +418,44 @@ impl Orchestrator {
                 };
             }
         }
+        if is_local_review(issue_id) {
+            if let Err(error) = self.rearm_stopped_review(issue_id) {
+                return ResumePlan {
+                    err: Some(error),
+                    ..Default::default()
+                };
+            }
+            self.claimed.remove(issue_id);
+        }
         ResumePlan::default()
+    }
+
+    /// Re-arm only an existing live watch row; stopping is not a completed verdict, and resume
+    /// must not resurrect a dismissed PR. Both SHA columns and the row's origin stay intact.
+    fn rearm_stopped_review(&mut self, issue_id: &str) -> Result<(), store::StoreError> {
+        let Some(pr) = crate::teamsknow::parse_pr_ref(issue_id) else {
+            return Ok(());
+        };
+        let key = store::ReviewWatchKey {
+            owner: pr.owner,
+            repo: pr.repo,
+            number: pr.number,
+            reviewer: pr.reviewer,
+        };
+        if crate::review::review_key(&key.owner, &key.repo, key.number, &key.reviewer) != issue_id {
+            return Ok(());
+        }
+        if let Some(row) = self.store.get_review_watch(&key)?
+            && row.open
+            && row.status != store::REVIEW_STATUS_DROPPED
+        {
+            self.store.save_review_watch(store::ReviewWatchRow {
+                status: store::REVIEW_STATUS_REQUESTED.into(),
+                ..row
+            })?;
+            self.review_attempts.remove(&key);
+        }
+        Ok(())
     }
 
     /// Runs ON the control task after the off-loop move-to-Todo. Mirrors Go `handleResumeFinalize`.
@@ -420,6 +467,11 @@ impl Orchestrator {
             self.claimed.remove(issue_id);
         }
     }
+}
+
+/// Manager PR runs share the review prefix but have no reviewer watch row.
+fn is_local_review(issue_id: &str) -> bool {
+    !crate::managerrun::is_manager_key(issue_id) && crate::review::is_review_key(issue_id)
 }
 
 impl ControlHandle {
@@ -511,7 +563,7 @@ impl ControlHandle {
                 ..Default::default()
             });
         }
-        if run.team_id.is_empty() {
+        if run.team_id.is_empty() && !is_local_review(&run.issue_id) {
             return Ok(ResumeResult {
                 no_team: true,
                 identifier: run.issue_identifier,
@@ -817,13 +869,41 @@ mod tests {
             "lead:example/repo#0:1@manager",
             "limit:account@manager",
             "LIMIT:ACCOUNT@MANAGER",
+            "pr:example/repo#1@manager",
             "pr:example/repo#1@reviewer",
         ] {
             let mut fake = Fake::new();
             fake.move_to_type_name = "Backlog".into();
             let tr = Arc::new(fake);
             let (mut o, env) = stop_orch(tr.clone());
-            if crate::review::is_review_key(key) {
+            if key == "pr:example/repo#1@manager" {
+                o.pending_manager.insert(
+                    key.into(),
+                    crate::managerrun::ManagerRun {
+                        owner: "example".into(),
+                        repo: "repo".into(),
+                        number: 1,
+                        ..Default::default()
+                    },
+                );
+            }
+            let review = is_local_review(key);
+            let watch_key = store::ReviewWatchKey {
+                owner: "example".into(),
+                repo: "repo".into(),
+                number: 1,
+                reviewer: "reviewer".into(),
+            };
+            if review {
+                env.store
+                    .save_review_watch(store::ReviewWatchRow {
+                        key: watch_key.clone(),
+                        status: store::REVIEW_STATUS_IN_FLIGHT.into(),
+                        requested_sha: "head".into(),
+                        open: true,
+                        ..Default::default()
+                    })
+                    .expect("watch row");
                 o.pending_review.insert(
                     key.into(),
                     crate::review::ReviewRun {
@@ -837,7 +917,7 @@ mod tests {
                 );
             }
             o.dispatch_issue(
-                issue_team(key, key, "In Progress", "TEAM-1"),
+                issue_team(key, key, "In Progress", if review { "" } else { "TEAM-1" }),
                 None,
                 None,
                 String::new(),
@@ -845,6 +925,12 @@ mod tests {
             let run_id = o.running[key].run_id;
             let (task, handle) = start(o, &env.signal);
             let stopped = handle.stop_run(CancelWait::default(), run_id).await;
+            if review {
+                let row = env.store.get_review_watch(&watch_key).unwrap().unwrap();
+                assert_eq!(row.status, store::REVIEW_STATUS_REQUESTED);
+                assert_eq!(row.requested_sha, "head");
+                assert!(row.last_reviewed_sha.is_empty());
+            }
             let cancelled_before_shutdown =
                 env.cancelled.lock().expect("cancelled")[key].is_cancelled();
             let resumed = handle.resume_run(CancelWait::default(), run_id).await;
@@ -866,7 +952,11 @@ mod tests {
             assert!(!resumed.not_found && !resumed.no_team && !resumed.not_stopped);
             assert!(!resumed.live_run && !resumed.superseded);
             assert!(resumed.moved_to.is_empty() && !resumed.move_err.is_empty());
-            assert!(o.claimed.contains(key), "no move can clear suppression");
+            if crate::review::is_review_key(key) && !crate::managerrun::is_manager_key(key) {
+                assert!(!o.claimed.contains(key), "review rounds end locally");
+            } else {
+                assert!(o.claimed.contains(key), "no move can clear suppression");
+            }
         }
     }
 

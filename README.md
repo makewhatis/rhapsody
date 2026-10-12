@@ -82,6 +82,17 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Operator stop/resume ends a ticketless review round locally (STUDIO-1182)
+
+Stopping a reviewer releases its synthetic key's claim immediately and re-arms its existing live
+watch row to `requested`, preserving the requested and last-completed SHAs. The next watcher tick
+can review the current head, and an operator review rerun can re-arm it without a daemon restart.
+An admitted resume does the same, including for ticketless rows without a tracker team ID; live
+and superseded-run guards still apply. Neither operation moves a tracker ticket, and dismissed
+watch rows stay dismissed. Lead/manager suppression and ticket stop/resume's move-window semantics
+are unchanged. This review-only behavior has no frozen Go counterpart; API shapes, schema and
+goldens are unchanged.
+
 ### Linear issue-id input guards (STUDIO-1172)
 
 Linear reads now validate issue inputs locally as a canonical UUID or an ASCII `TEAM-123`
