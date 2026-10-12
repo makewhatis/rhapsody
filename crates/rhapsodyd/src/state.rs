@@ -229,6 +229,16 @@ impl StateProvider for DaemonState {
         self.handle
             .accounts(self.account_now_s.unwrap_or_else(|| Utc::now().timestamp()))
     }
+    async fn clear_credential_hold(
+        &self,
+        harness: &str,
+        account: &str,
+    ) -> Result<bool, RunActionError> {
+        self.handle
+            .clear_credential_hold(harness, account)
+            .await
+            .map_err(RunActionError::new)
+    }
 
     async fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
         // `None` means the control loop is not serving — it is gone (the daemon is shutting down) or

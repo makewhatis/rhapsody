@@ -31,7 +31,8 @@ use rhapsody_provider_status::{CatalogError, CatalogSnapshot, ProviderStatusView
 use rhapsody_store::StoreError;
 
 use crate::handlers::{
-    handle_accounts, handle_healthz, handle_refresh, handle_state, handle_version,
+    handle_accounts, handle_clear_credential, handle_healthz, handle_refresh, handle_state,
+    handle_version,
 };
 use crate::handlers_config::{handle_capabilities, handle_config};
 use crate::handlers_drain::handle_drain;
@@ -108,6 +109,14 @@ pub trait StateProvider: Send + Sync {
     /// Read-only account ledger snapshot (STUDIO-1123); no control round-trip or provider I/O.
     fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
         Vec::new()
+    }
+    /// Explicit credential recovery acknowledgement; mutation is scheduling-task-owned.
+    async fn clear_credential_hold(
+        &self,
+        _harness: &str,
+        _account: &str,
+    ) -> Result<bool, RunActionError> {
+        Ok(false)
     }
 
     /// The synchronous runtime view served at `/api/v1/state` (Go `Snapshot(ctx)`). An `Err` renders
@@ -856,6 +865,10 @@ where
         // state-free — `/state` is golden-pinned to the Go daemon's payload and cannot carry it.
         .route("/api/v1/version", any(handle_version))
         .route("/api/v1/accounts", any(handle_accounts))
+        .route(
+            "/api/v1/accounts/{id}/credentials/{harness}/clear",
+            operator_write(handle_clear_credential),
+        )
         .route(
             "/api/v1/notifications",
             any(crate::handlers_notifications::handle_notifications),

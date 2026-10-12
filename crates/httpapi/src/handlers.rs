@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::extract::Path;
 use axum::extract::State;
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
@@ -125,6 +126,29 @@ pub(crate) async fn handle_accounts(
         StatusCode::OK,
         &serde_json::json!({"accounts": provider.accounts()}),
     )
+}
+
+/// Operator acknowledgement after re-authenticating, scoped to one harness/account.
+pub(crate) async fn handle_clear_credential(
+    method: Method,
+    Path((account, harness)): Path<(String, String)>,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(response) = require_post(&method, "use POST to clear a credential hold") {
+        return response;
+    }
+    match provider.clear_credential_hold(&harness, &account).await {
+        Ok(cleared) => write_json(
+            StatusCode::OK,
+            &serde_json::json!({"account":account, "harness":harness, "cleared":cleared}),
+        ),
+        Err(error) => write_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credential_clear_failed",
+            error.to_string(),
+            None,
+        ),
+    }
 }
 
 /// Enforce GET/HEAD on a read-only route: `Some(405 envelope)` (with `Allow: GET, HEAD`) on any other
@@ -252,6 +276,40 @@ mod tests {
             .unwrap();
         assert_eq!(head.status(), 200);
         assert!(head.bytes().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn accounts_report_rejected_login_and_operator_can_clear_its_harness() {
+        let account = serde_json::from_value(serde_json::json!({
+            "account":"fireworks-ai", "windows":[], "status":"credential_held", "level":"stop_new",
+            "using_credits":false, "last_seen_s":0, "source":"", "stale":false, "detection":"inactive",
+            "probe_reason":"login rejected — run `opencode auth login` as the daemon's user",
+            "credential_probes":[{"account":"fireworks-ai", "harness":"opencode", "held":true,
+                "reason":"login rejected — run `opencode auth login` as the daemon's user", "checked_at_s":1}]
+        })).unwrap();
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_accounts(vec![account])).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/accounts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["accounts"][0]["status"], "credential_held");
+        assert_eq!(body["accounts"][0]["credential_probes"][0]["held"], true);
+        assert!(
+            body["accounts"][0]["probe_reason"]
+                .as_str()
+                .unwrap()
+                .contains("opencode auth login")
+        );
+        let client = crate::testutil::operator_client();
+        let url = format!("{base}/api/v1/accounts/fireworks-ai/credentials/opencode/clear");
+        let response = client.post(&url).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap(),
+            serde_json::json!({
+                "account":"fireworks-ai", "harness":"opencode", "cleared":true
+            })
+        );
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status().as_u16(), 405);
     }
 
     // Mirrors Go `TestHealthzEndpoint`.

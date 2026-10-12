@@ -82,6 +82,24 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Credential-scoped rejected-login holds (STUDIO-1199)
+
+A typed agent login rejection holds new work on its dispatch-time harness/account, including other
+tickets using that credential. The failed author records one `failed` run without a timed retry,
+claim or human label; recovery re-offers it even if its earlier linked-PR summons was consumed.
+Selection and final admission report a credential-wait reason without automatically switching
+engines or reassigning teammates. Other credentials and live runs remain independently usable.
+
+`GET /api/v1/accounts` publishes the hold through `credential_probes`, `credential_held` and
+`stop_new`. The shared notification centre projects one Needs-you `credential_rejected` episode
+per harness/account, updated in place on repeats and deactivated on recovery. A successful run on
+that credential, a healthy existing Claude credential or ChatGPT usage probe, or operator-guarded
+`POST /api/v1/accounts/{account}/credentials/{harness}/clear` releases the rejection. Unknown probes
+cannot erase a confirmed run failure. Providers without an existing probe require an operator
+clear (or success from an already-live run); no new provider calls are introduced. Holds and author
+resume admissions share the existing process-local credential-cache lifetime. No frozen Go schema,
+payload golden, normalization rule or credential file changes.
+
 ### Operator stop/resume ends a ticketless review round locally (STUDIO-1182)
 
 Stopping a reviewer releases its synthetic key's claim immediately and re-arms its existing live

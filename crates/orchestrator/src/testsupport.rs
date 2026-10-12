@@ -425,6 +425,7 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         model: String::new(),
         model_override: rhapsody_agent::ModelOverride::default(),
         harness: String::new(),
+        credential_harness: String::new(),
         harness_origin: String::new(),
         model_origin: String::new(),
         stack_context: String::new(),

@@ -843,6 +843,17 @@ impl Orchestrator {
         };
         let model = self.manager_model_override(inherited, entry);
         let pricing = self.run_pricing_for(&entry.harness, &model, project);
+        let credential_account = crate::accounts::account_for(&entry.harness, &pricing.model, true);
+        if let Some(reason) = self.rejected_credential_reason(&entry.harness, &credential_account) {
+            return Some(crate::budget::BudgetHeld {
+                subject: iss.identifier,
+                title: iss.title,
+                project: project.into(),
+                provider: credential_account,
+                reason: format!("waiting: credential — {reason}"),
+                ..Default::default()
+            });
+        }
         if let Some(reason) = self.manager_credential_probe_reason(&entry.harness, project) {
             return Some(crate::budget::BudgetHeld {
                 subject: iss.identifier,
