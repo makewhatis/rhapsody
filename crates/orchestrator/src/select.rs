@@ -16,7 +16,7 @@
 //!   * `o.eff` is `Option<Effective>`; the passes guard `None` (returning no picks — there is
 //!     nothing to schedule without a loaded config) instead of Go's nil-deref-relies-on-invariant.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use rhapsody_core::{Issue, normalize_state};
 
@@ -82,7 +82,16 @@ impl Orchestrator {
             self.log_non_live_claim(issue);
             self.observe_parked_issue(issue);
         }
-        crate::dispatch::sort_for_dispatch(&mut issues);
+        // Snapshot due candidates once: no profile reads or changing clock inside the comparator.
+        let due: BTreeSet<_> = issues
+            .iter()
+            .filter(|i| self.issue_credential_canary(i, "").is_some())
+            .map(|i| i.id.clone())
+            .collect();
+        issues.sort_by(|a, b| {
+            Self::credential_canary_cmp(a, b, due.contains(&a.id), due.contains(&b.id))
+        });
+        let mut canaries = BTreeSet::new();
 
         let mut running = self.running_id_set();
         let mut state_counts = self.running_state_counts();
@@ -242,6 +251,9 @@ impl Orchestrator {
                 {
                     continue;
                 }
+                if !self.select_credential_canary(&iss, "", &mut canaries) {
+                    continue;
+                }
                 running.insert(iss.id.clone());
                 *state_counts.entry(pst).or_insert(0) += 1;
                 global_remaining -= 1;
@@ -394,6 +406,9 @@ impl Orchestrator {
                 continue;
             }
             // Reserve so a single tick cannot over-dispatch.
+            if !self.select_credential_canary(&iss, "", &mut canaries) {
+                continue;
+            }
             running.insert(iss.id.clone());
             *state_counts.entry(st).or_insert(0) += 1;
             global_remaining -= 1;
@@ -522,6 +537,26 @@ impl Orchestrator {
             self.observe_parked_issue_in_project(&issue.iss, issue.proj);
         }
         sort_tagged_stable(&mut tagged);
+        let due: BTreeSet<_> = tagged
+            .iter()
+            .filter(|t| {
+                let slug = t
+                    .proj
+                    .and_then(|i| eff.projects.get(i))
+                    .map_or("", |p| p.slug.as_str());
+                self.issue_credential_canary(&t.iss, slug).is_some()
+            })
+            .map(|t| (t.iss.id.clone(), t.proj))
+            .collect();
+        tagged.sort_by(|a, b| {
+            Self::credential_canary_cmp(
+                &a.iss,
+                &b.iss,
+                due.contains(&(a.iss.id.clone(), a.proj)),
+                due.contains(&(b.iss.id.clone(), b.proj)),
+            )
+        });
+        let mut canaries = BTreeSet::new();
 
         let mut running = self.running_id_set();
         let mut global_remaining =
@@ -663,6 +698,9 @@ impl Orchestrator {
                         eff.max_concurrent,
                     )
                 {
+                    continue;
+                }
+                if !self.select_credential_canary(&ti.iss, &p.slug, &mut canaries) {
                     continue;
                 }
                 running.insert(ti.iss.id.clone());
@@ -821,6 +859,9 @@ impl Orchestrator {
                 continue;
             }
             // Reserve all three counters per admit.
+            if !self.select_credential_canary(&ti.iss, &p.slug, &mut canaries) {
+                continue;
+            }
             let group = p.group.clone();
             running.insert(ti.iss.id.clone());
             global_remaining -= 1;

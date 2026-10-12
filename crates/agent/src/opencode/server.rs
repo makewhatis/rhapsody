@@ -979,7 +979,14 @@ mod tests {
             "1.18.30"
         );
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        for (brokered, scenario) in [(true, "wait"), (true, "mcp-error"), (false, "wait")] {
+        for (brokered, scenario) in [
+            (true, "wait"),
+            (true, "mcp-error"),
+            (true, "subagent"),
+            (true, "auth"),
+            (false, "auth"),
+            (false, "wait"),
+        ] {
             let d = TempDir::new();
             let ws = d.path().join("ws");
             std::fs::create_dir(&ws).unwrap();
@@ -1151,7 +1158,7 @@ mod tests {
                 seen.lock().unwrap().push(e);
             };
             let mut prior_id = String::new();
-            for turn in 0..2 {
+            for turn in 0..if scenario == "auth" { 1 } else { 2 } {
                 let attempt_receipt = ledger.as_mut().map(|l| {
                     l.arm_turn(rhapsody_provider_broker::TurnMeta::without_deadline())
                         .unwrap()
@@ -1167,10 +1174,38 @@ mod tests {
                         attempt,
                     )
                     .await;
+                if scenario == "auth" {
+                    assert_eq!(result.status, crate::TURN_FAILED, "{error:?}");
+                    assert!(
+                        error
+                            .as_ref()
+                            .is_some_and(|e| e.to_string().contains("401")),
+                        "provider rejection must survive: {error:?}"
+                    );
+                    assert_eq!(
+                        matches!(error, Some(crate::AgentError::AuthNeeded(_))),
+                        !brokered,
+                        "native login rejection must stay typed"
+                    );
+                    if let Some(receipt) = receipt {
+                        assert_eq!(
+                            receipt.take().unwrap().outcome(),
+                            rhapsody_provider_broker::TurnOutcome::Revoked
+                        );
+                    }
+                    break;
+                }
                 assert!(error.is_none(), "{brokered}/{scenario}: {error:?}");
                 assert_eq!(result.status, crate::TURN_SUCCEEDED);
                 assert_eq!(result.result_text, "P0_OK");
-                assert_eq!(result.usage.total_tokens, if turn == 0 { 26 } else { 13 });
+                assert_eq!(
+                    result.usage.total_tokens,
+                    if turn == 0 {
+                        if scenario == "subagent" { 38 } else { 26 }
+                    } else {
+                        13
+                    }
+                );
                 if let Some(receipt) = receipt {
                     assert_eq!(
                         receipt.take().unwrap().outcome(),
@@ -1190,14 +1225,31 @@ mod tests {
                 .flat_map(|e| &e.tool_calls)
                 .cloned()
                 .collect();
-            assert!(calls.iter().any(|c| c.open));
-            assert_eq!(calls.first().unwrap().id, calls.last().unwrap().id);
-            assert!(!calls.last().unwrap().open);
+            if scenario == "auth" {
+                assert!(calls.is_empty());
+            } else {
+                assert!(calls.iter().any(|c| c.open));
+                assert_eq!(calls.first().unwrap().id, calls.last().unwrap().id);
+                assert!(!calls.last().unwrap().open);
+            }
             assert!(!marker.exists(), "pure/project controls failed");
             let records: Value = serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
-            assert_eq!(records.as_array().unwrap().len(), 3);
+            assert_eq!(
+                records.as_array().unwrap().len(),
+                if scenario == "auth" {
+                    1
+                } else if scenario == "subagent" {
+                    4
+                } else {
+                    3
+                }
+            );
             for r in records.as_array().unwrap() {
                 assert_eq!(r["path"], "/v1/chat/completions");
+                assert_eq!(
+                    r["response_status"],
+                    if scenario == "auth" { 401 } else { 200 }
+                );
                 assert_eq!(r["body"]["model"], "probe-model");
                 assert_eq!(r["body"]["max_tokens"], 32000);
                 assert_eq!(
@@ -1223,9 +1275,12 @@ mod tests {
             drop(custody);
             provider.kill().unwrap();
             provider.wait().unwrap();
-            eprintln!(
-                "PASS: pinned {brokered}/{scenario}: lifecycle, final text, summed usage, resume, schema, pure/project controls"
-            );
+            let verified = if scenario == "auth" {
+                "credential rejection, schema, pure/project controls"
+            } else {
+                "lifecycle, final text, summed usage, resume, schema, pure/project controls"
+            };
+            eprintln!("PASS: pinned {brokered}/{scenario}: {verified}");
         }
     }
 }

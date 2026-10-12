@@ -12,6 +12,7 @@
 //! window, then uses events alone. Compiling the reader on every target lets the
 //! `/proc`-parsing parity tests (`sampler_linux_test.go`) run under the macOS CI via a synthetic
 //! proc root — exactly as Go's linux tests override `procRoot` — instead of being skipped.
+
 use std::path::Path;
 use std::sync::Arc;
 
@@ -71,10 +72,10 @@ fn group_cpu(proc_root: &Path, pgid: i32) -> Option<u64> {
             continue;
         };
         if name.parse::<i64>().is_err() {
-            continue;
+            continue; // not a `<pid>` directory
         }
         let Ok(data) = std::fs::read_to_string(e.path().join("stat")) else {
-            continue;
+            continue; // process exited between read_dir and read
         };
         if let Some((grp, utime, stime)) = parse_stat(&data)
             && grp == pgid

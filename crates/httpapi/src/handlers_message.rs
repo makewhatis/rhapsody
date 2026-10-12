@@ -9,7 +9,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{Method, StatusCode};
 use axum::response::Response;
-use rhapsody_store::{RUN_MESSAGE_SENT, RunMessage};
+use rhapsody_store::{RUN_MESSAGE_QUEUED_NEXT_TURN, RUN_MESSAGE_SENT, RunMessage};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
 
@@ -89,9 +89,22 @@ pub(crate) async fn handle_run_message(
             None,
         );
     }
+    if res.queue_failed {
+        return write_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "message_queue_unavailable",
+            "message was not accepted: durable next-turn storage is unavailable",
+            None,
+        );
+    }
+    let status = if res.queued_next_turn {
+        RUN_MESSAGE_QUEUED_NEXT_TURN
+    } else {
+        RUN_MESSAGE_SENT
+    };
     write_json(
         StatusCode::ACCEPTED,
-        &json!({ "id": res.id, "identifier": res.identifier, "status": RUN_MESSAGE_SENT }),
+        &json!({ "id": res.id, "identifier": res.identifier, "status": status }),
     )
 }
 
@@ -135,6 +148,9 @@ fn run_message_json(m: &RunMessage) -> Value {
     out.insert("status".into(), Value::from(m.status.clone()));
     if let Some(turn) = m.delivered_turn {
         out.insert("delivered_turn".into(), Value::from(turn));
+    }
+    if let Some(run) = m.delivered_run_id {
+        out.insert("delivered_run_id".into(), Value::from(run));
     }
     Value::Object(out)
 }
@@ -203,6 +219,46 @@ mod tests {
             "watch the branch",
             "text trimmed before dispatch"
         );
+    }
+
+    #[tokio::test]
+    async fn message_post_reports_next_turn_queue_or_storage_refusal() {
+        for (result, status, label) in [
+            (
+                rhapsody_orchestrator::RunMessageResult {
+                    id: 11,
+                    queued_next_turn: true,
+                    ..Default::default()
+                },
+                202,
+                "queued_next_turn",
+            ),
+            (
+                rhapsody_orchestrator::RunMessageResult {
+                    queue_failed: true,
+                    ..Default::default()
+                },
+                503,
+                "message_queue_unavailable",
+            ),
+        ] {
+            let base = spawn(Arc::new(
+                FakeProvider::ok(empty_snapshot()).with_message_result(result),
+            ))
+            .await;
+            let resp = post_message(
+                &format!("{base}/api/v1/runs/7/message"),
+                r#"{"text":"correct the scope"}"#,
+            )
+            .await;
+            assert_eq!(resp.status(), status);
+            let body = body_json(resp).await;
+            if status == 202 {
+                assert_eq!(body["status"], label);
+            } else {
+                assert_eq!(body["error"]["code"], label);
+            }
+        }
     }
 
     // Mirrors Go `TestHandleRunMessage_GetIs405`.

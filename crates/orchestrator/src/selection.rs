@@ -1209,6 +1209,7 @@ mod tests {
             max_concurrent_reviews: None,
             max_run_tokens: 0,
             stall_cpu_threshold: 0.05,
+            credential_canary_interval_ms: 1_800_000,
             max_turns: 0,
             max_retry_backoff_ms: 0,
             max_concurrent_agents_by_state: Default::default(),

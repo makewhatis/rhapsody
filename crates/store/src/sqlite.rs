@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 36;
+const SCHEMA_VERSION: i64 = 37;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -778,6 +778,17 @@ UPDATE rhapsody_notifications SET active = 0
       (source = 'lead:' || h.decision OR source = 'lead-park:' || h.id)
       AND (h.released_reason IS NOT NULL OR h.state_pending = 1));
 "#,
+    // v36 -> v37: next-turn messages survive their originating run (STUDIO-1209).
+    r#"
+CREATE TABLE rhapsody_queued_run_messages (
+    message_id INTEGER PRIMARY KEY,
+    identifier TEXT NOT NULL,
+    prompt TEXT NOT NULL,
+    delivered_run_id INTEGER
+);
+CREATE INDEX rhapsody_queued_run_messages_pending
+    ON rhapsody_queued_run_messages(identifier, message_id) WHERE delivered_run_id IS NULL;
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1264,14 +1275,16 @@ fn review_run_pattern(owner: &str, repo: &str, number: i64) -> String {
     )
 }
 
-/// The non-empty `transcript_path` values of every ended run older than `cutoff` (the same
-/// predicate [`Sqlite::prune`]'s DELETE uses) — the port of Go `prunablePaths`. Best-effort: a
-/// failed read yields whatever was collected so far and never blocks the row prune.
+/// One retention predicate for rows and transcript paths; pending message history pins its run.
+const PRUNABLE_RUN_WHERE: &str = "ended_at IS NOT NULL AND ended_at <> '' AND ended_at < ?1
+    AND NOT EXISTS (SELECT 1 FROM run_messages m JOIN rhapsody_queued_run_messages q
+      ON q.message_id = m.id WHERE m.run_id = runs.id AND q.delivered_run_id IS NULL)";
+
+/// Port of Go `prunablePaths`. A failed read yields the paths collected so far.
 fn prunable_paths(conn: &Connection, cutoff: &str) -> Vec<String> {
-    let mut stmt = match conn.prepare(
-        "SELECT transcript_path FROM runs \
-          WHERE ended_at IS NOT NULL AND ended_at <> '' AND ended_at < ?1 AND transcript_path <> ''",
-    ) {
+    let mut stmt = match conn.prepare(&format!(
+        "SELECT transcript_path FROM runs WHERE {PRUNABLE_RUN_WHERE} AND transcript_path <> ''"
+    )) {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
@@ -1639,7 +1652,7 @@ impl Store for Sqlite {
                  ON CONFLICT(source) WHERE active = 1 DO UPDATE SET
                  kind = excluded.kind, notice_group = excluded.notice_group,
                   subject = excluded.subject, summary = excluded.summary, href = excluded.href,
-                  at = CASE WHEN excluded.source LIKE 'lead-park:%' THEN excluded.at ELSE at END",
+                   at = CASE WHEN excluded.source LIKE 'lead-park:%' OR excluded.kind = 'credential_rejected' THEN excluded.at ELSE at END",
                 params![row.source, row.kind, row.group, row.subject, row.summary, row.href, row.at, row.transient],
             )?;
         }
@@ -3119,8 +3132,12 @@ impl Store for Sqlite {
     fn list_run_messages(&self, run_id: i64) -> Result<Vec<RunMessage>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT id, run_id, body, created_at_ms, status, delivered_turn \
-               FROM run_messages WHERE run_id = ?1 ORDER BY id",
+            "SELECT id, run_id, body, created_at_ms, status, delivered_turn,
+               (SELECT delivered_run_id FROM rhapsody_queued_run_messages q
+                WHERE q.message_id = run_messages.id AND q.delivered_run_id != run_messages.run_id)
+               FROM run_messages WHERE run_id = ?1 OR id IN (
+                 SELECT message_id FROM rhapsody_queued_run_messages WHERE delivered_run_id = ?1)
+               ORDER BY id",
         )?;
         let rows = stmt.query_map([run_id], |row| {
             Ok(RunMessage {
@@ -3130,6 +3147,7 @@ impl Store for Sqlite {
                 created_at_ms: row.get(3)?,
                 status: row.get(4)?,
                 delivered_turn: row.get(5)?, // Option<i64> from the nullable INTEGER column
+                delivered_run_id: row.get(6)?,
             })
         })?;
         let mut out = Vec::new();
@@ -3137,6 +3155,77 @@ impl Store for Sqlite {
             out.push(m?);
         }
         Ok(out)
+    }
+
+    fn queue_run_message(
+        &self,
+        run_id: i64,
+        identifier: &str,
+        body: &str,
+        prompt: &str,
+        created_at_ms: i64,
+        cap: usize,
+    ) -> Result<Option<i64>, StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let pending: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM rhapsody_queued_run_messages WHERE identifier = ?1 AND delivered_run_id IS NULL",
+            [identifier], |row| row.get(0),
+        )?;
+        if pending >= cap as i64 {
+            return Ok(None);
+        }
+        tx.execute(
+            "INSERT INTO run_messages (run_id, body, created_at_ms, status) VALUES (?1, ?2, ?3, ?4)",
+            params![run_id, body, created_at_ms, RUN_MESSAGE_QUEUED_NEXT_TURN],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO rhapsody_queued_run_messages (message_id, identifier, prompt) VALUES (?1, ?2, ?3)",
+            params![id, identifier, prompt],
+        )?;
+        tx.commit()?;
+        Ok(Some(id))
+    }
+
+    fn pending_run_messages(&self, identifier: &str) -> Result<Vec<QueuedRunMessage>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(
+            "SELECT message_id, prompt FROM rhapsody_queued_run_messages
+             WHERE identifier = ?1 AND delivered_run_id IS NULL ORDER BY message_id",
+        )?;
+        let rows = stmt.query_map([identifier], |row| {
+            Ok(QueuedRunMessage {
+                id: row.get(0)?,
+                prompt: row.get(1)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    fn deliver_queued_run_messages(
+        &self,
+        ids: &[i64],
+        run_id: i64,
+        turn: i64,
+    ) -> Result<(), StoreError> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        for id in ids {
+            let changed = tx.execute(
+                "UPDATE rhapsody_queued_run_messages SET delivered_run_id = ?1
+                 WHERE message_id = ?2 AND delivered_run_id IS NULL",
+                params![run_id, id],
+            )?;
+            if changed > 0 {
+                tx.execute(
+                    "UPDATE run_messages SET status = ?1, delivered_turn = ?2 WHERE id = ?3",
+                    params![RUN_MESSAGE_DELIVERED, turn, id],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     fn save_review_watch(&self, w: ReviewWatchRow) -> Result<(), StoreError> {
@@ -4872,19 +4961,27 @@ impl Store for Sqlite {
         let tx = conn.transaction()?;
         // Delete events + operator messages of old runs first (FK-safe), then the runs themselves.
         // A run is "old" when it ended before the cutoff (a still-running run has ended_at == '').
-        let old_runs =
-            "SELECT id FROM runs WHERE ended_at IS NOT NULL AND ended_at <> '' AND ended_at < ?1";
+        // Keep the source row while a correction is pending: runs' INTEGER PRIMARY KEY may reuse
+        // the highest deleted id, which would otherwise attribute the queued history to a new run.
+        let old_runs = format!("SELECT id FROM runs WHERE {PRUNABLE_RUN_WHERE}");
         tx.execute(
             &format!("DELETE FROM events WHERE run_id IN ({old_runs})"),
             params![cutoff],
         )?;
         // run_messages has no FK to runs but is still per-run history (INF-250); prune it too.
         tx.execute(
-            &format!("DELETE FROM run_messages WHERE run_id IN ({old_runs})"),
+            &format!(
+                "DELETE FROM run_messages WHERE (run_id IN ({old_runs}) OR
+                  (run_id NOT IN (SELECT id FROM runs) AND id IN
+                    (SELECT message_id FROM rhapsody_queued_run_messages))) AND id NOT IN
+                (SELECT message_id FROM rhapsody_queued_run_messages WHERE delivered_run_id IS NULL
+                 OR delivered_run_id IN (SELECT id FROM runs WHERE id NOT IN ({old_runs})))"
+            ),
             params![cutoff],
         )?;
+        tx.execute("DELETE FROM rhapsody_queued_run_messages WHERE message_id NOT IN (SELECT id FROM run_messages)", [])?;
         tx.execute(
-            "DELETE FROM runs WHERE ended_at IS NOT NULL AND ended_at <> '' AND ended_at < ?1",
+            &format!("DELETE FROM runs WHERE id IN ({old_runs})"),
             params![cutoff],
         )?;
         // A summons watermark is only ever read by comparing it against the ticket's LAST RUN
@@ -5975,6 +6072,113 @@ mod tests {
 
         // Other runs are untouched.
         assert!(s.list_run_messages(8).expect("list 8").is_empty());
+    }
+
+    #[test]
+    fn queued_messages_survive_restart_and_pruning_and_deliver_by_id() {
+        let dir = scratch_dir();
+        let path = StorePath::Disk(dir.path.join("messages.db"));
+        let store = Sqlite::open(path.clone()).unwrap();
+        let run = store
+            .start_run(RunStart {
+                issue_identifier: "MT-1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let a = store
+            .queue_run_message(run, "MT-1", "same", "OPERATOR MESSAGE: same", 1, 2)
+            .unwrap()
+            .unwrap();
+        let b = store
+            .queue_run_message(run, "MT-1", "same", "OPERATOR MESSAGE: same", 2, 2)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .queue_run_message(run, "MT-1", "overflow", "overflow", 3, 2)
+                .unwrap(),
+            None
+        );
+        store
+            .queue_run_message(run, "MT-2", "other", "other", 4, 2)
+            .unwrap();
+        store
+            .end_run(
+                run,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ended_at: "2000-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.expire_run_messages(run).unwrap();
+        drop(store);
+        let store = Sqlite::open(path).unwrap();
+        store.prune(1).unwrap();
+        assert!(
+            store.get_run(run).unwrap().is_some(),
+            "pending history pins its source run id"
+        );
+        let queued = store.pending_run_messages("MT-1").unwrap();
+        assert_eq!(queued.iter().map(|m| m.id).collect::<Vec<_>>(), vec![a, b]);
+        assert_eq!(
+            store.list_run_messages(run).unwrap()[0].status,
+            RUN_MESSAGE_QUEUED_NEXT_TURN
+        );
+        let next = store
+            .start_run(RunStart {
+                issue_identifier: "MT-1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store.deliver_queued_run_messages(&[a], next, 1).unwrap();
+        store.deliver_queued_run_messages(&[a], next, 2).unwrap(); // same id cannot be re-stamped
+        assert_eq!(
+            store.list_run_messages(next).unwrap()[0].delivered_turn,
+            Some(1)
+        );
+        assert_eq!(
+            store.list_run_messages(run).unwrap()[0].delivered_run_id,
+            Some(next)
+        );
+        assert_eq!(store.pending_run_messages("MT-1").unwrap()[0].id, b);
+        assert_eq!(store.pending_run_messages("MT-2").unwrap().len(), 1);
+        store.prune(1).unwrap(); // pending source and destination history survive
+        assert_eq!(store.list_run_messages(next).unwrap().len(), 1);
+        let remaining = store.pending_run_messages("MT-2").unwrap()[0].id;
+        store
+            .deliver_queued_run_messages(&[b, remaining], next, 2)
+            .unwrap();
+        store.prune(1).unwrap();
+        assert!(store.get_run(run).unwrap().is_none());
+        assert_eq!(store.list_run_messages(next).unwrap().len(), 3);
+        store
+            .end_run(
+                next,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ended_at: "2000-01-02T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.prune(1).unwrap();
+        assert!(store.list_run_messages(next).unwrap().is_empty());
+        assert!(store.list_run_messages(run).unwrap().is_empty());
+    }
+
+    #[test]
+    fn queued_message_write_failure_leaves_no_half_admission() {
+        let store = open_mem();
+        store.lock().execute_batch("CREATE TRIGGER fail_queue BEFORE INSERT ON rhapsody_queued_run_messages BEGIN SELECT RAISE(ABORT, 'queue failed'); END;").unwrap();
+        assert!(
+            store
+                .queue_run_message(7, "MT-1", "scope", "OPERATOR MESSAGE: scope", 1, 16)
+                .is_err()
+        );
+        assert!(store.list_run_messages(7).unwrap().is_empty());
+        assert!(store.pending_run_messages("MT-1").unwrap().is_empty());
     }
 
     // Mirror TestWALEnabled: journal_mode=WAL is active on a file-backed handle.
@@ -9618,6 +9822,8 @@ mod tests {
                 "rhapsody_subject_prs".to_string(),
                 "rhapsody_review_head_findings".to_string(),
                 "rhapsody_subject_terminal".to_string(),
+                "rhapsody_queued_run_messages".to_string(),
+                "rhapsody_queued_run_messages_pending".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

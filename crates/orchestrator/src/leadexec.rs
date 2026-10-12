@@ -102,6 +102,115 @@ impl RuntimeHost<'_> {
             text.replace(&self.project.summon_token, "")
         }
     }
+
+    async fn update_answer(
+        &self,
+        ticket: &Issue,
+        item: i64,
+        text: Option<(&str, bool)>,
+    ) -> Result<(), String> {
+        let current = self.subject().await?;
+        if current.ticket.id != ticket.id {
+            return Err("lead ticket identity changed".into());
+        }
+        let description = current.ticket.description.as_deref().unwrap_or_default();
+        let updated = match text {
+            Some((text, commission)) => Some(write_lead_answer(
+                description,
+                item,
+                &self.tokenless(text),
+                commission,
+            )?),
+            None => close_lead_answer(description, item, &ticket.identifier)?,
+        };
+        let Some(updated) = updated else {
+            return Ok(());
+        };
+        self.project
+            .tracker
+            .update_issue_description(&ticket.id, &updated)
+            .await
+            .map_err(|_| "lead description update failed".into())
+    }
+}
+
+const ANSWER_BEGIN: &str = "<!-- rhapsody:lead-answer:begin id=";
+const ANSWER_END: &str = "<!-- rhapsody:lead-answer:end -->";
+const COMMISSION_SCOPE: &str = "Diagnose, do not fix for this run; once findings are published, the ticket's own implementation scope applies.";
+
+/// Only marked blocks belong to us. Refuse broken/duplicate markers rather than guessing where
+/// the author's description ends. The entire byte range outside the block is copied verbatim.
+fn lead_answer_span(
+    description: &str,
+) -> Result<Option<(std::ops::Range<usize>, i64, bool)>, String> {
+    let Some(start) = description.find(ANSWER_BEGIN) else {
+        return if description.contains(ANSWER_END) {
+            Err("lead answer has an unmatched end marker".into())
+        } else {
+            Ok(None)
+        };
+    };
+    let rest = &description[start + ANSWER_BEGIN.len()..];
+    let (header, body) = rest
+        .split_once(" -->")
+        .ok_or("lead answer marker is incomplete")?;
+    let (id, scope) = header
+        .split_once(" scope=")
+        .ok_or("lead answer marker has no scope")?;
+    let item = id
+        .parse::<i64>()
+        .map_err(|_| "lead answer marker has an invalid id")?;
+    let commission = match scope {
+        "commission" => true,
+        "answer" => false,
+        _ => return Err("lead answer marker has an invalid scope".into()),
+    };
+    let end = body
+        .find(ANSWER_END)
+        .ok_or("lead answer has no end marker")?;
+    if description.matches(ANSWER_BEGIN).count() != 1
+        || description.matches(ANSWER_END).count() != 1
+    {
+        return Err("lead answer has duplicate markers".into());
+    }
+    let end = description.len() - body.len() + end + ANSWER_END.len();
+    Ok(Some((start..end, item, commission)))
+}
+
+fn write_lead_answer(
+    description: &str,
+    item: i64,
+    text: &str,
+    commission: bool,
+) -> Result<String, String> {
+    if text.contains(ANSWER_BEGIN) || text.contains(ANSWER_END) {
+        return Err("lead answer text contains reserved markers".into());
+    }
+    let scope = if commission { "commission" } else { "answer" };
+    let block =
+        format!("{ANSWER_BEGIN}{item} scope={scope} -->\n\n## Lead answer\n{text}\n\n{ANSWER_END}");
+    match lead_answer_span(description)? {
+        Some((range, _, _)) => Ok(format!(
+            "{}{}{}",
+            &description[..range.start],
+            block,
+            &description[range.end..]
+        )),
+        // Append so a new block never interferes with the author's opening Markdown heading.
+        None => Ok(format!("{description}{block}")),
+    }
+}
+
+fn close_lead_answer(description: &str, item: i64, ticket: &str) -> Result<Option<String>, String> {
+    let Some((_, owner, commission)) = lead_answer_span(description)? else {
+        return Ok(None);
+    };
+    if owner != item || !commission {
+        return Ok(None);
+    }
+    write_lead_answer(description, item, &format!(
+        "Lead: the commissioned diagnosis is complete — findings at ~/.rhapsody/docs/{ticket}-findings.md. Proceed with the ticket's own scope."
+    ), false).map(Some)
 }
 
 impl LeadRuntime {
@@ -441,21 +550,18 @@ impl LeadHost for RuntimeHost<'_> {
         Ok(subject)
     }
 
-    async fn prepend(&self, ticket: &Issue, text: &str) -> Result<(), String> {
-        let current = self.subject().await?;
-        if current.ticket.id != ticket.id {
-            return Err("lead ticket identity changed".into());
-        }
-        let description = format!(
-            "## Lead answer\n{}\n\n{}",
-            self.tokenless(text),
-            current.ticket.description.as_deref().unwrap_or_default()
-        );
-        self.project
-            .tracker
-            .update_issue_description(&ticket.id, &description)
+    async fn write_answer(
+        &self,
+        ticket: &Issue,
+        item: i64,
+        text: &str,
+        commission: bool,
+    ) -> Result<(), String> {
+        self.update_answer(ticket, item, Some((text, commission)))
             .await
-            .map_err(|_| "lead description update failed".into())
+    }
+    async fn close_commission(&self, ticket: &Issue, item: i64) -> Result<(), String> {
+        self.update_answer(ticket, item, None).await
     }
     async fn todo(&self, ticket: &Issue) -> Result<(), String> {
         self.project
@@ -574,7 +680,7 @@ impl LeadHost for RuntimeHost<'_> {
             .await
             .map_err(|_| "commission viewer lookup failed")?;
         let body = self.tokenless(&format!(
-            "Diagnose, don't fix. Origin: {}\nQuestion: {question}\nHypothesis: {hypothesis}\nDo not modify repository code. Report verified findings to ~/.rhapsody/docs/<YOUR-TICKET-ID>-findings.md, then hand off. The lead is parked awaiting that file.",
+            "{COMMISSION_SCOPE}\nOrigin: {}\nQuestion: {question}\nHypothesis: {hypothesis}\nDo not modify repository code during this run. Report verified findings to ~/.rhapsody/docs/<YOUR-TICKET-ID>-findings.md, then hand off. The lead is parked awaiting that file.",
             ticket.identifier
         ));
         self.project
@@ -834,7 +940,14 @@ pub trait LeadHost: Send + Sync {
         Ok(())
     }
     async fn subject(&self) -> Result<LeadSubject, String>;
-    async fn prepend(&self, ticket: &Issue, text: &str) -> Result<(), String>;
+    async fn write_answer(
+        &self,
+        ticket: &Issue,
+        item: i64,
+        text: &str,
+        commission: bool,
+    ) -> Result<(), String>;
+    async fn close_commission(&self, ticket: &Issue, item: i64) -> Result<(), String>;
     async fn todo(&self, ticket: &Issue) -> Result<(), String>;
     async fn clear_review(&self, pr: &str) -> Result<(), String>;
     async fn release(&self, _ticket: &Issue) -> Result<(), String> {
@@ -870,14 +983,15 @@ unknown actions are invalid. Each action object includes "action" and its fields
 - authorize_credential {ticket, rule}
 - escalate {need}
 - release {ticket, reason}: lift a circuit-breaker/blocked hold only for a concrete change; reason is audited
-- resolve {reason}: close this lead item when evidence confirms no work is needed; no ticket mutation
+- resolve {reason}: close this lead item when evidence confirms no work is needed; closes its marked commission scope if present
 At most 8 actions, each string at most 4000 characters. Choose at most one work transition
 (route_back, requeue or commission). Escalate is the only action when it is needed.
 Resolve is also used alone. Document-only reviews legitimately have no PR: read the findings with
 docs_read and confirm publication using tracker_documents or symphony_ticket before resolving.
 
 At most one route_back per subject/question; a repeated block must commission or escalate.
-Commission diagnoses and reports findings, never fixes. Credentials ONLY via
+Commission diagnoses and reports findings for that run, never fixes during it; once findings are published,
+the ticket's own implementation scope applies. Credentials ONLY via
 openai-refresh-blank-copy or fireworks-key-measurement; grant the rule, never handle a credential.
 Never merge, push, commit, spend beyond policy, act on another installation, or change configuration.
 Escalate console/login/key-minting/restart, cluster deploys (including flux), money/security outside
@@ -1047,6 +1161,15 @@ pub async fn execute(
         result.state = "proposed".into();
     }
     if result.state != "queued" && result.state != "proposed" && result.escalation.is_none() {
+        // Replacing a block must not discard credential rules granted by this same decision.
+        let grants = actions
+            .iter()
+            .filter_map(|a| match a {
+                LeadAction::AuthorizeCredential { rule, .. } => credential_rule(rule),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
         for action in &actions {
             if host.admit_action().await.is_err() {
                 result.escalation =
@@ -1071,7 +1194,8 @@ pub async fn execute(
             }
             let mut action_case = case.clone();
             action_case.subject = fresh;
-            let effect = apply_action(store, host, &action_case, action, &mut result).await;
+            let effect =
+                apply_action(store, host, &action_case, action, &grants, &mut result).await;
             if let Err(reason) = effect {
                 // External requests can have landed even on an error. Never replay a commission
                 // or a route-back on uncertainty; the row gives the operator a reconciliation root.
@@ -1210,6 +1334,7 @@ async fn apply_action(
     host: &dyn LeadHost,
     case: &LeadCase,
     action: &LeadAction,
+    grants: &str,
     result: &mut LeadResult,
 ) -> Result<(), String> {
     let ticket = &case.subject.ticket;
@@ -1231,19 +1356,26 @@ async fn apply_action(
             if !stored(store.reserve_lead_route_back(case.item.id))? {
                 return Err("second route_back refused; commission or escalate".into());
             }
+            let answer = if grants.is_empty() {
+                answer.clone()
+            } else {
+                format!("{grants}\n{answer}")
+            };
             return_to_author(
                 host,
                 &case.subject,
-                &crate::managerapply::strip_summon_tokens(answer),
+                case.item.id,
+                &crate::managerapply::strip_summon_tokens(&answer),
+                false,
             )
             .await?;
         }
         LeadAction::Requeue { .. } => host.todo(ticket).await?,
         LeadAction::ClearReview { pr } => host.clear_review(pr).await?,
         LeadAction::Reassign { identity, .. } => host.reassign(ticket, identity).await?,
-        LeadAction::AuthorizeCredential { rule, .. } => {
-            let rule = credential_rule(rule).ok_or("credential rule is not allow-listed")?;
-            host.prepend(ticket, rule).await?;
+        LeadAction::AuthorizeCredential { .. } => {
+            host.write_answer(ticket, case.item.id, grants, false)
+                .await?;
         }
         LeadAction::Commission {
             kind,
@@ -1254,10 +1386,10 @@ async fn apply_action(
                 chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             let commissioned = if kind == "author" {
                 let instructions = crate::managerapply::strip_summon_tokens(&format!(
-                    "Diagnose, do not fix. Question: {question}\nHypothesis: {hypothesis}\nReport findings to ~/.rhapsody/docs/{}-findings.md, then hand off.",
+                    "{COMMISSION_SCOPE}\nQuestion: {question}\nHypothesis: {hypothesis}\n{grants}\nReport findings to ~/.rhapsody/docs/{}-findings.md, then hand off.",
                     ticket.identifier
                 ));
-                return_to_author(host, &case.subject, &instructions).await?;
+                return_to_author(host, &case.subject, case.item.id, &instructions, true).await?;
                 ticket.identifier.clone()
             } else {
                 host.commission(ticket, question, hypothesis).await?
@@ -1271,7 +1403,7 @@ async fn apply_action(
             result.commission_ticket = Some(commissioned);
         }
         LeadAction::Escalate { need } => result.escalation = Some(need.clone()),
-        LeadAction::Resolve { .. } => {}
+        LeadAction::Resolve { .. } => host.close_commission(ticket, case.item.id).await?,
     }
     Ok(())
 }
@@ -1281,9 +1413,12 @@ async fn apply_action(
 async fn return_to_author(
     host: &dyn LeadHost,
     subject: &LeadSubject,
+    item: i64,
     text: &str,
+    commission: bool,
 ) -> Result<(), String> {
-    host.prepend(&subject.ticket, text).await?;
+    host.write_answer(&subject.ticket, item, text, commission)
+        .await?;
     if let Some(pr) = &subject.pr {
         recheck_effect(host, subject).await?;
         host.clear_review(pr).await?;
@@ -1320,6 +1455,14 @@ pub async fn resume_on_findings(
     };
     if findings.trim().is_empty() {
         return Ok(false);
+    }
+    let subject = host.subject().await?;
+    if execution
+        .commission_ticket
+        .eq_ignore_ascii_case(&subject.ticket.identifier)
+    {
+        host.admit_action().await?;
+        host.close_commission(&subject.ticket, item).await?;
     }
     execution.findings = findings;
     execution.commission_ticket.clear();

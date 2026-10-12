@@ -409,6 +409,7 @@ pub(crate) fn empty_resolved_project(slug: &str, tracker: Arc<dyn Tracker>) -> R
 pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &str) -> RunningEntry {
     let epoch = DateTime::from_timestamp(0, 0).expect("epoch");
     RunningEntry {
+        messages_next_turn: false,
         engine_index: 0,
         engine: None,
         resume_session: String::new(),
@@ -729,7 +730,6 @@ pub(crate) fn retry_entry(issue_id: &str, identifier: &str, attempt: i64) -> Ret
 /// walked and then clamped to its last value.
 pub(crate) struct FakeSampler {
     ok: bool,
-    pub(crate) hz: Option<u64>,
     seq: HashMap<i32, Vec<u64>>,
     idx: Mutex<HashMap<i32, usize>>,
 }
@@ -738,7 +738,6 @@ impl FakeSampler {
     pub(crate) fn new(ok: bool, seq: HashMap<i32, Vec<u64>>) -> FakeSampler {
         FakeSampler {
             ok,
-            hz: Some(100),
             seq,
             idx: Mutex::new(HashMap::new()),
         }
@@ -747,7 +746,7 @@ impl FakeSampler {
 
 impl Sampler for FakeSampler {
     fn ticks_per_second(&self) -> Option<u64> {
-        self.hz
+        Some(100)
     }
 
     fn group_cpu(&self, pgid: i32) -> Option<u64> {

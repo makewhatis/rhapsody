@@ -54,8 +54,8 @@ to understand the crate's actual behavior, not any single module in isolation:
   dropped the instant a terminal result is classified — "no write after result" is structural, not
   just documented. ⚠️ It is NOT a crate-wide assumption: `harness::StdinPolicy` declares the
   requirement per backend, and `opencode` closes stdin at start (its prompt is an argv positional),
-  so that backend has no mailbox, declares `Steering::BetweenTurns`, and logs any message it could
-  not deliver rather than dropping it silently.
+  so that backend declares `Steering::BetweenTurns` and never consumes live mailbox messages.
+  The orchestrator durably queues them for its next turn or ticket dispatch (STUDIO-1209).
 - **Billing guard is fail-closed and per-turn.** Every turn's first `system`/`init` line must report
   `apiKeySource == "none"` (checked once per turn via `billing_checked`, since `--resume` re-emits its
   own init). A non-`"none"` source kills the process tree immediately (`BillingGuard`); a result

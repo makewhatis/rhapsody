@@ -217,6 +217,9 @@ pub struct Agent {
     /// Minimum CPU/wall-time fraction of one core for silent-run liveness (STUDIO-1177).
     /// Rhapsody-only; decoded/encoded, omitted from the Go-owned config JSON view.
     pub stall_cpu_threshold: f64,
+    /// Retry one waiting ticket on a rejected credential without a probe (STUDIO-1211).
+    /// Positive milliseconds; Rhapsody-only, omitted from the Go-owned config JSON view.
+    pub credential_canary_interval_ms: i64,
     pub max_turns: i64,
     pub max_retry_backoff_ms: i64,
     /// Per-state concurrency caps: keys lowercased, only positive ints kept (upstream §5.3.5).
@@ -705,6 +708,7 @@ pub(crate) struct RawAgent {
     /// STUDIO-967; Rhapsody-only, absent ⇒ unlimited (0). A per-run token ceiling.
     pub max_run_tokens: Option<i64>,
     pub stall_cpu_threshold: Option<f64>,
+    pub credential_canary_interval_ms: Option<i64>,
     pub max_turns: Option<i64>,
     pub max_retry_backoff_ms: Option<i64>,
     pub handoff_drain_grace_ms: Option<i64>,

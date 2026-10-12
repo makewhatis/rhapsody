@@ -18,13 +18,10 @@
 //! | billing guard | `apiKeySource == "none"` | none exists; see below |
 //!
 //! **stdin stays closed at start.** The legacy spike's argv/stdin contract is now
-//! lowered into owned HTTP requests, without adding mid-turn steering. This
-//! backend has no operator-message mailbox: a message that arrives mid-turn cannot be delivered,
-//! and [`crate::Session::run_turn`]'s `messages` receiver is therefore drained but NOT written,
-//! with a warning naming what was dropped. That is the honest reading of
-//! `HarnessCapabilities::steering: BetweenTurns` — the console (design D7, slice 5) is what will
-//! stop offering the affordance; until then a dropped message is loud in the log rather than
-//! silent.
+//! lowered into owned HTTP requests, without adding mid-turn steering. The
+//! orchestrator queues messages durably and
+//! prepends them to the next turn's prompt (STUDIO-1209), including a later ticket dispatch.
+//! The receiver is left untouched here: consuming it without delivery would lose guidance.
 //!
 //! **No billing guard, on purpose.** Claude's guard exists to force subscription billing and is
 //! verified from `apiKeySource` on each `system/init`; opencode emits no such signal and the entire
@@ -1066,7 +1063,7 @@ impl OpencodeSession {
         &self,
         prompt: &str,
         attempt: Option<i64>,
-        mut messages: Option<&mut mpsc::Receiver<String>>,
+        _messages: Option<&mut mpsc::Receiver<String>>,
         on_event: &(dyn Fn(Event) + Send + Sync),
         broker: Option<BrokerTurnAttempt>,
         resume_note: bool,
@@ -1505,8 +1502,6 @@ impl OpencodeSession {
         // the session is new) would emit it once per RUN, and every multi-turn opencode run would
         // report as a single turn for its whole life.
         let mut session_announced = false;
-        let mut mailbox_open = messages.is_some();
-        let mut dropped_messages = 0usize;
         let mut stderr_buf = CappedBuffer::new(MAX_STDERR_CAPTURE);
         let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
         let mut out_chunk = vec![0u8; READ_CHUNK];
@@ -1678,23 +1673,6 @@ impl OpencodeSession {
                         Err(_) => stderr_open = false,
                     }
                 }
-                // ⚠️ Drained, never delivered. stdin is closed, so there is nowhere to write an
-                // operator message. Draining (rather than ignoring) keeps the channel from filling
-                // and stalling its sender, and every dropped message is counted and named below —
-                // a message this backend cannot deliver must not vanish quietly.
-                m = recv_opt(&mut messages), if mailbox_open => {
-                    match m {
-                        Some(msg) => {
-                            dropped_messages += 1;
-                            tracing::warn!(
-                                issue = %self.issue.identifier, turn = turn_n, message = %msg,
-                                "opencode cannot steer a live turn (stdin is closed at start); \
-                                 operator message NOT delivered"
-                            );
-                        }
-                        None => mailbox_open = false,
-                    }
-                }
             }
         }
 
@@ -1765,13 +1743,6 @@ impl OpencodeSession {
             child.wait().await
         };
         teardown.disarm_tree();
-
-        if dropped_messages > 0 {
-            tracing::warn!(
-                issue = %self.issue.identifier, turn = turn_n, dropped = dropped_messages,
-                "opencode turn finished with undelivered operator messages"
-            );
-        }
 
         // A stop part is not a successful drain: observer loss or a deadline before
         // root idle / prompt success must still fail the observation-dependent turn.
@@ -1890,14 +1861,6 @@ fn timed_out_result(usage: Usage) -> TurnResult {
         status: TURN_TIMED_OUT.to_string(),
         usage,
         result_text: String::new(),
-    }
-}
-
-/// `None` never yields, so a backend with no mailbox pays nothing for the select arm.
-async fn recv_opt(messages: &mut Option<&mut mpsc::Receiver<String>>) -> Option<String> {
-    match messages {
-        Some(rx) => rx.recv().await,
-        None => std::future::pending().await,
     }
 }
 
@@ -2839,6 +2802,38 @@ exit 1"#,
         );
     }
 
+    #[tokio::test]
+    async fn non_steerable_runner_never_drains_an_undeliverable_mailbox_message() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let script = write_script(
+            &scripts,
+            "mailbox.sh",
+            r#"sleep 0.1
+printf '{"type":"step_finish","sessionID":"ses_mailbox","part":{"reason":"stop"}}\n'
+"#,
+        );
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let runner = runner_for(&script, &root, &auth, &state_root.path().to_string_lossy());
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1209"), None)
+            .await
+            .unwrap();
+        let (tx, mut rx) = mpsc::channel(16);
+        tx.try_send("OPERATOR MESSAGE: correct the scope".into())
+            .unwrap();
+        let (result, err) = sess.run_turn("Work", None, Some(&mut rx), &|_| {}).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(result.status, TURN_SUCCEEDED);
+        assert_eq!(
+            rx.try_recv().unwrap(),
+            "OPERATOR MESSAGE: correct the scope"
+        );
+    }
+
     // ⚠️ EVERY turn announces its session, and a continuation turn resumes with `-s <id>`.
     //
     // The consumer counts turns off `EVENT_SESSION_STARTED` (`agentupdate.rs` increments
@@ -3656,23 +3651,29 @@ printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
         let ws = make_ws(&root, "w");
         let sr = state_root.path().to_string_lossy().into_owned();
 
-        // A turn deadline long enough that only the outer timeout can end the turn, so the drop is
+        // A turn deadline long enough that only cancellation can end the turn, so the drop is
         // the cancellation path and not a `turn_timeout` return.
         let runner = runner_with(&cut, &root, &auth, &sr, "m", 30);
         let sess = runner
             .start_session(&ws, issue("STUDIO-1043"), None)
             .await
             .expect("session");
-        let (_s, on) = collector();
-        let cancelled = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            sess.run_turn("cut off mid-turn", None, None, &on),
-        )
-        .await;
-        assert!(
-            cancelled.is_err(),
-            "the outer timeout must cut the turn off"
-        );
+        let started = tokio::sync::Notify::new();
+        let on = |e: Event| {
+            if e.event_type == EVENT_SESSION_STARTED {
+                started.notify_one();
+            }
+        };
+        {
+            let turn = sess.run_turn("cut off mid-turn", None, None, &on);
+            tokio::pin!(turn);
+            tokio::select! {
+                result = &mut turn => panic!("cut-off fixture ended before cancellation: {result:?}"),
+                ready = tokio::time::timeout(Duration::from_secs(5),started.notified()) => ready.expect("owned session must be established before cancellation"),
+            }
+            // Drop the live turn only AFTER its session exists. A 500ms timer
+            // raced HTTP/Python startup under parallel tests and tested cold refusal.
+        }
         // The worker future is dropped without `stop()` — exactly the operator-Stop shape.
         drop(sess);
 

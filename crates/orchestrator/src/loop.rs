@@ -636,6 +636,7 @@ fn worker_deps_for(
         pr_label: eff.pr_label.clone(),
         // Per-dispatch, like `stack_context` above: `spawn_worker` stamps the dispatched run's id.
         run_id: 0,
+        message_store: None,
         // Per-dispatch and review-only (STUDIO-715): `spawn_worker` stamps it, and `None` keeps the
         // two existing provisioning paths exactly as they were.
         review: None,
@@ -2120,6 +2121,7 @@ impl Orchestrator {
         // The dispatched run's store row id, so the agent child's env carries SYMPHONY_RUN_ID and
         // its `teams_post` / `teams_retain` can resolve WHICH run is speaking (STUDIO-675).
         deps.run_id = run_id;
+        deps.message_store = Some(Arc::clone(&self.store));
         // Take this run's operator-message mailbox receiver (INF-250, O6): the worker drains it onto the
         // agent's held-open stdin. `None` for legacy / test-injected entries with no mailbox.
         let mut mailbox = self
