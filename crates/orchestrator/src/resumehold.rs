@@ -568,7 +568,6 @@ mod tests {
         let mut proj = empty_resolved_project("rhapsody", Arc::clone(&tracker) as Arc<dyn Tracker>);
         proj.repo = "git@github.com:makewhatis/rhapsody.git".into();
         eff.projects = vec![proj];
-        let run_id;
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
         o.set_store(Arc::clone(&store));
@@ -583,27 +582,13 @@ mod tests {
             ..Default::default()
         };
         o.spawn = Some(Box::new(|_iss, _attempt, _re| {}));
+        let run_id = seed_run(&store, iss);
+        o.claimed.insert(iss.id.clone());
         if auth_hold {
-            o.dispatch_issue(iss.clone(), None, None, String::new());
-            let re = &o.running[&iss.id];
-            run_id = re.run_id;
-            o.on_worker_exit(crate::retry::EvWorkerExit {
-                issue_id: iss.id.clone(),
-                started_at: re.started_at,
-                failed: true,
-                auth_needed: true,
-                err_msg: "opencode_auth_needed: rejected login".into(),
-                last_state: iss.state.clone(),
-                declared_handoff: false,
-                review_verdict: None,
-                verdict_text: None,
-                refused: false,
-            });
-            assert!(o.claimed.contains(&iss.id));
-            assert!(!o.running.contains_key(&iss.id));
-        } else {
-            run_id = seed_run(&store, iss);
-            o.claimed.insert(iss.id.clone());
+            // Exercise the existing per-ticket claim resume contract. STUDIO-1199's real
+            // auth exits no longer create these claims; their credential recovery is tested
+            // through the production spawn in retry.rs instead.
+            o.auth_hold_claims.insert(iss.id.clone());
         }
         let signal = CancelSignal::new();
         o.set_ctx(signal.wait());
@@ -706,7 +691,7 @@ mod tests {
         );
     }
 
-    /// STUDIO-1200: resume a real auth-needed exit after an operator removes the label.
+    /// STUDIO-1200: resume a legacy auth claim after an operator removes the label.
     /// The fake's candidates/by-id inputs describe the post-removal board (label mutations
     /// intentionally do not rewrite those programmed inputs). Mutating resume to retain the
     /// claim must make the next-tick dispatch assertion fail.

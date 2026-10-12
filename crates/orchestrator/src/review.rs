@@ -590,6 +590,12 @@ impl Orchestrator {
         }
         self.feed_budget_windows();
         let pricing = self.review_projected_pricing(&iss, &route.slug);
+        if let Some(reason) =
+            self.rejected_credential_reason(&self.review_harness_for(&iss), &pricing.account)
+        {
+            self.note_credential_wait(&iss, &route.slug, &pricing.account, reason);
+            return ReviewDispatchOutcome::BudgetHeld;
+        }
         if self.credential_probe_held(&self.review_harness_for(&iss), &route.slug)
             || !self.account_usable(&pricing.account)
         {

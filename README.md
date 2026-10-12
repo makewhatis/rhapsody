@@ -82,11 +82,29 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Credential-scoped rejected-login holds (STUDIO-1199)
+
+A typed agent login rejection holds new work on its dispatch-time harness/account, including other
+tickets using that credential. The failed author records one `failed` run without a timed retry,
+claim or human label; recovery re-offers it even if its earlier linked-PR summons was consumed.
+Selection and final admission report a credential-wait reason without automatically switching
+engines or reassigning teammates. Other credentials and live runs remain independently usable.
+
+`GET /api/v1/accounts` publishes the hold through `credential_probes`, `credential_held` and
+`stop_new`. The shared notification centre projects one Needs-you `credential_rejected` episode
+per harness/account, updated in place on repeats and deactivated on recovery. A successful run on
+that credential, a healthy existing Claude credential or ChatGPT usage probe, or operator-guarded
+`POST /api/v1/accounts/{account}/credentials/{harness}/clear` releases the rejection. Unknown probes
+cannot erase a confirmed run failure. Providers without an existing probe require an operator
+clear (or success from an already-live run); no new provider calls are introduced. Holds and author
+resume admissions share the existing process-local credential-cache lifetime. No frozen Go schema,
+payload golden, normalization rule or credential file changes.
+
 ### Rejected-login holds remain resumable after manual label removal (STUDIO-1200)
 
-Rejected-login exits retain loop-local claim provenance. The existing human-step resume action
-accepts that non-live claim even when an operator already removed `rhapsody:human` by hand; the
-job page's hold read still offers Resume for that claim. Resuming
+The existing human-step resume action accepts a non-live rejected-login claim even when an
+operator already removed `rhapsody:human` by hand; the job page's hold read still offers Resume
+for that claim. Resuming
 clears the claim and seeds the operator's note atomically before the next tick can dispatch.
 Ordinary unlabeled suppressions and claims with live runs, retries or preparation remain refused.
 Label-present resumes still remove the label and clear the claim together. Manual removal alone
@@ -94,6 +112,8 @@ does not resume a rejected-login claim: use the resume-hold action, without re-a
 Selection reports claims with no live run at INFO once per ticket/cause on both ladders, including
 when capacity is full. These human-hold extensions have no frozen Go counterpart; API shapes,
 schema and golden fixtures are unchanged.
+STUDIO-1199 supersedes creation of per-ticket login claims: new failures wait on the shared
+credential and resume automatically on its recovery, without the human-step action.
 
 ### Operator stop/resume ends a ticketless review round locally (STUDIO-1182)
 

@@ -254,6 +254,9 @@ impl Orchestrator {
             project,
         );
         !self.credential_probe_held(&spec.harness, project)
+            && self
+                .rejected_credential_reason(&spec.harness, &pricing.account)
+                .is_none()
             && self.account_usable(&pricing.account)
             && self.usd_budget_hold(&pricing).is_none()
     }
@@ -341,6 +344,10 @@ impl Orchestrator {
         } else {
             &run.pricing.account
         };
+        if let Some(reason) = self.rejected_credential_reason(&run.harness, account) {
+            self.note_credential_wait(issue, project, account, reason);
+            return false;
+        }
         if !self.credential_probe_held(&run.harness, project) && self.account_usable(account) {
             return true;
         }
@@ -430,6 +437,10 @@ impl Orchestrator {
     ) -> bool {
         let pricing = self.run_pricing_for(&re.harness, &re.model_override, &re.project_slug);
         let account = account.unwrap_or(&pricing.account);
+        if let Some(reason) = self.rejected_credential_reason(&re.harness, account) {
+            self.note_credential_wait(&re.issue, &re.project_slug, account, reason);
+            return false;
+        }
         if let Some(mut held) = self.usd_budget_hold(&pricing)
             && (held.reason.contains("cannot be enforced") || held.reason.starts_with("no price"))
         {
@@ -1399,7 +1410,10 @@ impl Orchestrator {
             self.budget_ledger
                 .held(self.budget_hold_ttl())
                 .into_iter()
-                .filter(|h| h.reason.starts_with("waiting:") && h.reason.contains(" limit"))
+                .filter(|h| {
+                    h.reason.starts_with("waiting:")
+                        && (h.reason.contains(" limit") || h.reason.contains(" credential"))
+                })
                 .map(|h| format!("{}: {}", h.subject, h.reason)),
         );
         holds

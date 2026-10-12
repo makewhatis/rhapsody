@@ -31,13 +31,16 @@ enum Kind {
     LimitPark,
     LimitSwitch,
     CreditSpend,
+    CredentialRejected,
 }
 impl Kind {
     fn group(self) -> &'static str {
         match self {
-            Self::LeadEscalation | Self::StuckPr | Self::HumanHold | Self::LimitDecision => {
-                "needs_you"
-            }
+            Self::LeadEscalation
+            | Self::StuckPr
+            | Self::HumanHold
+            | Self::LimitDecision
+            | Self::CredentialRejected => "needs_you",
             Self::LeadDecision => "decisions",
             Self::ManagerDisabled | Self::LoginCheck | Self::BudgetWall | Self::LimitWall => {
                 "system"
@@ -65,6 +68,7 @@ impl Kind {
             Self::LimitPark => "limit_park",
             Self::LimitSwitch => "limit_switch",
             Self::CreditSpend => "credit_spend",
+            Self::CredentialRejected => "credential_rejected",
         }
     }
 }
@@ -293,6 +297,9 @@ async fn observe(
         ));
     }
     for budget in &snapshot.budget_held {
+        if budget.reason.starts_with("waiting:") && budget.reason.contains("login rejected") {
+            continue;
+        }
         rows.push(notice(
             Kind::BudgetWall,
             format!("budget:{}:{}", budget.provider, budget.subject),
@@ -304,10 +311,27 @@ async fn observe(
         ));
     }
     for account in provider.accounts() {
-        if let Some(reason) = account
-            .probe_reason
-            .as_ref()
-            .or(account.stale_reason.as_ref())
+        let rejected: Vec<_> = account
+            .credential_probes
+            .iter()
+            .filter(|p| p.held && p.reason.starts_with("login rejected"))
+            .collect();
+        for probe in &rejected {
+            rows.push(notice(
+                Kind::CredentialRejected,
+                format!("credential:{}:{}", probe.harness, account.account),
+                &account.account,
+                &format!("{}: {}", account.account, probe.reason),
+                "#accounts".into(),
+                &at,
+                true,
+            ));
+        }
+        if rejected.is_empty()
+            && let Some(reason) = account
+                .probe_reason
+                .as_ref()
+                .or(account.stale_reason.as_ref())
         {
             rows.push(notice(
                 Kind::LoginCheck,
@@ -533,6 +557,64 @@ pub(crate) async fn handle_read(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn rejected_credential_is_one_needs_you_episode_until_recovery() {
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        let mut account: rhapsody_orchestrator::accounts::AccountView = serde_json::from_value(serde_json::json!({
+            "account": "fireworks-ai", "windows": [], "status": "credential_held",
+            "using_credits": false, "last_seen_s": 0, "source": "", "stale": false,
+            "detection": "inactive", "level": "stop_new",
+            "probe_reason": "login rejected — run `opencode auth login` as the daemon's user",
+            "credential_probes": [{"account":"fireworks-ai", "harness":"opencode", "held":true,
+                "reason":"login rejected — run `opencode auth login` as the daemon's user", "checked_at_s":1}]
+        })).unwrap();
+        let mut snapshot = empty_snapshot();
+        snapshot
+            .budget_held
+            .push(rhapsody_orchestrator::budget::BudgetHeld {
+                subject: "TEST-B".into(),
+                provider: "fireworks-ai".into(),
+                reason: "waiting: fireworks-ai credential — login rejected".into(),
+                ..Default::default()
+            });
+        for at in ["2026-10-12T05:14:18Z", "2026-10-12T05:32:25Z"] {
+            account.credential_probes[0].checked_at_s += 1;
+            let rows = observe(
+                &FakeProvider::ok(snapshot.clone()).with_accounts(vec![account.clone()]),
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                rows.len(),
+                1,
+                "no duplicate quota/login or per-ticket notice"
+            );
+            assert_eq!(rows[0].kind, "credential_rejected");
+            assert_eq!(rows[0].group, "needs_you");
+            assert!(
+                rows[0].summary.contains("fireworks-ai")
+                    && rows[0].summary.contains("opencode auth login")
+            );
+            store.observe_notices(&rows, at).unwrap();
+        }
+        let rows = store.notices().unwrap();
+        assert_eq!(rows.len(), 1, "repeated rejection updates the same notice");
+        let id = rows[0].id;
+        assert!(rows[0].active && rows[0].read_at.is_none());
+        let recovered = observe(&FakeProvider::ok(empty_snapshot()), None)
+            .await
+            .unwrap();
+        store
+            .observe_notices(&recovered, "2026-10-12T06:00:00Z")
+            .unwrap();
+        let rows = store.notices().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, id);
+        assert!(!rows[0].active);
+        assert!(rows[0].read_at.is_some());
+    }
+
     #[tokio::test]
     async fn ticket_and_pr_reescalations_update_one_needs_you_notice() {
         use rhapsody_store::{LeadDecisionRow, LeadTrigger, ReviewWatchKey, ReviewWatchRow};

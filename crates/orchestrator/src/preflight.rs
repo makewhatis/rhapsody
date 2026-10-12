@@ -260,8 +260,8 @@ fn definite_credential_failure(stdout: &[u8], stderr: &[u8]) -> Option<&'static 
     None
 }
 
-/// The cached credential-probe verdict for the dispatch preflight. Control-task-owned (only on_tick's
-/// [`Orchestrator::credential_preflight`] mutates it), so it needs no lock.
+/// The cached credential-probe verdict for the dispatch preflight. Control-task-owned, so it needs
+/// no lock. A rejected run also invalidates its healthy TTL.
 #[derive(Debug, Clone)]
 pub struct ProbeCache {
     /// When the last probe ran (read through [`Orchestrator::now`]).
@@ -388,7 +388,133 @@ impl Orchestrator {
     }
 
     pub(crate) fn has_credential_holds(&self) -> bool {
-        self.probe_cache.values().any(|c| c.held)
+        !self.credential_rejections.is_empty() || self.probe_cache.values().any(|c| c.held)
+    }
+
+    pub(crate) fn rejected_credential_reason(&self, harness: &str, account: &str) -> Option<&str> {
+        self.credential_rejections
+            .get(&(self.effective_harness(harness), account.into()))
+            .map(|hold| hold.reason.as_str())
+    }
+
+    pub(crate) fn projected_credential_rejection(&self, run: &crate::RunningEntry) -> Option<&str> {
+        let account = if run.pricing.account.is_empty() {
+            self.run_pricing_for(&run.harness, &run.model_override, &run.project_slug)
+                .account
+        } else {
+            run.pricing.account.clone()
+        };
+        self.rejected_credential_reason(&run.harness, &account)
+    }
+
+    pub(crate) fn note_credential_wait(
+        &self,
+        issue: &rhapsody_core::Issue,
+        project: &str,
+        account: &str,
+        reason: &str,
+    ) {
+        self.note_usd_budget_hold(crate::budget::BudgetHeld {
+            subject: issue.identifier.clone(),
+            title: issue.title.clone(),
+            project: project.into(),
+            provider: account.into(),
+            reason: format!("waiting: {account} credential — {reason}"),
+            ..Default::default()
+        });
+    }
+
+    pub(crate) fn record_credential_rejection(&mut self, run: &crate::RunningEntry) {
+        let harness = if run.credential_harness.is_empty() {
+            self.effective_harness(&run.harness)
+        } else {
+            run.credential_harness.clone()
+        };
+        let account = run.pricing.account.clone();
+        if account.is_empty() {
+            tracing::warn!(
+                run_id = run.run_id,
+                "rejected login has no account attribution"
+            );
+            return;
+        }
+        let command = match harness.as_str() {
+            "opencode" => "opencode auth login",
+            "claude" => "claude auth login",
+            _ => "the harness login command",
+        };
+        for (key, cached) in &mut self.probe_cache {
+            if key.harness == harness && key.account == account {
+                cached.cache.healthy = false;
+            }
+        }
+        self.credential_rejections.insert(
+            (harness.clone(), account.clone()),
+            crate::accounts::CredentialView {
+                account,
+                harness,
+                held: true,
+                reason: format!("login rejected — run `{command}` as the daemon's user"),
+                checked_at_s: (self.now)().timestamp(),
+            },
+        );
+        self.publish_credential_views();
+    }
+
+    pub(crate) fn clear_credential_rejection(&mut self, harness: &str, account: &str) -> bool {
+        let removed = self
+            .credential_rejections
+            .remove(&(harness.into(), account.into()))
+            .is_some();
+        if removed {
+            // Drop only this credential's display holds, never an independent quota/budget hold.
+            for held in self.budget_ledger.held(self.budget_hold_ttl()) {
+                if held.provider == account && held.reason.contains("login rejected") {
+                    if self
+                        .credential_rejections
+                        .values()
+                        .any(|hold| hold.account == account)
+                    {
+                        continue;
+                    }
+                    self.release_budget_hold(&held.subject);
+                    self.limit_policy.holds.remove(&held.subject);
+                }
+            }
+            self.publish_credential_views();
+            self.schedule_tick(Duration::ZERO);
+        }
+        removed
+    }
+
+    pub(crate) fn operator_clear_credential(&mut self, harness: &str, account: &str) -> bool {
+        let before = self.probe_cache.len();
+        self.probe_cache.retain(|key, cached| {
+            !(key.harness == harness && key.account == account && cached.held)
+        });
+        let probe_cleared = before != self.probe_cache.len();
+        let rejection_cleared = self.clear_credential_rejection(harness, account);
+        if probe_cleared && !rejection_cleared {
+            self.publish_credential_views();
+            self.schedule_tick(Duration::ZERO);
+        }
+        probe_cleared || rejection_cleared
+    }
+
+    fn publish_credential_views(&self) {
+        self.accounts.replace_credential_probes(
+            self.probe_cache
+                .iter()
+                .map(|(key, c)| crate::accounts::CredentialView {
+                    account: key.account.clone(),
+                    harness: key.harness.clone(),
+                    held: c.held,
+                    reason: c.reason.clone(),
+                    checked_at_s: c.cache.checked_at.timestamp(),
+                })
+                .chain(self.credential_rejections.values().cloned())
+                .collect(),
+        );
     }
 
     pub(crate) fn credential_probe_reason(&self, harness: &str, project: &str) -> Option<&str> {
@@ -418,6 +544,9 @@ impl Orchestrator {
     }
 
     pub(crate) fn run_credential_probe_reason(&self, run: &crate::RunningEntry) -> Option<&str> {
+        if let Some(reason) = self.projected_credential_rejection(run) {
+            return Some(reason);
+        }
         if crate::managerrun::is_manager_key(&run.issue.id) {
             self.manager_credential_probe_reason(&run.harness, &run.project_slug)
         } else {
@@ -527,6 +656,10 @@ impl Orchestrator {
             };
             let held = matches!(outcome, ProbeOutcome::Dead(_));
             let healthy = matches!(outcome, ProbeOutcome::Healthy);
+            if healthy {
+                self.clear_credential_rejection(&key.harness, &key.account);
+            }
+            let prev = self.probe_cache.get(&key);
             let reason = match outcome {
                 ProbeOutcome::Healthy => String::new(),
                 ProbeOutcome::Dead(reason) | ProbeOutcome::Unknown(reason) => reason,
@@ -573,18 +706,30 @@ impl Orchestrator {
                 },
             );
         }
-        self.accounts.replace_credential_probes(
-            self.probe_cache
-                .iter()
-                .map(|(key, c)| crate::accounts::CredentialView {
-                    account: key.account.clone(),
-                    harness: key.harness.clone(),
-                    held: c.held,
-                    reason: c.reason.clone(),
-                    checked_at_s: c.cache.checked_at.timestamp(),
-                })
-                .collect(),
-        );
+        self.publish_credential_views();
+    }
+}
+
+impl crate::ControlHandle {
+    /// Operator release; no credential contents or provider I/O cross this surface.
+    pub async fn clear_credential_hold(
+        &self,
+        harness: &str,
+        account: &str,
+    ) -> Result<bool, String> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.events
+            .send(crate::control_loop::Event::ClearCredentialHold {
+                harness: harness.into(),
+                account: account.into(),
+                reply,
+            })
+            .map_err(|_| "control loop unavailable".to_string())?;
+        let mut lifetime = self.ctx.clone();
+        tokio::select! {
+            result = rx => result.map_err(|_| "control loop unavailable".to_string()),
+            _ = lifetime.cancelled() => Err("daemon stopping".into()),
+        }
     }
 }
 
@@ -601,6 +746,192 @@ mod tests {
         DispatchedEntries, empty_effective, empty_resolved_project, issue, record_entries, set_of,
     };
     use rhapsody_tracker::fake::Fake;
+
+    fn credential_exit(o: &Orchestrator, id: &str, failed: bool) -> crate::retry::EvWorkerExit {
+        crate::retry::EvWorkerExit {
+            issue_id: id.into(),
+            started_at: o.running[id].started_at,
+            last_state: "Done".into(),
+            failed,
+            auth_needed: failed,
+            err_msg: if failed {
+                "opencode_auth_needed: login rejected".into()
+            } else {
+                String::new()
+            },
+            refused: false,
+            declared_handoff: false,
+            review_verdict: None,
+            verdict_text: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn login_rejection_waits_even_with_a_healthy_profile_fallback() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (mut o, _, _) = orch_with_probe(false, FakeKind::Healthy);
+        let dir = crate::testsupport::TempDir::new();
+        std::fs::write(dir.child("worker.md"), "---\nextends: swe\nharness: opencode\nmodel: fireworks-ai/test-model\nfallback:\n  - harness: opencode\n    model: openai/gpt-test\n---\nWorker.\n").unwrap();
+        let mut teams = rhapsody_config::teams::Teams::disabled();
+        teams.enabled = true;
+        teams.roster.push(rhapsody_config::teams::Identity {
+            name: "worker".into(),
+            profile: "worker".into(),
+            ..Default::default()
+        });
+        o.teams = Some(teams);
+        o.teams_profiles_dir = Some(dir.child("").into());
+        let mut a = issue("a", "TEST-1", "Todo");
+        a.labels = Some(vec!["rhapsody:@worker".into()]);
+        o.dispatch_issue(a.clone(), None, None, String::new());
+        let rejection = credential_exit(&o, "a", true);
+        o.on_worker_exit(rejection);
+        let run = o.limit_projection(&a, "");
+        let fallback = o.engine_list(
+            "worker",
+            rhapsody_config::profiles::EngineSpec {
+                harness: "opencode".into(),
+                model: "fireworks-ai/test-model".into(),
+                effort: String::new(),
+            },
+        );
+        assert_eq!(fallback.len(), 2);
+        assert!(o.engine_usable(&fallback[1], ""));
+        assert!(
+            !o.limit_dispatch_ready(&a, ""),
+            "credential rejection never chooses a fallback automatically"
+        );
+        let mut supplied = None;
+        let mut run = run;
+        assert!(!o.gate_limit_dispatch(&mut run, &mut supplied, None));
+        assert!(supplied.is_none());
+    }
+
+    #[tokio::test]
+    async fn repeated_rejection_and_success_use_the_dispatch_time_credential() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (mut o, _, _) = orch_with_probe(false, FakeKind::Healthy);
+        o.cred_probe = None;
+        let eff = o.eff.as_mut().unwrap();
+        eff.cfg.agent.backend = "opencode".into();
+        eff.cfg.opencode.model = "fireworks-ai/test-model".into();
+        // Three already-live runs can complete after the first rejection has closed admission.
+        for id in ["a", "repeat", "success"] {
+            o.dispatch_issue(
+                issue(id, &format!("TEST-{id}"), "Todo"),
+                None,
+                None,
+                String::new(),
+            );
+        }
+        let first = credential_exit(&o, "a", true);
+        o.on_worker_exit(first);
+        let before = o
+            .credential_rejections
+            .values()
+            .next()
+            .unwrap()
+            .checked_at_s;
+        o.now = Box::new(move || chrono::DateTime::from_timestamp(before + 60, 0).unwrap());
+        // Reloads must not attribute an old run's failure/success to a replacement engine.
+        let eff = o.eff.as_mut().unwrap();
+        eff.cfg.agent.backend = "claude".into();
+        eff.cfg.opencode.model = "openai/gpt-test".into();
+        let repeat = credential_exit(&o, "repeat", true);
+        o.on_worker_exit(repeat);
+        assert_eq!(o.credential_rejections.len(), 1);
+        let held = o.credential_rejections.values().next().unwrap();
+        assert_eq!(
+            (&*held.harness, &*held.account),
+            ("opencode", "fireworks-ai")
+        );
+        assert_eq!(
+            held.checked_at_s,
+            before + 60,
+            "repeat updates the same credential"
+        );
+        let success = credential_exit(&o, "success", false);
+        o.on_worker_exit(success);
+        assert!(
+            o.credential_rejections.is_empty(),
+            "in-flight success releases its original credential"
+        );
+        assert!(o.retry_attempts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_probe_keeps_run_rejection_and_healthy_probe_releases_it() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (mut o, _, calls) = orch_with_probe(false, FakeKind::Healthy);
+        o.credential_preflight().await; // establish a fresh healthy TTL
+        o.dispatch_issue(issue("a", "TEST-1", "Todo"), None, None, String::new());
+        let rejected = credential_exit(&o, "a", true);
+        o.on_worker_exit(rejected);
+        o.cred_probe = Some(Arc::new(FakeProbe {
+            kind: FakeKind::Hang,
+            calls: calls.clone(),
+        }));
+        o.probe_timeout = Duration::from_millis(1);
+        o.credential_preflight().await;
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "a rejection invalidates the healthy TTL"
+        );
+        assert!(
+            o.has_credential_holds(),
+            "unknown cannot erase a confirmed rejection"
+        );
+        o.cred_probe = Some(Arc::new(FakeProbe {
+            kind: FakeKind::Healthy,
+            calls,
+        }));
+        o.credential_preflight().await;
+        assert!(!o.has_credential_holds());
+        assert_eq!(
+            o.select_dispatch(vec![
+                issue("a", "TEST-1", "Todo"),
+                issue("b", "TEST-2", "Todo")
+            ])
+            .len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_chatgpt_usage_probe_releases_only_its_credential() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (mut o, _, _) = orch_with_probe(false, FakeKind::Healthy);
+        let mut run = crate::RunningEntry::empty(issue("a", "TEST-1", "Todo"));
+        run.credential_harness = "opencode".into();
+        for account in ["chatgpt-subscription", "fireworks-ai"] {
+            run.pricing.account = account.into();
+            o.record_credential_rejection(&run);
+        }
+        o.drive_event(crate::control_loop::Event::ChatgptProbeResult(Err(
+            "usage_timeout",
+        )))
+        .await;
+        assert_eq!(o.credential_rejections.len(), 2);
+        o.drive_event(crate::control_loop::Event::ChatgptProbeResult(Ok(
+            rhapsody_agent::ratelimit::LimitObs {
+                source: "probe",
+                status: rhapsody_agent::ratelimit::LimitStatus::Allowed,
+                windows: Vec::new(),
+                using_credits: false,
+                observed_at_s: (o.now)().timestamp(),
+            },
+        )))
+        .await;
+        assert!(
+            o.rejected_credential_reason("opencode", "chatgpt-subscription")
+                .is_none()
+        );
+        assert!(
+            o.rejected_credential_reason("opencode", "fireworks-ai")
+                .is_some()
+        );
+    }
 
     fn fixed_now() -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 8, 19, 12, 0, 0)

@@ -764,6 +764,9 @@ impl Orchestrator {
         if self.subject_parked(&iss.identifier, "author") {
             return true;
         }
+        if self.credential_resume.contains(&iss.id) {
+            return false;
+        }
         if self
             .store()
             .subject_resume_pending(&iss.identifier)

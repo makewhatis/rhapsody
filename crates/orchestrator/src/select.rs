@@ -1005,20 +1005,10 @@ mod tests {
         let (_, events) = capture_events(|| {
             let mut o = orch_for_select(0, HashMap::new(), None);
             o.spawn = Some(Box::new(|_, _, _| {}));
-            o.dispatch_issue(issue("1", "A-1", "Todo"), None, None, String::new());
-            let started_at = o.running["1"].started_at;
-            o.on_worker_exit(crate::retry::EvWorkerExit {
-                issue_id: "1".into(),
-                started_at,
-                failed: true,
-                auth_needed: true,
-                err_msg: "opencode_auth_needed".into(),
-                last_state: "Todo".into(),
-                declared_handoff: false,
-                review_verdict: None,
-                verdict_text: None,
-                refused: false,
-            });
+            // Seed the claim this diagnostic describes. New auth exits wait on a shared
+            // credential (STUDIO-1199) instead of creating per-ticket claims.
+            o.claimed.insert("1".into());
+            o.auth_hold_claims.insert("1".into());
             let mut held = issue("1", "A-1", "Todo");
             held.labels = Some(vec![crate::teams::HUMAN_LABEL.into()]);
             // Warm the shared callsite before rebuilding tracing's global interest cache.
@@ -1027,20 +1017,8 @@ mod tests {
             let mut other = held.clone();
             other.id = "2".into();
             other.identifier = "A-2".into();
-            o.dispatch_issue(other.clone(), None, None, String::new());
-            let started_at = o.running["2"].started_at;
-            o.on_worker_exit(crate::retry::EvWorkerExit {
-                issue_id: "2".into(),
-                started_at,
-                failed: true,
-                auth_needed: true,
-                err_msg: "opencode_auth_needed".into(),
-                last_state: "Todo".into(),
-                declared_handoff: false,
-                review_verdict: None,
-                verdict_text: None,
-                refused: false,
-            });
+            o.claimed.insert("2".into());
+            o.auth_hold_claims.insert("2".into());
             // A third ticket is seen ONLY by the multi-project ladder, so removing that
             // ladder's diagnostic cannot hide behind the single-project call above.
             let mut multi_only = other.clone();

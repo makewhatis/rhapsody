@@ -122,6 +122,8 @@ pub struct RunningEntry {
     /// run (this value when the build implements it, else the configured backend) is written to
     /// `rhapsody_run_provenance` beside `harness_origin` and the model.
     pub harness: String,
+    /// Actual dispatch-time harness for credential failure attribution, independent of reloads.
+    pub(crate) credential_harness: String,
 
     /// The config key that named the harness (STUDIO-909), so an operator can tell a profile's
     /// choice from the installation default. `profile` when the routed teammate's profile named an
@@ -242,6 +244,7 @@ impl RunningEntry {
             teammate_section: String::new(),
             model_override: rhapsody_agent::ModelOverride::default(),
             harness: String::new(),
+            credential_harness: String::new(),
             harness_origin: String::new(),
             model_origin: String::new(),
             last_delivered_summon_at: zero_time(),
@@ -1036,6 +1039,10 @@ pub struct Orchestrator {
     /// `credential_preflight` on the single control task, so it needs no lock. Keyed by credential
     /// context; an empty map means no probe verdicts yet.
     pub(crate) probe_cache: BTreeMap<crate::preflight::ProbeKey, crate::preflight::CachedProbe>,
+    /// Confirmed run login failures, scoped by harness/account; only positive recovery clears them.
+    pub(crate) credential_rejections: BTreeMap<(String, String), crate::accounts::CredentialView>,
+    /// Failed authors retain one fresh admission after login recovery, even with an existing PR.
+    pub(crate) credential_resume: HashSet<String>,
     /// The per-probe timeout bound: no answer is unknown, permits dispatch and retries next tick.
     /// A field (not a const) so tests can shrink it; defaulted to
     /// [`PROBE_TIMEOUT`](crate::preflight::PROBE_TIMEOUT).
@@ -1265,6 +1272,8 @@ impl Orchestrator {
             // byte-identical to the pre-feature behavior. The daemon installs the real probe at startup.
             cred_probe: None,
             probe_cache: BTreeMap::new(),
+            credential_rejections: BTreeMap::new(),
+            credential_resume: HashSet::new(),
             probe_timeout: crate::preflight::PROBE_TIMEOUT,
             // STUDIO-880: never draining by default → the gate and the turn-boundary check are both
             // inert, i.e. byte-identical to a daemon built before the feature.

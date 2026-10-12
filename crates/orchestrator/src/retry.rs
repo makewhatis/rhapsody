@@ -826,6 +826,7 @@ impl Orchestrator {
         self.claimed.insert(id.clone());
         self.clear_retry(&id);
         self.persist_start_run(&mut re, attempt_norm);
+        self.credential_resume.remove(&iss.id);
         // AFTER the run row exists: the decision is a row ON a run, so it cannot be written before
         // one (§3.1 — the router has no store and can persist no intention). A zero `run_id` (store
         // disabled / `start_run` failed) makes this a no-op.
@@ -1101,6 +1102,12 @@ impl Orchestrator {
             self.refresh_prompt_file_warnings(inputs, checker);
         }
 
+        // Credential health is shared even when the failed run is a reviewer or manager.
+        if e.auth_needed {
+            self.record_credential_rejection(&re);
+        } else if !e.failed {
+            self.clear_credential_rejection(&re.credential_harness, &re.pricing.account);
+        }
         // A ticketless review run has no ticket, so `classify_clean_exit` cannot serve it: both of
         // its state samples are empty, which reads as "still active" and schedules the continuation
         // retry that re-dispatches the review forever (STUDIO-716, design §14.2 F4). Its own exit
@@ -1155,28 +1162,27 @@ impl Orchestrator {
         // The provider rejected the run's login and the operator's current login is the same one
         // (STUDIO-1118). Before this branch it went out as an ordinary failure, so the backoff
         // re-dispatched every few minutes for an hour — each attempt 401ing on the same dead copy.
-        // Recorded once and held exactly as a refusal is above; the worker labelled the ticket
-        // `rhapsody:human`, which keeps it out of selection across a restart too, and resuming it
-        // from the job page clears the claim and the label together, even when the operator
-        // already removed the label by hand (STUDIO-1200).
+        // Record this ticket failed once. The shared credential gate holds it and other candidates;
+        // no claim or human label may strand it after the operator fixes the login.
         if e.auth_needed {
             self.completed.remove(&e.issue_id);
+            self.credential_resume.insert(e.issue_id.clone());
+            let action = self
+                .rejected_credential_reason(&re.credential_harness, &re.pricing.account)
+                .unwrap_or("refresh the harness login");
             tracing::warn!(
                 run_id = re.run_id,
                 issue_id = %e.issue_id,
                 issue_identifier = %re.issue.identifier,
                 identity = %re.identity,
-                harness = %re.harness,
-                reason = %e.err_msg,
-                "agent login rejected: operator must run `opencode auth login` as the daemon's \
-                 user; recording failed once, holding the ticket for a human and scheduling no \
-                 retry"
+                harness = %re.credential_harness,
+                account = %re.pricing.account,
+                "agent login rejected: {action}; recording failed once, holding the credential and scheduling no retry"
             );
             self.persist_end_run(&re, store::OUTCOME_FAILED, &e.err_msg);
             self.persist_complete(&re.issue.identifier);
             self.persist_totals();
-            self.claimed.insert(e.issue_id.clone());
-            self.auth_hold_claims.insert(e.issue_id.clone());
+            self.claimed.remove(&e.issue_id);
             return;
         }
         if self.subject_parked(&re.issue.identifier, "author") {
@@ -2533,7 +2539,7 @@ mod tests {
     }
 
     /// STUDIO-1118: the agent's auth-needed outcome is recorded failed ONCE and schedules no timed
-    /// retry; the ticket is held for a human. MUTATION GUARD: drop the `auth_needed` branch and the
+    /// retry; the credential gate holds new work. MUTATION GUARD: drop the `auth_needed` branch and the
     /// exit falls into the ordinary failure backoff, populating `retry_attempts`.
     #[test]
     fn an_auth_needed_exit_records_failed_once_and_schedules_no_retry() {
@@ -2566,7 +2572,10 @@ mod tests {
             !o.retry_attempts.contains_key("1"),
             "an auth-needed exit must schedule no timed retry"
         );
-        assert!(o.claimed.contains("1"), "held until a human resumes it");
+        assert!(
+            !o.claimed.contains("1"),
+            "the credential gate owns the hold"
+        );
         assert!(!o.running.contains_key("1"));
         let runs = store_handle
             .list_runs(rhapsody_store::RunFilter {
@@ -2582,15 +2591,14 @@ mod tests {
     /// STUDIO-1118, the PRODUCTION path (alice's B1). The test above hand-sets `auth_needed`; this
     /// one drives the real `spawn_worker` with an agent whose turn ends in the runner's typed
     /// [`rhapsody_agent::AgentError::AuthNeeded`], so the mapping in `loop.rs` that joins the two is
-    /// what decides the outcome. The exit must carry the flag, the ticket must be labelled for a
-    /// human (what keeps the hold across a restart), and `on_worker_exit` must WARN naming the
-    /// identity and the harness, record one failed row and schedule no timed retry.
+    /// what decides the outcome. The exit must carry the flag and hold the credential, while
+    /// `on_worker_exit` WARNs naming the identity and harness, records one failed row and schedules
+    /// no timed retry. B must wait and an unrelated credential must still dispatch.
     ///
     /// MUTATION GUARD: force the `loop.rs` mapping to `false` and the exit falls into the ordinary
-    /// failure backoff (`retry_attempts` populated, no WARN, no label); misname the label and the
-    /// `rhapsody:human` assertion goes red.
+    /// failure backoff (`retry_attempts` populated). Omitting the shared hold lets B run and fail.
     #[tokio::test]
-    async fn an_auth_needed_turn_is_held_for_a_human_through_the_real_spawn() {
+    async fn rejected_login_holds_same_credential_through_the_real_spawn() {
         let _serial = TRACING_TEST_LOCK.lock().await; // TRA-243: this test captures events
         let tr = Arc::new(Fake::new());
         let (mut o, _) = orch_for_retry(Arc::clone(&tr), 10);
@@ -2617,6 +2625,8 @@ mod tests {
             eff.agent = ag.clone();
             eff.workspace = mk_workspace(&root.child("ws"));
             eff.prompt_tmpl = "do it".to_string();
+            eff.cfg.agent.backend = "opencode".into();
+            eff.cfg.opencode.model = "fireworks-ai/test-model".into();
         }
         // Drive the real spawn, not the recording seam.
         o.spawn = None;
@@ -2674,31 +2684,120 @@ mod tests {
             !o.retry_attempts.contains_key("1"),
             "an auth-needed exit must schedule no timed retry"
         );
-        assert!(o.claimed.contains("1"), "held until a human resumes it");
+        assert!(
+            !o.claimed.contains("1"),
+            "A waits on the credential, not a claim"
+        );
         assert!(!o.running.contains_key("1"));
         let labels: Vec<(String, String, String)> = tr
             .add_label_calls()
             .into_iter()
             .map(|c| (c.issue_id, c.team_id, c.label_name))
             .collect();
+        assert!(labels.is_empty(), "credential failure adds no human label");
+        let b = issue("b", "MT-2", "Todo");
+        o.dispatch_issue(b.clone(), None, None, String::new());
+        // Mutation witness: without the shared hold B starts and the same fake rejects it.
+        if o.running.contains_key("b") {
+            let exit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Some(Event::WorkerExit(exit)) = rx.recv().await {
+                        return exit;
+                    }
+                }
+            })
+            .await
+            .expect("B fake worker exit");
+            assert!(exit.auth_needed && exit.failed);
+            o.on_worker_exit(exit);
+        }
         assert_eq!(
-            labels,
-            vec![(
-                "1".to_string(),
-                "team-1".to_string(),
-                crate::teams::HUMAN_LABEL.to_string()
-            )],
-            "the ticket is labelled for a human exactly once"
+            ag.start_calls(),
+            1,
+            "B must never dispatch onto A's rejected credential"
         );
+        let picks = o.select_dispatch(vec![issue("1", "MT-1", "Todo"), b.clone()]);
+        assert!(
+            picks.is_empty(),
+            "A and B must wait on the rejected credential"
+        );
+        assert!(o.limit_holds().iter().any(|reason| reason.contains("MT-2")
+            && reason.contains("fireworks-ai")
+            && reason.contains("opencode auth login")));
+        let accounts = o.control().accounts((o.now)().timestamp());
+        let held = accounts
+            .iter()
+            .find(|a| a.account == "fireworks-ai")
+            .unwrap();
+        assert_eq!(held.status, "credential_held");
+        assert_eq!(held.level.as_deref(), Some("stop_new"));
+        assert_eq!(held.credential_probes.len(), 1);
+        assert!(held.credential_probes[0].held);
+
+        // The same harness, a different provider/account: this must still start normally.
+        o.spawn = Some(crate::testsupport::record_entries(&Arc::new(
+            std::sync::Mutex::new(Vec::new()),
+        )));
+        let mut other = crate::testsupport::empty_resolved_project("openai", Arc::new(Fake::new()));
+        other.mcfg.opencode.model = "openai/gpt-test".into();
+        o.eff.as_mut().unwrap().projects.push(other);
+        o.dispatch_issue(
+            issue("c", "MT-3", "Todo"),
+            None,
+            Some(DispatchRoute {
+                slug: "openai".into(),
+                group: "openai".into(),
+                repo: String::new(),
+                model: String::new(),
+                workspace_mode: String::new(),
+            }),
+            String::new(),
+        );
+        assert!(
+            o.running.contains_key("c"),
+            "different credential dispatches"
+        );
+        // Even a prepared/direct dispatch cannot bypass the last gate.
+        o.dispatch_issue(b.clone(), None, None, String::new());
+        assert!(!o.running.contains_key("b"));
+        // Exercise the public operator surface and its control event, without an HTTP server.
+        let handle = o.control();
+        let clear = tokio::spawn(async move {
+            handle
+                .clear_credential_hold("opencode", "fireworks-ai")
+                .await
+        });
+        o.drive_event(rx.recv().await.unwrap()).await;
+        assert!(clear.await.unwrap().unwrap());
+        let mut a = issue("1", "MT-1", "Todo");
+        a.linked_pr = true;
+        assert_eq!(
+            o.select_dispatch(vec![a.clone(), b.clone()]).len(),
+            2,
+            "clear releases A and B, including A's consumed linked-PR summons"
+        );
+        assert!(
+            !o.control()
+                .accounts((o.now)().timestamp())
+                .iter()
+                .any(|a| a.status == "credential_held")
+        );
+        o.dispatch_issue(a, None, None, String::new());
+        o.dispatch_issue(b, None, None, String::new());
+        assert!(o.running.contains_key("1") && o.running.contains_key("b"));
         let runs = store_handle
             .list_runs(rhapsody_store::RunFilter {
                 issue: "MT-1".to_string(),
                 ..Default::default()
             })
             .expect("list runs");
-        assert_eq!(runs.len(), 1, "exactly one failed row");
-        assert_eq!(runs[0].outcome, store::OUTCOME_FAILED);
-        assert_eq!(runs[0].error, msg);
+        assert_eq!(runs.len(), 2, "one failed row and the post-clear dispatch");
+        let failed: Vec<_> = runs
+            .iter()
+            .filter(|r| r.outcome == store::OUTCOME_FAILED)
+            .collect();
+        assert_eq!(failed.len(), 1, "exactly one failed row, no retry failures");
+        assert_eq!(failed[0].error, msg);
         let events = events.lock().expect("event buffer lock").clone();
         let warns: Vec<_> = events
             .iter()

@@ -262,6 +262,12 @@ pub enum Event {
         reply: oneshot::Sender<Option<std::path::PathBuf>>,
     },
     ChatgptProbeResult(Result<agent::ratelimit::LimitObs, &'static str>),
+    /// Explicit operator release, applied on the scheduling task.
+    ClearCredentialHold {
+        account: String,
+        harness: String,
+        reply: oneshot::Sender<bool>,
+    },
     /// The concrete per-run transcript path the worker opened (Go `evTranscriptOpened`).
     TranscriptOpened {
         issue_id: String,
@@ -809,13 +815,23 @@ impl Orchestrator {
             }
             Event::ChatgptProbeResult(result) => {
                 match result {
-                    Ok(obs) => self.accounts.observe("chatgpt-subscription", obs),
+                    Ok(obs) => {
+                        self.clear_credential_rejection("opencode", "chatgpt-subscription");
+                        self.accounts.observe("chatgpt-subscription", obs);
+                    }
                     Err(reason) => {
                         self.accounts.probe_failed(reason);
                         tracing::warn!(reason, "ChatGPT usage probe failed; account marked stale");
                     }
                 }
                 self.enforce_limits();
+            }
+            Event::ClearCredentialHold {
+                account,
+                harness,
+                reply,
+            } => {
+                let _ = reply.send(self.operator_clear_credential(&harness, &account));
             }
             Event::TranscriptOpened { issue_id, path } => {
                 self.on_transcript_opened(&issue_id, &path)
@@ -2182,29 +2198,13 @@ impl Orchestrator {
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
             // succeed, and the failure backoff would loop forever.
             let refused = matches!(err, Some(WorkerError::CapabilityRefused(_)));
-            // The provider rejected the run's login and no retry can fix it (STUDIO-1118): hold the
-            // ticket for a human with the daemon's human-needed label, so it stays out of selection
-            // even across a restart, and the job page's resume clears it once they have logged in.
+            // The control task holds the shared credential after a typed login rejection.
             let auth_needed = matches!(
                 err,
                 Some(WorkerError::Agent(
                     agent::AgentError::AuthNeeded(_) | agent::AgentError::AuthFailed(_)
                 ))
             );
-            if auth_needed
-                && deps.manager.is_none()
-                && !iss.team_id.is_empty()
-                && let Err(e) = deps
-                    .tracker
-                    .add_issue_label(&iss.id, &iss.team_id, crate::teams::HUMAN_LABEL)
-                    .await
-            {
-                tracing::warn!(
-                    issue = %iss.identifier, err = %e,
-                    "agent login rejected, but the ticket could not be labelled for a human; it is \
-                     still held in memory — apply the label by hand"
-                );
-            }
             if let Some(question) = declared.blocked_question {
                 let _ = events_exit.send(Event::LeadBlockedHandoff {
                     issue_id: issue_id.clone(),

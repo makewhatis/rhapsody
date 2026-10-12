@@ -729,6 +729,19 @@ impl StateProvider for FakeProvider {
     fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
         self.accounts.clone()
     }
+    async fn clear_credential_hold(
+        &self,
+        harness: &str,
+        account: &str,
+    ) -> Result<bool, RunActionError> {
+        self.touch();
+        Ok(self.accounts.iter().any(|a| {
+            a.account == account
+                && a.credential_probes
+                    .iter()
+                    .any(|p| p.harness == harness && p.held)
+        }))
+    }
 
     async fn snapshot(&self) -> Result<Snapshot, SnapshotError> {
         self.touch();
