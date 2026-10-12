@@ -55,6 +55,12 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     let r: Raw = serde_yaml_ng::from_str(&bytes).map_err(|e| ConfigError::Parse(e.to_string()))?;
     let limits = r.limits.clone().unwrap_or_default();
     limits.validate().map_err(ConfigError::Parse)?;
+    let credential_canary_interval_ms = r.agent.credential_canary_interval_ms.unwrap_or(1_800_000);
+    if credential_canary_interval_ms <= 0 {
+        return Err(ConfigError::Parse(
+            "agent.credential_canary_interval_ms: must be positive".into(),
+        ));
+    }
     let stall_cpu_threshold = r.agent.stall_cpu_threshold.unwrap_or(0.05);
     if !stall_cpu_threshold.is_finite()
         || !(0.0 < stall_cpu_threshold && stall_cpu_threshold <= 1.0)
@@ -179,6 +185,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         // non-positive key must bound nothing, so the reader only acts on `> 0`.
         max_run_tokens: or_int(r.agent.max_run_tokens, 0),
         stall_cpu_threshold,
+        credential_canary_interval_ms,
         max_turns: or_int(r.agent.max_turns, 20),
         max_retry_backoff_ms: or_int(r.agent.max_retry_backoff_ms, 300000),
         max_concurrent_agents_by_state: normalize_state_map(r.agent.max_concurrent_agents_by_state),
@@ -885,6 +892,31 @@ mod tests {
             negative.agent.max_run_tokens, -5,
             "decode is verbatim; the reader treats a non-positive value as unlimited"
         );
+    }
+
+    #[test]
+    fn credential_canary_interval_defaults_and_requires_positive_milliseconds() {
+        assert_eq!(
+            decode_yaml("", "body").agent.credential_canary_interval_ms,
+            1_800_000
+        );
+        assert_eq!(
+            decode_yaml("agent:\n  credential_canary_interval_ms: 60000\n", "body")
+                .agent
+                .credential_canary_interval_ms,
+            60_000
+        );
+        for value in ["0", "-1"] {
+            assert!(
+                try_decode_yaml(
+                    &format!("agent:\n  credential_canary_interval_ms: {value}\n"),
+                    "body"
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("agent.credential_canary_interval_ms")
+            );
+        }
     }
 
     #[test]

@@ -129,6 +129,9 @@ fn raw_from_config(c: &Config) -> Raw {
     if c.agent.stall_cpu_threshold != 0.05 {
         r.agent.stall_cpu_threshold = Some(c.agent.stall_cpu_threshold);
     }
+    if c.agent.credential_canary_interval_ms != 1_800_000 {
+        r.agent.credential_canary_interval_ms = Some(c.agent.credential_canary_interval_ms);
+    }
     r.agent.max_turns = Some(c.agent.max_turns);
     r.agent.max_retry_backoff_ms = Some(c.agent.max_retry_backoff_ms);
     r.agent.handoff_drain_grace_ms = Some(c.agent.handoff_drain_grace_ms);
@@ -810,6 +813,32 @@ mod tests {
             "an unset key must not be materialized"
         );
         assert_eq!(re_encode_decode(&absent).agent.max_run_tokens, 0);
+    }
+
+    #[test]
+    fn credential_canary_interval_round_trips_without_materializing_the_default() {
+        let configured = decode_map("agent:\n  credential_canary_interval_ms: 60000\n", "body");
+        assert_eq!(
+            re_encode_decode(&configured)
+                .agent
+                .credential_canary_interval_ms,
+            60_000
+        );
+        let default = decode_map("", "body");
+        assert_eq!(
+            nested(
+                &encode(&default).unwrap().config,
+                "agent",
+                "credential_canary_interval_ms"
+            ),
+            None
+        );
+        assert_eq!(
+            re_encode_decode(&default)
+                .agent
+                .credential_canary_interval_ms,
+            1_800_000
+        );
     }
 
     #[test]

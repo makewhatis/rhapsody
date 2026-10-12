@@ -4020,6 +4020,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_canary_consumes_the_prepared_provider_not_the_opaque_model_prefix() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (mut o, sink) = crate::testsupport::orch_for_retry(Arc::new(Fake::new()), 10);
+        let start = chrono::DateTime::from_timestamp(1_790_000_000, 0).unwrap();
+        o.now = Box::new(move || start);
+        let mut rejected = crate::RunningEntry::empty(issue("old", "MT-1", "Todo"));
+        rejected.credential_harness = "opencode".into();
+        rejected.pricing.account = "fireworks".into();
+        o.record_credential_rejection(&rejected);
+        o.now = Box::new(move || start + chrono::Duration::minutes(30));
+        for id in ["a", "b"] {
+            let spec = o.prepared_spec(custody_dispatch(), None).unwrap();
+            o.dispatch_issue_prepared(
+                issue(id, &format!("MT-{id}"), "Todo"),
+                None,
+                None,
+                String::new(),
+                spec,
+            );
+        }
+        assert_eq!(
+            sink.lock().unwrap().len(),
+            1,
+            "one prepared canary despite opaque accounts/fireworks/models/x model"
+        );
+        assert_eq!(
+            o.credential_canaries[&("opencode".into(), "fireworks".into())],
+            (o.now)()
+        );
+    }
+
+    #[tokio::test]
     async fn explicit_provider_usd_never_bypasses_the_gate_with_an_opaque_model() {
         let (mut o, sink) = crate::testsupport::orch_for_retry(Arc::new(Fake::new()), 10);
         o.eff.as_mut().unwrap().cfg.budgets.insert(

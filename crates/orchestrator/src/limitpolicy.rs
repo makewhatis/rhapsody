@@ -345,6 +345,10 @@ impl Orchestrator {
             &run.pricing.account
         };
         if let Some(reason) = self.rejected_credential_reason(&run.harness, account) {
+            if self.credential_canary_due(&run, account) {
+                return !self.credential_probe_held(&run.harness, project)
+                    && self.account_usable(account);
+            }
             self.note_credential_wait(issue, project, account, reason);
             return false;
         }
@@ -437,7 +441,12 @@ impl Orchestrator {
     ) -> bool {
         let pricing = self.run_pricing_for(&re.harness, &re.model_override, &re.project_slug);
         let account = account.unwrap_or(&pricing.account);
-        if let Some(reason) = self.rejected_credential_reason(&re.harness, account) {
+        let canary = self.credential_canary_due(re, account);
+        if let Some(reason) = self.rejected_credential_reason(&re.harness, account)
+            && (!canary
+                || self.credential_probe_held(&re.harness, &re.project_slug)
+                || !self.account_usable(account))
+        {
             self.note_credential_wait(&re.issue, &re.project_slug, account, reason);
             return false;
         }
@@ -450,7 +459,7 @@ impl Orchestrator {
             self.note_usd_budget_hold(held);
             return false;
         }
-        if self.run_credential_probe_reason(re).is_none()
+        if (canary || self.run_credential_probe_reason(re).is_none())
             && (self.account_usable(account) || self.credit_approved(&re.issue.id, account))
         {
             self.limit_policy.holds.remove(&re.issue.identifier);

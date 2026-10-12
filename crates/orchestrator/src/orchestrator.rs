@@ -1044,6 +1044,8 @@ pub struct Orchestrator {
     pub(crate) probe_cache: BTreeMap<crate::preflight::ProbeKey, crate::preflight::CachedProbe>,
     /// Confirmed run login failures, scoped by harness/account; only positive recovery clears them.
     pub(crate) credential_rejections: BTreeMap<(String, String), crate::accounts::CredentialView>,
+    /// Last rejection/admitted canary, loop-owned and scoped to the same credential hold.
+    pub(crate) credential_canaries: BTreeMap<(String, String), DateTime<Utc>>,
     /// Failed authors retain one fresh admission after login recovery, even with an existing PR.
     pub(crate) credential_resume: HashSet<String>,
     /// The per-probe timeout bound: no answer is unknown, permits dispatch and retries next tick.
@@ -1276,6 +1278,7 @@ impl Orchestrator {
             cred_probe: None,
             probe_cache: BTreeMap::new(),
             credential_rejections: BTreeMap::new(),
+            credential_canaries: BTreeMap::new(),
             credential_resume: HashSet::new(),
             probe_timeout: crate::preflight::PROBE_TIMEOUT,
             // STUDIO-880: never draining by default → the gate and the turn-boundary check are both
