@@ -364,11 +364,11 @@ fn insert_bounded(
     out.insert(key, entry);
 }
 
-/// The live tracker one cycle reads candidates from. Mirrors
+/// The enabled project trackers one cycle reads candidates from. Mirrors
 /// [`TriageTarget`](crate::triage::TriageTarget), and for the same reason: the
 /// handle exists before the first config load, so the tracker arrives later.
 pub struct PrefetchTarget {
-    pub tracker: Arc<dyn Tracker>,
+    pub trackers: Vec<Arc<dyn Tracker>>,
 }
 
 /// Everything [`run_prefetch_schedule`] runs against. The absence of an
@@ -379,7 +379,7 @@ pub struct PrefetchDeps<TF> {
     /// scope for this slice, as for T3b), so this is captured once at the
     /// composition root.
     pub teams: Arc<Teams>,
-    /// Yields the live tracker, or `None` when no config has loaded yet.
+    /// Yields the enabled project trackers, or `None` when no config has loaded yet.
     pub target: TF,
     /// The remote bank. A `dyn MemoryBackend` rather than a concrete
     /// `HindsightBackend` **because this is the off-loop side**: nothing here
@@ -525,13 +525,21 @@ where
     let Some(target) = (deps.target)() else {
         return CycleOutcome::Idle; // no config loaded yet
     };
-    let issues = match target.tracker.fetch_candidate_issues().await {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::warn!(err = %e, "teams memory prefetch could not fetch candidates");
-            return CycleOutcome::TrackerFailure;
+    // Account-level clients can have an empty slug under `projects:` and see no work.
+    // Use the poll loop's enabled project clients, with its first-project-wins deduplication.
+    let mut issues = Vec::new();
+    let mut seen = HashSet::new();
+    for tracker in target.trackers {
+        match tracker.fetch_candidate_issues().await {
+            Ok(candidates) => {
+                issues.extend(candidates.into_iter().filter(|i| seen.insert(i.id.clone())));
+            }
+            Err(e) => {
+                tracing::warn!(err = %e, "teams memory prefetch could not fetch candidates");
+                return CycleOutcome::TrackerFailure;
+            }
         }
-    };
+    }
     let routed = routed_candidates(&deps.teams, &issues);
     if routed.is_empty() {
         // Nothing routes anywhere: clear the cache rather than leaving
@@ -821,7 +829,7 @@ mod tests {
             teams: Arc::new(t),
             target: move || {
                 Some(PrefetchTarget {
-                    tracker: Arc::clone(&tracker) as Arc<dyn Tracker>,
+                    trackers: vec![Arc::clone(&tracker) as Arc<dyn Tracker>],
                 })
             },
             backend: bank as Arc<dyn MemoryBackend>,
@@ -878,6 +886,45 @@ mod tests {
     }
 
     // ── the cycle ───────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn a_cycle_recalls_all_projects_and_deduplicates_first_project_wins() {
+        let bank = bank_with(&[]);
+        let first = tracker(vec![issue("1", "MT-1", &["rust"])]);
+        let second = tracker(vec![
+            issue("1", "MT-1", &["web"]),
+            issue("2", "MT-2", &["web"]),
+        ]);
+        let cache = Arc::new(PrefetchCache::new());
+        let d = PrefetchDeps {
+            teams: Arc::new(teams(true, BackendKind::Hindsight)),
+            target: || {
+                Some(PrefetchTarget {
+                    trackers: vec![first.clone(), second.clone()],
+                })
+            },
+            backend: bank.clone() as Arc<dyn MemoryBackend>,
+            cache: cache.clone(),
+            interval: PREFETCH_INTERVAL,
+            max_backoff_ms: MAX_PREFETCH_BACKOFF_MS,
+            now: Box::new(|| at(0)),
+        };
+        assert_eq!(
+            prefetch_cycle(&CancelWait::default(), &d, &mut 0).await,
+            CycleOutcome::Prefetched(2)
+        );
+        assert_eq!(first.candidate_calls(), 1);
+        assert_eq!(second.candidate_calls(), 1);
+        assert_eq!(
+            *bank.asked.lock().unwrap(),
+            vec![
+                ("alice".into(), "MT-1".into()),
+                ("bob".into(), "MT-2".into())
+            ]
+        );
+        assert!(cache.try_get("alice", "MT-1", at(1)).is_some());
+        assert!(cache.try_get("bob", "MT-1", at(1)).is_none());
+    }
 
     /// The happy path: each candidate is routed with the existing `route()` and
     /// recalled for under the identity that ticket routes to.
@@ -1095,6 +1142,10 @@ mod tests {
     /// error.
     #[tokio::test]
     async fn a_failing_bank_backs_off_without_burning_the_backlog() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (events, subscriber) = crate::testsupport::recording_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
         let bank = Arc::new(FakeBank {
             fail: true,
             ..FakeBank::default()
@@ -1121,6 +1172,19 @@ mod tests {
             "one failure ends the cycle; the rest is picked up after the back-off"
         );
         assert!(cache.is_empty(), "and dispatch degrades to exactly `none`");
+        assert!(
+            events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event.level == "WARN"
+                    && event.message.contains("the remote bank failed")
+                    && event
+                        .fields
+                        .get("error")
+                        .is_some_and(|e| e.contains("the tailnet is down"))),
+            "an attempted failing recall must not swallow the warning"
+        );
     }
 
     /// A tracker outage is a failure too, and leaves the cache alone: what was
@@ -1197,10 +1261,10 @@ mod tests {
             teams: Arc::new(teams(true, BackendKind::Hindsight)),
             target: || {
                 Some(PrefetchTarget {
-                    tracker: tracker(vec![
+                    trackers: vec![tracker(vec![
                         issue("1", "MT-1", &["rust"]),
                         issue("2", "MT-2", &["rust"]),
-                    ]) as Arc<dyn Tracker>,
+                    ]) as Arc<dyn Tracker>],
                 })
             },
             backend: Arc::new(FlakyBank {
