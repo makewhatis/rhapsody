@@ -1300,7 +1300,7 @@ mod tests {
                     after_create: format!("printf '%s' '{}' > .rhapsody/landing.yaml", GOOD),
                     ..Default::default()
                 },
-                hook_timeout: Duration::from_secs(1),
+                hook_timeout: Duration::from_secs(30),
             })
             .unwrap(),
         );
@@ -1311,7 +1311,21 @@ mod tests {
         });
         rig.tick(0).await;
         assert_eq!(rig.row().phase, LandingPhase::Held);
-        assert!(rig.row().hold_reason.unwrap().contains("live.htp"));
+        assert!(
+            rig.row()
+                .hold_reason
+                .as_deref()
+                .is_some_and(|r| r.contains("live.htp")),
+            "{:?}",
+            rig.row()
+        );
+        let worktree = crate::testsupport::mk_workspace(&rig._dir.child("hook-workspaces"))
+            .path_for(&rig.origin, &RepoChecks::key(&rig.row()));
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&worktree).join(".rhapsody/landing.yaml")).unwrap(),
+            GOOD,
+            "the hook must actually run and replace the checkout for this regression to be meaningful"
+        );
     }
     #[tokio::test]
     async fn contract_deleted_by_the_merge_holds() {
