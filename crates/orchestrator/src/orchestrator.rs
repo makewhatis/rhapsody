@@ -372,6 +372,11 @@ pub struct StackHint {
 /// per-project warning maps + read-only tracker surfaces (O6/O4), the worker-spawn seam (O3), and
 /// the GitHub-summons source (O6).
 pub struct Orchestrator {
+    pub(crate) landing_task: Option<crate::landing::LandingTask>,
+    /// Landing-enabled merge plans reserve project admission before GitHub runs, through the
+    /// later observation that confirms an ambiguous attempt or durably admits the merged row.
+    pub(crate) landing_merges:
+        HashMap<crate::prstate::PrCoord, crate::automerge::LandingMergeState>,
     /// The path of the WORKFLOW.md this orchestrator loads and watches (the HTTP config endpoint
     /// reads and rewrites it; the watcher then hot-reloads).
     pub workflow_path: String,
@@ -1187,6 +1192,8 @@ impl Orchestrator {
             // `o.spawn = o.spawnWorker`). O5's handler tests + O7's loop tests inject a recorder.
             spawn: None,
             eff: None,
+            landing_task: None,
+            landing_merges: HashMap::new(),
             capabilities_registry: None,
             teams: None,
             teams_profiles_dir: None,

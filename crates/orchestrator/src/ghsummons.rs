@@ -173,6 +173,36 @@ pub struct GH {
 }
 
 impl GH {
+    /// Landing alone needs the merged commit, not the PR's (possibly squash-merged) head.
+    pub(crate) async fn landing_merge_sha(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> Result<String, String> {
+        let coord = format!("{owner}/{repo}");
+        let body = self
+            .run_off_task(vec![
+                "pr".into(),
+                "view".into(),
+                number.to_string(),
+                "--repo".into(),
+                coord,
+                "--json".into(),
+                "state,mergeCommit".into(),
+            ])
+            .await
+            .map_err(|e| e.to_string())?;
+        let value: serde_json::Value = serde_json::from_slice(&body).map_err(|e| e.to_string())?;
+        let sha = value["mergeCommit"]["oid"].as_str().unwrap_or("");
+        if value["state"] != "MERGED"
+            || !(7..=64).contains(&sha.len())
+            || !sha.bytes().all(|c| c.is_ascii_hexdigit())
+        {
+            return Err("landing: GitHub did not report a merged commit".into());
+        }
+        Ok(sha.into())
+    }
     /// Creates a `GH` summon source for `token` (e.g. `"@symphony"`). Pass `None` for `run` to shell
     /// out to the real `gh` binary. Mirrors Go `ghsummons.NewGH` (nil run → `defaultRun`). The token
     /// matcher reuses [`compile_summon_matcher`] so the GitHub path matches identically to the
@@ -3113,6 +3143,37 @@ mod tests {
                     .to_string()
             ],
         );
+    }
+
+    #[tokio::test]
+    async fn landing_resolves_the_merge_commit_and_never_substitutes_the_pr_head() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let src = GH::new(
+            "",
+            Some(run_recording(
+                r#"{"state":"MERGED","headRefOid":"bbbbbbb","mergeCommit":{"oid":"aaaaaaa"}}"#,
+                seen.clone(),
+            )),
+        );
+        assert_eq!(
+            src.landing_merge_sha("o", "r", 86).await.unwrap(),
+            "aaaaaaa"
+        );
+        assert_eq!(
+            *seen.lock().unwrap(),
+            vec!["pr view 86 --repo o/r --json state,mergeCommit"]
+        );
+        for payload in [
+            r#"{"state":"MERGED","headRefOid":"bbbbbbb","mergeCommit":null}"#,
+            r#"{"state":"OPEN","mergeCommit":{"oid":"aaaaaaa"}}"#,
+            r#"{"state":"MERGED","mergeCommit":{"oid":"--all"}}"#,
+        ] {
+            let src = GH::new(
+                "",
+                Some(run_recording(payload, Arc::new(Mutex::new(Vec::new())))),
+            );
+            assert!(src.landing_merge_sha("o", "r", 86).await.is_err());
+        }
     }
 
     /// Merged and closed are DIFFERENT terminal states and the watcher records them differently, so

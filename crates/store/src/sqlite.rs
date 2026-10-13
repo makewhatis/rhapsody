@@ -65,7 +65,7 @@ use std::sync::{Mutex, MutexGuard};
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
 /// evidence-access log, then the manager intervention lifecycle) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 37;
+const SCHEMA_VERSION: i64 = 38;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -789,6 +789,19 @@ CREATE TABLE rhapsody_queued_run_messages (
 CREATE INDEX rhapsody_queued_run_messages_pending
     ON rhapsody_queued_run_messages(identifier, message_id) WHERE delivered_run_id IS NULL;
 "#,
+    // v37 -> v38: opt-in merged-change landing (STUDIO-1249).
+    r#"
+CREATE TABLE rhapsody_landing (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_slug TEXT NOT NULL, owner TEXT NOT NULL, repo TEXT NOT NULL, pr INTEGER NOT NULL,
+    ticket TEXT NOT NULL, merge_sha TEXT NOT NULL, phase TEXT NOT NULL,
+    deploy_deadline_s INTEGER NOT NULL, watch_until_s INTEGER,
+    results_json TEXT NOT NULL, revert_of INTEGER, revert_pr INTEGER,
+    hold_reason TEXT, updated_at_s INTEGER NOT NULL,
+    UNIQUE(owner, repo, pr)
+);
+CREATE INDEX rhapsody_landing_project ON rhapsody_landing(project_slug, id);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1411,7 +1424,133 @@ fn release_subject(conn: &Connection, subject: &str, reason: &str) -> Result<(),
     Ok(())
 }
 
+const LANDING_COLS: &str = "id, project_slug, owner, repo, pr, ticket, merge_sha, phase,
+    deploy_deadline_s, watch_until_s, results_json, revert_of, revert_pr, hold_reason, updated_at_s";
+
+fn map_landing(row: &rusqlite::Row<'_>) -> rusqlite::Result<LandingRow> {
+    let phase: String = row.get(7)?;
+    let phase = match phase.as_str() {
+        "WaitingForDeploy" => LandingPhase::WaitingForDeploy,
+        "Watching" => LandingPhase::Watching,
+        "AwaitingAcceptance" => LandingPhase::AwaitingAcceptance,
+        "Done" => LandingPhase::Done,
+        "Held" => LandingPhase::Held,
+        "Reverting" => LandingPhase::Reverting,
+        "Reopened" => LandingPhase::Reopened,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    Ok(LandingRow {
+        id: row.get(0)?,
+        project_slug: row.get(1)?,
+        owner: row.get(2)?,
+        repo: row.get(3)?,
+        pr: row.get(4)?,
+        ticket: row.get(5)?,
+        merge_sha: row.get(6)?,
+        phase,
+        deploy_deadline_s: row.get(8)?,
+        watch_until_s: row.get(9)?,
+        results_json: row.get(10)?,
+        revert_of: row.get(11)?,
+        revert_pr: row.get(12)?,
+        hold_reason: row.get(13)?,
+        updated_at_s: row.get(14)?,
+    })
+}
+
 impl Store for Sqlite {
+    fn save_landing(&self, row: LandingRow) -> Result<i64, StoreError> {
+        let conn = self.lock();
+        // Re-observing a merge must never reset a watch window.
+        if row.id == 0 {
+            conn.execute(
+                "INSERT INTO rhapsody_landing (project_slug, owner, repo, pr, ticket, merge_sha,
+                 phase, deploy_deadline_s, watch_until_s, results_json, revert_of, revert_pr,
+                 hold_reason, updated_at_s) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                 ON CONFLICT(owner, repo, pr) DO NOTHING",
+                params![
+                    row.project_slug,
+                    row.owner,
+                    row.repo,
+                    row.pr,
+                    row.ticket,
+                    row.merge_sha,
+                    row.phase.as_str(),
+                    row.deploy_deadline_s,
+                    row.watch_until_s,
+                    row.results_json,
+                    row.revert_of,
+                    row.revert_pr,
+                    row.hold_reason,
+                    row.updated_at_s
+                ],
+            )?;
+            return Ok(conn.query_row(
+                "SELECT id FROM rhapsody_landing WHERE owner=?1 AND repo=?2 AND pr=?3",
+                params![row.owner, row.repo, row.pr],
+                |r| r.get(0),
+            )?);
+        }
+        conn.execute(
+            "UPDATE rhapsody_landing SET merge_sha=?2, phase=?3, deploy_deadline_s=?4,
+            watch_until_s=?5, results_json=?6, revert_of=?7, revert_pr=?8, hold_reason=?9,
+            updated_at_s=?10 WHERE id=?1",
+            params![
+                row.id,
+                row.merge_sha,
+                row.phase.as_str(),
+                row.deploy_deadline_s,
+                row.watch_until_s,
+                row.results_json,
+                row.revert_of,
+                row.revert_pr,
+                row.hold_reason,
+                row.updated_at_s
+            ],
+        )?;
+        Ok(row.id)
+    }
+    fn delete_landing_reservation(&self, id: i64) -> Result<(), StoreError> {
+        self.lock().execute(
+            "DELETE FROM rhapsody_landing WHERE id=?1 AND phase='WaitingForDeploy'
+            AND merge_sha='' AND json_extract(results_json, '$.merge_pending')=1",
+            [id],
+        )?;
+        Ok(())
+    }
+    fn load_open_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {LANDING_COLS} FROM rhapsody_landing
+            WHERE phase NOT IN ('Done','Held','Reopened') ORDER BY id"
+        ))?;
+        Ok(stmt
+            .query_map([], map_landing)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
+    fn get_landing(&self, id: i64) -> Result<Option<LandingRow>, StoreError> {
+        Ok(self
+            .lock()
+            .query_row(
+                &format!("SELECT {LANDING_COLS} FROM rhapsody_landing WHERE id=?1"),
+                [id],
+                map_landing,
+            )
+            .optional()?)
+    }
+    fn open_landing_for_project(&self, slug: &str) -> Result<Option<LandingRow>, StoreError> {
+        Ok(self
+            .lock()
+            .query_row(
+                &format!(
+                    "SELECT {LANDING_COLS} FROM rhapsody_landing
+            WHERE project_slug=?1 AND phase NOT IN ('Done','Held','Reopened') ORDER BY id LIMIT 1"
+                ),
+                [slug],
+                map_landing,
+            )
+            .optional()?)
+    }
     fn observe_subject_state(&self, subject: &str, terminal: bool) -> Result<(), StoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -1474,7 +1613,9 @@ impl Store for Sqlite {
     fn subject_resume_pending(&self, subject: &str) -> Result<bool, StoreError> {
         let conn = self.lock();
         let subject = canonical_subject(&conn, subject)?;
-        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE subject = ?1 AND released_reason IS NOT NULL AND resume_pending = 1)", [subject], |r| r.get(0))?)
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE subject = ?1 AND released_reason IS NOT NULL AND resume_pending = 1)
+            OR EXISTS(SELECT 1 FROM rhapsody_landing WHERE ticket = ?1 COLLATE NOCASE
+                AND phase = 'Reopened' AND json_valid(results_json) AND json_extract(results_json, '$.resume_pending') = 1)", [subject], |r| r.get(0))?)
     }
     fn link_subject_pr(&self, ticket: &str, pr: &str) -> Result<(), StoreError> {
         self.lock().execute("INSERT INTO rhapsody_subject_prs(pr, ticket) VALUES (?1, ?2) ON CONFLICT(pr) DO UPDATE SET ticket = excluded.ticket", params![pr.to_ascii_lowercase(), ticket.to_ascii_uppercase()])?;
@@ -2047,6 +2188,9 @@ impl Store for Sqlite {
         )?;
         let id = tx.last_insert_rowid();
         tx.execute("UPDATE rhapsody_subject_holds SET resume_pending = 0 WHERE subject = ?1 COLLATE NOCASE", [&r.issue_identifier])?;
+        tx.execute("UPDATE rhapsody_landing SET results_json = json_set(results_json, '$.resume_pending', json('false'))
+            WHERE ticket = ?1 COLLATE NOCASE AND phase = 'Reopened' AND json_valid(results_json)
+                AND json_extract(results_json, '$.resume_pending') = 1", [&r.issue_identifier])?;
         tx.commit()?;
         Ok(id)
     }
@@ -5025,6 +5169,126 @@ impl Store for Sqlite {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reopened_landing_grants_one_author_admission() {
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        store
+            .save_landing(LandingRow {
+                owner: "o".into(),
+                repo: "r".into(),
+                pr: 1,
+                ticket: "APP-1".into(),
+                phase: LandingPhase::Reopened,
+                results_json: "{\"resume_pending\":true}".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(store.subject_resume_pending("APP-1").unwrap());
+        store
+            .start_run(RunStart {
+                issue_identifier: "APP-1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!store.subject_resume_pending("APP-1").unwrap());
+    }
+    #[test]
+    fn schema_38_migration_applies_on_37_db() {
+        let dir = scratch_dir();
+        let path = dir.path.join("v37.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for migration in &MIGRATIONS[..37] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 37).unwrap();
+        }
+        let store = Sqlite::open(StorePath::Disk(path)).unwrap();
+        let version: i64 = store
+            .lock()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, 38);
+        assert!(
+            store
+                .lock()
+                .prepare("SELECT * FROM rhapsody_landing")
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn landings_round_trip_queue_and_duplicate_admission_preserves_deadlines() {
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        let first = LandingRow {
+            project_slug: "app".into(),
+            owner: "o".into(),
+            repo: "r".into(),
+            pr: 1,
+            ticket: "APP-1".into(),
+            merge_sha: "abc".into(),
+            deploy_deadline_s: 1234,
+            watch_until_s: Some(2345),
+            results_json: "{\"failures\":1}".into(),
+            updated_at_s: 12,
+            ..LandingRow::default()
+        };
+        let id = store.save_landing(first.clone()).unwrap();
+        let mut duplicate = first.clone();
+        duplicate.deploy_deadline_s = 9999;
+        assert_eq!(store.save_landing(duplicate).unwrap(), id);
+        let mut loaded = store.get_landing(id).unwrap().unwrap();
+        assert_eq!(
+            loaded,
+            LandingRow {
+                id,
+                ..first.clone()
+            }
+        );
+        let second = store.save_landing(LandingRow { pr: 2, ..first }).unwrap();
+        assert_eq!(
+            store.open_landing_for_project("app").unwrap().unwrap().id,
+            id
+        );
+        assert_eq!(store.load_open_landings().unwrap().len(), 2);
+        for phase in [
+            LandingPhase::Done,
+            LandingPhase::Held,
+            LandingPhase::Reopened,
+        ] {
+            loaded.phase = phase;
+            store.save_landing(loaded.clone()).unwrap();
+            assert_eq!(
+                store.open_landing_for_project("app").unwrap().unwrap().id,
+                second
+            );
+        }
+    }
+    #[test]
+    fn cancelling_landing_reservation_never_deletes_a_confirmed_landing() {
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        for (pr, pending, sha, phase, cancelled) in [
+            (1, true, "", LandingPhase::WaitingForDeploy, true),
+            (2, false, "", LandingPhase::WaitingForDeploy, false),
+            (3, true, "merge", LandingPhase::WaitingForDeploy, false),
+            (4, true, "", LandingPhase::Watching, false),
+        ] {
+            let id = store
+                .save_landing(LandingRow {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    pr,
+                    merge_sha: sha.into(),
+                    phase,
+                    results_json: format!("{{\"merge_pending\":{pending}}}"),
+                    ..Default::default()
+                })
+                .unwrap();
+            store.delete_landing_reservation(id).unwrap();
+            assert_eq!(store.get_landing(id).unwrap().is_none(), cancelled);
+        }
+    }
+
     #[test]
     fn dispute_adjudication_enqueue_failure_is_atomic_and_retryable() {
         for mode in [None, Some(MANAGER_MODE_ACT)] {
@@ -9824,6 +10088,8 @@ mod tests {
                 "rhapsody_subject_terminal".to_string(),
                 "rhapsody_queued_run_messages".to_string(),
                 "rhapsody_queued_run_messages_pending".to_string(),
+                "rhapsody_landing".to_string(),
+                "rhapsody_landing_project".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

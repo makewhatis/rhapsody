@@ -601,13 +601,28 @@ impl ReviewWatchSink for ControlWatchSink {
     async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
         let Some(deps) = self.automerge.as_ref() else {
             tracing::warn!(pr = %plan.pr, "auto-merge: no GitHub source is configured; not merging");
+            self.control.landing_merge_finished(plan.pr, None);
             return;
         };
         // Infallible by contract: no outcome has a caller with anything to do about it, and every
         // one of them is logged — the two that CHANGED something where the change happens, in
         // `runautomerge`, which holds the fields describing it, and the three that changed nothing
         // here. A refusal is re-considered on the next tick.
-        match crate::runautomerge::perform_auto_merge(&plan, deps).await {
+        let outcome = crate::runautomerge::perform_auto_merge(&plan, deps).await;
+        let state = match &outcome {
+            crate::runautomerge::AutoMergeOutcome::Merged(_) => {
+                Some(crate::automerge::LandingMergeState::Merged)
+            }
+            crate::runautomerge::AutoMergeOutcome::Failed(_)
+            | crate::runautomerge::AutoMergeOutcome::Declined(
+                "the pull request is no longer open",
+            )
+            | crate::runautomerge::AutoMergeOutcome::Held("the pull request is no longer open") => {
+                Some(crate::automerge::LandingMergeState::AwaitingObservation)
+            }
+            _ => None,
+        };
+        match outcome {
             crate::runautomerge::AutoMergeOutcome::Merged(_) => {}
             crate::runautomerge::AutoMergeOutcome::Updated => {}
             crate::runautomerge::AutoMergeOutcome::Declined(why) => {
@@ -622,6 +637,7 @@ impl ReviewWatchSink for ControlWatchSink {
                 tracing::warn!(pr = %plan.pr, %err, "auto-merge: a gate could not be read; not merging")
             }
         }
+        self.control.landing_merge_finished(plan.pr, state);
     }
     async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
         self.control.finish_review_ticket(plan).await
@@ -1451,11 +1467,23 @@ impl Orchestrator {
             match &obs.lookup {
                 // GitHub cannot resolve it any more: deleted, transferred, or never there. Nothing
                 // is left to observe, so it leaves the watch set for good.
-                PrLookup::Gone => report.retired += self.retire_review_pr(&obs.pr, "gone"),
+                PrLookup::Gone => {
+                    if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                        tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed");
+                        continue;
+                    }
+                    self.landing_merges.remove(&obs.pr);
+                    report.retired += self.retire_review_pr(&obs.pr, "gone");
+                }
                 // The head repository is neither the base's nor allowlisted. A review of it would
                 // check out and execute a stranger's code (§14.1 F-SEC), so it can never be
                 // dispatched — and re-asking every tick forever is not a plan.
                 PrLookup::Untrusted => {
+                    if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                        tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed");
+                        continue;
+                    }
+                    self.landing_merges.remove(&obs.pr);
                     report.retired += self.retire_review_pr(&obs.pr, "untrusted head repository")
                 }
                 PrLookup::Found(snap) if snap.status != PrStatus::Open => {
@@ -1467,9 +1495,26 @@ impl Orchestrator {
                     // read off `rows` — this tick's in-memory snapshot — so the retirement below
                     // cannot race it, whichever order the two run in.
                     let why = if snap.status == PrStatus::Merged {
-                        report.done.extend(self.plan_review_done(&rows, &obs.pr));
+                        match self.admit_landing(&rows, &obs.pr, swept_now.timestamp()) {
+                            Ok(crate::landing::Admission::Disabled) => {
+                                if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                                    tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed; merge stays watched");
+                                    continue;
+                                }
+                                report.done.extend(self.plan_review_done(&rows, &obs.pr));
+                            }
+                            Ok(crate::landing::Admission::Admitted) => {}
+                            Err(err) => {
+                                tracing::warn!(pr = %obs.pr, %err, "landing admission failed; merge stays watched for retry");
+                                continue;
+                            }
+                        }
                         "merged"
                     } else {
+                        if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                            tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed");
+                            continue;
+                        }
                         "closed"
                     };
                     // STUDIO-1018 (§9/§11.1): a proposal's PR leaving the watch set is the
@@ -1482,9 +1527,20 @@ impl Orchestrator {
                         "closed_unmerged"
                     };
                     self.record_manager_proposal_outcomes(&churn_key(&obs.pr), outcome);
+                    self.landing_merges.remove(&obs.pr);
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
                 PrLookup::Found(snap) => {
+                    if !self.landing_merges.contains_key(&obs.pr)
+                        || self.landing_merges.get(&obs.pr)
+                            == Some(&crate::automerge::LandingMergeState::AwaitingObservation)
+                    {
+                        if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                            tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed; retained for retry");
+                            continue;
+                        }
+                        self.landing_merges.remove(&obs.pr);
+                    }
                     // The observed-head memo for this coordinate was already updated above the store
                     // read (STUDIO-1005), so a failed local read cannot leave the reconciliation
                     // sweep comparing against a stale head.
@@ -4021,6 +4077,10 @@ impl Orchestrator {
         if !self.review_auto_merge_for_repo(&pr.owner, &pr.repo) {
             return; // opt-in, and off by default (the D5 invariant)
         }
+        if let Err(reason) = self.landing_merge_gate(pr) {
+            tracing::debug!(pr = %pr, reason, "auto-merge: declined");
+            return;
+        }
         // STUDIO-964: the fail-closed human-hold gate lives HERE, not at the tail of
         // `service_review_pr`. It used to guard only the one tail call, while the seven
         // adjudication arms (STUDIO-956) each called this function at their own early return —
@@ -4082,6 +4142,15 @@ impl Orchestrator {
         }
         match crate::automerge::auto_merge_verdict_with_proof(mine, head, proven) {
             Ok(approved_by) => {
+                if !self.landing_merge_groups(pr).is_empty() {
+                    if let Err(err) = self.reserve_landing_merge(mine, pr, (self.now)().timestamp())
+                    {
+                        tracing::warn!(pr = %pr, %err, "auto-merge: could not persist landing admission; not merging");
+                        return;
+                    }
+                    self.landing_merges
+                        .insert(pr.clone(), crate::automerge::LandingMergeState::InFlight);
+                }
                 // At INFO when it is news, and at DEBUG for as long as it stays the same plan.
                 // The gate is re-decided from the watch rows on EVERY tick and the plan is handed
                 // out on every tick — a pull request held by a gate on the other side of the seam
@@ -4575,6 +4644,14 @@ pub(crate) const CAPACITY_HOLD_TTL: std::time::Duration = std::time::Duration::f
 pub(crate) const UNREADABLE_ATTEMPTS_TO_DROP_HOLD: u32 = 2;
 
 impl ControlHandle {
+    fn landing_merge_finished(
+        &self,
+        pr: PrCoord,
+        state: Option<crate::automerge::LandingMergeState>,
+    ) {
+        let _ = self.events.send(Event::LandingMergeFinished { pr, state });
+    }
+
     /// The pull requests the watcher should ask GitHub about, each with the head SHAs its rows have
     /// already had read. Empty when the subsystem is off or the control task is gone — an empty
     /// poll list, never a guess.
@@ -8008,6 +8085,191 @@ mod tests {
             1,
             "once the hold is gone the approved merge is proposed"
         );
+    }
+
+    #[test]
+    fn one_sweep_does_not_propose_two_merges_for_one_landing_project() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        enable_landing(&mut o);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        introduce(&o, approved_row(65, "bob", HEAD_A));
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A), open_at(65, HEAD_A)]);
+        assert_eq!(
+            report.merge.len(),
+            1,
+            "only one merge may enter landing per project"
+        );
+    }
+
+    fn enable_landing(o: &mut Orchestrator) {
+        let slug = o.eff.as_ref().unwrap().projects[0].slug.clone();
+        o.eff.as_mut().unwrap().cfg.projects = vec![rhapsody_config::model::Project {
+            slugs: vec![slug],
+            landing: Some(serde_yaml_ng::from_str("enabled: true").unwrap()),
+            ..Default::default()
+        }];
+    }
+
+    #[test]
+    fn landing_merge_reservation_spans_handbacks_until_attempt_is_observed() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        enable_landing(&mut o);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        introduce(&o, approved_row(65, "bob", HEAD_A));
+        // The first observation cannot merge past a sibling not reconciled since boot.
+        assert!(
+            o.handle_review_sweep_slots(&[open_at(64, HEAD_A)], None)
+                .0
+                .merge
+                .is_empty()
+        );
+        let (first, slots) = o.handle_review_sweep_slots(&[open_at(65, HEAD_A)], Some(10));
+        assert_eq!(first.merge.len(), 1);
+        assert!(
+            o.handle_review_sweep_slots(&[open_at(64, HEAD_A)], Some(slots))
+                .0
+                .merge
+                .is_empty()
+        );
+        // Even a re-observation of the reserved PR cannot release a still-executing attempt.
+        assert!(
+            o.handle_review_sweep(&[open_at(65, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        // An ambiguous outcome (including success) needs the reserved PR to answer, not a sibling.
+        o.landing_merge_finished(
+            &coord(65),
+            Some(crate::automerge::LandingMergeState::Merged),
+        );
+        assert!(
+            o.handle_review_sweep(&[open_at(65, HEAD_A)])
+                .merge
+                .is_empty(),
+            "a stale open answer cannot release a known merge"
+        );
+        o.landing_merge_finished(
+            &coord(65),
+            Some(crate::automerge::LandingMergeState::AwaitingObservation),
+        );
+        assert!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        o.handle_review_unreadable(&[coord(65)]);
+        assert!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        assert_eq!(o.handle_review_sweep(&[open_at(65, HEAD_A)]).merge.len(), 1);
+        // A definite refusal releases admission, allowing the other approved PR to try.
+        o.landing_merge_finished(&coord(65), None);
+        assert_eq!(o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(), 1);
+    }
+
+    #[test]
+    fn landing_restart_reconciles_merged_sibling_before_proposing_another_merge() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        enable_landing(&mut o);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        introduce(&o, approved_row(65, "bob", HEAD_A));
+        o.store()
+            .start_run(rs::RunStart {
+                issue_identifier: "STUDIO-721".into(),
+                issue_id: "ID".into(),
+                team_id: "TEAM".into(),
+                project_slug: o.eff.as_ref().unwrap().projects[0].slug.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            o.handle_review_sweep(&[open_at(65, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        // Open is listed first deliberately: a terminal sibling must be admitted before it merges.
+        let report = o.handle_review_sweep(&[open_at(65, HEAD_A), observed(64, merged_at(HEAD_A))]);
+        assert!(report.merge.is_empty());
+        assert_eq!(o.store().load_open_landings().unwrap().len(), 1);
+        assert!(
+            o.handle_review_sweep(&[open_at(65, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn landing_merge_reservations_do_not_serialize_other_projects_or_disabled_landing() {
+        for enabled in [false, true] {
+            let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+            if enabled {
+                enable_landing(&mut o);
+            }
+            introduce(&o, approved_row(64, "bob", HEAD_A));
+            let mut row = approved_row(65, "bob", HEAD_A);
+            if enabled {
+                let tracker = Arc::new(Fake::new());
+                let mut project = empty_resolved_project("other", tracker);
+                project.group = "other".into();
+                project.repo = "https://github.com/makewhatis/other.git".into();
+                o.eff.as_mut().unwrap().projects.push(project);
+                o.eff
+                    .as_mut()
+                    .unwrap()
+                    .cfg
+                    .projects
+                    .push(rhapsody_config::model::Project {
+                        slugs: vec!["other".into()],
+                        landing: Some(serde_yaml_ng::from_str("enabled: true").unwrap()),
+                        ..Default::default()
+                    });
+                row.key.repo = "other".into();
+            }
+            introduce(&o, row);
+            let mut second = open_at(65, HEAD_A);
+            if enabled {
+                second.pr.repo = "other".into();
+            }
+            let report = o.handle_review_sweep(&[open_at(64, HEAD_A), second]);
+            assert_eq!(
+                report.merge.len(),
+                2,
+                "independent projects and disabled landing retain throughput"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_merge_declines_while_project_has_open_landing() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        assert_eq!(o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(), 1);
+        let slug = o.eff.as_ref().unwrap().projects[0].slug.clone();
+        let id = o
+            .store()
+            .save_landing(rhapsody_store::LandingRow {
+                project_slug: slug,
+                owner: OWNER.into(),
+                repo: REPO.into(),
+                pr: 63,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            o.landing_merge_gate(&coord(64)).unwrap_err(),
+            "a landing is in progress for this project"
+        );
+        assert!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        let mut row = o.store().get_landing(id).unwrap().unwrap();
+        row.phase = rhapsody_store::LandingPhase::Done;
+        o.store().save_landing(row).unwrap();
+        assert_eq!(o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(), 1);
     }
 
     /// ⚠️ STUDIO-949 round 11: an approved, at-head pull request is NOT merged while the human-hold

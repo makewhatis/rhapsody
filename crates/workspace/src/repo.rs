@@ -153,6 +153,77 @@ pub(crate) fn is_commit_sha(s: &str) -> bool {
 }
 
 impl Manager {
+    /// Existence at the merge and its first parent. Missing objects/infrastructure errors do not
+    /// masquerade as a repo without a contract; a root commit alone has no before tree.
+    pub async fn landing_contract_exists(
+        &self,
+        repo_url: &str,
+        merge_sha: &str,
+    ) -> Result<(bool, bool), Error> {
+        if !is_commit_sha(merge_sha) {
+            return Err(Error::ReviewCheckout("invalid landing merge SHA".into()));
+        }
+        let _guard = self.repo_lock(repo_url).lock_owned().await;
+        let mirror = self.mirror_dir(repo_url);
+        let (parents, err) = self
+            .git(&mirror, &["rev-list", "--parents", "-n", "1", merge_sha])
+            .await;
+        if let Some(err) = err {
+            return Err(err);
+        }
+        let after = self.landing_path_exists(&mirror, merge_sha).await?;
+        let before = match parents.split_whitespace().nth(1) {
+            Some(parent) => self.landing_path_exists(&mirror, parent).await?,
+            None => false,
+        };
+        Ok((after, before))
+    }
+    async fn landing_path_exists(&self, mirror: &str, revision: &str) -> Result<bool, Error> {
+        let path = format!("{revision}:.rhapsody/landing.yaml");
+        let (out, err) = self.git(mirror, &["cat-file", "-e", &path]).await;
+        match err {
+            None => Ok(true),
+            Some(_) if git_path_absent(&out) => Ok(false),
+            Some(err) => Err(err),
+        }
+    }
+    /// An unknown reported object gets one fetch, then is not live if still unknown. Revisions
+    /// from the app must be SHAs, never flags or ref expressions. Caller persists the fetch budget.
+    pub async fn landing_revision_contains(
+        &self,
+        repo_url: &str,
+        merge_sha: &str,
+        reported: &str,
+        fetch: bool,
+    ) -> Result<(bool, bool), Error> {
+        if !is_commit_sha(merge_sha) {
+            return Err(Error::ReviewCheckout("invalid landing merge SHA".into()));
+        }
+        if !is_commit_sha(reported) {
+            return Ok((false, false));
+        }
+        let _guard = self.repo_lock(repo_url).lock_owned().await;
+        let mirror = self.mirror_dir(repo_url);
+        let object = format!("{reported}^{{commit}}");
+        let (_, err) = self.git(&mirror, &["cat-file", "-e", &object]).await;
+        let fetched = err.is_some() && fetch;
+        if fetched {
+            let _ = self.git(&mirror, &["fetch", "--prune", "origin"]).await;
+        }
+        if err.is_some() {
+            let (_, unknown) = self.git(&mirror, &["cat-file", "-e", &object]).await;
+            if unknown.is_some() {
+                return Ok((false, fetched));
+            }
+        }
+        let (_, err) = self
+            .git(
+                &mirror,
+                &["merge-base", "--is-ancestor", merge_sha, reported],
+            )
+            .await;
+        Ok((err.is_none(), fetched))
+    }
     /// The bare-mirror directory for `repo_url`: `<root>/.mirrors/<RepoKey>.git`. A sibling of every
     /// per-issue worktree under root, so the existing containment invariant covers it.
     pub(crate) fn mirror_dir(&self, repo_url: &str) -> String {
@@ -894,6 +965,51 @@ impl Manager {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn landing_live_uses_ancestry_and_fetches_an_unknown_object_once() {
+        let origin = init_local_origin();
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let (head, err) = m.git(&origin.path, &["rev-parse", "HEAD"]).await;
+        assert!(err.is_none());
+        let head = head.trim();
+        m.ensure_review_worktree(&origin.path, "app", "land:o/r#1", 1, head)
+            .await
+            .unwrap();
+        assert_eq!(
+            m.landing_revision_contains(&origin.path, head, head, true)
+                .await
+                .unwrap(),
+            (true, false)
+        );
+        add_origin_commit(&origin.path);
+        let (descendant, err) = m.git(&origin.path, &["rev-parse", "HEAD"]).await;
+        assert!(err.is_none());
+        assert_eq!(
+            m.landing_revision_contains(&origin.path, head, descendant.trim(), true)
+                .await
+                .unwrap(),
+            (true, true)
+        );
+        let unknown = "ffffffffffffffffffffffffffffffffffffffff";
+        assert_eq!(
+            m.landing_revision_contains(&origin.path, head, unknown, true)
+                .await
+                .unwrap(),
+            (false, true)
+        );
+        assert_eq!(
+            m.landing_revision_contains(&origin.path, head, unknown, false)
+                .await
+                .unwrap(),
+            (false, false)
+        );
+        assert_eq!(
+            m.landing_revision_contains(&origin.path, head, "--all", true)
+                .await
+                .unwrap(),
+            (false, false)
+        );
+    }
     use super::*;
     use crate::HookScripts;
     use crate::testutil::{
