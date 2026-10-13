@@ -341,6 +341,8 @@ impl LeadRuntime {
                 ticket: ticket.clone(),
                 pr: pr_key,
             };
+            // Refuse busy subjects or revoked authority before fetching evidence and memory.
+            host.admit_action().await?;
             if item.state == "parked"
                 && !resume_on_findings(self.store.as_ref(), &host, item.id).await?
             {

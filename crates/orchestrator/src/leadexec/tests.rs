@@ -2089,6 +2089,58 @@ fn memory_runtime(
 }
 
 #[tokio::test]
+async fn queued_item_with_revoked_admission_does_not_recall_memory() {
+    use rhapsody_config::hindsight::HindsightBackend;
+    // A busy ticket revokes subject admission while authority-only reads still succeed.
+    // Also cover revoked authority, which must refuse the same preparation without recalls.
+    for authority in [true, false] {
+        let operator = operator_stub(200).await;
+        let team = memory_stub(200, "scratch-team").await;
+        let (store, _, case) = setup("subject is busy");
+        let mut tracker = rhapsody_tracker::fake::Fake::new();
+        tracker
+            .by_identifier
+            .insert("TEST-100".into(), case.subject.ticket);
+        let mut runtime = memory_runtime(store.clone(), Some(operator.memory.clone()));
+        runtime.projects = vec![LeadProject {
+            tracker: Arc::new(tracker),
+            repo_url: "https://github.com/o/r.git".into(),
+            terminal_states: Default::default(),
+            summon_token: String::new(),
+        }];
+        runtime.memory = Some(Arc::new(
+            HindsightBackend::new(&team.endpoint, "agent-", "").unwrap(),
+        ));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        runtime.control.events = tx;
+        let task = tokio::spawn(async move {
+            while let Some(event) = rx.recv().await {
+                if let crate::Event::LeadAllowed { ticket, reply, .. } = event {
+                    assert!(ticket.is_empty() || ticket == "TEST-100");
+                    let _ = reply.send(authority && ticket.is_empty());
+                }
+            }
+        });
+        let item = store.load_lead_items().unwrap().remove(0);
+        assert_eq!(item.state, "queued");
+        let result = runtime.prepare(item.clone()).await;
+        task.abort();
+        assert_eq!(
+            operator.requests.lock().unwrap().len(),
+            0,
+            "operator recall"
+        );
+        assert_eq!(team.requests.lock().unwrap().len(), 0, "team recall");
+        assert_eq!(
+            result.unwrap_err(),
+            "lead authority or subject admission revoked"
+        );
+        assert_eq!(store.load_lead_items().unwrap()[0], item);
+        assert!(store.lead_execution(item.id).unwrap().is_none());
+    }
+}
+
+#[tokio::test]
 async fn lead_prompt_includes_recalled_preferences() {
     use rhapsody_config::memory::{LocalBank, Record};
     let stub = operator_stub(200).await;
