@@ -592,12 +592,16 @@ impl Orchestrator {
         reason: &str,
         project_slug: &str,
     ) {
+        let reason = self
+            .drain_continuations
+            .get(identifier)
+            .map_or_else(|| reason.to_string(), |record| record.retry_text(reason));
         if let Err(e) = self.store.save_retry(store::RetryRow {
             issue_id: identifier.to_string(),
             identifier: identifier.to_string(),
             attempt,
             due_at_ms,
-            error: reason.to_string(),
+            error: reason,
             project_slug: project_slug.to_string(),
         }) {
             tracing::error!(issue_identifier = %identifier, error = %e, "persist retry failed");
@@ -606,7 +610,10 @@ impl Orchestrator {
     }
 
     /// Drops the retry row and the claim for an issue that is gone/ineligible. Mirrors Go `persistRelease`.
-    pub fn persist_release(&self, identifier: &str) {
+    pub fn persist_release(&mut self, identifier: &str) {
+        if let Some(record) = self.drain_continuations.remove(identifier) {
+            self.limit_policy.pinned_engines.remove(&record.issue.id);
+        }
         if let Err(e) = self.store.delete_retry(identifier) {
             tracing::error!(issue_identifier = %identifier, error = %e, "persist delete retry failed");
         }
@@ -616,7 +623,7 @@ impl Orchestrator {
     /// Drops the retry row (if any) and the claim for an issue that finished cleanly (terminal/handoff).
     /// Its body is identical to `persist_release` today; it delegates so the delete sequence lives in
     /// one place if it ever changes. Mirrors Go `persistComplete`.
-    pub fn persist_complete(&self, identifier: &str) {
+    pub fn persist_complete(&mut self, identifier: &str) {
         self.persist_release(identifier);
     }
 
@@ -818,7 +825,7 @@ mod tests {
     #[test]
     fn persist_terminal_outcomes() {
         for want in [OUTCOME_COMPLETED, OUTCOME_STOPPED] {
-            let (o, st) = orch_with_store();
+            let (mut o, st) = orch_with_store();
             let mut re = re_for("ID-1", "MT-1", "In Progress");
             o.persist_start_run(&mut re, 0);
             o.persist_end_run(&re, want, "");
@@ -960,7 +967,7 @@ mod tests {
     // Direct coverage of `persist_release`: the retry row + claim are both dropped.
     #[test]
     fn persist_release_drops_retry_and_claim() {
-        let (o, st) = orch_with_store();
+        let (mut o, st) = orch_with_store();
         o.persist_retry("MT-1", 1, 0, "reason", "alpha");
         o.persist_release("MT-1");
 

@@ -414,6 +414,7 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         engine_index: 0,
         engine: None,
         resume_session: String::new(),
+        resume_after_drain: false,
         issue,
         started_at: epoch,
         retry_attempt: 0,

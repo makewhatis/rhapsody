@@ -98,6 +98,19 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Durable drain continuations (STUDIO-1259)
+
+Retry-backed ticket runs parked at a drain boundary retain their harness's resumable conversation,
+including OpenCode's private session state. The existing retry queue stores `drain continuation:`
+JSON containing the thread ID, harness, issue snapshot and pinned fallback engine; restart recovery
+restores it and does not suppress in-flight work for a PR it already opened. Admission delays keep
+the metadata until dispatch, and release/completion clears it. Non-resumable harnesses start fresh.
+Every drain continuation prompt identifies the drain and requires inspecting `git status`,
+`git log <base>..HEAD` and the ticket's progress file before new writes. A missing/expired session
+refused before model/tool work falls back once to a fresh conversation with one warning; unrelated
+turn, authentication and billing failures retain normal error handling. Ticketless review/manager
+exit policies, Go-owned schemas, payload shapes and parity fixtures are unchanged.
+
 ### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1252)
 
 Landing is **Rhapsody-only, with no Go counterpart**. Per-project `projects[].landing` in
@@ -428,6 +441,17 @@ Desktop sidecars are killed on child-handle drop if their supervisor task/runtim
 normal SIGTERM/graceful-stop behavior stays the same. Test guards request stop before signaling,
 preventing the restart loop from relaunching a daemon during failure cleanup. No configuration,
 API payload, schema or golden changes.
+
+### Desktop quit and child-stop deadlines (STUDIO-1116, STUDIO-1268)
+
+The Tauri main thread's final Quit waits on a standard channel for at most twelve seconds rather
+than blocking on a runtime timer. It requests stop before scheduling async teardown, so a blocked
+tray setter cannot prevent the sidecar from receiving SIGTERM. A per-launch standard-thread
+backstop observes child exit and escalates to process-group SIGKILL after `stop_grace` (five seconds
+by default), independently of Tokio's driver. Signaling and reaping share the owned child handle,
+preventing a delayed backstop from signaling a recycled PID. Go's goroutines and `time.After` need
+no UI/runtime driver; these explicit backstops preserve that lifecycle guarantee in the Tauri port.
+No configuration, API payload, schema or golden changes.
 
 ### Manager findings and tracker documents (STUDIO-1146)
 
