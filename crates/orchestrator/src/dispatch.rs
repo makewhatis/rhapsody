@@ -37,7 +37,7 @@ use crate::orchestrator::Orchestrator;
 
 /// A policy-selected engine for one run. It decorates routing; it never reassigns the teammate.
 /// Sessions cannot move between engines, so an override always starts a fresh conversation.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct DispatchEngine {
     /// 0 is primary, 1 is the first profile fallback.
     pub index: usize,

@@ -774,6 +774,17 @@ impl Orchestrator {
             .resume_sessions
             .remove(&iss.id)
             .unwrap_or_default();
+        if let Some(record) = self.drain_continuations.get(&iss.identifier) {
+            re.resume_after_drain = true;
+            re.stack_context = if re.stack_context.is_empty() {
+                record.prompt()
+            } else {
+                format!("{}\n\n{}", record.prompt(), re.stack_context)
+            };
+            if record.harness == self.effective_harness(&re.harness) {
+                re.resume_session = record.session.clone();
+            }
+        }
         // STUDIO-957: the per-provider daily budget, the STOP beside the concurrency gate. It
         // bounds NEW dispatch only, and it is checked HERE — after the run's harness/model are
         // resolved (so the provider it reads is the one [`persist_start_run`](Orchestrator::persist_start_run)
@@ -856,6 +867,11 @@ impl Orchestrator {
         self.claimed.insert(id.clone());
         self.clear_retry(&id);
         self.persist_start_run(&mut re, attempt_norm);
+        if self.drain_continuations.remove(&iss.identifier).is_some()
+            && let Err(error) = self.store.delete_retry(&iss.identifier)
+        {
+            tracing::error!(%error, issue_identifier = %iss.identifier, "drain: consumed continuation could not be deleted");
+        }
         // Consume only after all admission gates, using the same credential as final preflight.
         if let Some(key) = canary {
             self.credential_canaries.insert(key, (self.now)());
@@ -1550,7 +1566,9 @@ impl Orchestrator {
             .and_then(|eff| eff.projects.iter().position(|p| p.slug == re.project_slug));
         self.observe_parked_issue_in_project(&iss, project);
         if self.subject_parked(&iss.identifier, "author")
-            || (re.recovered && self.pr_suppressed(&iss))
+            || (re.recovered
+                && !self.drain_continuations.contains_key(&re.identifier)
+                && self.pr_suppressed(&iss))
         {
             tracing::info!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "releasing recovered claim: issue has a linked PR and no newer summons");
             self.claimed.remove(&e.issue_id);
@@ -1563,7 +1581,10 @@ impl Orchestrator {
         // has reached its bound and needs a human (reported by the reconciliation sweep). Only
         // reached when a summons lifted the suppression above, so a ticket whose work is merely
         // linked was already released there.
-        if re.recovered && self.author_round_budget_spent(&iss) {
+        if re.recovered
+            && !self.drain_continuations.contains_key(&re.identifier)
+            && self.author_round_budget_spent(&iss)
+        {
             tracing::warn!(issue_id = %e.issue_id, issue_identifier = %re.identifier, "releasing recovered claim: the pull request's shared review↔author round budget is spent");
             self.claimed.remove(&e.issue_id);
             self.completed.remove(&e.issue_id);
@@ -1680,7 +1701,13 @@ impl Orchestrator {
         // re-writes the claim to running) (§3.7).
         if re.recovered {
             self.claimed.remove(&e.issue_id);
-            if let Err(err) = self.store.delete_retry(&re.identifier) {
+            if self.completed.remove(&e.issue_id) {
+                self.completed.insert(iss.id.clone());
+            }
+            // Keep a drain's durable metadata until final admission, including off-loop preparation.
+            if !self.drain_continuations.contains_key(&re.identifier)
+                && let Err(err) = self.store.delete_retry(&re.identifier)
+            {
                 tracing::error!(issue_identifier = %re.identifier, error = %err, "persist delete retry failed");
             }
         }
