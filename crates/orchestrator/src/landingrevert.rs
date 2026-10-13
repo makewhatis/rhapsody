@@ -23,6 +23,7 @@ pub(crate) struct RevertSnapshot {
     pub status: PrStatus,
     pub labelled: bool,
     pub merge_sha: String,
+    pub opened_at_s: i64,
 }
 
 #[async_trait::async_trait]
@@ -338,6 +339,7 @@ pub(crate) mod tests {
                 head,
                 merge_sha,
                 labelled: true,
+                opened_at_s: 5,
             })
         }
     }
@@ -463,7 +465,7 @@ pub(crate) mod tests {
                     ["label", "create"] => "",
                     ["pr", "create"] => "https://github.com/o/r/pull/2\n",
                     ["pr", "view"] => {
-                        r#"{"state":"OPEN","headRefOid":"abcdef1234567","labels":[{"name":"rhapsody:revert"}]}"#
+                        r#"{"state":"OPEN","headRefOid":"abcdef1234567","createdAt":"1970-01-01T00:00:05Z","labels":[{"name":"rhapsody:revert"}]}"#
                     }
                     _ => return Err("unexpected gh call".into()),
                 };
@@ -487,8 +489,14 @@ pub(crate) mod tests {
             .unwrap(),
             2
         );
-        assert!(gh.snapshot(&row, 2).await.unwrap().labelled);
+        let snapshot = gh.snapshot(&row, 2).await.unwrap();
+        assert!(snapshot.labelled);
+        assert_eq!(snapshot.opened_at_s, 5);
         let calls = calls.lock().unwrap();
+        assert!(calls.iter().any(|a| {
+            a.windows(2)
+                .any(|w| w == ["--json", "state,headRefOid,mergeCommit,labels,createdAt"])
+        }));
         let create = calls
             .iter()
             .find(|a| a[0] == "pr" && a[1] == "create")

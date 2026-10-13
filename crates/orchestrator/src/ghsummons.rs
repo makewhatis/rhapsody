@@ -421,7 +421,7 @@ impl crate::landingrevert::RevertGithub for GH {
         pr: i64,
     ) -> Result<crate::landingrevert::RevertSnapshot, crate::landingrevert::RevertError> {
         let value = self
-            .landing_pr_json(row, pr, "state,headRefOid,mergeCommit,labels")
+            .landing_pr_json(row, pr, "state,headRefOid,mergeCommit,labels,createdAt")
             .await?;
         let status = match value["state"].as_str() {
             Some("OPEN") => PrStatus::Open,
@@ -435,6 +435,15 @@ impl crate::landingrevert::RevertGithub for GH {
         };
         Ok(crate::landingrevert::RevertSnapshot {
             status,
+            opened_at_s: value["createdAt"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|at| at.timestamp())
+                .ok_or_else(|| {
+                    crate::landingrevert::RevertError::Other(
+                        "recovery PR has no valid creation time".into(),
+                    )
+                })?,
             head: value["headRefOid"].as_str().unwrap_or("").into(),
             merge_sha: value["mergeCommit"]["oid"].as_str().unwrap_or("").into(),
             labelled: value["labels"]

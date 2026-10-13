@@ -42,6 +42,9 @@ struct Progress {
     pending: Option<String>,
     evidence_sent: bool,
     revert_landing: Option<i64>,
+    revert_opened_at_s: Option<i64>,
+    revert_merge_refusal: Option<String>,
+    revert_pr_notified: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Sample {
@@ -825,11 +828,21 @@ impl LandingRuntime {
             }
         }
         let pr = row.revert_pr.ok_or("revert PR was not recorded")?;
+        if !progress.revert_pr_notified {
+            self.notify_reverting(row, progress);
+            progress.revert_pr_notified = true;
+            self.save(row, progress, now)?;
+        }
         let snapshot = reverter
             .github
             .snapshot(row, pr)
             .await
             .map_err(|e| e.to_string())?;
+        if progress.revert_opened_at_s.is_none() {
+            // GitHub's creation time also reconciles a crash after opening the PR but before saving.
+            progress.revert_opened_at_s = Some(snapshot.opened_at_s);
+            self.save(row, progress, now)?;
+        }
         match snapshot.status {
             crate::ghsummons::PrStatus::Closed => {
                 return self
@@ -879,54 +892,125 @@ impl LandingRuntime {
                 self.save(row, progress, now)
             }
             crate::ghsummons::PrStatus::Open => {
-                if self.config.revert_review {
-                    reverter.introduce_review(row, pr).await?;
+                if progress
+                    .revert_opened_at_s
+                    .is_some_and(|opened| now >= deadline(opened, self.config.deploy_timeout))
+                {
+                    let timeout = rhapsody_config::go_duration_string(
+                        chrono::Duration::from_std(self.config.deploy_timeout)
+                            .unwrap_or(chrono::Duration::MAX),
+                    );
+                    let reason = format!(
+                        "revert PR #{pr} not merged within {timeout}; last merge-gate refusal: {}",
+                        progress
+                            .revert_merge_refusal
+                            .as_deref()
+                            .unwrap_or("not yet attempted")
+                    );
+                    return self.hold(row, progress, &reason, now).await;
                 }
-                if !reverter.auto_merge {
-                    return Ok(());
-                }
-                let (held, primed) = reverter.holds.labelled_and_primed();
-                if !primed || held.contains(&row.ticket.to_ascii_lowercase()) {
-                    return Ok(());
-                }
-                let watches = self
-                    .store
-                    .load_live_review_watch()
-                    .map_err(|e| e.to_string())?;
-                let mine: Vec<_> = watches
-                    .iter()
-                    .filter(|w| {
-                        w.key.number == pr
-                            && w.key.owner.eq_ignore_ascii_case(&row.owner)
-                            && w.key.repo.eq_ignore_ascii_case(&row.repo)
-                    })
-                    .collect();
-                if let Ok(approved_by) = crate::automerge::revert_merge_verdict(
-                    row,
-                    snapshot.labelled,
-                    self.config.revert_review,
-                    &mine,
-                    &snapshot.head,
-                ) {
-                    let plan = crate::automerge::AutoMergePlan {
-                        pr: PrCoord::new(&row.owner, &row.repo, pr),
-                        head: snapshot.head,
-                        approved_by,
-                        manager_approval: None,
-                    };
-                    match crate::runautomerge::perform_auto_merge(&plan, &reverter.merges).await {
-                        crate::runautomerge::AutoMergeOutcome::Failed(err) => return Err(err),
-                        crate::runautomerge::AutoMergeOutcome::Declined(reason)
-                        | crate::runautomerge::AutoMergeOutcome::Held(reason) => tracing::debug!(
+                let result = self.merge_revert(row, pr, snapshot, reverter).await;
+                match result {
+                    Ok(Some(reason)) => {
+                        tracing::debug!(
                             landing_id = row.id,
                             reason,
                             "revert merge gates refused; waiting"
-                        ),
-                        _ => {}
+                        );
+                        progress.revert_merge_refusal = Some(reason);
                     }
+                    Err(err) => {
+                        progress.revert_merge_refusal = Some(err.clone());
+                        self.save(row, progress, now)?;
+                        return Err(err);
+                    }
+                    Ok(None) => {}
                 }
-                Ok(())
+                self.save(row, progress, now)
             }
+        }
+    }
+    async fn merge_revert(
+        &self,
+        row: &LandingRow,
+        pr: i64,
+        snapshot: crate::landingrevert::RevertSnapshot,
+        reverter: &crate::landingrevert::Reverter,
+    ) -> Result<Option<String>, String> {
+        if self.config.revert_review {
+            reverter.introduce_review(row, pr).await?;
+        }
+        if !reverter.auto_merge {
+            return Ok(Some("auto-merge is disabled".into()));
+        }
+        let (held, primed) = reverter.holds.labelled_and_primed();
+        if !primed {
+            return Ok(Some("human holds have not been read".into()));
+        }
+        if held.contains(&row.ticket.to_ascii_lowercase()) {
+            return Ok(Some("the ticket has a human-hold label".into()));
+        }
+        let watches = self
+            .store
+            .load_live_review_watch()
+            .map_err(|e| e.to_string())?;
+        let mine: Vec<_> = watches
+            .iter()
+            .filter(|w| {
+                w.key.number == pr
+                    && w.key.owner.eq_ignore_ascii_case(&row.owner)
+                    && w.key.repo.eq_ignore_ascii_case(&row.repo)
+            })
+            .collect();
+        let approved_by = match crate::automerge::revert_merge_verdict(
+            row,
+            snapshot.labelled,
+            self.config.revert_review,
+            &mine,
+            &snapshot.head,
+        ) {
+            Ok(approved_by) => approved_by,
+            Err(refusal) => return Ok(Some(refusal.why().into())),
+        };
+        let plan = crate::automerge::AutoMergePlan {
+            pr: PrCoord::new(&row.owner, &row.repo, pr),
+            head: snapshot.head,
+            approved_by,
+            manager_approval: None,
+        };
+        match crate::runautomerge::perform_auto_merge(&plan, &reverter.merges).await {
+            crate::runautomerge::AutoMergeOutcome::Failed(err) => return Err(err),
+            crate::runautomerge::AutoMergeOutcome::Declined(reason)
+            | crate::runautomerge::AutoMergeOutcome::Held(reason) => {
+                return Ok(Some(reason.into()));
+            }
+            _ => {}
+        }
+        Ok(None)
+    }
+    fn notify_reverting(&self, row: &LandingRow, progress: &Progress) {
+        if let Some(notifications) = &self.notifications {
+            let failed = failed_samples(progress, self.config.failure_threshold);
+            let first = failed
+                .first()
+                .map(|s| format!("{}: {}", cell(&s.name), cell(&s.observed)))
+                .unwrap_or_else(|| "acceptance failed".into());
+            let body = match row.revert_pr {
+                Some(pr) => format!("{first}; revert PR #{pr}"),
+                None => format!("{first}; opening a revert PR"),
+            };
+            notifications.push(
+                Utc::now(),
+                "Landing failed: reverting".into(),
+                body,
+                row.ticket.clone(),
+                format!(
+                    "{}/{}#{}",
+                    row.owner,
+                    row.repo,
+                    row.revert_pr.unwrap_or(row.pr)
+                ),
+            );
         }
     }
     async fn hold(
@@ -1055,7 +1139,10 @@ impl LandingRuntime {
                 LandingPhase::Done
             }
             "AwaitingAcceptance" => LandingPhase::AwaitingAcceptance,
-            "Reverting" => LandingPhase::Reverting,
+            "Reverting" => {
+                self.notify_reverting(row, progress);
+                LandingPhase::Reverting
+            }
             _ => return Err("unknown landing outcome".into()),
         };
         progress.pending = None;
@@ -1407,6 +1494,188 @@ pub(crate) mod tests {
         assert_eq!(rig.row().phase, LandingPhase::Reopened);
         assert_eq!(rig.row().revert_pr, None);
     }
+    #[tokio::test]
+    async fn revert_pr_not_merged_by_deadline_holds_and_notifies() {
+        for (gate, refusal) in [
+            ("disabled", "auto-merge is disabled"),
+            ("human", "the ticket has a human-hold label"),
+            ("unprimed", "human holds have not been read"),
+            ("review", "no reviewer is watching this pull request"),
+            ("ci", "a check is failing or has not finished"),
+        ] {
+            let mut rig = RepoRig::new(None, Some(GOOD));
+            let gh = crate::landingrevert::tests::Github::new();
+            let mut reverter = crate::landingrevert::tests::reverter(&rig, gh.clone());
+            let deps = Arc::get_mut(&mut reverter).unwrap();
+            deps.auto_merge = gate != "disabled";
+            if gate == "human" {
+                deps.holds.note_human_label("APP-1");
+            } else if gate == "unprimed" {
+                deps.holds = Arc::new(crate::dispatch::HumanHoldLedger::default());
+            } else if gate == "ci" {
+                let checks = Arc::new(ScriptedGh {
+                    origin: rig.origin.clone(),
+                    merged: Mutex::new(BTreeMap::new()),
+                    calls: Mutex::new(Vec::new()),
+                    branches: Mutex::new(BTreeMap::from([(2, "feature".into())])),
+                    app: None,
+                    ci_green: std::sync::atomic::AtomicBool::new(false),
+                });
+                *gh.state.lock().unwrap() =
+                    (PrStatus::Open, checks.snapshot(2).head_sha, String::new());
+                deps.merges = Arc::new(crate::runautomerge::AutoMergeDeps {
+                    prs: checks.clone(),
+                    mergestate: checks.clone(),
+                    policy: checks.clone(),
+                    updater: checks.clone(),
+                    checks: checks.clone(),
+                    merger: checks,
+                    allow: HeadAllowlist::none(),
+                    approvals: None,
+                    ledger: Arc::new(crate::runautomerge::AutoMergeLedger::default()),
+                });
+            }
+            rig.runtime.config.revert_review = gate == "review";
+            rig.runtime.reverter = Some(reverter.clone());
+            let mut row = rig.row();
+            row.phase = LandingPhase::Reverting;
+            rig.runtime.store.save_landing(row).unwrap();
+            rig.tick(5).await;
+            assert_eq!(rig.row().revert_pr, Some(2));
+            rig.tick(20).await;
+            assert_eq!(rig.row().phase, LandingPhase::Reverting);
+            rig.restart();
+            let persisted: serde_json::Value =
+                serde_json::from_str(&rig.row().results_json).unwrap();
+            assert_eq!(persisted["revert_opened_at_s"], 5);
+            assert_eq!(persisted["revert_merge_refusal"], refusal);
+            rig.runtime.reverter = Some(reverter);
+            rig.runtime.notifications =
+                Some(Arc::new(crate::breaker::NotificationsState::default()));
+            rig.tick(34).await;
+            assert_eq!(rig.row().phase, LandingPhase::Reverting);
+            rig.tick(35).await;
+            assert_eq!(rig.row().phase, LandingPhase::Held, "{gate}");
+            let reason =
+                format!("revert PR #2 not merged within 30s; last merge-gate refusal: {refusal}");
+            assert_eq!(rig.row().hold_reason.as_deref(), Some(reason.as_str()));
+            let progress: serde_json::Value =
+                serde_json::from_str(&rig.row().results_json).unwrap();
+            assert_eq!(progress["revert_opened_at_s"], 5);
+            let notices = rig.runtime.notifications.as_ref().unwrap().pending();
+            assert_eq!(
+                notices.len(),
+                1,
+                "no repeated Reverting notice after restart"
+            );
+            assert_eq!(notices[0].title, "Landing held");
+            assert_eq!(notices[0].body, reason);
+            assert_eq!(gh.state.lock().unwrap().0, PrStatus::Open);
+            assert_eq!(gh.opened.lock().unwrap().len(), 1);
+            assert!(
+                rig.runtime
+                    .tracker
+                    .list_comments("ID-1")
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|c| c.body.contains(&reason))
+            );
+            rig.tick(100).await;
+            assert_eq!(
+                rig.runtime.notifications.as_ref().unwrap().pending().len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciled_revert_uses_original_opening_time_but_merged_pr_still_lands() {
+        for status in [PrStatus::Open, PrStatus::Merged] {
+            let mut rig = RepoRig::new(None, Some(GOOD));
+            let gh = crate::landingrevert::tests::Github::new();
+            *gh.existing.lock().unwrap() = Some(2);
+            *gh.state.lock().unwrap() = (
+                status,
+                rig.row().merge_sha.clone(),
+                rig.row().merge_sha.clone(),
+            );
+            rig.runtime.reverter = Some(crate::landingrevert::tests::reverter(&rig, gh.clone()));
+            let mut row = rig.row();
+            row.phase = LandingPhase::Reverting;
+            rig.runtime.store.save_landing(row).unwrap();
+            // Crash after GitHub creation, before saving its PR number/time. First resumed tick
+            // is already past createdAt + deploy_timeout, not a fresh thirty-second window.
+            rig.tick(100).await;
+            assert_eq!(rig.row().revert_pr, Some(2));
+            assert!(gh.opened.lock().unwrap().is_empty());
+            let progress: Progress = serde_json::from_str(&rig.row().results_json).unwrap();
+            assert_eq!(progress.revert_opened_at_s, Some(5));
+            if status == PrStatus::Open {
+                assert_eq!(rig.row().phase, LandingPhase::Held);
+                assert_eq!(
+                    rig.row().hold_reason.as_deref(),
+                    Some(
+                        "revert PR #2 not merged within 30s; last merge-gate refusal: not yet attempted"
+                    )
+                );
+                assert_eq!(progress.revert_landing, None);
+            } else {
+                assert_eq!(rig.row().phase, LandingPhase::Reverting);
+                let child = rig
+                    .runtime
+                    .store
+                    .get_landing(progress.revert_landing.unwrap())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(child.revert_of, Some(rig.id));
+                assert_eq!(child.deploy_deadline_s, 130);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn entering_reverting_pushes_an_operator_notification() {
+        let mut rig = RepoRig::new(
+            None,
+            Some(
+                "version: 1\nlive: {command: [git, rev-parse, HEAD]}\nchecks:\n- name: health\n  command: ['false']\n  every: 1s\n",
+            ),
+        );
+        rig.runtime.config.auto_revert = true;
+        rig.runtime.notifications = Some(Arc::new(crate::breaker::NotificationsState::default()));
+        let gh = crate::landingrevert::tests::Github::new();
+        rig.runtime.reverter = Some(crate::landingrevert::tests::reverter(&rig, gh));
+        rig.tick(0).await;
+        assert!(
+            rig.runtime
+                .notifications
+                .as_ref()
+                .unwrap()
+                .pending()
+                .is_empty()
+        );
+        rig.tick(1).await;
+        assert_eq!(rig.row().phase, LandingPhase::Reverting);
+        let notices = rig.runtime.notifications.as_ref().unwrap().pending();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].title, "Landing failed: reverting");
+        assert!(notices[0].body.contains("health"));
+        assert_eq!(notices[0].ticket, "APP-1");
+        rig.tick(5).await;
+        let notices = rig.runtime.notifications.as_ref().unwrap().pending();
+        assert_eq!(notices.len(), 2);
+        assert_eq!(notices[1].title, "Landing failed: reverting");
+        assert!(notices[1].body.contains("health"));
+        assert!(notices[1].body.contains("revert PR #2"));
+        assert_eq!(notices[1].pr, "o/r#2");
+        rig.tick(6).await;
+        assert_eq!(
+            rig.runtime.notifications.as_ref().unwrap().pending().len(),
+            2
+        );
+    }
+
     #[tokio::test]
     async fn revert_gets_its_own_landing_and_original_reopens_after_it_passes() {
         let mut rig = RepoRig::new(Some(GOOD), Some(GOOD));
@@ -2353,6 +2622,7 @@ pub(crate) mod tests {
             let snap = self.snapshot(pr);
             Ok(crate::landingrevert::RevertSnapshot {
                 head: snap.head_sha,
+                opened_at_s: 0,
                 status: snap.status,
                 labelled: true,
                 merge_sha: self
