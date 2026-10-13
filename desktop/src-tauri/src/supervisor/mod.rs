@@ -8,6 +8,7 @@
 //! this port keeps that shape with a spawned tokio task per `Start` and a per-run set of
 //! `tokio::sync` primitives (a `oneshot` for first-readiness, `watch`es for stop/done).
 
+mod child;
 mod env;
 mod resolve;
 
@@ -17,7 +18,7 @@ pub use resolve::{ResolveError, is_executable_file, resolve_binary, resources_di
 use std::future::Future;
 use std::path::PathBuf;
 use std::process::{ExitStatus, Stdio};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use rhapsody_credential_ipc::wire::BootstrapMessage;
@@ -26,6 +27,7 @@ use tokio::sync::{oneshot, watch};
 use crate::credential_bootstrap::{
     BootstrapListener, ChannelObservations, CredentialOwnerLookup, ListenerShutdown,
 };
+use child::DaemonChild;
 
 /// The supervised daemon's lifecycle state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,6 +209,9 @@ struct SupRun {
     /// `true` once the supervise loop has finished draining (closed `doneCh` in Go).
     done_tx: watch::Sender<bool>,
     done_rx: watch::Receiver<bool>,
+    /// Weak so cancelling the supervise task still drops (and kills) its child. A stop backstop
+    /// upgrades only this launch's handle, never a PID copied from a possibly stale status snapshot.
+    child: Mutex<Option<Weak<DaemonChild>>>,
 }
 
 impl SupRun {
@@ -220,6 +225,7 @@ impl SupRun {
             stop_rx,
             done_tx,
             done_rx,
+            child: Mutex::new(None),
         });
         (run, ready_rx)
     }
@@ -227,6 +233,17 @@ impl SupRun {
     /// Signals this run to terminate (idempotent).
     fn request_stop(&self) {
         let _ = self.stop_tx.send(true);
+        if let Some(child) = lock(&self.child).as_ref().and_then(Weak::upgrade) {
+            child.request_stop();
+        }
+    }
+
+    fn set_child(&self, child: &Arc<DaemonChild>) {
+        *lock(&self.child) = Some(Arc::downgrade(child));
+        // Stop can race launch publication. Either request_stop saw the child, or we see its flag.
+        if self.stop_requested() {
+            child.request_stop();
+        }
     }
 
     /// Reports whether this run has been asked to stop (non-blocking).
@@ -425,8 +442,8 @@ impl Supervisor {
         run.done().await;
     }
 
-    /// Requests shutdown without waiting for the runtime to drive the drain. Test drop guards use
-    /// this before signaling the child directly, so a multi-thread runtime cannot restart it.
+    /// Requests shutdown and arms the child's wall-clock termination backstop without waiting for
+    /// the runtime. The final Quit and test drop guards use this even when workers are blocked.
     pub fn request_stop(&self) {
         if let Some(run) = lock(&self.inner.state).run.clone() {
             run.request_stop();
@@ -620,6 +637,9 @@ impl Inner {
         };
         let pid = child.id().map(|p| p as i32).unwrap_or(0);
         self.set_starting(pid);
+        let stdin = child.stdin.take();
+        let child = DaemonChild::new(child, self.stop_grace);
+        run.set_child(&child);
 
         // Serve the channel and write the child its ONE bootstrap frame, then close the pipe. The
         // listener task is owned for the whole launch and torn down before this returns.
@@ -629,13 +649,13 @@ impl Inner {
                 let (future, shutdown) =
                     listener.accept_and_serve_registry(cfg.lookup, cfg.observations);
                 let handle = tokio::spawn(future);
-                write_bootstrap_frame(&mut child, &message).await;
+                write_bootstrap_frame(stdin, &message).await;
                 Some(ServingListener { shutdown, handle })
             }
             _ => None,
         };
 
-        let outcome = self.wait_once(run, &mut child, pid).await;
+        let outcome = self.wait_once(run, &child, pid).await;
         if let Some(serving) = serving {
             serving.stop().await;
         }
@@ -645,12 +665,7 @@ impl Inner {
     /// Waits for one launched child: first readiness (bounded by `startup_timeout`), then the steady
     /// state, returning the same [`Outcome`] the pre-STUDIO-1035 `run_once` did. Split out so
     /// `run_once` can hold the credential listener around this wait without duplicating every exit.
-    async fn wait_once(
-        &self,
-        run: &Arc<SupRun>,
-        child: &mut tokio::process::Child,
-        pid: i32,
-    ) -> Outcome {
+    async fn wait_once(&self, run: &Arc<SupRun>, child: &Arc<DaemonChild>, pid: i32) -> Outcome {
         // Phase 1: poll for readiness, bounded by startup_timeout.
         let deadline = Instant::now() + self.startup_timeout;
         while !self.healthy().await {
@@ -688,21 +703,11 @@ impl Inner {
         }
     }
 
-    /// Sends SIGTERM and waits up to `stop_grace` for the process to exit, escalating to SIGKILL if it
-    /// overruns. The daemon shuts down gracefully on SIGTERM, so SIGKILL is a backstop only. Mirrors
-    /// Go `terminate`.
-    async fn terminate(&self, child: &mut tokio::process::Child) {
-        let pid = match child.id() {
-            Some(p) => p as i32,
-            None => return, // already reaped
-        };
-        signal_group(pid, libc::SIGTERM);
-        tokio::select! {
-            _ = child.wait() => {}
-            _ = tokio::time::sleep(self.stop_grace) => {
-                signal_group(pid, libc::SIGKILL);
-                let _ = child.wait().await;
-            }
+    /// Go's `terminate`, with a wall-clock backstop instead of a runtime-driven grace timer.
+    async fn terminate(&self, child: &Arc<DaemonChild>) {
+        child.request_stop();
+        if let Err(e) = child.wait().await {
+            eprintln!("rhapsody-desktop: daemon termination wait failed: {e}");
         }
     }
 }
@@ -731,10 +736,13 @@ impl ServingListener {
 /// there will never be another). Errors are logged, not fatal: the child is already spawned and a
 /// frame that never arrives simply leaves it with no credential owner — the same honest outcome as a
 /// confused-deputy launch.
-async fn write_bootstrap_frame(child: &mut tokio::process::Child, message: &BootstrapMessage) {
+async fn write_bootstrap_frame(
+    stdin: Option<tokio::process::ChildStdin>,
+    message: &BootstrapMessage,
+) {
     use tokio::io::AsyncWriteExt;
 
-    let Some(mut stdin) = child.stdin.take() else {
+    let Some(mut stdin) = stdin else {
         eprintln!("rhapsody-desktop: supervisor: credential-bootstrap child has no piped stdin");
         return;
     };

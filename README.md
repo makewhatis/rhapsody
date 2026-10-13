@@ -164,6 +164,15 @@ documents availability, every config/contract field, worked examples and migrati
 With landing absent or disabled, merge completion and auto-merge behavior are unchanged; the
 Go-owned tables, config/API golden shapes and fixture normalization are untouched.
 
+### Hindsight prefetch freshness (STUDIO-1270)
+
+Worker memory prefetch skips a cached `(identity, ticket)` entry younger than five minutes
+(half its ten-minute TTL), including successful empty answers. Personal and shared-team facts
+refresh together under that entry. Each minute's rotating pass spends at most ten actual bank
+calls, counting both banks; skipped fresh entries spend no calls. Carry-over keeps the original
+timestamp and expiry semantics, bank failures still warn, and dispatch reads only the cache
+without waiting. This Teams-only scheduling change has no frozen Go counterpart.
+
 ### Hindsight recall deadlines and failure diagnostics (STUDIO-1253)
 
 Off-loop Hindsight recall searches allow 15 seconds for the whole request, including response-body
@@ -448,6 +457,17 @@ Desktop sidecars are killed on child-handle drop if their supervisor task/runtim
 normal SIGTERM/graceful-stop behavior stays the same. Test guards request stop before signaling,
 preventing the restart loop from relaunching a daemon during failure cleanup. No configuration,
 API payload, schema or golden changes.
+
+### Desktop quit and child-stop deadlines (STUDIO-1116, STUDIO-1268)
+
+The Tauri main thread's final Quit waits on a standard channel for at most twelve seconds rather
+than blocking on a runtime timer. It requests stop before scheduling async teardown, so a blocked
+tray setter cannot prevent the sidecar from receiving SIGTERM. A per-launch standard-thread
+backstop observes child exit and escalates to process-group SIGKILL after `stop_grace` (five seconds
+by default), independently of Tokio's driver. Signaling and reaping share the owned child handle,
+preventing a delayed backstop from signaling a recycled PID. Go's goroutines and `time.After` need
+no UI/runtime driver; these explicit backstops preserve that lifecycle guarantee in the Tauri port.
+No configuration, API payload, schema or golden changes.
 
 ### Manager findings and tracker documents (STUDIO-1146)
 

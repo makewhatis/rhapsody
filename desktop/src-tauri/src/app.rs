@@ -468,6 +468,11 @@ impl App {
         runtime: &tokio::runtime::Handle,
         bound: Duration,
     ) -> ShutdownWait {
+        // A runtime that cannot even start on_shutdown must still stop its child. This arms the
+        // supervisor's wall-clock SIGTERM/grace/SIGKILL backstop before scheduling async teardown.
+        if let Some(sup) = self.get_sup() {
+            sup.request_stop();
+        }
         let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
         let app = self.clone();
         runtime.spawn(async move {

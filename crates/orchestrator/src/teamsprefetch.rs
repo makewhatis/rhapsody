@@ -65,7 +65,7 @@ use crate::teamscompose::{recall_query, team_recall_query};
 
 /// The prefetch pass's own cadence. One minute matches [`triage`]'s and is
 /// slower than the 30s poll on purpose: this is ahead-of-dispatch work nobody
-/// waits on, and each cycle spends one remote recall per candidate.
+/// waits on. Only missing or aging entries spend remote recalls.
 ///
 /// [`triage`]: crate::triage::TRIAGE_INTERVAL
 pub const PREFETCH_INTERVAL: Duration = Duration::from_secs(60);
@@ -84,11 +84,12 @@ pub const MAX_PREFETCH_BACKOFF_MS: i64 = 15 * 60 * 1000;
 /// slow bank, one back-off step) does not empty the cache.
 pub const PREFETCH_TTL: Duration = Duration::from_secs(10 * 60);
 
-/// How many candidates one cycle will recall for. A freshly-enabled Teams
-/// pointed at a large backlog would otherwise fire one remote recall per
-/// candidate in a burst; the remainder is picked up next cycle, in candidate
-/// order, so nothing is skipped — only spread. Triage's `MAX_PER_CYCLE`, at the
-/// same value and for the same reason.
+/// Refresh before expiry, leaving half the TTL for rotation or a slow bank.
+const PREFETCH_REFRESH_AGE: Duration = Duration::from_secs(PREFETCH_TTL.as_secs() / 2);
+
+/// How many actual bank recalls one cycle may make, counting personal and shared
+/// calls. Fresh cache entries spend nothing; missing/aging candidates past this
+/// budget are picked up next cycle in rotating candidate order.
 const MAX_PER_CYCLE: usize = 10;
 
 /// The most entries the cache will hold.
@@ -195,6 +196,22 @@ impl PrefetchCache {
             return None;
         }
         Some(entry.team.clone())
+    }
+
+    /// Off-loop freshness check for BOTH banks under this key, including empty
+    /// successful answers. No lock or fact copy survives into a remote recall.
+    fn needs_refresh(&self, key: &PrefetchKey, now: DateTime<Utc>) -> bool {
+        let Ok(guard) = self.entries.read() else {
+            return true;
+        };
+        let Some(entry) = guard.get(key) else {
+            return true;
+        };
+        match now.signed_duration_since(entry.at).to_std() {
+            Ok(age) => age >= PREFETCH_REFRESH_AGE,
+            // Like the TTL check, a backwards clock keeps existing entries fresh.
+            Err(_) => false,
+        }
     }
 
     /// Installs this cycle's `fresh` results and **evicts everything whose ticket
@@ -506,10 +523,9 @@ where
 /// — no memory section, the safe degradation — never a wrong teammate's facts,
 /// because the key carries the identity the facts were recalled for.
 /// `cursor` is where this cycle's window starts, and is advanced past what it
-/// covered. It exists because a cycle recalls at most [`MAX_PER_CYCLE`]
-/// candidates: a fixed window would re-recall the same first ten every minute
-/// and never reach the eleventh, so the window rotates and the cache carries
-/// what it already holds for the candidates outside it
+/// covered. The window examines at most one traversal and spends at most
+/// [`MAX_PER_CYCLE`] actual bank calls. Fresh entries are skipped without spending
+/// that budget, and the cache carries entries the window did not refresh
 /// ([`PrefetchCache::sync`]).
 pub(crate) async fn prefetch_cycle<TF>(
     ctx: &CancelWait,
@@ -551,24 +567,24 @@ where
     // The rotating window. `routed` is in candidate order, which is stable
     // across cycles, so advancing the cursor is what makes coverage fair.
     let start = *cursor % routed.len();
-    let take = MAX_PER_CYCLE.min(routed.len());
-    let window: Vec<(String, &Issue)> = routed
-        .iter()
-        .cycle()
-        .skip(start)
-        .take(take)
-        .map(|(identity, iss)| (identity.clone(), *iss))
-        .collect();
-    *cursor = start + take;
-
-    let mut fresh: Vec<(PrefetchKey, Vec<Fact>, Vec<Fact>)> = Vec::with_capacity(window.len());
-    for (identity, iss) in window {
+    let calls_per_candidate = 1 + usize::from(deps.teams.memory.team_bank_enabled());
+    let mut calls = 0;
+    let mut fresh: Vec<(PrefetchKey, Vec<Fact>, Vec<Fact>)> = Vec::new();
+    for offset in 0..routed.len() {
         // A shutdown must not have to wait out a whole cycle of remote recalls.
-        if ctx.is_cancelled() {
+        if ctx.is_cancelled() || calls + calls_per_candidate > MAX_PER_CYCLE {
             break;
         }
+        let (identity, iss) = &routed[(start + offset) % routed.len()];
+        *cursor = start + offset + 1;
+        let key = PrefetchKey::new(identity, &iss.identifier);
+        if !deps.cache.needs_refresh(&key, (deps.now)()) {
+            continue;
+        }
+        // Reserve both calls before starting so a shared recall cannot overspend.
+        calls += calls_per_candidate;
         let q = recall_query(&deps.teams, iss);
-        match deps.backend.recall(&identity, &q).await {
+        match deps.backend.recall(identity, &q).await {
             Ok(recalled) => {
                 // "A record that could not be read is skipped LOUDLY, never
                 // fatal" — the same contract `local` has, and this is the caller
@@ -582,11 +598,7 @@ where
                     );
                 }
                 let team = prefetch_team_facts(deps, iss).await;
-                fresh.push((
-                    PrefetchKey::new(identity, iss.identifier.clone()),
-                    recalled.facts,
-                    team,
-                ));
+                fresh.push((key, recalled.facts, team));
             }
             Err(e) => {
                 // Stop the cycle rather than walking the rest of the backlog into
@@ -880,6 +892,203 @@ mod tests {
     }
 
     // ── the cycle ───────────────────────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fresh_cache_entries_are_not_re_recalled() {
+        // Successful empty answers are fresh too, not misses to retry each minute.
+        for with_facts in [false, true] {
+            let mut cfg = teams(true, BackendKind::Hindsight);
+            cfg.memory.team_bank = "team".into();
+            let bank = Arc::new(FakeBank {
+                facts: if with_facts {
+                    [("alice".into(), vec![fact("own", "personal note")])]
+                        .into_iter()
+                        .collect()
+                } else {
+                    HashMap::new()
+                },
+                team_facts: if with_facts {
+                    vec![fact("shared", "team note")]
+                } else {
+                    Vec::new()
+                },
+                ..FakeBank::default()
+            });
+            let cache = Arc::new(PrefetchCache::new());
+            let mut d = deps(
+                cfg,
+                bank.clone(),
+                tracker(vec![
+                    issue("1", "MT-1", &["rust"]),
+                    issue("2", "MT-2", &["web"]),
+                ]),
+                cache.clone(),
+                0,
+            );
+            let mut cursor = 0;
+            assert_eq!(
+                prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await,
+                CycleOutcome::Prefetched(2)
+            );
+            bank.asked.lock().unwrap().clear();
+            bank.asked_shared.lock().unwrap().clear();
+            d.now = Box::new(|| at(60));
+            assert_eq!(
+                prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await,
+                CycleOutcome::Idle
+            );
+            assert!(
+                bank.asked.lock().unwrap().is_empty(),
+                "fresh personal cache must cost zero calls"
+            );
+            assert!(
+                bank.asked_shared.lock().unwrap().is_empty(),
+                "fresh team cache must cost zero calls"
+            );
+            assert!(cache.try_get("alice", "MT-1", at(60)).is_some());
+            assert!(cache.try_get_team("alice", "MT-1", at(60)).is_some());
+            assert!(cache.try_get("bob", "MT-2", at(60)).is_some());
+            assert_eq!(
+                cache.entries.read().unwrap()[&PrefetchKey::new("alice", "MT-1")].at,
+                at(0),
+                "skipping must not renew the timestamp"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn aging_entries_are_refreshed_before_ttl() {
+        let mut cfg = teams(true, BackendKind::Hindsight);
+        cfg.memory.team_bank = "team".into();
+        let bank = Arc::new(FakeBank {
+            facts: [("alice".into(), vec![fact("new-own", "personal note")])]
+                .into_iter()
+                .collect(),
+            team_facts: vec![fact("new-team", "team note")],
+            ..FakeBank::default()
+        });
+        let cache = Arc::new(PrefetchCache::new());
+        cache.replace_both(
+            vec![(
+                PrefetchKey::new("alice", "MT-1"),
+                vec![fact("old-own", "old")],
+                vec![fact("old-team", "old")],
+            )],
+            at(0),
+        );
+        let mut d = deps(
+            cfg,
+            bank.clone(),
+            tracker(vec![issue("1", "MT-1", &["rust"])]),
+            cache.clone(),
+            0,
+        );
+        let mut cursor = 0;
+        let refresh = (PREFETCH_TTL / 2).as_secs() as i64;
+        for now in [-60, refresh - 1] {
+            d.now = Box::new(move || at(now));
+            assert_eq!(
+                prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await,
+                CycleOutcome::Idle
+            );
+        }
+        assert!(bank.asked.lock().unwrap().is_empty());
+        assert!(bank.asked_shared.lock().unwrap().is_empty());
+        d.now = Box::new(move || at(refresh));
+        assert_eq!(
+            prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await,
+            CycleOutcome::Prefetched(1)
+        );
+        assert_eq!(bank.asked.lock().unwrap().len(), 1);
+        assert_eq!(bank.asked_shared.lock().unwrap().len(), 1);
+        let past_original_ttl = at(PREFETCH_TTL.as_secs() as i64 + 1);
+        assert_eq!(
+            cache.try_get("alice", "MT-1", past_original_ttl).unwrap()[0].id,
+            "new-own"
+        );
+        assert_eq!(
+            cache
+                .try_get_team("alice", "MT-1", past_original_ttl)
+                .unwrap()[0]
+                .id,
+            "new-team"
+        );
+        assert!(
+            cache
+                .try_get(
+                    "alice",
+                    "MT-1",
+                    at(refresh + PREFETCH_TTL.as_secs() as i64 + 1)
+                )
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_entries_do_not_spend_the_actual_recall_budget() {
+        for shared in [false, true] {
+            let mut cfg = teams(true, BackendKind::Hindsight);
+            if shared {
+                cfg.memory.team_bank = "team".into();
+            }
+            let bank = bank_with(&[]);
+            let cache = Arc::new(PrefetchCache::new());
+            let issues: Vec<_> = (0..MAX_PER_CYCLE * 2 + 1)
+                .map(|i| issue(&i.to_string(), &format!("MT-{i}"), &["rust"]))
+                .collect();
+            cache.replace(
+                (0..MAX_PER_CYCLE)
+                    .map(|i| (PrefetchKey::new("alice", format!("MT-{i}")), Vec::new()))
+                    .collect(),
+                at(0),
+            );
+            let d = deps(
+                cfg,
+                bank.clone(),
+                tracker(issues.clone()),
+                cache.clone(),
+                60,
+            );
+            let mut cursor = 0;
+            let expected = if shared {
+                MAX_PER_CYCLE / 2
+            } else {
+                MAX_PER_CYCLE
+            };
+            assert_eq!(
+                prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await,
+                CycleOutcome::Prefetched(expected)
+            );
+            assert_eq!(
+                bank.asked.lock().unwrap().len() + bank.asked_shared.lock().unwrap().len(),
+                MAX_PER_CYCLE,
+                "both bank calls count; fresh entries cost nothing"
+            );
+            assert_eq!(
+                bank.asked.lock().unwrap()[0].1,
+                format!("MT-{MAX_PER_CYCLE}")
+            );
+            assert_eq!(cursor, MAX_PER_CYCLE + expected);
+            assert!(
+                cache
+                    .try_get("alice", &format!("MT-{}", cursor), at(60))
+                    .is_none(),
+                "work past the budget waits for the next cycle"
+            );
+            assert_eq!(cache.len(), MAX_PER_CYCLE + expected);
+            prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await;
+            assert!(
+                cache
+                    .try_get(
+                        "alice",
+                        &issues[MAX_PER_CYCLE + expected].identifier,
+                        at(60)
+                    )
+                    .is_some(),
+                "rotation reaches the deferred candidate"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn prefetch_cycle_makes_no_tracker_calls_when_candidates_are_published() {
