@@ -1467,7 +1467,16 @@ impl Orchestrator {
                     // read off `rows` — this tick's in-memory snapshot — so the retirement below
                     // cannot race it, whichever order the two run in.
                     let why = if snap.status == PrStatus::Merged {
-                        report.done.extend(self.plan_review_done(&rows, &obs.pr));
+                        match self.admit_landing(&rows, &obs.pr, swept_now.timestamp()) {
+                            Ok(crate::landing::Admission::Disabled) => {
+                                report.done.extend(self.plan_review_done(&rows, &obs.pr));
+                            }
+                            Ok(crate::landing::Admission::Admitted) => {}
+                            Err(err) => {
+                                tracing::warn!(pr = %obs.pr, %err, "landing admission failed; merge stays watched for retry");
+                                continue;
+                            }
+                        }
                         "merged"
                     } else {
                         "closed"
@@ -4020,6 +4029,10 @@ impl Orchestrator {
     ) {
         if !self.review_auto_merge_for_repo(&pr.owner, &pr.repo) {
             return; // opt-in, and off by default (the D5 invariant)
+        }
+        if let Err(reason) = self.landing_merge_gate(pr) {
+            tracing::debug!(pr = %pr, reason, "auto-merge: declined");
+            return;
         }
         // STUDIO-964: the fail-closed human-hold gate lives HERE, not at the tail of
         // `service_review_pr`. It used to guard only the one tail call, while the seven
@@ -8008,6 +8021,37 @@ mod tests {
             1,
             "once the hold is gone the approved merge is proposed"
         );
+    }
+
+    #[test]
+    fn auto_merge_declines_while_project_has_open_landing() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        assert_eq!(o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(), 1);
+        let slug = o.eff.as_ref().unwrap().projects[0].slug.clone();
+        let id = o
+            .store()
+            .save_landing(rhapsody_store::LandingRow {
+                project_slug: slug,
+                owner: OWNER.into(),
+                repo: REPO.into(),
+                pr: 63,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            o.landing_merge_gate(&coord(64)).unwrap_err(),
+            "a landing is in progress for this project"
+        );
+        assert!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        let mut row = o.store().get_landing(id).unwrap().unwrap();
+        row.phase = rhapsody_store::LandingPhase::Done;
+        o.store().save_landing(row).unwrap();
+        assert_eq!(o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(), 1);
     }
 
     /// ⚠️ STUDIO-949 round 11: an approved, at-head pull request is NOT merged while the human-hold

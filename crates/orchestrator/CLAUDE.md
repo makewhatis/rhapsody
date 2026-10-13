@@ -196,6 +196,12 @@ the `Orchestrator` struct itself. Concretely:
     transaction as attempts/generations. Executor notifications wake the reporting task over a
     channel; pages/digests are independent of launch admission and never perform I/O on control.
 
+  - `landing.rs` (STUDIO-1249) snapshots owned project dependencies on control and runs deterministic
+    git/check/tracker effects in one owned `LandingTask`. It shares only the existing Store and
+    NotificationsState. The JoinHandle prevents overlapping sweeps and aborts on drop; cancellation
+    releases its WaitGroup registration. Absolute deadlines, check cadence/counters and pending
+    effects are stored in `rhapsody_landing`, with stable tracker-comment markers for restart dedupe.
+
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
   worker code; add an event variant instead.

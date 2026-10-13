@@ -1130,6 +1130,7 @@ impl Orchestrator {
         // has quietly stopped, and that is when this report is worth the most. It also runs before
         // the publish so the snapshot below carries the same tick's verdict.
         self.reconcile_review_divergence();
+        self.landing_tick((self.now)()).await;
         // STUDIO-1015: the manager intervention pass. The sweep above has just enqueued or merged
         // any stall signal the manager owns; this recovers dead leases (§7.5) and tries to launch
         // every candidate whose §10.2 gates pass, each at its own entry point. Local writes only —

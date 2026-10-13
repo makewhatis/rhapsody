@@ -1605,7 +1605,9 @@ impl Store for Sqlite {
     fn subject_resume_pending(&self, subject: &str) -> Result<bool, StoreError> {
         let conn = self.lock();
         let subject = canonical_subject(&conn, subject)?;
-        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE subject = ?1 AND released_reason IS NOT NULL AND resume_pending = 1)", [subject], |r| r.get(0))?)
+        Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE subject = ?1 AND released_reason IS NOT NULL AND resume_pending = 1)
+            OR EXISTS(SELECT 1 FROM rhapsody_landing WHERE ticket = ?1 COLLATE NOCASE
+                AND phase = 'Reopened' AND json_valid(results_json) AND json_extract(results_json, '$.resume_pending') = 1)", [subject], |r| r.get(0))?)
     }
     fn link_subject_pr(&self, ticket: &str, pr: &str) -> Result<(), StoreError> {
         self.lock().execute("INSERT INTO rhapsody_subject_prs(pr, ticket) VALUES (?1, ?2) ON CONFLICT(pr) DO UPDATE SET ticket = excluded.ticket", params![pr.to_ascii_lowercase(), ticket.to_ascii_uppercase()])?;
@@ -2178,6 +2180,9 @@ impl Store for Sqlite {
         )?;
         let id = tx.last_insert_rowid();
         tx.execute("UPDATE rhapsody_subject_holds SET resume_pending = 0 WHERE subject = ?1 COLLATE NOCASE", [&r.issue_identifier])?;
+        tx.execute("UPDATE rhapsody_landing SET results_json = json_set(results_json, '$.resume_pending', json('false'))
+            WHERE ticket = ?1 COLLATE NOCASE AND phase = 'Reopened' AND json_valid(results_json)
+                AND json_extract(results_json, '$.resume_pending') = 1", [&r.issue_identifier])?;
         tx.commit()?;
         Ok(id)
     }
@@ -5156,6 +5161,29 @@ impl Store for Sqlite {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reopened_landing_grants_one_author_admission() {
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        store
+            .save_landing(LandingRow {
+                owner: "o".into(),
+                repo: "r".into(),
+                pr: 1,
+                ticket: "APP-1".into(),
+                phase: LandingPhase::Reopened,
+                results_json: "{\"resume_pending\":true}".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(store.subject_resume_pending("APP-1").unwrap());
+        store
+            .start_run(RunStart {
+                issue_identifier: "APP-1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!store.subject_resume_pending("APP-1").unwrap());
+    }
     #[test]
     fn schema_38_migration_applies_on_37_db() {
         let dir = scratch_dir();

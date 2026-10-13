@@ -64,6 +64,38 @@ use rhapsody_store::{
 use crate::managerapproval::ApprovalScope;
 use crate::prstate::PrCoord;
 
+impl crate::orchestrator::Orchestrator {
+    /// Every configured slug in the owning project group participates in the lock. A read error
+    /// refuses merging too: inability to prove there is no landing must not bypass attribution.
+    pub(crate) fn landing_merge_gate(&self, pr: &PrCoord) -> Result<(), String> {
+        let Some(eff) = &self.eff else {
+            return Ok(());
+        };
+        let groups: Vec<_> = eff
+            .projects
+            .iter()
+            .filter(|p| {
+                crate::ghsummons::parse_repo(&p.repo).is_some_and(|(o, r)| {
+                    o.eq_ignore_ascii_case(&pr.owner) && r.eq_ignore_ascii_case(&pr.repo)
+                })
+            })
+            .map(|p| &p.group)
+            .collect();
+        for project in &eff.projects {
+            if groups.contains(&&project.group)
+                && self
+                    .store()
+                    .open_landing_for_project(&project.slug)
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+            {
+                return Err("a landing is in progress for this project".into());
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The provenance of an `effective` manager approval an [`AutoMergePlan`] counted (STUDIO-1011;
 /// design record `manager-agent-design.md` §6.5, §8.3).
 ///
