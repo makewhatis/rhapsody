@@ -87,6 +87,7 @@ pub(crate) struct ProjectWarnInput {
     /// paths hard-fail at run time and get no pre-flight flag, so they stay empty.
     pub repo: String,
     pub prompt_file: String,
+    pub landing_enabled: bool,
 }
 
 /// A future resolving to `(exists, checked)` for one mirror check.
@@ -97,7 +98,7 @@ type CheckFut = Pin<Box<dyn Future<Output = (bool, bool)> + Send>>;
 /// produces a flag. It is captured from the workspace `Manager` on the control task and passed into
 /// the off-loop resolver, so the producers never read loop-owned `eff` state off-loop (INF-279).
 /// Mirrors Go `promptFileChecker` (async here because `Manager::prompt_file_in_repo` is async).
-pub(crate) type PromptFileChecker = Box<dyn Fn(String, String) -> CheckFut + Send + Sync>;
+pub(crate) type PromptFileChecker = Box<dyn Fn(String, String, bool) -> CheckFut + Send + Sync>;
 
 /// The off-loop-shared warning state (Go's `warningsMu` + `projectWarnings` / `projectFileWarnings` +
 /// `warningsGen` / `fileWarningsGen`). Held behind [`Arc`] so the resolver tasks store into it while
@@ -438,30 +439,50 @@ impl WarningsState {
         // N-slug project gets ONE flag, not N identical ones.
         let mut done: HashSet<String> = HashSet::new();
         for in_ in inputs {
-            if in_.prompt_file.is_empty() || in_.repo.is_empty() || done.contains(&in_.group) {
+            if (in_.prompt_file.is_empty() && !in_.landing_enabled)
+                || in_.repo.is_empty()
+                || done.contains(&in_.group)
+            {
                 continue;
             }
             done.insert(in_.group.clone());
-            let (exists, checked) = check(in_.repo.clone(), in_.prompt_file.clone()).await;
-            if !checked {
-                // Inconclusive (mirror not synced yet / a transient git error): the result map REPLACES
-                // the whole stored map, so omitting this group would DROP a flag a prior conclusive pass
-                // already surfaced. Carry the prior flag forward so "cannot verify" preserves, never
-                // clears.
-                let prior = self.prior_file(&in_.group);
-                if !prior.is_empty() {
-                    out.insert(in_.group.clone(), prior);
-                }
-            } else if !exists {
-                let msg = format!(
-                    "prompt_file {:?} not found or empty in {} — runs use the inline prompt",
-                    in_.prompt_file,
-                    repo_label(&in_.repo)
-                );
-                out.entry(in_.group.clone()).or_default().push(msg.clone());
-                tracing::debug!(repo = %in_.repo, project_name = %in_.name, prompt_file = %in_.prompt_file, "{msg}");
+            let mut files = Vec::new();
+            if !in_.prompt_file.is_empty() {
+                files.push((in_.prompt_file.as_str(), false));
             }
-            // exists && checked: file is present → emit nothing (a fixed file clears its prior flag).
+            if in_.landing_enabled {
+                files.push((".rhapsody/landing.yaml", true));
+            }
+            for (file, landing) in files {
+                let (exists, checked) = check(in_.repo.clone(), file.into(), landing).await;
+                if !checked {
+                    // Inconclusive (mirror not synced yet / a transient git error): the result map REPLACES
+                    // the whole stored map, so omitting this group would DROP a flag a prior conclusive pass
+                    // already surfaced. Carry the prior flag forward so "cannot verify" preserves, never
+                    // clears.
+                    let prior: Vec<_> = self
+                        .prior_file(&in_.group)
+                        .into_iter()
+                        .filter(|warning| warning.starts_with("landing enabled") == landing)
+                        .collect();
+                    if !prior.is_empty() {
+                        out.entry(in_.group.clone()).or_default().extend(prior);
+                    }
+                } else if !exists {
+                    let msg = if landing {
+                        "landing enabled but no .rhapsody/landing.yaml".into()
+                    } else {
+                        format!(
+                            "prompt_file {:?} not found or empty in {} — runs use the inline prompt",
+                            in_.prompt_file,
+                            repo_label(&in_.repo)
+                        )
+                    };
+                    out.entry(in_.group.clone()).or_default().push(msg.clone());
+                    tracing::debug!(repo = %in_.repo, project_name = %in_.name, prompt_file = %in_.prompt_file, "{msg}");
+                }
+                // exists && checked: file is present → emit nothing (a fixed file clears its prior flag).
+            }
         }
         out
     }
@@ -525,12 +546,12 @@ fn repo_label(repo_url: &str) -> String {
     seg.to_string()
 }
 
-/// Reports whether any project carries a repo-relative prompt_file worth a mirror check — lets the
-/// worker-exit path skip spawning a resolver when nothing can flag. Mirrors Go `hasPromptFileInputs`.
-fn has_prompt_file_inputs(inputs: &[ProjectWarnInput]) -> bool {
+/// Reports whether any project needs a mirror file check. Extends Go `hasPromptFileInputs` with
+/// landing contracts, which need a worker-exit refresh even when the prompt is inline.
+fn has_mirror_file_inputs(inputs: &[ProjectWarnInput]) -> bool {
     inputs
         .iter()
-        .any(|in_| !in_.prompt_file.is_empty() && !in_.repo.is_empty())
+        .any(|in_| (!in_.prompt_file.is_empty() || in_.landing_enabled) && !in_.repo.is_empty())
 }
 
 /// Captures the warning resolver's inputs from an effective config, on the control task (reload)
@@ -546,6 +567,9 @@ pub(crate) fn project_warn_inputs(eff: &Effective) -> Vec<ProjectWarnInput> {
             name: p.name.clone(),
             repo: p.repo.clone(),
             prompt_file: String::new(),
+            landing_enabled: eff.cfg.projects.iter().any(|config| {
+                config.slugs.contains(&p.slug) && config.landing.as_ref().is_some_and(|l| l.enabled)
+            }),
         };
         let pf = p.prompt_file.trim();
         if !pf.is_empty() && !is_host_prompt_path(pf) {
@@ -570,9 +594,15 @@ impl Orchestrator {
     /// nil-workspace guard — this is always `Some`).
     pub(crate) fn prompt_file_checker_for(&self, eff: &Effective) -> Option<PromptFileChecker> {
         let ws = Arc::clone(&eff.workspace);
-        Some(Box::new(move |repo, rel| {
+        Some(Box::new(move |repo, rel, landing| {
             let ws = Arc::clone(&ws);
-            Box::pin(async move { ws.prompt_file_in_repo(&repo, &rel).await })
+            Box::pin(async move {
+                if landing {
+                    ws.landing_contract_in_repo(&repo).await
+                } else {
+                    ws.prompt_file_in_repo(&repo, &rel).await
+                }
+            })
         }))
     }
 
@@ -619,10 +649,9 @@ impl Orchestrator {
         });
     }
 
-    /// Recomputes ONLY the prompt-file producer off the control task. The worker-exit path uses it so
-    /// the missing-prompt-file flag surfaces after the first mirror sync WITHOUT re-running the Linear
-    /// slug producer. A no-op when nothing carries a repo-relative prompt_file. Mirrors Go
-    /// `refreshPromptFileWarnings`.
+    /// Recomputes ONLY the mirror-file producer off the control task. The worker-exit path uses it so
+    /// missing prompt files and landing contracts surface after the first mirror sync WITHOUT
+    /// re-running the Linear slug producer. Extends Go `refreshPromptFileWarnings` for landing.
     pub(crate) fn refresh_prompt_file_warnings(
         &self,
         inputs: Vec<ProjectWarnInput>,
@@ -631,7 +660,7 @@ impl Orchestrator {
         let Some(ctx) = self.ctx.clone() else {
             return;
         };
-        if checker.is_none() || !has_prompt_file_inputs(&inputs) {
+        if checker.is_none() || !has_mirror_file_inputs(&inputs) {
             return;
         }
         let generation = self.warnings.bump_file_gen();
@@ -695,7 +724,7 @@ mod tests {
 
     /// Wraps a synchronous `repo -> (exists, checked)` verdict into an async [`PromptFileChecker`].
     fn checker_from(f: impl Fn(&str) -> (bool, bool) + Send + Sync + 'static) -> PromptFileChecker {
-        Box::new(move |repo, _rel| {
+        Box::new(move |repo, _rel, _landing| {
             let verdict = f(&repo);
             let fut: CheckFut = Box::pin(async move { verdict });
             fut
@@ -811,6 +840,41 @@ mod tests {
         assert!(
             o.warnings
                 .compute_prompt_file(&inputs, None)
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn landing_advisory_requires_enabled_and_a_conclusive_missing_contract() {
+        let warnings = WarningsState::default();
+        let mut input = warn_input_file("app", "App", "https://github.com/o/r.git", "");
+        input.landing_enabled = true;
+        let absent = checker_from(|_| (false, true));
+        assert_eq!(
+            warnings
+                .compute_prompt_file(&[input.clone()], Some(&absent))
+                .await["app"],
+            vec!["landing enabled but no .rhapsody/landing.yaml"]
+        );
+        let present = checker_from(|_| (true, true));
+        assert!(
+            warnings
+                .compute_prompt_file(&[input.clone()], Some(&present))
+                .await
+                .is_empty()
+        );
+        let unknown = checker_from(|_| (false, false));
+        assert!(
+            warnings
+                .compute_prompt_file(&[input.clone()], Some(&unknown))
+                .await
+                .is_empty()
+        );
+        input.landing_enabled = false;
+        assert!(
+            warnings
+                .compute_prompt_file(&[input], Some(&absent))
                 .await
                 .is_empty()
         );
@@ -963,6 +1027,60 @@ mod tests {
             o.project_warnings_for("g").len(),
             2,
             "a no-prompt-file refresh must be a no-op"
+        );
+    }
+
+    #[tokio::test]
+    async fn worker_exit_refreshes_landing_advisory_for_inline_prompt_project() {
+        let tr: Arc<dyn Tracker> = Arc::new(Fake::new());
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.ctx = Some(CancelWait::default());
+        let mut eff = crate::testsupport::empty_effective(Arc::clone(&tr));
+        let mut p = empty_resolved_project("g", tr);
+        p.repo = "git@github.com:org/repo.git".into();
+        eff.projects = vec![p];
+        eff.cfg.projects.push(rhapsody_config::Project {
+            slugs: vec!["g".into()],
+            landing: Some(crate::landing::tests::config()),
+            ..Default::default()
+        });
+        let inputs = project_warn_inputs(&eff);
+        assert!(inputs[0].prompt_file.is_empty());
+        assert!(inputs[0].landing_enabled);
+        o.eff = Some(eff);
+        o.refresh_project_warnings(inputs.clone(), None, Some(checker_from(|_| (false, false))));
+        wait_wg(&o.wg).await;
+        assert!(
+            o.project_warnings_for("g").is_empty(),
+            "initial unsynced mirror is inconclusive"
+        );
+
+        // The normal worker-exit refresh after the first mirror sync must now surface the advisory.
+        o.refresh_prompt_file_warnings(
+            inputs.clone(),
+            Some(Box::new(|_, file, landing| {
+                assert_eq!(file, ".rhapsody/landing.yaml");
+                assert!(landing);
+                Box::pin(async { (false, true) })
+            })),
+        );
+        wait_wg(&o.wg).await;
+        assert_eq!(
+            o.project_statuses()[0].warnings,
+            vec!["landing enabled but no .rhapsody/landing.yaml"]
+        );
+
+        o.refresh_prompt_file_warnings(inputs.clone(), Some(checker_from(|_| (false, false))));
+        wait_wg(&o.wg).await;
+        assert_eq!(
+            o.project_warnings_for("g"),
+            vec!["landing enabled but no .rhapsody/landing.yaml"]
+        );
+        o.refresh_prompt_file_warnings(inputs, Some(checker_from(|_| (true, true))));
+        wait_wg(&o.wg).await;
+        assert!(
+            o.project_warnings_for("g").is_empty(),
+            "adding the contract clears the advisory"
         );
     }
 

@@ -216,6 +216,12 @@ the `Orchestrator` struct itself. Concretely:
     CI merge gates. Peer-review introduction round-trips the existing ControlHandle seam with a
     landing-only origin. Child landings bypass their parent/queued siblings, but do not move the
     original ticket to Done or run its acceptance checklist. Only their verified Done reopens it.
+    STUDIO-1252 serializes operator actions and acceptance-result application in that same task.
+    Control reserves operator admission before off-loop actions so Held retry cannot race auto-merge.
+    Acceptance dispatch round-trips Event::LandingDispatch through the ordinary worker/run ledger;
+    land runs use a pinned checkout, a host prompt and the dedicated read-only Harness entry point.
+    Their landing.verdict event is durable before run end, and landing owns their restart recovery
+    rather than tracker retries. Drain gates this dispatch independently of deterministic checks.
 
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from

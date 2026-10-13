@@ -21,6 +21,9 @@ impl Store for Noop {
     fn load_open_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
         Ok(Vec::new())
     }
+    fn list_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
+        Ok(Vec::new())
+    }
     fn get_landing(&self, _id: i64) -> Result<Option<LandingRow>, StoreError> {
         Ok(None)
     }

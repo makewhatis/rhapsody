@@ -2256,6 +2256,25 @@ export async function fetchReviews(): Promise<ReviewsResponse> {
   return r;
 }
 
+export interface LandingView {
+  id: number;
+  project_slug: string;
+  ticket: string;
+  pr: string;
+  phase: string;
+  phase_since_s: number | null;
+  phase_age_s: number | null;
+  first_failing_check: string | null;
+  hold_reason: string | null;
+  revert_of?: number | null;
+  pausing_auto_merge: string[];
+}
+
+export async function fetchLandings(): Promise<LandingView[]> {
+  const response = await getJSON<{ landings: LandingView[] }>("/api/v1/landings");
+  return response.landings ?? [];
+}
+
 // postReviewRerun asks the daemon for one more review round of a WATCHED pull request. It is the
 // TRUSTED operator lever (design §15-e): the daemon re-validates the coordinate — including the
 // watched-repo allowlist — and can only ever re-arm a row that already exists, so this cannot

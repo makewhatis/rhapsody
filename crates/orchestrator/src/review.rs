@@ -246,7 +246,9 @@ pub fn is_non_tracker_key(id: &str) -> bool {
     // Subject ledgers canonicalize ticket-like strings to uppercase; role rendering still uses
     // the original, case-sensitive key predicates, but lookup exclusion must survive that fold.
     let id = id.to_ascii_lowercase();
-    is_review_key(&id) || crate::managerrun::is_manager_key(&id)
+    is_review_key(&id)
+        || crate::managerrun::is_manager_key(&id)
+        || crate::landing::is_landing_key(&id)
 }
 
 #[cfg(test)]
