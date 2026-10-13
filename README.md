@@ -34,6 +34,22 @@ expected failure as success. Do not enable this feature for ordinary test runs. 
 checkout-scoped test processes before testing and checks for new survivors on every job exit;
 it names and cleans up leaks while preserving pre-existing processes and other checkouts.
 
+## Features
+
+- **Opt-in [Landing](LANDING.md):** observe the merged application revision, watch repo-owned
+  HTTP/command checks, and complete or reopen the ticket with evidence. Automatic revert and
+  post-deploy acceptance/operator controls are coming in L3/L4.
+
+## WORKFLOW.md configuration
+
+Landing is configured with `projects[].landing` in WORKFLOW.md's YAML front matter, not in
+`teams.yaml`. The [Landing configuration reference](LANDING.md#workflowmd-configuration-reference)
+lists all eight keys (`enabled`, `auto_revert`, `deploy_timeout`, `watch`, `failure_threshold`,
+`revert_review`, `state`, `env_file`), their defaults, validation and rollout availability.
+It also covers the [repo-owned contract](LANDING.md#contract-reference) and two tested examples.
+An absent block leaves merge completion unchanged; `enabled` defaults to `false` even when the
+block is present. The feature requires the Teams ticketless merge watcher and enabled persistence.
+
 ## Claude Code plugin
 
 This repo is also a Claude Code **marketplace**. `plugin/` ships the skills that describe how to
@@ -82,7 +98,30 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
-Landing (opt-in, schema 38): see docs/landing.md (guide follows in L5).
+### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1251)
+
+Landing is **Rhapsody-only, with no Go counterpart**. Per-project `projects[].landing` in
+WORKFLOW.md opts watched ticket merges into deploy verification instead of immediate
+`review.done_state` completion. The merged commit's `.rhapsody/landing.yaml` supplies an HTTP or
+command live probe and checks; the daemon confirms the reported revision contains the merge,
+watches checks with per-check consecutive-failure thresholds, and posts timestamped observations.
+Success completes the ticket (or leaves tracker state unchanged when `done_state` is unset).
+Deploy timeout, an invalid contract or a contract deleted by the merge holds with evidence;
+a repo without a contract before or after the merge explicitly records that deployment was not
+observed. A post-deploy checklist parks in AwaitingAcceptance until the L4 agent is available.
+
+Migration **38** adds `rhapsody_landing` and `rhapsody_landing_project` for phases, merge/revert
+coordinates, absolute deadlines, check samples and restart-safe pending effects. Durable merge
+admission pauses auto-merge per WORKFLOW project group before GitHub is invoked; watched human
+merges queue behind the current landing. Off-loop checks continue during drain and restart
+recovery keeps the original watch window and deduplicates evidence comments.
+
+**L2 reopens check failures with REVIEW FEEDBACK without reverting**, even with the default
+`auto_revert: true`. Auto-revert is coming in L3; the read-only acceptance agent, landing API,
+project advisory and console badge are coming in L4. The [operational guide](LANDING.md)
+documents availability, every config/contract field, worked examples and migration precautions.
+With landing absent or disabled, merge completion and auto-merge behavior are unchanged; the
+Go-owned tables, config/API golden shapes and fixture normalization are untouched.
 
 ### Hindsight recall deadlines and failure diagnostics (STUDIO-1253)
 

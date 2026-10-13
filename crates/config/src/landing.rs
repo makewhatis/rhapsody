@@ -335,6 +335,74 @@ mod tests {
         })
     }
 
+    fn landing_guide() -> String {
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../LANDING.md"))
+            .expect("the operational landing guide must exist")
+    }
+
+    fn documented_yaml<'a>(guide: &'a str, example: &str) -> &'a str {
+        guide
+            .split_once(&format!("<!-- landing-example:{example} -->"))
+            .expect("worked example marker")
+            .1
+            .split_once("```yaml\n")
+            .expect("worked example YAML fence")
+            .1
+            .split_once("\n```")
+            .expect("closed YAML fence")
+            .0
+    }
+
+    #[test]
+    fn landing_guide_worked_contracts_parse() {
+        let guide = landing_guide();
+        for example in ["http", "gitops"] {
+            let contract = parse_contract(documented_yaml(&guide, example))
+                .unwrap_or_else(|e| panic!("{example} contract: {e}"));
+            assert!(!contract.checks.is_empty(), "{example} needs health checks");
+            assert!(matches!(
+                (&contract.live, example),
+                (CheckSpec::Http(_), "http") | (CheckSpec::Command(_), "gitops")
+            ));
+        }
+    }
+
+    #[test]
+    fn landing_guide_documents_config_defaults_and_all_fields() {
+        let guide = landing_guide();
+        let documented = config(documented_yaml(&guide, "defaults")).unwrap();
+        let defaults = config("projects: [{slugs: [app], landing: {}}]").unwrap();
+        assert_eq!(documented.projects[0].landing, defaults.projects[0].landing);
+        let keys = serde_yaml_ng::to_value(defaults.projects[0].landing.as_ref().unwrap()).unwrap();
+        for key in keys.as_mapping().unwrap().keys() {
+            let key = key.as_str().unwrap();
+            assert!(
+                guide.contains(&format!("| `{key}` |")),
+                "missing landing.{key}"
+            );
+        }
+        for field in [
+            "version",
+            "live",
+            "checks",
+            "name",
+            "http",
+            "command",
+            "every",
+            "timeout",
+            "expect_stdout",
+            "url",
+            "status",
+            "headers",
+            "body_contains",
+        ] {
+            assert!(
+                guide.contains(&format!("| `{field}` |")),
+                "missing contract {field}"
+            );
+        }
+    }
+
     #[test]
     fn landing_absent_means_disabled_and_defaults_apply_when_present() {
         assert!(
