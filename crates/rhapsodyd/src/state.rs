@@ -211,6 +211,16 @@ impl DaemonState {
 
 #[async_trait]
 impl StateProvider for DaemonState {
+    async fn landings(&self) -> Result<rhapsody_orchestrator::landing::LandingsView, String> {
+        self.handle.landings().await
+    }
+    async fn landing_action(
+        &self,
+        id: i64,
+        action: rhapsody_orchestrator::landing::LandingAction,
+    ) -> rhapsody_orchestrator::landing::LandingActionOutcome {
+        self.handle.landing_action(id, action).await
+    }
     fn lead_harnesses(
         &self,
     ) -> Option<Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>> {

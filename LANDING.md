@@ -12,10 +12,8 @@ Your application repository owns the deployment-specific scripts and expectation
 
 ## Availability and setup
 
-The shipped L2 implementation provides deploy waiting, watching, evidence, Done/Held/reopen and
-the project landing lock. **Auto-revert is coming in L3. The acceptance agent, operator API,
-missing-contract project advisory and dashboard badge are coming in L4.** Their sections below
-describe the intended behavior and are explicitly marked; they are not available in L2.
+Landing provides deploy waiting, watching, evidence, recovery and the project lock. The read-only
+acceptance agent, operator API, missing-contract advisory and dashboard badge are available with L4.
 
 1. Use the Teams ticketless review watcher (`review.mode: ticketless` in `teams.yaml`), with a
    watched PR linked to a ticket this daemon ran. Landing takes over that watcher's merge-to-Done
@@ -29,8 +27,8 @@ describe the intended behavior and are explicitly marked; they are not available
    Name `review.done_state` in `teams.yaml` if successful landings should move tickets to Done.
    With it unset, landing still posts evidence but leaves tracker state alone.
 
-In L2, avoid adding a `## Post-deploy acceptance` checklist unless you intend to park for a human:
-it enters `AwaitingAcceptance`, keeps the project lock, and has no agent to finish it until L4.
+A `## Post-deploy acceptance` checklist enters `AwaitingAcceptance` and keeps the project lock
+until the lander finishes. Keep acceptance items concrete and observable through read-only tools.
 
 ## Lifecycle
 
@@ -85,7 +83,7 @@ parent and counts as absent before. A contract must be a regular file, not a sym
 | Absent | Absent | No live probe or checks. Done, or AwaitingAcceptance if a checklist exists. Evidence says `no landing contract: the deploy was not observed`. |
 
 Enabling landing alone is therefore **not proof of deployment**. Add and validate the contract.
-The `GET /api/v1/projects` advisory for enabled projects without a contract is coming in L4.
+`GET /api/v1/projects` advises when landing is enabled without a `.rhapsody/landing.yaml` contract.
 
 ## WORKFLOW.md configuration reference
 
@@ -316,12 +314,15 @@ lands successfully does the original ticket reopen with REVIEW FEEDBACK. A confl
 a failed revert landing goes Held and escalates to a lead/human. **At most one automatic revert
 per landing**: there is no revert-of-revert loop. `auto_revert: false` reopens directly.
 
-### Post-deploy acceptance (agent coming in L4)
+### Post-deploy acceptance
 
 A ticket may include a `## Post-deploy acceptance` section with Markdown checklist items.
-After deterministic checks pass, it enters `AwaitingAcceptance`. L4 will dispatch a read-only
+After deterministic checks pass, it enters `AwaitingAcceptance`. The daemon dispatches a read-only
 `lander` run keyed `land:<owner>/<repo>#<pr>`, given the checklist and existing evidence. It cannot
-push or open PRs; it verifies each item and posts one comment with evidence and a pass/fail verdict.
+push, open PRs or edit tickets. The host validates its per-item evidence and verdict and posts one
+acceptance comment. The built-in profile currently selects Claude with Read/Glob/Grep/WebFetch/
+WebSearch only: no shell, edit tools, MCP servers or project settings. Unsupported harnesses refuse
+the read-only startup instead of falling back to a coding session.
 No checklist means no agent or token cost. Unmet items fail the landing. Drain pauses new landing
 agent dispatches; deterministic checks continue while draining.
 
@@ -335,31 +336,36 @@ Avoid overlapping human merges if you need checks to attribute failure to exactl
 
 The store's open phases are `WaitingForDeploy`, `Watching`, `AwaitingAcceptance` and `Reverting`.
 Done, Held and Reopened are terminal and release the lock; **Held is not a deployment freeze**.
-In particular, L2's parked AwaitingAcceptance keeps the lock until it can be resolved.
+In particular, a stuck AwaitingAcceptance keeps the lock until it is resolved.
 
 Migration 38 adds `rhapsody_landing` and `rhapsody_landing_project`. Rows retain merge/revert
 coordinates, phase, absolute deadlines, results and pending effects. A restart resumes the
 existing window rather than granting a fresh one. Deterministic checks run off the control loop
 and continue during a drain. Do not edit the database to force a phase transition.
 
-## Operator API (coming in L4)
+## Operator API
 
-These endpoints and the ticket-card badge are **not implemented in L2**. Until L4, inspect the
-ticket evidence and the database read below; a 404 from a landing route is not an empty listing.
+The listing includes every open landing plus the latest 200 terminal rows, so Held recovery IDs
+remain discoverable. Phase age uses persisted `phase_since_s`, not the last check's update time;
+older rows without that timestamp report an unknown age. `pausing_auto_merge` names watched PRs
+whose auto-merge is paused by that landing's project lock.
 
-| Endpoint | Intended operation |
+| Endpoint | Operation |
 |---|---|
-| `GET /api/v1/landings` | List landings, phases and evidence. |
-| `POST /api/v1/landings/{id}/retry` | Retry a held/failed landing after its underlying issue is fixed. |
-| `POST /api/v1/landings/{id}/skip` | Mark Done with an explicit `skipped by operator` evidence record. Skipping is an override, not a passed check. |
-| `POST /api/v1/landings/{id}/stop` | Cancel a pending revert. |
+| `GET /api/v1/landings` | List phases, phase age, first failing check, hold reason and paused PRs. |
+| `POST /api/v1/landings/{id}/retry` | Held only: restore the recorded prior phase with fresh deadlines, reset fetch state and retain all revert linkage. Refuse if another landing owns the project lock or the merged commit has an immutable contract problem. |
+| `POST /api/v1/landings/{id}/skip` | WaitingForDeploy, Watching, AwaitingAcceptance or Held: Done with `skipped by operator` evidence and the normal non-revert `done_state` move. This is an override, not a passed check. Reverting requires stop instead. |
+| `POST /api/v1/landings/{id}/stop` | Reverting only, with an unmerged recovery PR: close it with an operator-stop comment, then Held. Refuse once merged. |
 
 L4 operator writes use the shared loopback operator-write guard: target
 `http://127.0.0.1:<daemon-port>`, send `X-Rhapsody-Operator: 1` and JSON, and omit cookies.
-The dashboard/desktop client will provide this posture. Bad IDs or phase-incompatible operations
-return 404/409; consult the shipped API for permitted phase transitions when L4 lands.
-The badge will show phase and the first failing check; `/api/v1/projects` will advise on enabled
-projects missing a contract.
+Unknown IDs return 404; incompatible phases return 409 with a reason. Retrying a held revert child
+also restores its parent to Reverting when that child caused the parent hold. A recorded recovery
+PR or child is reused, never replaced by a second automatic revert. Older Held rows whose prior
+phase was never recorded refuse retry; skip remains available.
+The badge shows phase and the first failing check, plus "auto-merge paused" when PRs are paused.
+`/api/v1/projects` advises on enabled projects missing a contract. Lock refusals log at INFO once
+per PR/head, rather than on every tick.
 
 ## Read real state
 
@@ -373,7 +379,7 @@ When investigating a Kubernetes result, enumerate pods and target **pods by name
 with `-c`), as the live example does. `kubectl logs deployment/app` can silently select a different
 pod from the one you meant to inspect. Use logs to explain observed state, not replace it.
 
-For Rhapsody itself, prefer the landing API once L4 is available. The durable L2 state can be read
+For Rhapsody itself, prefer the landing API. The durable state can also be read
 without changing it (substitute your actual `storage.path`):
 
 ```sh

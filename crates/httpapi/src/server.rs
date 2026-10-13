@@ -43,6 +43,7 @@ use crate::handlers_history::{
     handle_run_provenance, handle_run_transcript, handle_stderr_download,
     handle_transcript_download,
 };
+use crate::handlers_landings::{handle_landing_action, handle_landings};
 use crate::handlers_linear::{handle_linear_identity, handle_linear_projects};
 use crate::handlers_logs::{handle_log_stream, handle_logs};
 use crate::handlers_manager::handle_investigate;
@@ -90,6 +91,16 @@ use crate::web::{WebDist, serve_web};
 /// Every handler tests against a fake, exactly as Go's `server_test.go` uses `fakeProvider`.
 #[async_trait]
 pub trait StateProvider: Send + Sync {
+    async fn landings(&self) -> Result<rhapsody_orchestrator::landing::LandingsView, String> {
+        Ok(rhapsody_orchestrator::landing::LandingsView::default())
+    }
+    async fn landing_action(
+        &self,
+        _id: i64,
+        _action: rhapsody_orchestrator::landing::LandingAction,
+    ) -> rhapsody_orchestrator::landing::LandingActionOutcome {
+        rhapsody_orchestrator::landing::LandingActionOutcome::NotFound
+    }
     /// Notification persistence only (STUDIO-1145). The history surface remains read-only.
     fn notification_store(&self) -> Option<Arc<dyn rhapsody_store::Store + Send + Sync>> {
         None
@@ -948,6 +959,19 @@ where
             operator_write(handle_review_dismiss),
         )
         .route("/api/v1/reviews/clear", operator_write(handle_review_clear))
+        .route("/api/v1/landings", any(handle_landings))
+        .route(
+            "/api/v1/landings/{id}/retry",
+            operator_write(handle_landing_action),
+        )
+        .route(
+            "/api/v1/landings/{id}/skip",
+            operator_write(handle_landing_action),
+        )
+        .route(
+            "/api/v1/landings/{id}/stop",
+            operator_write(handle_landing_action),
+        )
         // The manager run's host-served reads (STUDIO-1014; Rhapsody-only, no Go v0.4.0
         // counterpart). Read-only GETs the `--role manager` MCP facade proxies; the coordinate is
         // the run's own `run_id`. `/api/v1/manager/pr/activity` and `/pr/commits` are more specific
