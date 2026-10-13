@@ -45,7 +45,7 @@ pub struct EventRecord {
 /// The worker-machinery fields Go carries here — the cancellation handle (`cancel`), the per-run
 /// operator-message mailbox (`mailbox`, INF-250), and the dispatch span context
 /// (`dispatchSpanContext`) — need types that arrive with the worker (O3) and telemetry (P6); they
-/// are added by those tickets. Every field below is control-task-owned.
+/// are added by those tickets. Fields are control-task-owned except the worker emission watermark.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunningEntry {
     pub issue: rhapsody_core::Issue,
@@ -159,6 +159,8 @@ pub struct RunningEntry {
     pub last_event: String,
     pub last_message: String,
     pub last_event_at: DateTime<Utc>,
+    /// Worker-stamped liveness, independent of the control loop's applied event/history time.
+    pub(crate) worker_emit_time: crate::liveness::WorkerEmitTime,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
@@ -272,6 +274,7 @@ impl RunningEntry {
             last_event: String::new(),
             last_message: String::new(),
             last_event_at: zero_time(),
+            worker_emit_time: crate::liveness::WorkerEmitTime::default(),
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,

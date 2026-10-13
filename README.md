@@ -252,7 +252,7 @@ watch rows stay dismissed. Lead/manager suppression and ticket stop/resume's mov
 are unchanged. This review-only behavior has no frozen Go counterpart; API shapes, schema and
 goldens are unchanged.
 
-### Bounded CPU-based stall liveness and tool waits (STUDIO-1177, STUDIO-1208)
+### Bounded CPU-based stall liveness and tool waits (STUDIO-1177, STUDIO-1208, STUDIO-1262)
 
 Silent workers now renew CPU liveness only when positive process-group CPU time exceeds
 `agent.stall_cpu_threshold` of elapsed wall time (default `0.05`, 5% of one core; valid range
@@ -271,15 +271,24 @@ event-silence rule applies again. Outcomes, reason strings and retries are uncha
 Once STUDIO-1208 ships, the operator can restore `stall_timeout_ms` to `300000` from the temporary
 `2700000` mitigation in WORKFLOW.md. This change does not rewrite that operator-owned configuration.
 
-A failed sampler logs once per run and grants one stall window from the first failed sample.
-Persistent failure then uses stream events alone, rather than Go's perpetual assume-alive rule.
+A failed sampler logs once per run and grants **twice** the configured stall window from the first
+failed sample. Persistent failure then uses stream events with the same doubled silence window,
+rather than Go's perpetual assume-alive rule. This gives saturated hosts extra time without granting
+unbounded liveness; successful measured recovery restores the configured window.
 Recovery establishes a fresh baseline, retaining the original bounded failure grace until a full
 CPU interval can be measured; new process groups also establish fresh baselines. CPU sampling is
-an extra signal on Linux; macOS uses events and open tools. Descendant presence alone is not liveness:
-an idle MCP server can exist while the model stream is dead.
-Event timestamps, disabled stall detection, persisted `failed` / `stalled` taxonomy and exponential
-failure retries are unchanged. The threshold round-trips through config encode/decode but is omitted
-from the Go-owned config JSON view; schemas, payload goldens and fixtures are untouched.
+an extra signal on **Linux only**: the sampler reads `/proc/<pid>/stat`, which macOS does not provide.
+Sampler-unavailable warnings on macOS are expected, independent of permissions or whether the PID is
+a group leader; macOS uses events and open tools with the doubled fallback window. Descendant presence
+alone is not liveness: an idle MCP server can exist while the model stream is dead.
+Stall detection reads a per-run timestamp stamped by the worker **before** queuing each real agent
+event, so a control-loop backlog cannot hide recent work. Applying old queued events does not renew
+that watermark. Synthetic delivery acknowledgements and account/limit-only observations still grant
+no event liveness. API/history event timestamps retain their control-apply semantics; the emission
+watermark is process-local and fresh for every retry. Disabled stall detection, persisted `failed` /
+`stalled` taxonomy and exponential failure retries are unchanged. The threshold round-trips through
+config encode/decode but is omitted from the Go-owned config JSON view; schemas, payload goldens and
+fixtures are untouched.
 
 ### Turn-owned OpenCode HTTP executor (STUDIO-1208; amends STUDIO-1001)
 

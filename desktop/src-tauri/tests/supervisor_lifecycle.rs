@@ -91,25 +91,35 @@ fn runtime_teardown_kills_the_supervised_child() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn assertion_unwind_kills_child_without_restarting_it() {
-    let sup = Supervisor::new(fast_options(fake_daemon(), &[]));
+    let mut opts = fast_options(fake_daemon(), &[]);
+    // Startup speed is not under test: this window outlasts both the readiness wait and CI's
+    // process-level test deadline, while the fast backoff still exposes an unwanted restart.
+    opts.startup_timeout = Duration::from_secs(600);
+    let sup = Supervisor::new(opts);
+    let _guard = SupervisorGuard::new(&sup);
     let test_sup = sup.clone();
     let failed = tokio::spawn(async move {
         let _guard = SupervisorGuard::new(&test_sup);
         test_sup
-            .start(cancel_after(Duration::from_secs(10)))
+            .start(cancel_after(Duration::from_secs(60)))
             .await
             .expect("start");
         panic!("simulated assertion failure after start");
     });
-    assert!(
-        failed
-            .await
-            .expect_err("simulated assertion must fail")
-            .is_panic()
+    let failure = failed.await.expect_err("simulated assertion must fail");
+    assert_eq!(
+        failure.into_panic().downcast_ref::<&str>(),
+        Some(&"simulated assertion failure after start"),
+        "the child must become healthy before the simulated failure"
     );
-    tokio::time::timeout(Duration::from_secs(5), sup.stop())
-        .await
-        .expect("guard must stop the supervisor");
+    // Observe the guard's shutdown; calling stop() here would mask a missing guard stop request.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while sup.status().state != State::Stopped {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("guard must stop the supervisor");
     assert_eq!(sup.status().state, State::Stopped);
     assert_eq!(
         sup.status().restarts,

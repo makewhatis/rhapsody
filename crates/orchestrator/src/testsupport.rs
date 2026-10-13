@@ -442,6 +442,7 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         last_event: String::new(),
         last_message: String::new(),
         last_event_at: epoch,
+        worker_emit_time: crate::liveness::WorkerEmitTime::default(),
         input_tokens: 0,
         output_tokens: 0,
         total_tokens: 0,
