@@ -111,24 +111,42 @@ impl crate::orchestrator::Orchestrator {
         }
     }
 
-    /// Every configured slug in the owning project group participates in the lock. A read error
-    /// refuses merging too: inability to prove there is no landing must not bypass attribution.
-    pub(crate) fn landing_merge_gate(&self, pr: &PrCoord) -> Result<(), String> {
+    /// Durable landing locks still apply after a reload disables new landings.
+    pub(crate) fn landing_lock_groups(&self, pr: &PrCoord) -> Vec<String> {
         let Some(eff) = &self.eff else {
-            return Ok(());
+            return Vec::new();
         };
-        let groups: Vec<_> = eff
-            .projects
+        eff.projects
             .iter()
             .filter(|p| {
                 crate::ghsummons::parse_repo(&p.repo).is_some_and(|(o, r)| {
                     o.eq_ignore_ascii_case(&pr.owner) && r.eq_ignore_ascii_case(&pr.repo)
                 })
             })
-            .map(|p| &p.group)
-            .collect();
+            .map(|p| p.group.clone())
+            .collect()
+    }
+
+    /// Every configured slug in the owning project group participates in the lock. A read error
+    /// refuses merging too: inability to prove there is no landing must not bypass attribution.
+    pub(crate) fn landing_merge_gate(&self, pr: &PrCoord) -> Result<(), String> {
+        let Some(eff) = &self.eff else {
+            return Ok(());
+        };
+        let groups = self.landing_lock_groups(pr);
+        // Operator actions run off-loop with deterministic checks. Reserve admission before
+        // handing them out, so a Held retry cannot race an auto-merge between its read and save.
+        for id in &self.landing_operator_pending {
+            if let Some(row) = self.store().get_landing(*id).map_err(|e| e.to_string())?
+                && eff
+                    .project_by_slug(&row.project_slug)
+                    .is_some_and(|p| groups.contains(&p.group))
+            {
+                return Err("a landing operator action is in progress for this project".into());
+            }
+        }
         for project in &eff.projects {
-            if groups.contains(&&project.group)
+            if groups.contains(&project.group)
                 && self
                     .store()
                     .open_landing_for_project(&project.slug)

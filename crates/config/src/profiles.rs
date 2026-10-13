@@ -64,8 +64,8 @@
 //! effective-build time — dispatch only SELECTS among runners already built.
 //! Slice 4 replaces the selection with real resolution.
 //!
-//! `tools` is parsed and explicitly unused: per-profile tool allowlists are
-//! deferred (they need permission-flag plumbing), not implied.
+//! Ordinary profile `tools` remain metadata. The built-in `lander` is the explicit exception:
+//! landing dispatch uses a dedicated, fail-closed read-only harness entry point.
 
 use std::path::{Path, PathBuf};
 
@@ -359,6 +359,18 @@ const BUILTINS: &[BuiltinProfile] = &[
         capabilities: &["code-review", "adversarial-verify"],
         tools: &[],
         body: include_str!("profiles/builtin/manager.v1.md"),
+    },
+    // A new opt-in role; its read-only launch currently has a Claude adapter only.
+    BuiltinProfile {
+        name: "lander",
+        version: 1,
+        model: "",
+        effort: "",
+        harness: "claude",
+        provider: "",
+        capabilities: &[],
+        tools: &["Read", "Glob", "Grep", "WebFetch", "WebSearch"],
+        body: include_str!("profiles/builtin/lander.v1.md"),
     },
 ];
 
@@ -1151,7 +1163,8 @@ mod tests {
                 ("swe", 3),
                 ("reviewer", 4),
                 // STUDIO-1013: the built-in manager identity's own profile.
-                ("manager", 1)
+                ("manager", 1),
+                ("lander", 1)
             ]
         );
         // Every v2 of a TEAMMATE role teaches the retain half of §5.1, and every v1 predates it.
@@ -1456,12 +1469,17 @@ mod tests {
 
     // ── harness (STUDIO-902) ────────────────────────────────────────────────
 
-    /// ⚠️ The property that keeps this additive: every SHIPPED built-in names no harness, so no
+    /// ⚠️ The property that keeps this additive: every existing built-in names no harness, so no
     /// existing installation changes behaviour until someone writes `harness:` in a profile. The
     /// same rule STUDIO-868's `model`/`effort` follow.
     #[test]
     fn every_shipped_builtin_inherits_the_configured_harness() {
         for b in BUILTINS {
+            if b.name == "lander" {
+                assert_eq!(b.harness, "claude");
+                assert_eq!(b.tools, ["Read", "Glob", "Grep", "WebFetch", "WebSearch"]);
+                continue;
+            }
             assert_eq!(
                 b.harness, "",
                 "built-in {}@{} ships a harness, which would change what an existing \

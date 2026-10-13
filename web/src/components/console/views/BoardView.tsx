@@ -1,4 +1,6 @@
 import { useMemo } from "react";
+import { LandingBadge, landingForTicket } from "../LandingBadge";
+import type { LandingView } from "@/lib/api";
 import {
   Chip,
   ExternalLink,
@@ -57,6 +59,7 @@ import {
 // READ-ONLY by design: a lane is a run status (Done is a tracker state), so dragging a card would imply a tracker write —
 // the console has no write path for it, and the rate limit hit on 2026-09-17 is why it stays out.
 export interface BoardViewProps {
+  landings?: readonly LandingView[];
   /** Every worklist row, review rows included — the board folds them onto their tickets. */
   rows: readonly ConsoleJobRow[];
   /** The live snapshot's held dependents — the board's only dependency edge. */
@@ -89,6 +92,7 @@ export interface BoardViewProps {
 }
 
 export function BoardView({
+  landings = [],
   rows,
   blocked,
   heldForHuman,
@@ -166,6 +170,7 @@ export function BoardView({
             roster={roster}
             fields={fields}
             onOpen={onOpenJob}
+            landings={landings}
           />
         ))}
       </div>
@@ -200,6 +205,7 @@ export function BoardView({
 // One lane. The Running lane also draws the pool: `occupied / max` in its header and one dashed slot
 // per unused seat, so free capacity is visible as absence made concrete.
 function LaneView({
+  landings,
   lane,
   filtered,
   tally,
@@ -211,6 +217,7 @@ function LaneView({
   fields,
   onOpen,
 }: {
+  landings: readonly LandingView[];
   lane: BoardLane;
   filtered: boolean;
   /** The lane's whole-store total from the daemon's tally, or `undefined` when it is not known. */
@@ -262,7 +269,7 @@ function LaneView({
       </header>
       <div className="bcards">
         {lane.cards.map((card) => (
-          <BoardCardView key={card.key} card={card} roster={roster} fields={fields} onOpen={onOpen} />
+          <BoardCardView key={card.key} card={card} roster={roster} fields={fields} onOpen={onOpen} landing={landingForTicket(landings, card.issue)} />
         ))}
         {runs.map((run) => (
           <RunningRunView key={run.key} run={run} roster={roster} onOpen={onOpen} />
@@ -288,11 +295,13 @@ function LaneView({
 // title and status pill are the card's identity and always draw; the assignee, project, harness,
 // review chips and pull request come and go with `fields`.
 function BoardCardView({
+  landing,
   card,
   roster,
   fields,
   onOpen,
 }: {
+  landing?: LandingView;
   card: BoardCard;
   roster: readonly string[];
   fields: BoardCardFields;
@@ -327,6 +336,7 @@ function BoardCardView({
         <Pill variant={card.status}>{card.statusLabel}</Pill>
       </div>
       {card.title === "" ? null : <div className="btitle">{card.title}</div>}
+      {landing ? <div className="bchips"><LandingBadge landing={landing} /></div> : null}
       {showMeta ? (
         <div className="bmeta">
           {!showAssignee && !showHarness ? null : (

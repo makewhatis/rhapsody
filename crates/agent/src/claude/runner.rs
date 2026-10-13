@@ -177,6 +177,32 @@ pub(crate) const CAPABILITIES: HarnessCapabilities = HarnessCapabilities {
 };
 
 impl Harness for Runner {
+    fn start_lander_session(
+        &self,
+        workspace_path: &str,
+        issue: Issue,
+        transcript: Option<Transcript>,
+    ) -> Result<Box<dyn Session>, AgentError> {
+        let (cmd_name, cmd_args) = split_command(&self.cfg.command)?;
+        Ok(Box::new(ClaudeSession {
+            cfg: crate::lander::lander_config(&self.cfg),
+            cmd_name,
+            cmd_args,
+            ws_path: workspace_path.into(),
+            issue,
+            thread_id: Mutex::new(String::new()),
+            turn_n: AtomicI64::new(0),
+            transcript: Mutex::new(transcript),
+            transcript_warned: AtomicBool::new(false),
+            run_id: AtomicI64::new(0),
+            review_head: Mutex::new(String::new()),
+            model_override: Mutex::new(crate::ModelOverride::default()),
+            manager_config_dir: None,
+            manager_credential: None,
+            account_oauth: Mutex::new(None),
+        }))
+    }
+
     fn id(&self) -> HarnessId {
         HarnessId::Claude
     }
@@ -2044,6 +2070,53 @@ mod tests {
             std::env::remove_var("LINEAR_API_KEY");
             std::env::remove_var("KEEP_ME");
         }
+    }
+
+    // STUDIO-1252: pin the actual lander launch, as well as its pure config helper.
+    #[tokio::test]
+    async fn lander_live_launch_has_only_read_tools_and_no_mcp_or_project_settings() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let cwd = make_ws(&root, "land-o-r-1");
+        let (_script_dir, script) = write_fake_claude(
+            "#!/usr/bin/env bash\nprintf '%s\\n' \"$@\" > argv.dump\nhead -n 1 >/dev/null\necho '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}'\necho '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"session_id\":\"s\",\"result\":\"observed live state\"}'\n",
+        );
+        let runner = Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path(),
+            permission_mode: "bypassPermissions".into(),
+            extra_args: vec!["--tools".into(), "Bash".into()],
+            inject_mcp: true,
+            turn_timeout: Duration::from_secs(5),
+            ..Default::default()
+        });
+        let session = runner
+            .start_lander_session(&cwd, issue("land:o/r#1", "land:o/r#1"), None)
+            .unwrap();
+        let (result, error) = session
+            .run_turn("check the live app", None, None, &|_| {})
+            .await;
+        assert!(error.is_none(), "{error:?}");
+        assert_eq!(result.result_text, "observed live state");
+        let argv: Vec<_> = std::fs::read_to_string(format!("{cwd}/argv.dump"))
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--tools", crate::lander::LANDER_TOOLS])
+        );
+        assert!(
+            argv.windows(2)
+                .any(|w| w == ["--mcp-config", r#"{"mcpServers":{}}"#])
+        );
+        assert!(argv.windows(2).any(|w| w == ["--setting-sources", ""]));
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "bypassPermissions" || arg == "Bash")
+        );
     }
 
     // STUDIO-1049 §4.2/§4.3 — the LIVE launch's argv is the manager posture, not merely the pure

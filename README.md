@@ -37,8 +37,8 @@ it names and cleans up leaks while preserving pre-existing processes and other c
 ## Features
 
 - **Opt-in [Landing](LANDING.md):** observe the merged application revision, watch repo-owned
-  HTTP/command checks, and complete or reopen the ticket with evidence. Automatic revert and
-  post-deploy acceptance/operator controls are coming in L3/L4.
+  HTTP/command checks, and complete or reopen the ticket with evidence. Optional read-only
+  post-deploy acceptance, automatic recovery, operator controls and console badges expose the outcome.
 
 ## WORKFLOW.md configuration
 
@@ -111,7 +111,7 @@ refused before model/tool work falls back once to a fresh conversation with one 
 turn, authentication and billing failures retain normal error handling. Ticketless review/manager
 exit policies, Go-owned schemas, payload shapes and parity fixtures are unchanged.
 
-### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1251)
+### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1252)
 
 Landing is **Rhapsody-only, with no Go counterpart**. Per-project `projects[].landing` in
 WORKFLOW.md opts watched ticket merges into deploy verification instead of immediate
@@ -121,7 +121,7 @@ watches checks with per-check consecutive-failure thresholds, and posts timestam
 Success completes the ticket (or leaves tracker state unchanged when `done_state` is unset).
 Deploy timeout, an invalid contract or a contract deleted by the merge holds with evidence;
 a repo without a contract before or after the merge explicitly records that deployment was not
-observed. A post-deploy checklist parks in AwaitingAcceptance until the L4 agent is available.
+observed. A post-deploy checklist holds AwaitingAcceptance and its project lock until acceptance ends.
 
 Migration **38** adds `rhapsody_landing` and `rhapsody_landing_project` for phases, merge/revert
 coordinates, absolute deadlines, check samples and restart-safe pending effects. Durable merge
@@ -129,9 +129,21 @@ admission pauses auto-merge per WORKFLOW project group before GitHub is invoked;
 merges queue behind the current landing. Off-loop checks continue during drain and restart
 recovery keeps the original watch window and deduplicates evidence comments.
 
-**L2 reopens check failures with REVIEW FEEDBACK without reverting**, even with the default
-`auto_revert: true`. Auto-revert is coming in L3; the read-only acceptance agent, landing API,
-project advisory and console badge are coming in L4. The [operational guide](LANDING.md)
+The acceptance run key is `land:owner/repo#number`. The built-in `lander` uses a dedicated Claude
+read-only launch: Read/Glob/Grep/WebFetch/WebSearch, no shell, edits, MCP servers, project settings or
+operator permission overrides. Other adapters refuse this posture instead of starting an ordinary
+coding session. The host validates every checklist item and its evidence, persists the verdict in the
+run ledger, and posts one acceptance comment. Missing, contradictory or unmet evidence takes the
+existing failure/recovery path. No checklist means no dispatch; drain pauses dispatch but keeps checks.
+
+`GET /api/v1/landings` lists all open rows plus the latest 200 terminal rows, including recoverable
+Held IDs. It reports phase age from persisted `phase_since_s` (unknown for older rows) and names
+watched PRs paused by each project lock. Lock refusals log at INFO once per PR/head. Operator-guarded
+retry/skip/stop use per-action phase rules: retry restores Held's recorded prior phase with fresh
+deadlines and preserved revert linkage, skip records an operator override rather than a passed check,
+and stop closes only an unmerged recovery PR. Immutable contract problems refuse retry. The projects
+view advises when landing is enabled without a contract; Board/Jobs badges reuse existing pill tones.
+The [operational guide](LANDING.md)
 documents availability, every config/contract field, worked examples and migration precautions.
 With landing absent or disabled, merge completion and auto-merge behavior are unchanged; the
 Go-owned tables, config/API golden shapes and fixture normalization are untouched.
