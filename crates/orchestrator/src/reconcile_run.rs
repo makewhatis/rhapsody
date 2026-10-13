@@ -261,6 +261,9 @@ impl Orchestrator {
 
         let mut wedged: Vec<String> = Vec::new();
         for (id, re) in self.running.iter_mut() {
+            if re.terminal_result_seen {
+                continue; // runner owns bounded post-result cleanup; never retry a captured result
+            }
             if self.limit_policy.deadlines.contains_key(id) {
                 continue;
             }
@@ -752,6 +755,115 @@ mod tests {
         let mut f = Fake::new();
         f.states_by_ids_func = Some(states_ok(vec![issue("1", "MT-1", "In Progress")]));
         orch_for_reconcile(Arc::new(f), stall)
+    }
+
+    #[tokio::test]
+    async fn stall_detector_does_not_retry_a_run_with_a_terminal_result() {
+        let _serial = TRACING_TEST_LOCK.lock().await;
+        let (logs, subscriber) = recording_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        for is_error in [false, true] {
+            let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+            o.eff.as_mut().unwrap().cpu_sampler = sampler(true, &[(42, &[0])]);
+            let base = utc(2026, 5, 29, 12, 0, 0);
+            let clock = install_clock(&mut o, base);
+            add_running(&mut o, "1", "MT-1", "In Progress", base);
+            let send = |o: &mut Orchestrator, mut ev: agent::Event| {
+                ev.pid = 42;
+                o.on_agent_update(AgentUpdate {
+                    issue_id: "1".into(),
+                    ev,
+                });
+            };
+            send(
+                &mut o,
+                agent::claude::classify(br#"{"type":"system","subtype":"init","session_id":"s"}"#)
+                    .event,
+            );
+            let line = format!(r#"{{"type":"result","subtype":"success","is_error":{is_error}}}"#);
+            send(&mut o, agent::claude::classify(line.as_bytes()).event);
+            // Late nonterminal chatter must not erase receipt of the result.
+            send(
+                &mut o,
+                agent::Event {
+                    event_type: agent::EVENT_NOTIFICATION.into(),
+                    ..Default::default()
+                },
+            );
+            advance(&clock, chrono::Duration::seconds(301));
+            logs.lock().unwrap().clear();
+            o.reconcile_stalled();
+            assert!(
+                o.running.contains_key("1"),
+                "captured result was killed as wedged"
+            );
+            assert!(
+                !o.retry_attempts.contains_key("1"),
+                "captured result was retried"
+            );
+            assert!(
+                !logs
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.message.contains("worker wedged"))
+            );
+
+            // A continuation on the same session is new work, not a sticky run exemption.
+            send(
+                &mut o,
+                agent::claude::classify(br#"{"type":"system","subtype":"init","session_id":"s"}"#)
+                    .event,
+            );
+            advance(&clock, chrono::Duration::seconds(301));
+            o.reconcile_stalled();
+            assert!(
+                !o.running.contains_key("1"),
+                "new resultless turn must still stall"
+            );
+            assert_eq!(o.retry_attempts["1"].err, "stalled");
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_result_stall_exemption_resets_on_pid_and_excludes_synthetic_failure() {
+        for replace_pid in [false, true] {
+            let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+            o.eff.as_mut().unwrap().cpu_sampler = sampler(true, &[(42, &[0]), (99, &[0])]);
+            let base = utc(2026, 5, 29, 12, 0, 0);
+            let clock = install_clock(&mut o, base);
+            add_running(&mut o, "1", "MT-1", "In Progress", base);
+            if replace_pid {
+                let mut result =
+                    agent::claude::classify(br#"{"type":"result","subtype":"success"}"#).event;
+                result.pid = 42;
+                o.on_agent_update(AgentUpdate {
+                    issue_id: "1".into(),
+                    ev: result,
+                });
+            }
+            o.on_agent_update(AgentUpdate {
+                issue_id: "1".into(),
+                ev: agent::Event {
+                    event_type: if replace_pid {
+                        agent::EVENT_NOTIFICATION
+                    } else {
+                        agent::EVENT_TURN_FAILED
+                    }
+                    .into(),
+                    pid: 99,
+                    ..Default::default()
+                },
+            });
+            advance(&clock, chrono::Duration::seconds(301));
+            o.reconcile_stalled();
+            assert!(
+                !o.running.contains_key("1"),
+                "resultless work must retain ordinary stall rules"
+            );
+            assert_eq!(o.retry_attempts["1"].err, "stalled");
+        }
     }
 
     fn sampler(ok: bool, seq: &[(i32, &[u64])]) -> std::sync::Arc<dyn Sampler> {

@@ -8,9 +8,11 @@
 //! (STUDIO-871). stdin is held open as an operator-message mailbox that is continuously drained and
 //! folded into the live turn at the next step boundary, closed the instant the terminal result lands
 //! so nothing is ever written after it (INF-250). The
-//! turn deadline (Go's `context.WithTimeout`) is the single timeout: a hang produces `TurnTimedOut`
+//! turn deadline (Go's `context.WithTimeout`) bounds work without a result: a hang produces `TurnTimedOut`
 //! (the "stalled" lifecycle), exactly as the reference does — the reference has no separate
 //! runner-level "stall timeout" (that knob is orchestrator-level; see `fake_claude_test.go`).
+//! After a result, a bounded exit grace kills lingering background work while preserving the
+//! captured result (STUDIO-1231; intentional divergence from Go's EOF wait).
 //!
 //! Porting shape: Go runs two goroutines (a stdin writer + an stdout scanner) coordinated by a
 //! `stdinDone` channel. Async Rust folds both — plus the stderr drain and the deadline — into ONE
@@ -78,6 +80,9 @@ impl Runner {
         }
         if cfg.turn_timeout.is_zero() {
             cfg.turn_timeout = Duration::from_secs(3600);
+        }
+        if cfg.result_grace.is_zero() {
+            cfg.result_grace = Duration::from_secs(30);
         }
         Runner { cfg }
     }
@@ -414,6 +419,16 @@ impl ClaudeSession {
             );
         }
     }
+
+    fn kill_after_result_grace(&self, pid: u32) {
+        tracing::warn!(
+            run_id = self.run_id.load(Ordering::SeqCst),
+            pid,
+            issue = %self.issue.identifier,
+            "agent result exit grace expired; killing lingering process tree"
+        );
+        kill_tree(pid);
+    }
 }
 
 #[async_trait]
@@ -623,6 +638,7 @@ impl Session for ClaudeSession {
         // system/init of EVERY turn (Go `billingCheckedThisTurn`).
         let mut billing_checked = false;
         let mut terminal_seen = false;
+        let mut result_grace_expired = false;
         let mut timed_out = false;
         let mut stderr_open = true;
         let mut mailbox_open = messages.is_some();
@@ -633,9 +649,17 @@ impl Session for ClaudeSession {
 
         let deadline = tokio::time::sleep_until(Instant::now() + self.cfg.turn_timeout);
         tokio::pin!(deadline);
+        // Inactive until the first result; subsequent output cannot renew this bound.
+        let result_grace = tokio::time::sleep(self.cfg.result_grace);
+        tokio::pin!(result_grace);
 
         'outer: loop {
             tokio::select! {
+                _ = &mut result_grace, if terminal_seen => {
+                    self.kill_after_result_grace(pid);
+                    result_grace_expired = true;
+                    break 'outer;
+                }
                 // Turn deadline: kill the whole process TREE so a hung child (and every command it
                 // launched, wherever it put them) dies and the pipes EOF. A captured result still
                 // wins post-loop.
@@ -713,7 +737,10 @@ impl Session for ClaudeSession {
                                 if c.terminal {
                                     // The terminal result is in: close stdin NOW so the process can
                                     // exit and nothing is ever written after the result (INF-250).
-                                    terminal_seen = true;
+                                    if !terminal_seen {
+                                        result_grace.as_mut().reset(Instant::now() + self.cfg.result_grace);
+                                        terminal_seen = true;
+                                    }
                                     stdin = None;
                                     let mut tr = c.result.clone();
                                     tr.usage = usage;
@@ -775,35 +802,51 @@ impl Session for ClaudeSession {
             }
         }
 
-        // The scan loop has exited (terminal result, EOF, deadline, scan error, or billing abort):
-        // close stdin, drain both pipes so a finishing child never blocks, then reap it. Every exit
-        // path leaves the child already dead (EOF / deadline kill / billing kill) or finishing
-        // finite output (scan error), so this completes promptly without extra deadline bounding.
+        // Close stdin, drain both pipes and reap. A result's SAME grace also bounds stderr and
+        // wait: stdout EOF alone does not prove the CLI (or its background children) exited.
         drop(stdin); // close stdin (idempotent — the terminal branch may already have dropped it)
-        let drain_out = async {
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = stdout.read(&mut buf).await {
-                if n == 0 {
-                    break;
-                }
-            }
-        };
-        let drain_err = async {
-            let mut buf = [0u8; 4096];
-            if stderr_open {
-                loop {
-                    match stderr.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            stderr_buf.write(&buf[..n]);
-                            self.tee_stderr(&buf[..n]);
+        let wait_res = if result_grace_expired {
+            // Drop the pipes rather than waiting for an already-orphaned writer we cannot attribute.
+            child.wait().await
+        } else {
+            let cleanup = async {
+                let drain_out = async {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stdout.read(&mut buf).await {
+                        if n == 0 {
+                            break;
                         }
                     }
+                };
+                let drain_err = async {
+                    let mut buf = [0u8; 4096];
+                    if stderr_open {
+                        loop {
+                            match stderr.read(&mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => {
+                                    stderr_buf.write(&buf[..n]);
+                                    self.tee_stderr(&buf[..n]);
+                                }
+                            }
+                        }
+                    }
+                };
+                tokio::join!(drain_out, drain_err);
+                child.wait().await
+            };
+            if terminal_seen {
+                match tokio::time::timeout_at(result_grace.deadline(), cleanup).await {
+                    Ok(res) => res,
+                    Err(_) => {
+                        self.kill_after_result_grace(pid);
+                        child.wait().await
+                    }
                 }
+            } else {
+                cleanup.await
             }
         };
-        tokio::join!(drain_out, drain_err);
-        let wait_res = child.wait().await;
         tree_kill.disarm(); // reaped — nothing left to signal, and the pid may now be recycled
 
         // Billing abort (a system/init reported a non-"none" apiKeySource): refuse to bill.
@@ -2480,6 +2523,184 @@ mod tests {
             !std::path::Path::new(&survivor).exists(),
             "a process of the stopped run survived the cancellation and kept working ({survivor})"
         );
+    }
+
+    // ── Bounded post-result cleanup (STUDIO-1231) ─────────────────────────────────────────────
+    fn assert_process_dead(pid: i32) {
+        let out = std::process::Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid.to_string()])
+            .output()
+            .expect("ps process state");
+        let state = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            state.trim().is_empty() || state.trim().starts_with('Z'),
+            "process {pid} survived turn cleanup: {state}"
+        );
+    }
+
+    async fn lingering_result_case(close_pipes: &str, is_error: bool) {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-1231");
+        let (_s, script) = write_fake_claude(&format!(
+            "#!/usr/bin/env bash\n\
+             read -r prompt\n\
+             echo $$ > leader.pid\n\
+             set -m\n\
+             sleep 60 >/dev/null &\n\
+             echo $! > child.pid\n\
+             ps -o pgid= -p \"$!\" > child.pgid\n\
+             echo '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}}'\n\
+             echo '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":{is_error},\"result\":\"captured handoff\",\"usage\":{{\"input_tokens\":2,\"output_tokens\":3}}}}'\n\
+             {}\n\
+             wait\n",
+            close_pipes
+        ));
+        let grace = Duration::from_millis(200);
+        let r = Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path(),
+            turn_timeout: Duration::from_secs(60),
+            result_grace: grace,
+            ..Default::default()
+        });
+        let sess = r
+            .start_session(&ws, issue("1231", "MT-1231"), None)
+            .await
+            .expect("start session");
+        sess.set_run_id(1231);
+        let completed_at = Mutex::new(None);
+        let on_event = |ev: Event| {
+            if matches!(
+                ev.event_type.as_str(),
+                EVENT_TURN_COMPLETED | EVENT_TURN_FAILED
+            ) {
+                *completed_at.lock().unwrap() = Some(StdInstant::now());
+            }
+        };
+        let (res, err) = tokio::time::timeout(
+            grace + Duration::from_secs(2),
+            sess.run_turn("p", None, None, &on_event),
+        )
+        .await
+        .expect("a captured result must finish within its exit grace plus cleanup epsilon");
+        let elapsed = completed_at
+            .lock()
+            .unwrap()
+            .expect("result event")
+            .elapsed();
+        assert!(elapsed >= grace, "the live fake must get its exit grace");
+        assert!(elapsed < grace + Duration::from_secs(2));
+        assert_eq!(
+            res.status,
+            if is_error {
+                TURN_FAILED
+            } else {
+                TURN_SUCCEEDED
+            }
+        );
+        assert_eq!(res.result_text, "captured handoff");
+        assert_eq!(res.usage.total_tokens, 5);
+        if is_error {
+            assert!(matches!(err, Some(AgentError::TurnFailed)));
+        } else {
+            assert!(err.is_none(), "captured success changed: {err:?}");
+        }
+        let leader = std::fs::read_to_string(format!("{ws}/leader.pid")).unwrap();
+        let child_group = std::fs::read_to_string(format!("{ws}/child.pgid")).unwrap();
+        assert_ne!(
+            leader.trim(),
+            child_group.trim(),
+            "tool child must escape the CLI group"
+        );
+        for file in ["leader.pid", "child.pid"] {
+            let pid = std::fs::read_to_string(format!("{ws}/{file}"))
+                .expect("fake pid")
+                .trim()
+                .parse()
+                .expect("numeric pid");
+            assert_process_dead(pid);
+        }
+    }
+
+    #[tokio::test]
+    async fn result_then_lingering_process_completes_turn_successfully() {
+        lingering_result_case(":", false).await;
+    }
+
+    #[tokio::test]
+    async fn result_then_stdout_eof_still_bounds_stderr_and_process_cleanup() {
+        lingering_result_case("exec 1>&-", false).await;
+    }
+
+    #[tokio::test]
+    async fn result_then_both_pipes_close_still_bounds_process_wait() {
+        lingering_result_case("exec 1>&- 2>&-", false).await;
+    }
+
+    #[tokio::test]
+    async fn failed_result_then_lingering_process_preserves_failure() {
+        lingering_result_case(":", true).await;
+    }
+
+    #[tokio::test]
+    async fn result_grace_does_not_bound_work_before_a_result() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-1231-WORK");
+        let (_s, script) = write_fake_claude(
+            "read -r prompt\n\
+             echo '{\"type\":\"system\",\"subtype\":\"init\",\"apiKeySource\":\"none\"}'\n\
+             sleep 0.2\n\
+             echo '{\"type\":\"result\",\"subtype\":\"success\"}'\n",
+        );
+        let r = Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path(),
+            turn_timeout: Duration::from_secs(5),
+            result_grace: Duration::from_millis(50),
+            ..Default::default()
+        });
+        let sess = r
+            .start_session(&ws, issue("1231", "MT-1231-WORK"), None)
+            .await
+            .unwrap();
+        let (res, err) = sess.run_turn("p", None, None, &|_| {}).await;
+        assert!(
+            err.is_none(),
+            "work before the result was bounded by exit grace: {err:?}"
+        );
+        assert_eq!(res.status, TURN_SUCCEEDED);
+    }
+
+    #[tokio::test]
+    async fn result_then_prompt_exit_is_unchanged() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-1231-EXIT");
+        let line = br#"{"type":"result","subtype":"success","result":"unchanged","usage":{"input_tokens":2,"output_tokens":3}}"#;
+        let (_s, script) = write_fake_claude(&format!(
+            "read -r prompt\necho '{{\"type\":\"system\",\"subtype\":\"init\",\"apiKeySource\":\"none\"}}'\necho '{}'\n",
+            String::from_utf8_lossy(line)
+        ));
+        let r = Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path(),
+            result_grace: Duration::from_secs(3),
+            ..Default::default()
+        });
+        let sess = r
+            .start_session(&ws, issue("1231", "MT-1231-EXIT"), None)
+            .await
+            .unwrap();
+        let (res, err) = tokio::time::timeout(
+            Duration::from_secs(1),
+            sess.run_turn("p", None, None, &|_| {}),
+        )
+        .await
+        .expect("prompt exit must not wait for grace");
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(res, classify(line).result);
     }
 
     // ── Per-teammate model/effort (STUDIO-868) ──────────────────────────────────────────────────

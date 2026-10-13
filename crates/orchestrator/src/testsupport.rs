@@ -458,6 +458,7 @@ pub(crate) fn running_entry(issue: Issue, project_slug: &str, project_group: &st
         cpu_failure_logged: false,
         open_tool_calls: HashSet::new(),
         tool_turn_finished: true,
+        terminal_result_seen: false,
         recent_events: Vec::new(),
     }
 }

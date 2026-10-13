@@ -97,6 +97,7 @@ impl Orchestrator {
             re.last_cpu_sample_at = zero_time();
             re.cpu_failure_since = None;
             re.open_tool_calls.clear();
+            re.terminal_result_seen = false;
         }
 
         re.recent_events.push(EventRecord {
@@ -112,6 +113,7 @@ impl Orchestrator {
         if e.ev.event_type == agent::EVENT_SESSION_STARTED {
             re.open_tool_calls.clear();
             re.tool_turn_finished = false;
+            re.terminal_result_seen = false;
             if !e.ev.message.is_empty() {
                 re.thread_id = e.ev.message.clone(); // claude session id carried in the init event
             }
@@ -135,6 +137,15 @@ impl Orchestrator {
         ) {
             re.open_tool_calls.clear();
             re.tool_turn_finished = true;
+        }
+        // Result classifiers always supply authoritative usage (even an empty total); synthetic
+        // startup/timeout failures do not. Only a captured result exempts post-turn cleanup.
+        if matches!(
+            e.ev.event_type.as_str(),
+            agent::EVENT_TURN_COMPLETED | agent::EVENT_TURN_FAILED
+        ) && e.ev.usage.is_some()
+        {
+            re.terminal_result_seen = true;
         }
 
         // Token usage has two sources, distinguished by event type, to keep committed totals

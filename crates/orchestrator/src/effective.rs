@@ -380,6 +380,7 @@ fn claude_config_from_cfg(cfg: &Config) -> claude::Config {
         add_dirs: cfg.claude.add_dirs.clone(),
         workspace_root: cfg.workspace.root.clone(),
         turn_timeout: Duration::from_millis(cfg.claude.turn_timeout_ms.max(0) as u64),
+        result_grace: Duration::from_millis(cfg.claude.result_grace_ms.max(0) as u64),
         extra_args: cfg.claude.extra_args.clone(),
         billing_guard: cfg.claude.billing_guard,
         ultracode: cfg.claude.ultracode,

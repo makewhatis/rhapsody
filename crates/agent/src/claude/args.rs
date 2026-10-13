@@ -45,6 +45,8 @@ pub struct Config {
     /// absolute; used for the launch containment invariant
     pub workspace_root: String,
     pub turn_timeout: Duration,
+    /// Post-result process exit grace; zero uses 30 seconds (STUDIO-1231).
+    pub result_grace: Duration,
     /// extra CLI args passed verbatim to the claude process (win last)
     pub extra_args: Vec<String>,
     /// An absent knob (`None`) defaults to enabled (`true`): the child runs with billing env vars
@@ -89,6 +91,7 @@ impl fmt::Debug for Config {
             .field("add_dirs", &self.add_dirs)
             .field("workspace_root", &self.workspace_root)
             .field("turn_timeout", &self.turn_timeout)
+            .field("result_grace", &self.result_grace)
             .field("extra_args", &self.extra_args)
             .field("billing_guard", &self.billing_guard)
             .field("ultracode", &self.ultracode)

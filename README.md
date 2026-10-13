@@ -82,6 +82,18 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Bounded Claude post-result cleanup (STUDIO-1231)
+
+After Claude emits its terminal `result`, the runner waits up to `claude.result_grace_ms`
+(positive milliseconds, default `30000`) for stdout EOF, stderr drain and process exit. At expiry it
+logs the run ID and PID, kills the CLI's process tree (including still-parented background shells),
+and returns the captured status, result text and usage unchanged; billing guards still apply. Normal
+prompt exits do not wait for the grace. Go waits for EOF until the turn deadline, which can leave a
+successful turn hanging behind a background watcher. The orchestrator also excludes captured-result
+cleanup from stall retries, resetting that exemption on a new PID or session/turn start. Turns without
+a result retain their existing deadline and event/tool/CPU liveness rules. Non-default grace settings
+survive config saves but stay out of the Go-owned config JSON view; schemas and goldens are unchanged.
+
 ### Durable next-turn operator messages (STUDIO-1209)
 
 Harnesses without live steering accept operator messages as `queued_next_turn`, rather than
