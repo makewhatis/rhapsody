@@ -148,6 +148,15 @@ documents availability, every config/contract field, worked examples and migrati
 With landing absent or disabled, merge completion and auto-merge behavior are unchanged; the
 Go-owned tables, config/API golden shapes and fixture normalization are untouched.
 
+### Hindsight prefetch freshness (STUDIO-1270)
+
+Worker memory prefetch skips a cached `(identity, ticket)` entry younger than five minutes
+(half its ten-minute TTL), including successful empty answers. Personal and shared-team facts
+refresh together under that entry. Each minute's rotating pass spends at most ten actual bank
+calls, counting both banks; skipped fresh entries spend no calls. Carry-over keeps the original
+timestamp and expiry semantics, bank failures still warn, and dispatch reads only the cache
+without waiting. This Teams-only scheduling change has no frozen Go counterpart.
+
 ### Hindsight recall deadlines and failure diagnostics (STUDIO-1253)
 
 Off-loop Hindsight recall searches allow 15 seconds for the whole request, including response-body
