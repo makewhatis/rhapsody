@@ -2261,6 +2261,7 @@ esac
 case " $* " in
   *' --resume missing-session '*)
     printf '%s\n' 'No conversation found with session ID: missing-session' >&2
+    printf '%s\n' '{{"type":"result","subtype":"error_during_execution","is_error":true,"duration_ms":12,"duration_api_ms":0,"num_turns":0,"session_id":"missing-session","total_cost_usd":0,"usage":{{"input_tokens":0,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}},"modelUsage":{{}},"errors":["No conversation found with session ID: missing-session"]}}'
     exit 1 ;;
 esac
 printf '%s\n' '{{"type":"system","subtype":"init","session_id":"fresh-session","apiKeySource":"none"}}'
