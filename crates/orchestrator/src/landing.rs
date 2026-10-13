@@ -899,6 +899,19 @@ impl LandingRuntime {
         now: i64,
     ) -> Result<(), String> {
         if progress.acceptance_items.is_empty() {
+            // L2 parked this phase before acceptance fields existed. Empty defaults are not
+            // evidence that its ticket had no checklist; recover it before spending or passing.
+            let issue = self
+                .tracker
+                .fetch_issue_by_identifier(&row.ticket)
+                .await
+                .map_err(|e| e.to_string())?
+                .ok_or("acceptance ticket could not be read")?;
+            progress.acceptance_items =
+                acceptance_items(issue.description.as_deref().unwrap_or(""));
+            self.save(row, progress, now)?;
+        }
+        if progress.acceptance_items.is_empty() {
             progress.pending = Some("Done".into());
             progress.acceptance_done = true;
             return self.finish(row, progress, now).await;
@@ -2087,6 +2100,46 @@ pub(crate) mod tests {
         fn progress(&self) -> Progress {
             serde_json::from_str(&self.row().results_json).unwrap()
         }
+    }
+
+    #[tokio::test]
+    async fn l2_awaiting_acceptance_does_not_pass_when_the_ticket_is_unreadable() {
+        let rig = Rig::new("Done");
+        let mut row = rig.row();
+        row.phase = LandingPhase::AwaitingAcceptance;
+        rig.runtime.store.save_landing(row.clone()).unwrap();
+        assert!(rig.runtime.advance(row, 1).await.is_err());
+        assert_eq!(rig.row().phase, LandingPhase::AwaitingAcceptance);
+        assert!(rig.tracker.move_calls().is_empty());
+        assert!(rig.tracker.create_comment_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn l2_awaiting_acceptance_row_recovers_its_checklist_instead_of_passing_unchecked() {
+        let mut rig = Rig::new("Done");
+        let mut tracker = Fake::new();
+        tracker.candidates = vec![rhapsody_core::Issue {
+            id: "ID-1".into(),
+            identifier: "APP-1".into(),
+            description: Some("## Post-deploy acceptance\n- [ ] live UI is healthy".into()),
+            ..Default::default()
+        }];
+        rig.runtime.tracker = Arc::new(tracker);
+        let mut row = rig.row();
+        row.phase = LandingPhase::AwaitingAcceptance;
+        // L2 stored only the phase; it predates all acceptance_* Progress fields.
+        rig.runtime.store.save_landing(row).unwrap();
+        rig.tick(1).await;
+        assert_eq!(rig.row().phase, LandingPhase::AwaitingAcceptance);
+        assert_eq!(rig.progress().acceptance_items, vec!["live UI is healthy"]);
+        assert!(
+            rig.runtime
+                .tracker
+                .list_comments("ID-1")
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
