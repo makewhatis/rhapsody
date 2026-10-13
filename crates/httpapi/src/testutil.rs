@@ -160,6 +160,9 @@ pub(crate) struct FakeProvider {
     /// lever reached the provider (STUDIO-1022).
     review_dismiss_reviewer: Mutex<Option<Option<String>>>,
     review_clear_pr: Mutex<Option<PrCoord>>,
+    landings: rhapsody_orchestrator::landing::LandingsView,
+    landing_outcome: rhapsody_orchestrator::landing::LandingActionOutcome,
+    landing_asked: Mutex<Option<(i64, rhapsody_orchestrator::landing::LandingAction)>>,
     /// The canned outcome `merge_run` returns, and what the last call was asked — how a test
     /// asserts the handler forwarded only the run id and the confirmation (STUDIO-767).
     merge_outcome: Option<MergeControlOutcome>,
@@ -293,6 +296,9 @@ impl FakeProvider {
             review_dismiss_pr: Mutex::new(None),
             review_dismiss_reviewer: Mutex::new(None),
             review_clear_pr: Mutex::new(None),
+            landings: rhapsody_orchestrator::landing::LandingsView::default(),
+            landing_outcome: rhapsody_orchestrator::landing::LandingActionOutcome::NotFound,
+            landing_asked: Mutex::new(None),
             merge_outcome: None,
             merge_asked: Mutex::new(None),
             mergeability_outcome: None,
@@ -557,6 +563,25 @@ impl FakeProvider {
         self.review_outcome = Some(outcome);
         self
     }
+    pub(crate) fn with_landings(
+        mut self,
+        view: rhapsody_orchestrator::landing::LandingsView,
+    ) -> Self {
+        self.landings = view;
+        self
+    }
+    pub(crate) fn with_landing_outcome(
+        mut self,
+        outcome: rhapsody_orchestrator::landing::LandingActionOutcome,
+    ) -> Self {
+        self.landing_outcome = outcome;
+        self
+    }
+    pub(crate) fn landing_asked(
+        &self,
+    ) -> Option<(i64, rhapsody_orchestrator::landing::LandingAction)> {
+        *self.landing_asked.lock().unwrap()
+    }
 
     /// The coordinates the last `review_rerun` / `review_dismiss` / `review_clear` was called with —
     /// how a test asserts the handler forwarded the body's own owner/repo/number and nothing else.
@@ -712,6 +737,19 @@ impl FakeProvider {
 
 #[async_trait]
 impl StateProvider for FakeProvider {
+    async fn landings(&self) -> Result<rhapsody_orchestrator::landing::LandingsView, String> {
+        self.touch();
+        Ok(self.landings.clone())
+    }
+    async fn landing_action(
+        &self,
+        id: i64,
+        action: rhapsody_orchestrator::landing::LandingAction,
+    ) -> rhapsody_orchestrator::landing::LandingActionOutcome {
+        self.touch();
+        *self.landing_asked.lock().unwrap() = Some((id, action));
+        self.landing_outcome.clone()
+    }
     fn lead_harnesses(
         &self,
     ) -> Option<Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>> {

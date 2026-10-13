@@ -372,6 +372,9 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicU64, Ordering};
 
+    // Behavior checks need scheduling headroom; timeout tests supply their own short deadlines.
+    const BEHAVIOR_TIMEOUT: Duration = Duration::from_secs(30);
+
     struct Server {
         url: String,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -386,9 +389,7 @@ mod tests {
             );
             let thread = std::thread::spawn(move || {
                 let (mut socket, _) = listener.accept().unwrap();
-                socket
-                    .set_read_timeout(Some(Duration::from_secs(2)))
-                    .unwrap();
+                socket.set_read_timeout(Some(BEHAVIOR_TIMEOUT)).unwrap();
                 let mut request = [0u8; 4096];
                 let _ = socket.read(&mut request);
                 std::thread::sleep(delay);
@@ -421,14 +422,14 @@ mod tests {
             expect_stdout: expected.map(str::to_string),
         })
     }
-    async fn check(spec: &CheckSpec) -> CheckOutcome {
-        run_check(spec, Path::new("."), &[], Duration::from_secs(2)).await
+    async fn check_behavior(spec: &CheckSpec) -> CheckOutcome {
+        run_check(spec, Path::new("."), &[], BEHAVIOR_TIMEOUT).await
     }
 
     #[tokio::test]
     async fn http_check_passes_on_status_header_present_and_body_contains() {
         let server = Server::new(200, "X-Ready: yes\r\n", "healthy app", Duration::ZERO);
-        let result = check(&http(&server.url)).await;
+        let result = check_behavior(&http(&server.url)).await;
         assert!(result.pass, "{}", result.observed);
         assert!(result.observed.contains("200") && result.observed.contains("x-ready"));
         assert!(result.observed.contains("yes"));
@@ -437,12 +438,12 @@ mod tests {
     #[tokio::test]
     async fn http_header_present_does_not_require_an_ascii_value() {
         let server = Server::new(200, "X-Ready: é\r\n", "healthy", Duration::ZERO);
-        assert!(check(&http(&server.url)).await.pass);
+        assert!(check_behavior(&http(&server.url)).await.pass);
     }
     #[tokio::test]
     async fn http_check_fails_on_wrong_status() {
         let server = Server::new(503, "X-Ready: yes\r\n", "healthy", Duration::ZERO);
-        let result = check(&http(&server.url)).await;
+        let result = check_behavior(&http(&server.url)).await;
         assert!(!result.pass);
         assert!(result.observed.contains("503"));
     }
@@ -459,14 +460,14 @@ mod tests {
             if let CheckSpec::Http(h) = &mut spec {
                 h.headers.insert("x-ready".into(), "ready".into());
             }
-            assert_eq!(check(&spec).await.pass, value == "ready");
+            assert_eq!(check_behavior(&spec).await.pass, value == "ready");
         }
     }
     #[tokio::test]
     async fn http_check_fails_on_missing_header_or_body_substring() {
         for (headers, body) in [("", "healthy"), ("X-Ready: yes\r\n", "broken")] {
             let server = Server::new(200, headers, body, Duration::ZERO);
-            assert!(!check(&http(&server.url)).await.pass);
+            assert!(!check_behavior(&http(&server.url)).await.pass);
         }
     }
     #[tokio::test]
@@ -489,43 +490,48 @@ mod tests {
     }
     #[tokio::test]
     async fn command_check_exit_zero_passes() {
-        let result = check(&command("printf 'ok'", None)).await;
+        let result = check_behavior(&command("printf 'ok'", None)).await;
         assert!(result.pass);
         assert!(result.observed.contains("ok"));
     }
     #[tokio::test]
     async fn command_nonzero_fails_with_exit_code_in_observed() {
-        let result = check(&command("printf 'broken'; exit 7", None)).await;
+        let result = check_behavior(&command("printf 'broken'; exit 7", None)).await;
         assert!(!result.pass);
         assert!(result.observed.contains("7") && result.observed.contains("broken"));
     }
     #[tokio::test]
     async fn command_expect_stdout_trims_and_compares_exactly() {
         assert!(
-            check(&command("printf '  8|f\n\t'", Some("8|f")))
+            check_behavior(&command("printf '  8|f\n\t'", Some("8|f")))
                 .await
                 .pass
         );
-        assert!(!check(&command("printf '8|false'", Some("8|f"))).await.pass);
-        assert!(!check(&command("printf '8|f'", Some(" 8|f"))).await.pass);
         assert!(
-            !check(&command("printf '8|f'; exit 1", Some("8|f")))
+            !check_behavior(&command("printf '8|false'", Some("8|f")))
+                .await
+                .pass
+        );
+        assert!(
+            !check_behavior(&command("printf '8|f'", Some(" 8|f")))
+                .await
+                .pass
+        );
+        assert!(
+            !check_behavior(&command("printf '8|f'; exit 1", Some("8|f")))
                 .await
                 .pass
         );
         // A matching evidence prefix is not a match for the complete stdout.
         let expected = "x".repeat(4096);
         assert!(
-            check(&command(
-                "i=0; while [ $i -lt 4096 ]; do printf x; i=$((i+1)); done",
-                Some(&expected)
-            ))
-            .await
-            .pass
+            check_behavior(&command("perl -e 'print \"x\" x 4096'", Some(&expected)))
+                .await
+                .pass
         );
         assert!(
-            !check(&command(
-                "i=0; while [ $i -lt 4096 ]; do printf x; i=$((i+1)); done; printf y",
+            !check_behavior(&command(
+                "perl -e 'print \"x\" x 4096, \"y\"'",
                 Some(&expected)
             ))
             .await
@@ -575,18 +581,14 @@ mod tests {
     }
     #[tokio::test]
     async fn command_output_capped_at_2kib() {
-        let result = check(&command(
-            "i=0; while [ $i -lt 8192 ]; do printf 'é'; i=$((i+1)); done",
-            None,
-        ))
-        .await;
-        assert!(result.pass);
+        let result = check_behavior(&command("perl -e 'print \"é\" x 8192'", None)).await;
+        assert!(result.pass, "{}", result.observed);
         assert!(result.observed.len() <= 2048);
         assert!(result.observed.contains('é'));
         // stderr cannot fill its pipe and deadlock the check.
         assert!(
-            check(&command(
-                "i=0; while [ $i -lt 20000 ]; do printf err >&2; i=$((i+1)); done; printf ok",
+            check_behavior(&command(
+                "perl -e 'print STDERR \"err\" x 20000; print \"ok\"'",
                 Some("ok")
             ))
             .await
@@ -598,15 +600,15 @@ mod tests {
         let secret = "landing-private-dsn";
         let env = vec![("LANDING_DSN".into(), secret.into())];
         let spec = command("printf '  %s\n' \"$LANDING_DSN\"", Some(secret));
-        let result = run_check(&spec, Path::new("."), &env, Duration::from_secs(2)).await;
+        let result = run_check(&spec, Path::new("."), &env, BEHAVIOR_TIMEOUT).await;
         assert!(result.pass);
         assert!(!result.observed.contains(secret), "{}", result.observed);
         assert!(result.observed.contains("[redacted]"));
         let spec = command(
-            "i=0; while [ $i -lt 2010 ]; do printf x; i=$((i+1)); done; printf '%s' \"$LANDING_DSN\"",
+            "perl -e 'print \"x\" x 2010'; printf '%s' \"$LANDING_DSN\"",
             None,
         );
-        let result = run_check(&spec, Path::new("."), &env, Duration::from_secs(2)).await;
+        let result = run_check(&spec, Path::new("."), &env, BEHAVIOR_TIMEOUT).await;
         assert!(result.pass);
         assert!(!result.observed.contains(secret));
         assert!(!result.observed.ends_with("landing-private"));
@@ -619,7 +621,7 @@ mod tests {
                 &command(&format!("printf '  {revision}\n'"), None),
                 Path::new("."),
                 &[],
-                Duration::from_secs(2)
+                BEHAVIOR_TIMEOUT
             )
             .await
             .unwrap(),
@@ -633,23 +635,33 @@ mod tests {
             body_contains: None,
         });
         assert_eq!(
-            run_live_probe(&spec, Path::new("."), &[], Duration::from_secs(2))
+            run_live_probe(&spec, Path::new("."), &[], BEHAVIOR_TIMEOUT)
                 .await
                 .unwrap(),
             revision
         );
-        for script in ["exit 7", "printf '  '", "sleep 5"] {
+        for script in ["exit 7", "printf '  '"] {
             assert!(
                 run_live_probe(
                     &command(script, None),
                     Path::new("."),
                     &[],
-                    Duration::from_millis(50)
+                    BEHAVIOR_TIMEOUT
                 )
                 .await
                 .is_err()
             );
         }
+        assert!(
+            run_live_probe(
+                &command("sleep 5", None),
+                Path::new("."),
+                &[],
+                Duration::from_millis(50)
+            )
+            .await
+            .is_err()
+        );
     }
     #[tokio::test]
     async fn errors_and_http_evidence_do_not_expose_env_values() {
@@ -661,13 +673,7 @@ mod tests {
             "healthy",
             Duration::ZERO,
         );
-        let result = run_check(
-            &http(&server.url),
-            Path::new("."),
-            &env,
-            Duration::from_secs(2),
-        )
-        .await;
+        let result = run_check(&http(&server.url), Path::new("."), &env, BEHAVIOR_TIMEOUT).await;
         assert!(result.pass);
         assert!(!result.observed.contains(secret));
         let spec = CheckSpec::Command(CommandCheck {
@@ -675,7 +681,7 @@ mod tests {
             expect_stdout: None,
         });
         assert!(
-            !run_check(&spec, Path::new("."), &env, Duration::from_secs(2))
+            !run_check(&spec, Path::new("."), &env, BEHAVIOR_TIMEOUT)
                 .await
                 .observed
                 .contains(secret)
@@ -722,10 +728,6 @@ mod tests {
             argv: vec!["/bin/cat".into(), "revision".into()],
             expect_stdout: Some("worktree-revision".into()),
         });
-        assert!(
-            run_check(&spec, &dir.0, &[], Duration::from_secs(2))
-                .await
-                .pass
-        );
+        assert!(run_check(&spec, &dir.0, &[], BEHAVIOR_TIMEOUT).await.pass);
     }
 }

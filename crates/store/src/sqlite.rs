@@ -1528,6 +1528,13 @@ impl Store for Sqlite {
             .query_map([], map_landing)?
             .collect::<Result<Vec<_>, _>>()?)
     }
+    fn list_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare(&format!("SELECT {LANDING_COLS} FROM rhapsody_landing WHERE phase NOT IN ('Done','Held','Reopened') OR id IN (SELECT id FROM rhapsody_landing WHERE phase IN ('Done','Held','Reopened') ORDER BY id DESC LIMIT 200) ORDER BY id DESC"))?;
+        Ok(stmt
+            .query_map([], map_landing)?
+            .collect::<Result<Vec<_>, _>>()?)
+    }
     fn get_landing(&self, id: i64) -> Result<Option<LandingRow>, StoreError> {
         Ok(self
             .lock()

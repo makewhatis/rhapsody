@@ -442,6 +442,18 @@ pub enum Event {
         pr: crate::prstate::PrCoord,
         state: Option<crate::automerge::LandingMergeState>,
     },
+    LandingRequest(crate::landing::LandingRequest),
+    LandingWake,
+    LandingActionFinished {
+        id: i64,
+    },
+    LandingsList {
+        reply: oneshot::Sender<Result<crate::landing::LandingsView, String>>,
+    },
+    LandingDispatch {
+        run: crate::landing::LandingRun,
+        reply: oneshot::Sender<Option<i64>>,
+    },
     /// The authenticated console's read of the ticketless review watch set (STUDIO-722, slice 8;
     /// NEW beyond Go v0.4.0). Loop-confined for [`Event::ReviewWatchList`]'s reason: the HTTP task
     /// never reads the store the control task is the single writer of.
@@ -620,6 +632,7 @@ fn worker_deps_for(
         Some(Arc::clone(&eff.transcripts))
     };
     let mut deps = WorkerDeps {
+        landing: None,
         lead_enabled: false,
         lead_progress_dir: None,
         workspace: Arc::clone(&eff.workspace),
@@ -967,6 +980,27 @@ impl Orchestrator {
             }
             Event::LandingMergeFinished { pr, state } => {
                 self.landing_merge_finished(&pr, state);
+            }
+            Event::LandingRequest(request) => {
+                if matches!(request.command, crate::landing::LandingCommand::Action(_)) {
+                    self.landing_operator_pending.insert(request.id);
+                }
+                self.landing_requests.push(request);
+                self.landing_tick((self.now)()).await;
+            }
+            Event::LandingActionFinished { id } => {
+                self.landing_operator_pending.remove(&id);
+            }
+            Event::LandingWake => {
+                if !self.landing_requests.is_empty() {
+                    self.landing_tick((self.now)()).await;
+                }
+            }
+            Event::LandingsList { reply } => {
+                let _ = reply.send(self.landings_view((self.now)().timestamp()));
+            }
+            Event::LandingDispatch { run, reply } => {
+                let _ = reply.send(self.dispatch_landing(run));
             }
             Event::ReviewConsoleList { reply } => {
                 let _ = reply.send(self.review_console_list());
@@ -2036,6 +2070,11 @@ impl Orchestrator {
             return; // no effective config → nothing to run (defensive; production always has one)
         };
         let mut deps = worker_deps_for(eff, eff.project_by_slug(&project_slug), &self.drain);
+        deps.landing = self.running.get(&iss.id).and_then(|re| re.landing.clone());
+        if deps.landing.is_some() {
+            deps.max_turns = 1;
+            deps.mcp_enabled = false;
+        }
         deps.lead_enabled = self.lead_enabled();
         if deps.lead_enabled {
             deps.lead_progress_dir = std::env::var_os("HOME")
@@ -2175,6 +2214,10 @@ impl Orchestrator {
         let issue_id = iss.id.clone();
         let issue_id_ev = iss.id.clone();
         let issue_id_tr = iss.id.clone();
+        let worker_emit_time = self
+            .running
+            .get(&iss.id)
+            .map(|re| re.worker_emit_time.clone());
         let attempt32 = attempt.map(|a| a as i32);
         let guard = self.wg.add();
         tokio::spawn(async move {
@@ -2204,6 +2247,13 @@ impl Orchestrator {
                     if e.event_type == agent::EVENT_LIMIT_OBSERVED {
                         return;
                     }
+                }
+                // Delivery acknowledgements carry no agent work. Account/limit-only updates
+                // returned above also retain their existing non-liveness semantics.
+                if e.event_type != agent::EVENT_OPERATOR_MESSAGE
+                    && let Some(time) = &worker_emit_time
+                {
+                    time.record(Utc::now());
                 }
                 let _ = events_ev.send(Event::AgentUpdate(AgentUpdate {
                     issue_id: issue_id_ev.clone(),

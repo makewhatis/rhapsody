@@ -4078,7 +4078,9 @@ impl Orchestrator {
             return; // opt-in, and off by default (the D5 invariant)
         }
         if let Err(reason) = self.landing_merge_gate(pr) {
-            tracing::debug!(pr = %pr, reason, "auto-merge: declined");
+            if self.landing_refusals.insert((pr.clone(), head.into())) {
+                tracing::info!(pr = %pr, head, reason, "auto-merge paused by landing lock");
+            }
             return;
         }
         // STUDIO-964: the fail-closed human-hold gate lives HERE, not at the tail of
@@ -8239,6 +8241,36 @@ mod tests {
                 "independent projects and disabled landing retain throughput"
             );
         }
+    }
+
+    #[test]
+    fn landing_refusal_logs_info_once_per_pr_head() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        let slug = o.eff.as_ref().unwrap().projects[0].slug.clone();
+        o.store()
+            .save_landing(rhapsody_store::LandingRow {
+                project_slug: slug,
+                owner: OWNER.into(),
+                repo: REPO.into(),
+                pr: 63,
+                ..Default::default()
+            })
+            .unwrap();
+        let (_, events) = crate::testsupport::capture_events(|| {
+            let mut report = ReviewSweepReport::default();
+            for head in [HEAD_A, HEAD_A, HEAD_B, HEAD_B] {
+                o.propose_auto_merge(&[], &coord(64), head, "CLEAN", &[], &mut report);
+            }
+            assert!(report.merge.is_empty());
+        });
+        let refusals: Vec<_> = events
+            .iter()
+            .filter(|e| e.message == "auto-merge paused by landing lock")
+            .collect();
+        assert_eq!(refusals.len(), 2);
+        assert!(refusals.iter().all(|event| event.level == "INFO"));
+        assert_eq!(refusals[0].fields["head"], HEAD_A);
+        assert_eq!(refusals[1].fields["head"], HEAD_B);
     }
 
     #[test]

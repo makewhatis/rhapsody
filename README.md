@@ -37,8 +37,8 @@ it names and cleans up leaks while preserving pre-existing processes and other c
 ## Features
 
 - **Opt-in [Landing](LANDING.md):** observe the merged application revision, watch repo-owned
-  HTTP/command checks, and complete or reopen the ticket with evidence. Automatic revert and
-  post-deploy acceptance/operator controls are coming in L3/L4.
+  HTTP/command checks, and complete or reopen the ticket with evidence. Optional read-only
+  post-deploy acceptance, automatic recovery, operator controls and console badges expose the outcome.
 
 ## WORKFLOW.md configuration
 
@@ -109,7 +109,7 @@ Future genuine-failure backoffs and account-limit waits retain their existing de
 implementation, per-project-group and shared per-state caps remain enforced, including preparation
 reservations. No configuration, schema, API shape or golden fixture changes.
 
-### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1251)
+### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1252)
 
 Landing is **Rhapsody-only, with no Go counterpart**. Per-project `projects[].landing` in
 WORKFLOW.md opts watched ticket merges into deploy verification instead of immediate
@@ -119,7 +119,7 @@ watches checks with per-check consecutive-failure thresholds, and posts timestam
 Success completes the ticket (or leaves tracker state unchanged when `done_state` is unset).
 Deploy timeout, an invalid contract or a contract deleted by the merge holds with evidence;
 a repo without a contract before or after the merge explicitly records that deployment was not
-observed. A post-deploy checklist parks in AwaitingAcceptance until the L4 agent is available.
+observed. A post-deploy checklist holds AwaitingAcceptance and its project lock until acceptance ends.
 
 Migration **38** adds `rhapsody_landing` and `rhapsody_landing_project` for phases, merge/revert
 coordinates, absolute deadlines, check samples and restart-safe pending effects. Durable merge
@@ -127,9 +127,21 @@ admission pauses auto-merge per WORKFLOW project group before GitHub is invoked;
 merges queue behind the current landing. Off-loop checks continue during drain and restart
 recovery keeps the original watch window and deduplicates evidence comments.
 
-**L2 reopens check failures with REVIEW FEEDBACK without reverting**, even with the default
-`auto_revert: true`. Auto-revert is coming in L3; the read-only acceptance agent, landing API,
-project advisory and console badge are coming in L4. The [operational guide](LANDING.md)
+The acceptance run key is `land:owner/repo#number`. The built-in `lander` uses a dedicated Claude
+read-only launch: Read/Glob/Grep/WebFetch/WebSearch, no shell, edits, MCP servers, project settings or
+operator permission overrides. Other adapters refuse this posture instead of starting an ordinary
+coding session. The host validates every checklist item and its evidence, persists the verdict in the
+run ledger, and posts one acceptance comment. Missing, contradictory or unmet evidence takes the
+existing failure/recovery path. No checklist means no dispatch; drain pauses dispatch but keeps checks.
+
+`GET /api/v1/landings` lists all open rows plus the latest 200 terminal rows, including recoverable
+Held IDs. It reports phase age from persisted `phase_since_s` (unknown for older rows) and names
+watched PRs paused by each project lock. Lock refusals log at INFO once per PR/head. Operator-guarded
+retry/skip/stop use per-action phase rules: retry restores Held's recorded prior phase with fresh
+deadlines and preserved revert linkage, skip records an operator override rather than a passed check,
+and stop closes only an unmerged recovery PR. Immutable contract problems refuse retry. The projects
+view advises when landing is enabled without a contract; Board/Jobs badges reuse existing pill tones.
+The [operational guide](LANDING.md)
 documents availability, every config/contract field, worked examples and migration precautions.
 With landing absent or disabled, merge completion and auto-merge behavior are unchanged; the
 Go-owned tables, config/API golden shapes and fixture normalization are untouched.
@@ -238,7 +250,7 @@ watch rows stay dismissed. Lead/manager suppression and ticket stop/resume's mov
 are unchanged. This review-only behavior has no frozen Go counterpart; API shapes, schema and
 goldens are unchanged.
 
-### Bounded CPU-based stall liveness and tool waits (STUDIO-1177, STUDIO-1208)
+### Bounded CPU-based stall liveness and tool waits (STUDIO-1177, STUDIO-1208, STUDIO-1262)
 
 Silent workers now renew CPU liveness only when positive process-group CPU time exceeds
 `agent.stall_cpu_threshold` of elapsed wall time (default `0.05`, 5% of one core; valid range
@@ -257,15 +269,24 @@ event-silence rule applies again. Outcomes, reason strings and retries are uncha
 Once STUDIO-1208 ships, the operator can restore `stall_timeout_ms` to `300000` from the temporary
 `2700000` mitigation in WORKFLOW.md. This change does not rewrite that operator-owned configuration.
 
-A failed sampler logs once per run and grants one stall window from the first failed sample.
-Persistent failure then uses stream events alone, rather than Go's perpetual assume-alive rule.
+A failed sampler logs once per run and grants **twice** the configured stall window from the first
+failed sample. Persistent failure then uses stream events with the same doubled silence window,
+rather than Go's perpetual assume-alive rule. This gives saturated hosts extra time without granting
+unbounded liveness; successful measured recovery restores the configured window.
 Recovery establishes a fresh baseline, retaining the original bounded failure grace until a full
 CPU interval can be measured; new process groups also establish fresh baselines. CPU sampling is
-an extra signal on Linux; macOS uses events and open tools. Descendant presence alone is not liveness:
-an idle MCP server can exist while the model stream is dead.
-Event timestamps, disabled stall detection, persisted `failed` / `stalled` taxonomy and exponential
-failure retries are unchanged. The threshold round-trips through config encode/decode but is omitted
-from the Go-owned config JSON view; schemas, payload goldens and fixtures are untouched.
+an extra signal on **Linux only**: the sampler reads `/proc/<pid>/stat`, which macOS does not provide.
+Sampler-unavailable warnings on macOS are expected, independent of permissions or whether the PID is
+a group leader; macOS uses events and open tools with the doubled fallback window. Descendant presence
+alone is not liveness: an idle MCP server can exist while the model stream is dead.
+Stall detection reads a per-run timestamp stamped by the worker **before** queuing each real agent
+event, so a control-loop backlog cannot hide recent work. Applying old queued events does not renew
+that watermark. Synthetic delivery acknowledgements and account/limit-only observations still grant
+no event liveness. API/history event timestamps retain their control-apply semantics; the emission
+watermark is process-local and fresh for every retry. Disabled stall detection, persisted `failed` /
+`stalled` taxonomy and exponential failure retries are unchanged. The threshold round-trips through
+config encode/decode but is omitted from the Go-owned config JSON view; schemas, payload goldens and
+fixtures are untouched.
 
 ### Turn-owned OpenCode HTTP executor (STUDIO-1208; amends STUDIO-1001)
 

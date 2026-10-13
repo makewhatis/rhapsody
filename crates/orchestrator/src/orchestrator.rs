@@ -45,7 +45,7 @@ pub struct EventRecord {
 /// The worker-machinery fields Go carries here — the cancellation handle (`cancel`), the per-run
 /// operator-message mailbox (`mailbox`, INF-250), and the dispatch span context
 /// (`dispatchSpanContext`) — need types that arrive with the worker (O3) and telemetry (P6); they
-/// are added by those tickets. Every field below is control-task-owned.
+/// are added by those tickets. Fields are control-task-owned except the worker emission watermark.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunningEntry {
     pub issue: rhapsody_core::Issue,
@@ -158,6 +158,8 @@ pub struct RunningEntry {
     pub last_event: String,
     pub last_message: String,
     pub last_event_at: DateTime<Utc>,
+    /// Worker-stamped liveness, independent of the control loop's applied event/history time.
+    pub(crate) worker_emit_time: crate::liveness::WorkerEmitTime,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
@@ -211,6 +213,7 @@ pub struct RunningEntry {
     /// `reconcile`'s cleanup never fires for one. `pub(crate)` like `cancel`: it is dispatch
     /// machinery, not part of the entry's observable shape.
     pub(crate) review: Option<crate::review::ReviewRun>,
+    pub(crate) landing: Option<crate::landing::LandingRun>,
 
     /// Whether this run is a BROKERED dispatch — one prepared through the private provider broker
     /// (STUDIO-1002). `false` for every legacy native-login dispatch, which is byte-identical to
@@ -238,6 +241,7 @@ impl RunningEntry {
     pub(crate) fn empty(issue: Issue) -> RunningEntry {
         RunningEntry {
             issue,
+            landing: None,
             started_at: zero_time(),
             retry_attempt: 0,
             cancel: CancelSignal::default(),
@@ -268,6 +272,7 @@ impl RunningEntry {
             last_event: String::new(),
             last_message: String::new(),
             last_event_at: zero_time(),
+            worker_emit_time: crate::liveness::WorkerEmitTime::default(),
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
@@ -372,6 +377,10 @@ pub struct StackHint {
 /// per-project warning maps + read-only tracker surfaces (O6/O4), the worker-spawn seam (O3), and
 /// the GitHub-summons source (O6).
 pub struct Orchestrator {
+    pub(crate) landing_requests: Vec<crate::landing::LandingRequest>,
+    pub(crate) pending_landing: HashMap<String, crate::landing::LandingRun>,
+    pub(crate) landing_refusals: HashSet<(crate::prstate::PrCoord, String)>,
+    pub(crate) landing_operator_pending: HashSet<i64>,
     pub(crate) landing_task: Option<crate::landing::LandingTask>,
     /// Landing-enabled merge plans reserve project admission before GitHub runs, through the
     /// later observation that confirms an ambiguous attempt or durably admits the merged row.
@@ -1193,6 +1202,10 @@ impl Orchestrator {
             spawn: None,
             eff: None,
             landing_task: None,
+            landing_requests: Vec::new(),
+            pending_landing: HashMap::new(),
+            landing_refusals: HashSet::new(),
+            landing_operator_pending: HashSet::new(),
             landing_merges: HashMap::new(),
             capabilities_registry: None,
             teams: None,

@@ -216,6 +216,17 @@ the `Orchestrator` struct itself. Concretely:
     CI merge gates. Peer-review introduction round-trips the existing ControlHandle seam with a
     landing-only origin. Child landings bypass their parent/queued siblings, but do not move the
     original ticket to Done or run its acceptance checklist. Only their verified Done reopens it.
+    STUDIO-1252 serializes operator actions and acceptance-result application in that same task.
+    Control reserves operator admission before off-loop actions so Held retry cannot race auto-merge.
+    Acceptance dispatch round-trips Event::LandingDispatch through the ordinary worker/run ledger;
+    land runs use a pinned checkout, a host prompt and the dedicated read-only Harness entry point.
+    Their landing.verdict event is durable before run end, and landing owns their restart recovery
+    rather than tracker retries. Drain gates this dispatch independently of deterministic checks.
+
+  - `liveness.rs`'s `WorkerEmitTime` (STUDIO-1262) is a per-run `Arc<AtomicI64>` watermark.
+    The worker's forwarding callback stamps it before queuing real agent events; stall detection
+    reads it directly so control-channel backlog cannot turn a live worker into a wedge. It shares
+    no scheduling maps, is never persisted, and a new RunningEntry gets a fresh watermark.
 
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
@@ -223,6 +234,7 @@ the `Orchestrator` struct itself. Concretely:
   STUDIO-1209 also shares the existing Store connection with that worker solely to read next-turn
   message blocks and mark their exact IDs delivered on SESSION_STARTED. No scheduling state is
   shared; the Store's existing connection mutex serializes queue admission, delivery and pruning.
+  Its callback also writes the emission watermark described above; all event folding stays on control.
 - A recurring pattern in the on-loop modules (`retry.rs::on_retry`, `reconcile_run.rs::reconcile`):
   before any `.await` or `&mut self` mutation, snapshot the bits of `Effective`/`ResolvedProject`
   you need into owned locals. Go aliases these via raw pointers across the await; Rust's borrow
