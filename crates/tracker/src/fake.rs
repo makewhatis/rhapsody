@@ -92,6 +92,9 @@ pub struct LinkPrCall {
 /// call, e.g. active-then-inactive). Takes precedence over `by_id`/`by_id_err` when set.
 type StatesByIdsFn = Box<dyn Fn(&[String]) -> Result<Vec<Issue>, TrackerError> + Send + Sync>;
 
+/// A programmable candidate-read override for polls whose results change between calls.
+type CandidatesFn = Box<dyn Fn() -> Result<Vec<Issue>, TrackerError> + Send + Sync>;
+
 /// A programmable [`Tracker::fetch_issue_labels_by_ids`] override, the sibling of
 /// [`StatesByIdsFn`]. It exists so a test can reproduce the one behaviour a canned map cannot: a
 /// tracker that answers or REFUSES depending on what the batch contains — Linear validates
@@ -113,6 +116,8 @@ pub struct Fake {
     pub documents: HashMap<String, crate::Documents>,
     pub documents_err: Option<TrackerError>,
     pub candidates: Vec<Issue>,
+    /// When set, overrides `fetch_candidate_issues`. Takes precedence over `candidates`/`candidates_err`.
+    pub candidates_func: Option<CandidatesFn>,
     /// Normalized-lowercase state -> issues.
     pub by_state: HashMap<String, Vec<Issue>>,
     /// Issue id -> issue.
@@ -440,6 +445,9 @@ impl Tracker for Fake {
     }
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         self.lock().candidate_calls += 1;
+        if let Some(func) = &self.candidates_func {
+            return func();
+        }
         if let Some(e) = &self.candidates_err {
             return Err(e.clone());
         }

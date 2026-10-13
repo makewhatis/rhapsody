@@ -3582,6 +3582,101 @@ mod tests {
         }
     }
 
+    // B4: admission reads newer data than the board poll. Releasing the retry must not expose
+    // the stale unheld candidate to fresh dispatch in that tick, including recovered key space.
+    // MUTATION: remove either ladder's tick-local exclusion; that ladder dispatches "old".
+    #[tokio::test]
+    async fn post_refresh_rejection_must_not_dispatch_stale_candidate() {
+        for ladder in ["legacy", "projects"] {
+            for recovered in [false, true] {
+                for competing_fresh in [false, true] {
+                    let base = utc(2026, 10, 13, 15, 0, 0);
+                    let busy = issue("busy", "A-2", "In Progress");
+                    let reads = std::sync::atomic::AtomicUsize::new(0);
+                    let mut f = Fake::new();
+                    f.by_id.insert("busy".into(), busy.clone());
+                    f.candidates_func = Some(Box::new(move || {
+                        let mut old = issue("old", "A-1", "Todo");
+                        let read = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if (1..=2).contains(&read) {
+                            old.labels = Some(vec!["rhapsody:human".into()]);
+                        }
+                        let mut candidates = vec![old];
+                        if competing_fresh {
+                            candidates.push(issue("fresh", "A-3", "Todo"));
+                        }
+                        Ok(candidates)
+                    }));
+                    let tr = Arc::new(f);
+                    let (mut o, dispatched) = orch_for_retry(tr.clone(), 2);
+                    if ladder == "projects" {
+                        let mut a = proj_with_tracker("a", tr.clone(), "");
+                        a.per_state_limits.insert("in progress".into(), 1);
+                        o.eff.as_mut().unwrap().projects = vec![a];
+                    } else {
+                        o.eff
+                            .as_mut()
+                            .unwrap()
+                            .per_state_limits
+                            .insert("in progress".into(), 1);
+                    }
+                    o.now = Box::new(move || base);
+                    o.running
+                        .insert("busy".into(), running_entry(busy, "a", "a"));
+                    let key = if recovered { "A-1" } else { "old" };
+                    let mut re = retry_entry("old", "A-1", 3);
+                    if ladder == "projects" {
+                        re.project_slug = "a".into();
+                    }
+                    re.recovered = recovered;
+                    if recovered {
+                        re.issue_id.clear();
+                    }
+                    re.issue = issue("old", "A-1", "In Progress");
+                    re.err = "no available orchestrator slots".into();
+                    re.due_at = base;
+                    re.due_at_ms = base.timestamp_millis();
+                    o.retry_attempts.insert(key.into(), re);
+                    o.claimed.insert(key.into());
+                    o.on_tick().await;
+                    let expected = if competing_fresh {
+                        vec!["fresh"]
+                    } else {
+                        vec![]
+                    };
+                    assert_eq!(
+                        *dispatched.lock().unwrap(),
+                        expected,
+                        "{ladder}, recovered={recovered}: newer human hold overrides the stale poll"
+                    );
+                    assert!(
+                        !o.claimed.contains(key),
+                        "release the rejected retry's claim"
+                    );
+                    assert!(!o.retry_attempts.contains_key(key));
+                    assert_eq!(
+                        tr.candidate_calls(),
+                        2,
+                        "board poll and admission read only"
+                    );
+                    // The exclusion is tick-local; another poll still sees the human hold.
+                    o.on_tick().await;
+                    assert_eq!(*dispatched.lock().unwrap(), expected);
+                    assert_eq!(tr.candidate_calls(), 3, "next tick is an ordinary poll");
+                    if !competing_fresh {
+                        o.on_tick().await;
+                        assert_eq!(
+                            *dispatched.lock().unwrap(),
+                            vec!["old"],
+                            "a later poll can admit the ticket after its hold is removed"
+                        );
+                        assert_eq!(tr.candidate_calls(), 4);
+                    }
+                }
+            }
+        }
+    }
+
     // Mirrors Go `TestOnRetryDispatchesWhenEligible`.
     #[tokio::test]
     async fn on_retry_dispatches_when_eligible() {

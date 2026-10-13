@@ -1286,7 +1286,7 @@ impl Orchestrator {
         self.set_held_for_capacity(HashMap::new());
         let has_projects = self.eff.as_ref().is_some_and(|e| !e.projects.is_empty());
         if has_projects {
-            let (tagged, read_the_board) = self.poll_all_projects().await;
+            let (mut tagged, read_the_board) = self.poll_all_projects().await;
             let queued: Vec<_> = tagged
                 .iter()
                 .map(|t| {
@@ -1310,6 +1310,11 @@ impl Orchestrator {
             // without asking the tracker anything (§5.2). In-memory, and a no-op with Teams off.
             self.record_issue_states(tagged.iter().map(|t| &t.iss));
             self.refresh_waiting_retry_issues(tagged.iter().map(|t| &t.iss));
+            let retry_identifiers: std::collections::HashSet<_> = self
+                .retry_attempts
+                .values()
+                .map(|re| re.identifier.clone())
+                .collect();
             // A waiter parked against its old state may now have capacity. Reconsider it before
             // fresh selection can spend that slot; saturated waiters still make no tracker read.
             self.dispatch_ready_retries().await;
@@ -1343,6 +1348,9 @@ impl Orchestrator {
                     tagged.iter().map(|t| t.iss.id.clone()).collect();
                 self.cancel_dropped_preparations(&present);
             }
+            // Retry admission can reject a newer ticket and release its claim. Do not let this
+            // tick's older board copy override that verdict through fresh or wake admission.
+            tagged.retain(|t| !retry_identifiers.contains(&t.iss.identifier));
             // STUDIO-1017 (§7.9): admit any pending manager wake obligation BEFORE ordinary
             // selection, so the author is dispatched once, with its seed, and selection never sees
             // the ticket as a fresh dispatch.
@@ -1442,6 +1450,11 @@ impl Orchestrator {
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
         self.refresh_waiting_retry_issues(issues.iter());
+        let retry_identifiers: std::collections::HashSet<_> = self
+            .retry_attempts
+            .values()
+            .map(|re| re.identifier.clone())
+            .collect();
         // The legacy ladder must give refreshed waiters the same first claim as the project path.
         self.dispatch_ready_retries().await;
         self.record_quorum_state(issues.iter());
@@ -1458,6 +1471,8 @@ impl Orchestrator {
                 issues.iter().map(|i| i.id.clone()).collect();
             self.cancel_dropped_preparations(&present);
         }
+        // The same tick-local exclusion covers recovered identifier-keyed retries on both ladders.
+        issues.retain(|iss| !retry_identifiers.contains(&iss.identifier));
         // STUDIO-1017 (§7.9): the legacy ladder's half of the wake admission — see the multi-project
         // ladder above for why it runs before selection.
         let wake_candidates: Vec<crate::managerwake::WakeCandidate<'_>> =
