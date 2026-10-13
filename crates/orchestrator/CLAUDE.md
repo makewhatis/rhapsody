@@ -211,6 +211,11 @@ the `Orchestrator` struct itself. Concretely:
     A `merge_pending` marker in `rhapsody_landing` persists admission before GitHub is invoked;
     deterministic ticks skip it until confirmed merge admission clears that flag. Cancellation is
     restricted to pre-merge markers, so a delayed refusal cannot delete a confirmed landing.
+    `landingrevert.rs` (STUDIO-1250) uses the same owned task and store for recovery PRs. Reverting
+    retains the project's lock; its linked, labelled recovery alone uses the existing off-loop
+    CI merge gates. Peer-review introduction round-trips the existing ControlHandle seam with a
+    landing-only origin. Child landings bypass their parent/queued siblings, but do not move the
+    original ticket to Done or run its acceptance checklist. Only their verified Done reopens it.
 
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from

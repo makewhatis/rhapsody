@@ -297,6 +297,30 @@ pub(crate) fn auto_merge_verdict_with_proof(
     auto_merge_verdict_with_proof_and_approval(rows, head, proven, None, 0, "")
 }
 
+pub(crate) fn revert_merge_verdict(
+    landing: &rhapsody_store::LandingRow,
+    labelled: bool,
+    revert_review: bool,
+    rows: &[&ReviewWatchRow],
+    head: &str,
+) -> Result<Vec<String>, AutoMergeRefusal> {
+    if head.trim().is_empty() {
+        return Err(AutoMergeRefusal::NoHead);
+    }
+    if !labelled
+        || landing.phase != rhapsody_store::LandingPhase::Reverting
+        || landing.revert_pr.is_none()
+        || landing.revert_of.is_some()
+    {
+        return Err(AutoMergeRefusal::NoVerdict);
+    }
+    if revert_review {
+        auto_merge_verdict_with_proof(rows, head, &[head])
+    } else {
+        Ok(vec!["landing recovery".into()])
+    }
+}
+
 /// [`auto_merge_verdict_with_proof`] with the manager-approval input (STUDIO-1011). See that
 /// function for the whole rule; this is the one carrying it, and the reviewer-only wrapper above
 /// delegates here with `approval = None`.
@@ -421,6 +445,47 @@ mod tests {
 
     const HEAD: &str = "c366a61c366a61c366a61c366a61c366a61c366a";
     const OLD: &str = "a324d2da324d2da324d2da324d2da324d2da324d";
+
+    #[test]
+    fn revert_pr_merges_without_peer_approval_when_revert_review_false() {
+        let landing = rhapsody_store::LandingRow {
+            phase: rhapsody_store::LandingPhase::Reverting,
+            revert_pr: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(
+            revert_merge_verdict(&landing, true, false, &[], HEAD),
+            Ok(vec!["landing recovery".into()])
+        );
+        assert!(revert_merge_verdict(&landing, false, false, &[], HEAD).is_err());
+        assert!(
+            revert_merge_verdict(
+                &rhapsody_store::LandingRow::default(),
+                true,
+                false,
+                &[],
+                HEAD
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn revert_pr_needs_approval_when_revert_review_true() {
+        let landing = rhapsody_store::LandingRow {
+            phase: rhapsody_store::LandingPhase::Reverting,
+            revert_pr: Some(2),
+            ..Default::default()
+        };
+        let pending = row("bob", REVIEW_STATUS_REQUESTED, HEAD);
+        assert!(revert_merge_verdict(&landing, true, true, &[&pending], HEAD).is_err());
+        let approved = row("bob", REVIEW_STATUS_APPROVED, HEAD);
+        assert_eq!(
+            revert_merge_verdict(&landing, true, true, &[&approved], HEAD),
+            Ok(vec!["bob".into()])
+        );
+        let stale = row("bob", REVIEW_STATUS_APPROVED, OLD);
+        assert!(revert_merge_verdict(&landing, true, true, &[&stale], HEAD).is_err());
+    }
 
     fn row(reviewer: &str, status: &str, reviewed_sha: &str) -> ReviewWatchRow {
         ReviewWatchRow {

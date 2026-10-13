@@ -53,6 +53,7 @@ pub mod investigate;
 pub mod issuelog;
 pub mod landing;
 pub mod landingcheck;
+pub(crate) mod landingrevert;
 pub mod leaddecision;
 pub mod leadexec;
 pub mod leaditems;

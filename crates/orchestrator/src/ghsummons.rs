@@ -274,6 +274,208 @@ impl GH {
     }
 }
 
+#[async_trait]
+impl crate::landingrevert::RevertGithub for GH {
+    async fn original(
+        &self,
+        row: &rhapsody_store::LandingRow,
+    ) -> Result<(String, String), crate::landingrevert::RevertError> {
+        let value = self
+            .landing_pr_json(row, row.pr, "title,baseRefName")
+            .await?;
+        let title = value["title"].as_str().ok_or_else(|| {
+            crate::landingrevert::RevertError::Other("original PR has no title".into())
+        })?;
+        let base = value["baseRefName"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                crate::landingrevert::RevertError::Other("original PR has no base".into())
+            })?;
+        Ok((title.into(), base.into()))
+    }
+    async fn find(
+        &self,
+        row: &rhapsody_store::LandingRow,
+        branch: &str,
+    ) -> Result<Option<i64>, crate::landingrevert::RevertError> {
+        let body = self
+            .run_off_task(vec![
+                "pr".into(),
+                "list".into(),
+                "--repo".into(),
+                format!("{}/{}", row.owner, row.repo),
+                "--state".into(),
+                "all".into(),
+                "--head".into(),
+                branch.into(),
+                "--json".into(),
+                "number,body,headRepositoryOwner,headRepository".into(),
+            ])
+            .await
+            .map_err(|e| crate::landingrevert::RevertError::Other(e.to_string()))?;
+        let values: Vec<serde_json::Value> = serde_json::from_slice(&body)
+            .map_err(|e| crate::landingrevert::RevertError::Other(e.to_string()))?;
+        for value in values {
+            if value["headRepositoryOwner"]["login"]
+                .as_str()
+                .is_some_and(|s| s.eq_ignore_ascii_case(&row.owner))
+                && value["headRepository"]["name"]
+                    .as_str()
+                    .is_some_and(|s| s.eq_ignore_ascii_case(&row.repo))
+            {
+                if !value["body"]
+                    .as_str()
+                    .is_some_and(|s| s.contains(&row.merge_sha))
+                {
+                    return Err(crate::landingrevert::RevertError::Other(
+                        "existing recovery PR has different provenance".into(),
+                    ));
+                }
+                return value["number"]
+                    .as_i64()
+                    .filter(|n| *n > 0)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        crate::landingrevert::RevertError::Other(
+                            "invalid recovery PR number".into(),
+                        )
+                    });
+            }
+        }
+        Ok(None)
+    }
+    async fn open(
+        &self,
+        row: &rhapsody_store::LandingRow,
+        branch: &str,
+        base: &str,
+        title: &str,
+        body: &str,
+    ) -> Result<i64, crate::landingrevert::RevertError> {
+        let coord = format!("{}/{}", row.owner, row.repo);
+        let labels = self
+            .run_off_task(vec![
+                "label".into(),
+                "list".into(),
+                "--repo".into(),
+                coord.clone(),
+                "--search".into(),
+                "rhapsody:revert".into(),
+                "--json".into(),
+                "name".into(),
+            ])
+            .await
+            .map_err(|e| crate::landingrevert::RevertError::Other(e.to_string()))?;
+        let labels: Vec<serde_json::Value> = serde_json::from_slice(&labels)
+            .map_err(|e| crate::landingrevert::RevertError::Other(e.to_string()))?;
+        if !labels.iter().any(|v| v["name"] == "rhapsody:revert") {
+            self.run_off_task(vec![
+                "label".into(),
+                "create".into(),
+                "rhapsody:revert".into(),
+                "--repo".into(),
+                coord.clone(),
+                "--color".into(),
+                "d73a4a".into(),
+                "--description".into(),
+                "Automatic landing recovery".into(),
+            ])
+            .await
+            .map_err(|e| crate::landingrevert::RevertError::Other(e.to_string()))?;
+        }
+        let result = self
+            .run_off_task(vec![
+                "pr".into(),
+                "create".into(),
+                "--repo".into(),
+                coord,
+                "--head".into(),
+                branch.into(),
+                "--base".into(),
+                base.into(),
+                "--title".into(),
+                title.into(),
+                "--body".into(),
+                body.into(),
+                "--label".into(),
+                "rhapsody:revert".into(),
+            ])
+            .await
+            .map_err(|e| crate::landingrevert::RevertError::Other(e.to_string()))?;
+        String::from_utf8_lossy(&result)
+            .trim()
+            .rsplit('/')
+            .next()
+            .and_then(|s| s.parse::<i64>().ok())
+            .filter(|n| *n > 0)
+            .ok_or_else(|| {
+                crate::landingrevert::RevertError::Other(
+                    "GitHub did not return a recovery PR number".into(),
+                )
+            })
+    }
+    async fn snapshot(
+        &self,
+        row: &rhapsody_store::LandingRow,
+        pr: i64,
+    ) -> Result<crate::landingrevert::RevertSnapshot, crate::landingrevert::RevertError> {
+        let value = self
+            .landing_pr_json(row, pr, "state,headRefOid,mergeCommit,labels,createdAt")
+            .await?;
+        let status = match value["state"].as_str() {
+            Some("OPEN") => PrStatus::Open,
+            Some("MERGED") => PrStatus::Merged,
+            Some("CLOSED") => PrStatus::Closed,
+            _ => {
+                return Err(crate::landingrevert::RevertError::Other(
+                    "unknown recovery PR state".into(),
+                ));
+            }
+        };
+        Ok(crate::landingrevert::RevertSnapshot {
+            status,
+            opened_at_s: value["createdAt"]
+                .as_str()
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|at| at.timestamp())
+                .ok_or_else(|| {
+                    crate::landingrevert::RevertError::Other(
+                        "recovery PR has no valid creation time".into(),
+                    )
+                })?,
+            head: value["headRefOid"].as_str().unwrap_or("").into(),
+            merge_sha: value["mergeCommit"]["oid"].as_str().unwrap_or("").into(),
+            labelled: value["labels"]
+                .as_array()
+                .is_some_and(|labels| labels.iter().any(|l| l["name"] == "rhapsody:revert")),
+        })
+    }
+}
+impl GH {
+    async fn landing_pr_json(
+        &self,
+        row: &rhapsody_store::LandingRow,
+        pr: i64,
+        fields: &str,
+    ) -> Result<serde_json::Value, crate::landingrevert::RevertError> {
+        let body = self
+            .run_off_task(vec![
+                "pr".into(),
+                "view".into(),
+                pr.to_string(),
+                "--repo".into(),
+                format!("{}/{}", row.owner, row.repo),
+                "--json".into(),
+                fields.into(),
+            ])
+            .await
+            .map_err(|e| crate::landingrevert::RevertError::Other(e.to_string()))?;
+        serde_json::from_slice(&body)
+            .map_err(|e| crate::landingrevert::RevertError::Other(e.to_string()))
+    }
+}
+
 /// The default runner: `gh <args>`, returning stdout. A non-zero exit is an error (Go's
 /// `exec.Command(...).Output()` returns an `*ExitError`). Only used in production — every test
 /// injects its own runner. The exec is synchronous (Go's is too, run on a goroutine), so it blocks
