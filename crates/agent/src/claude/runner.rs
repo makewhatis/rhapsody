@@ -1577,10 +1577,16 @@ mod tests {
             "#!/usr/bin/env bash\n\
              head -n 1 >/dev/null\n\
              echo '{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}'\n\
-             head -c 11000000 /dev/zero | tr '\\0' 'a'\n\
+             perl -e 'print \"a\" x 11000000'\n\
              echo\n",
         );
-        let r = new_runner(&script, &root.path());
+        // This tests the scanner error, not throughput under the shared runner's host load.
+        let r = Runner::new(Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path(),
+            turn_timeout: Duration::from_secs(60),
+            ..Default::default()
+        });
         let sess = r
             .start_session(&ws, issue("5", "MT-5"), None)
             .await
