@@ -1,4 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { useLandings } from "@/hooks/useLandings";
+import { LandingBadge, landingForTicket } from "../LandingBadge";
+import type { LandingView } from "@/lib/api";
 import {
   Card,
   Chip,
@@ -76,6 +79,7 @@ export function JobsView({
   onLoadMore: () => void;
 }) {
   const nowMs = useNow(30_000);
+  const landings = useLandings().data ?? [];
   // One feed, not two independent reads. The Now strip's counts and the table's rows are both
   // derived from `rows` below, so they are only ever as consistent as the two fetches feeding it —
   // and until STUDIO-791 the second of those never refetched at all, leaving this surface reporting
@@ -239,6 +243,7 @@ export function JobsView({
 
       {view === "board" ? (
         <BoardView
+          landings={landings}
           rows={rows}
           blocked={state.data?.blocked ?? []}
           heldForHuman={state.data?.held_for_human ?? []}
@@ -272,7 +277,7 @@ export function JobsView({
             </thead>
             <tbody>
               {visible.map((row) => (
-                <JobsRow key={row.key} row={row} roster={roster} onOpen={onOpenJob} />
+                <JobsRow key={row.key} row={row} roster={roster} onOpen={onOpenJob} landing={landingForTicket(landings, row.issue)} />
               ))}
             </tbody>
           </table>
@@ -372,11 +377,13 @@ function LiveActivity({ runId, elapsed }: { runId: number; elapsed: string }) {
 // One worklist row. It is a real activation target, not a div with a click handler: the whole
 // row navigates, so it owes Enter/Space and a focus ring as well as the pointer (§10 box 2.8).
 function JobsRow({
+  landing,
   row,
   roster,
   onOpen,
 }: {
   row: ConsoleJobRow;
+  landing?: LandingView;
   roster: readonly string[];
   onOpen: (issue: string) => void;
 }) {
@@ -483,6 +490,7 @@ function JobsRow({
           {row.statusNote === undefined ? "" : ` · ${row.statusNote}`}
           {row.subLabel === undefined ? "" : ` · ${row.subLabel}`}
         </Pill>
+        <LandingBadge landing={landing} />
       </td>
       <td>
         <TraceSpark runId={row.runId} live={row.live} armed={armed} />

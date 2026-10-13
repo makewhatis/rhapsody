@@ -213,6 +213,7 @@ pub struct RunningEntry {
     /// `reconcile`'s cleanup never fires for one. `pub(crate)` like `cancel`: it is dispatch
     /// machinery, not part of the entry's observable shape.
     pub(crate) review: Option<crate::review::ReviewRun>,
+    pub(crate) landing: Option<crate::landing::LandingRun>,
 
     /// Whether this run is a BROKERED dispatch — one prepared through the private provider broker
     /// (STUDIO-1002). `false` for every legacy native-login dispatch, which is byte-identical to
@@ -240,6 +241,7 @@ impl RunningEntry {
     pub(crate) fn empty(issue: Issue) -> RunningEntry {
         RunningEntry {
             issue,
+            landing: None,
             started_at: zero_time(),
             retry_attempt: 0,
             cancel: CancelSignal::default(),
@@ -375,6 +377,10 @@ pub struct StackHint {
 /// per-project warning maps + read-only tracker surfaces (O6/O4), the worker-spawn seam (O3), and
 /// the GitHub-summons source (O6).
 pub struct Orchestrator {
+    pub(crate) landing_requests: Vec<crate::landing::LandingRequest>,
+    pub(crate) pending_landing: HashMap<String, crate::landing::LandingRun>,
+    pub(crate) landing_refusals: HashSet<(crate::prstate::PrCoord, String)>,
+    pub(crate) landing_operator_pending: HashSet<i64>,
     pub(crate) landing_task: Option<crate::landing::LandingTask>,
     /// Landing-enabled merge plans reserve project admission before GitHub runs, through the
     /// later observation that confirms an ambiguous attempt or durably admits the merged row.
@@ -1196,6 +1202,10 @@ impl Orchestrator {
             spawn: None,
             eff: None,
             landing_task: None,
+            landing_requests: Vec::new(),
+            pending_landing: HashMap::new(),
+            landing_refusals: HashSet::new(),
+            landing_operator_pending: HashSet::new(),
             landing_merges: HashMap::new(),
             capabilities_registry: None,
             teams: None,

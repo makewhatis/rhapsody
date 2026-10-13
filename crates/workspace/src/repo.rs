@@ -404,6 +404,22 @@ impl Manager {
     /// true, `exists` is authoritative; any infrastructure failure yields `(false, false)`, an
     /// empty repoURL/relPath likewise (INF-279).
     pub async fn prompt_file_in_repo(&self, repo_url: &str, rel_path: &str) -> (bool, bool) {
+        self.file_in_repo(repo_url, rel_path, false).await
+    }
+
+    /// Landing's advisory tests presence, not validity: an empty contract is present and will hold
+    /// with a parse error at merge time. Like the prompt check, this never clones or fetches.
+    pub async fn landing_contract_in_repo(&self, repo_url: &str) -> (bool, bool) {
+        self.file_in_repo(repo_url, ".rhapsody/landing.yaml", true)
+            .await
+    }
+
+    async fn file_in_repo(
+        &self,
+        repo_url: &str,
+        rel_path: &str,
+        allow_empty: bool,
+    ) -> (bool, bool) {
         let rel_path = rel_path.trim();
         if repo_url.trim().is_empty() || rel_path.is_empty() {
             return (false, false);
@@ -427,7 +443,7 @@ impl Manager {
             }
             return (false, false); // transient git/infra error — cannot verify, no false flag
         }
-        if out.trim().is_empty() {
+        if !allow_empty && out.trim().is_empty() {
             return (false, true); // present but empty → unusable, treated as missing
         }
         (true, true)
@@ -1306,6 +1322,45 @@ mod tests {
         let (m, _root) = repo_test_manager(HookScripts::default());
         let mirror = m.ensure_mirror(&origin.path).await.unwrap();
         assert_eq!(m.default_branch(&mirror).await.unwrap(), "main");
+    }
+
+    #[tokio::test]
+    async fn landing_contract_advisory_checks_presence_even_when_the_blob_is_empty() {
+        let origin = init_local_origin();
+        let (manager, _root) = repo_test_manager(HookScripts::default());
+        assert_eq!(
+            manager.landing_contract_in_repo(&origin.path).await,
+            (false, false)
+        );
+        manager
+            .ensure_from_repo(&origin.path, "", "APP-1")
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.landing_contract_in_repo(&origin.path).await,
+            (false, true)
+        );
+        std::fs::create_dir_all(join(&[&origin.path, ".rhapsody"])).unwrap();
+        std::fs::write(join(&[&origin.path, ".rhapsody/landing.yaml"]), "").unwrap();
+        git_run(&origin.path, &["add", ".rhapsody/landing.yaml"]);
+        git_run(
+            &origin.path,
+            &["commit", "-m", "empty contract is present, not absent"],
+        );
+        manager
+            .ensure_from_repo(&origin.path, "", "APP-2")
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.landing_contract_in_repo(&origin.path).await,
+            (true, true)
+        );
+        assert_eq!(
+            manager
+                .prompt_file_in_repo(&origin.path, ".rhapsody/landing.yaml")
+                .await,
+            (false, true)
+        );
     }
 
     // Mirror of TestPromptFileInRepo (INF-279).

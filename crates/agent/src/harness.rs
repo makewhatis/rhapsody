@@ -473,6 +473,18 @@ pub trait Harness: Runner {
             self.id()
         )))
     }
+
+    /// A read-only lander cannot silently acquire an ordinary coding session.
+    fn start_lander_session(
+        &self,
+        _workspace_path: &str,
+        _issue: rhapsody_core::Issue,
+        _transcript: Option<crate::Transcript>,
+    ) -> Result<Box<dyn crate::Session>, crate::AgentError> {
+        Err(crate::AgentError::Other(
+            "lander read-only posture is unsupported by this harness".into(),
+        ))
+    }
 }
 
 /// What one dispatch NEEDS from its resolved harness (design §5's table). This is the PURE input to

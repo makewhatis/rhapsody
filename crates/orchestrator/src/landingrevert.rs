@@ -12,6 +12,8 @@ use crate::landingcheck::CheckOutcome;
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum RevertError {
+    #[error("revert PR already merged")]
+    Merged,
     #[error("git revert conflicts: {0}")]
     Conflict(String),
     #[error("landing revert: {0}")]
@@ -39,6 +41,9 @@ pub(crate) trait RevertGithub: Send + Sync {
         body: &str,
     ) -> Result<i64, RevertError>;
     async fn snapshot(&self, row: &LandingRow, pr: i64) -> Result<RevertSnapshot, RevertError>;
+    async fn stop(&self, _row: &LandingRow, _pr: i64) -> Result<(), RevertError> {
+        Err(RevertError::Other("revert stop is unavailable".into()))
+    }
 }
 
 pub(crate) struct Reverter {
@@ -296,6 +301,7 @@ pub(crate) mod tests {
     use std::sync::Mutex;
 
     pub(crate) struct Github {
+        pub merged_during_stop: std::sync::atomic::AtomicBool,
         pub opened: Mutex<Vec<(String, String, String)>>,
         pub existing: Mutex<Option<i64>>,
         pub state: Mutex<(PrStatus, String, String)>,
@@ -303,6 +309,7 @@ pub(crate) mod tests {
     impl Github {
         pub(crate) fn new() -> Arc<Self> {
             Arc::new(Self {
+                merged_during_stop: std::sync::atomic::AtomicBool::new(false),
                 opened: Mutex::new(Vec::new()),
                 existing: Mutex::new(None),
                 state: Mutex::new((PrStatus::Open, "abcdef1234567".into(), String::new())),
@@ -311,6 +318,17 @@ pub(crate) mod tests {
     }
     #[async_trait::async_trait]
     impl RevertGithub for Github {
+        async fn stop(&self, _: &LandingRow, _: i64) -> Result<(), RevertError> {
+            if self
+                .merged_during_stop
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                self.state.lock().unwrap().0 = PrStatus::Merged;
+                return Err(RevertError::Merged);
+            }
+            self.state.lock().unwrap().0 = PrStatus::Closed;
+            Ok(())
+        }
         async fn original(&self, _: &LandingRow) -> Result<(String, String), RevertError> {
             Ok(("ship health".into(), "main".into()))
         }
@@ -371,6 +389,23 @@ pub(crate) mod tests {
             }),
         })
     }
+    #[tokio::test]
+    async fn stop_rechecks_merged_state_before_commenting_or_closing() {
+        let gh = GH::new(
+            "",
+            Some(Box::new(|args| {
+                assert_eq!(&args[..2], ["pr", "view"]);
+                Ok(br#"{"state":"MERGED","comments":[]}"#.to_vec())
+            })),
+        );
+        let row = LandingRow {
+            owner: "o".into(),
+            repo: "r".into(),
+            ..Default::default()
+        };
+        assert!(matches!(gh.stop(&row, 2).await, Err(RevertError::Merged)));
+    }
+
     #[tokio::test]
     async fn failure_with_auto_revert_opens_labelled_revert_pr_with_evidence() {
         let rig = RepoRig::new(

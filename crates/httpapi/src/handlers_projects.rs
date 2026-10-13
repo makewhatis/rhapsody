@@ -150,4 +150,19 @@ mod tests {
             .status();
         assert_eq!(status, 405);
     }
+
+    #[tokio::test]
+    async fn projects_endpoint_advises_missing_contract() {
+        let mut snap = empty_snapshot();
+        let mut app = project("app", "App", "idle", 0);
+        app.warnings = vec!["landing enabled but no .rhapsody/landing.yaml".into()];
+        snap.projects = vec![app];
+        let base = spawn(FakeProvider::ok(snap)).await;
+        let (status, body) = get_json(&format!("{base}/api/v1/projects")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            body["projects"][0]["warnings"][0],
+            "landing enabled but no .rhapsody/landing.yaml"
+        );
+    }
 }

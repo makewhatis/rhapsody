@@ -136,6 +136,10 @@ pub trait Store {
     fn load_open_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
         Ok(Vec::new())
     }
+    /// Every open landing plus the 200 most recent terminal rows for operator recovery/history.
+    fn list_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
+        Ok(Vec::new())
+    }
     fn get_landing(&self, _id: i64) -> Result<Option<LandingRow>, StoreError> {
         Ok(None)
     }

@@ -336,6 +336,11 @@ impl Orchestrator {
             // string survives so the UI can show `failed · stalled`.
             self.persist_end_run(&re, store::OUTCOME_FAILED, "stalled");
             self.persist_totals();
+            if re.landing.is_some() {
+                self.claimed.remove(&id);
+                self.persist_complete(&re.issue.identifier);
+                continue; // the durable landing, rather than tracker retry, consumes this failure
+            }
             let max_backoff = self.eff.as_ref().map_or(0, |e| e.max_retry_backoff_ms);
             self.schedule_retry_for(
                 RetryTarget {
@@ -446,6 +451,9 @@ impl Orchestrator {
         // is still alive inside the tree it deletes.
         if let Some(run) = re.review.as_ref() {
             self.teardown_review_worktree(run, &re.project_slug);
+        }
+        if let Some(run) = re.landing.as_ref() {
+            self.teardown_landing_worktree(run);
         }
         let dur = ((self.now)() - re.started_at)
             .num_nanoseconds()

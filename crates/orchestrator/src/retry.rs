@@ -380,6 +380,7 @@ impl Orchestrator {
         }
         if prepared.is_none()
             && engine.is_none()
+            && !crate::landing::is_landing_key(&iss.id)
             && !self.pending_manager.contains_key(&iss.id)
             && !self.limit_dispatch_ready(&iss, route.as_ref().map_or("", |r| r.slug.as_str()))
         {
@@ -481,7 +482,16 @@ impl Orchestrator {
         // the single control task (§0.11.2).
         // NB: `route` (the parameter) is the owning PROJECT's snapshot — an unrelated sense of the
         // word. `teams_dispatch` is named in full so the two cannot be conflated at a glance.
-        let teams_dispatch = self.route_teams(&iss);
+        let teams_dispatch = if crate::landing::is_landing_key(&iss.id) {
+            None
+        } else {
+            self.route_teams(&iss)
+        };
+        let landing = self.pending_landing.remove(&iss.id);
+        if crate::landing::is_landing_key(&iss.id) && landing.is_none() {
+            tracing::warn!(issue_id = %iss.id, "refusing landing key without landing coordinates");
+            return;
+        }
         // Review-mode coordinates staged by `dispatch_review` for THIS dispatch (STUDIO-715),
         // consumed the way a graphite stacking hint is. `None` for every ticket dispatch, which
         // leaves the rest of this function byte-identical to a daemon built before review mode.
@@ -508,6 +518,11 @@ impl Orchestrator {
         }
         let attempt_norm = normalize_attempt(attempt);
         let mut re = RunningEntry::empty(iss.clone());
+        re.landing = landing.clone();
+        if landing.is_some() {
+            re.harness = "claude".into();
+            re.teammate_section.clear();
+        }
         re.review = review.clone();
         // PB7 (STUDIO-1002, STUDIO-1047): a prepared dispatch's usage is settled from the broker
         // receipt, so its child figure is excluded from the cumulative aggregate (`on_agent_update`)
@@ -637,6 +652,12 @@ impl Orchestrator {
                 model: engine.spec.model.clone(),
                 effort: engine.spec.effort.clone(),
             };
+        }
+        if landing.is_some() {
+            re.harness = "claude".into();
+            re.engine = None;
+            re.teammate_section.clear();
+            re.capabilities_section.clear();
         }
         // Bounded telemetry label, stamped at dispatch (Go `re.model = o.modelFor(rp)`): the routed
         // project's model, else the top-level effective claude model.
@@ -1136,6 +1157,47 @@ impl Orchestrator {
         // mint.
         if crate::managerrun::is_manager_key(&re.issue.id) {
             self.on_manager_exit(&re, &e);
+            self.rearm_tick_for_held_capacity();
+            return;
+        }
+        if let Some(landing) = &re.landing {
+            self.claimed.remove(&e.issue_id);
+            let text = e.verdict_text.unwrap_or_default();
+            let durable = serde_json::json!({"text": text, "failed": e.failed}).to_string();
+            if let Err(error) = self.store().append_events(
+                re.run_id,
+                &[store::EventRow {
+                    seq: re.event_seq + 1,
+                    at: (self.now)().to_rfc3339(),
+                    kind: "landing.verdict".into(),
+                    text: durable,
+                    ..Default::default()
+                }],
+            ) {
+                tracing::warn!(landing_id = landing.row.id, %error, "landing verdict could not be persisted; restart recovery will fail closed");
+            }
+            self.persist_end_run(
+                &re,
+                if e.failed {
+                    store::OUTCOME_FAILED
+                } else {
+                    store::OUTCOME_COMPLETED
+                },
+                &e.err_msg,
+            );
+            self.persist_complete(&re.issue.identifier);
+            self.persist_totals();
+            self.landing_requests.push(crate::landing::LandingRequest {
+                id: landing.row.id,
+                command: crate::landing::LandingCommand::Acceptance {
+                    run_id: re.run_id,
+                    text,
+                    failed: e.failed,
+                },
+                reply: None,
+            });
+            // The next owned sweep applies the verdict alongside operator actions and checks.
+            let _ = self.events.send(crate::control_loop::Event::LandingWake);
             self.rearm_tick_for_held_capacity();
             return;
         }

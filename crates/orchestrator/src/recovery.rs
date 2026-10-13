@@ -69,6 +69,12 @@ impl Orchestrator {
         let mut retry_by_key: HashMap<String, store::RetryRow> = HashMap::new();
         let mut limit_claims = HashSet::new();
         for rr in rec.retries {
+            if crate::landing::is_landing_key(&rr.identifier)
+                || crate::landing::is_landing_key(&rr.issue_id)
+            {
+                self.persist_release(&rr.identifier);
+                continue;
+            }
             if !rr.project_slug.is_empty() && self.project_unconfigured(&rr.project_slug) {
                 tracing::info!(issue_identifier = %rr.identifier, project_slug = %rr.project_slug, "recovery: releasing recovered retry; project no longer configured");
                 self.persist_release(&rr.identifier);
@@ -98,6 +104,10 @@ impl Orchestrator {
         // `ClaimRow.issue_id` IS the identifier (store PK).
         for cl in rec.claims {
             let identifier = cl.issue_id;
+            if crate::landing::is_landing_key(&identifier) {
+                self.persist_release(&identifier);
+                continue;
+            }
             if limit_claims.contains(&identifier) {
                 continue;
             }
@@ -405,6 +415,18 @@ mod tests {
             o.running.contains_key("ID-PAST"),
             "re-dispatched issue running under its real ID"
         );
+    }
+
+    #[test]
+    fn landing_recovery_is_owned_by_landing_not_tracker_retry() {
+        let st = mem_store();
+        st.save_claim("land:o/r#1", store::CLAIM_RUNNING, "")
+            .unwrap();
+        let (mut o, _) = recovery_orch(Arc::clone(&st), Arc::new(Fake::new()), Utc::now());
+        o.boot_recovery();
+        assert!(!o.claimed.contains("land:o/r#1"));
+        assert!(!o.retry_attempts.contains_key("land:o/r#1"));
+        assert!(st.load_recovery().unwrap().claims.is_empty());
     }
 
     // Mirrors Go `TestBootRecoveryConvertsInterruptedClaimToImmediateRetry`.
