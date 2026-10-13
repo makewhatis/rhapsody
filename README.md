@@ -98,6 +98,22 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Retry admission before fresh work (STUDIO-1263)
+
+Due retries and retries waiting for capacity are served oldest-first before fresh candidates on
+each poll tick; retry timer events use the same ordering. The frozen Go scheduler lets fresh polls
+compete with independently backed-off retries, which can starve already-started work. A slot wait
+now preserves the attempt and original due time (including across restart), and re-arms a fixed
+five-second timer like drain parking instead of charging another failure or growing backoff.
+Waiting retries check local capacity before making any tracker read; a full pool consumes no retry
+polls. The ordinary board poll refreshes waiting snapshots without extra reads and reconsiders retries
+before fresh selection in the same tick. Admission still revalidates the ticket and all caps once
+capacity is free. That tick's older board snapshots cannot re-admit a retry rejected by the newer read.
+Selection still observes the full board's human holds; retry ownership excludes admission only.
+Future genuine-failure backoffs and account-limit waits retain their existing deadlines. Global
+implementation, per-project-group and shared per-state caps remain enforced, including preparation
+reservations. No configuration, schema, API shape or golden fixture changes.
+
 ### Durable drain continuations (STUDIO-1259)
 
 Retry-backed ticket runs parked at a drain boundary retain their harness's resumable conversation,
