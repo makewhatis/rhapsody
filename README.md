@@ -520,7 +520,8 @@ Claude's tool allowlist and OpenCode's server-prefixed permissions cover it; ord
 not register it. Operator recall uses the configured Hindsight endpoint and the exact bank
 `operator-decisions`, independent of the personal-bank prefix or the team's local/remote backend.
 Lead preparation prefetches operator preferences and the configured team bank off-loop, before
-dispatch; quoted, attributed memory is context, never binding precedent or policy. Missing or
+dispatch, only after authority and subject admission succeed (STUDIO-1255); launch still rechecks
+admission. Quoted, attributed memory is context, never binding precedent or policy. Missing or
 unavailable memory is stated in the case packet/tool answer, and the lead continues deciding.
 
 The daemon retains each lead decision with `by: lead` metadata and the `lead` tag. The host-only
