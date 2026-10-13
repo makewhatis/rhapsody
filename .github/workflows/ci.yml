@@ -3,18 +3,13 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: '23 3 * * *' # Nightly Darwin coverage, 03:23 UTC.
 
-# Self-hosted runners (STUDIO-1028): repo-scoped, like the tally/booch runners. `lint`, `web` and
-# `pr-title` moved off the saturated Macs onto the Linux pool (`rhapsody-linux`:
-# djohansen-fedora-desktop-1-rhapsody-{1,2,3}, each with its own warm `_work`), and `boot-e2e` runs
-# there at PR time too — it was the job timing out on the busy Macs and it passes on Linux. `test`
-# joined them at PR time in STUDIO-1029, once the credential client stopped reading a Linux
-# `ECONNRESET` after a rejected `Hello` as an unavailable owner (see the `test` job); both `test` and
-# `boot-e2e` fall back to macOS on a push to main so the daemon is still exercised on the platform
-# that ships, and `desktop` (the Tauri `.app`) is macOS everywhere. The Macs were the only runners
-# until 2026-09-23, when they saturated (queued runs, "not acquired by Runner of type self-hosted",
-# boot-e2e timeouts); moving the PR traffic that can run on Linux keeps the Macs for the desktop
-# gate and the push-to-main daemon runs.
+# Self-hosted runners (STUDIO-1028, STUDIO-1267): `lint`, `web`, `test` and `boot-e2e` use the
+# Linux pool (`rhapsody-linux`) for every event. Keep the shared Macs for the Tauri `.app`/parity
+# gate and throttled Darwin coverage (`test-macos`, main pushes/manual/nightly only).
 # rustup lives in ~/.cargo/bin which is not in the runner's seeded PATH — each rust job adds it.
 
 # Per-branch cancellation (STUDIO-1027). A superseded push to the same branch would otherwise queue
@@ -77,8 +72,8 @@ jobs:
       - run: python3 harness/ci/check-process-leaks_test.py
       # STUDIO-1174: the job-private `env.HOME` on each `taiki-e/install-action` step is what keeps
       # the action's fixed `${HOME}/.install-action/tmp` scratch per-job; without it the concurrent
-      # `test`/`desktop` jobs on one Mac host clobber each other's checksum verify. The check reads
-      # ci.yml; its mutation test proves it reds when either override is dropped. Python-only, so it
+      # `test-macos`/`desktop` jobs on one Mac host clobber each other's checksum verify. The check reads
+      # ci.yml; its mutation test proves it reds when any override is dropped. Python-only, so it
       # rides `lint` rather than adding a branch-protection context.
       - run: python3 harness/ci/check-install-action-home.py
       - run: python3 harness/ci/check-install-action-home_test.py
@@ -91,10 +86,9 @@ jobs:
     # The credential client now reads a rejected owner as `OwnerUnauthorized` on Linux too: a unix
     # socket closed with an unread inbound frame yields `ECONNRESET` there where macOS delivers a
     # clean EOF, and both are classified as the rejection they are (STUDIO-1029). The last Linux
-    # blocker is gone, so `test` runs on the Linux pool at PR time like `boot-e2e` — and on macOS on
-    # a push to main, the platform that ships. `--no-fail-fast` stays: it is what surfaces every
-    # failing crate in one run rather than stopping at the first.
-    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","macOS","ARM64"]') || fromJSON('["self-hosted","Linux","rhapsody-linux"]') }}
+    # blocker is gone, so `test` runs on the Linux pool for every event like `boot-e2e`.
+    # `--no-fail-fast` surfaces every failing crate in one run rather than stopping at the first.
+    runs-on: [self-hosted, Linux, rhapsody-linux]
     steps:
       - uses: actions/checkout@v4
       - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
@@ -103,7 +97,7 @@ jobs:
       # scratch dir (`main.sh`: install_action_dir="${HOME}/.install-action", tmp_dir=.../tmp,
       # `curl -o tmp`, `sha256sum -c ... *tmp`, then `rm -rf "${tmp_dir}"`, no locking). Every
       # self-hosted Mac runner runs as the same user on the same host, so two jobs that both use
-      # install-action at the same instant (test + desktop on a push to main) share that one
+      # install-action at the same instant (test-macos + desktop on a push to main) share that one
       # directory: one job's download or its trailing `rm -rf` clobbers the other's in-flight
       # `tmp`, and the checksum verify dies seconds in (`sha256sum: *tmp: No such file or
       # directory`, or `1 computed checksum did NOT match`). A job-private HOME gives the action
@@ -135,14 +129,41 @@ jobs:
       # second task's prehook git work outlasted the first hook's sleep), so a single run is not
       # evidence of determinism — this loop pins 50 consecutive passes. It runs under the same
       # job-private TMPDIR, before the STUDIO-1031 leak scan, so the scan still covers it, and
-      # `runner.os != 'macOS'` keeps the repetition off the shared Macs (the push-to-main leg runs
-      # there); the workspace run above has already compiled everything, so each iteration only
-      # re-runs the one test.
-      - if: runner.os != 'macOS'
-        run: |
-          for i in $(seq 1 50); do
+      # this Linux-only job keeps the repetition off the shared Macs; the workspace run above
+      # has already compiled everything, so each iteration only re-runs the one test.
+      - run: |
+          for _ in $(seq 1 50); do
             TMPDIR="$RUNNER_TEMP/job-tmp" cargo test -p rhapsody-workspace --lib repo::tests::ensure_from_repo_hook_runs_unlocked -- --exact | grep -q 'test result: ok. 1 passed' || exit 1
           done
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"
+      - if: always()
+        run: python3 harness/ci/check-process-leaks.py check "$RUNNER_TEMP/process-baseline.json" --cleanup
+
+  # Darwin-specific process groups, CPU sampling and kill_tree remain covered without adding a
+  # required PR check. Operator: run or check `test-macos` on the RC revision before cutting an RC.
+  test-macos:
+    timeout-minutes: 60
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: [self-hosted, macOS, ARM64]
+    env:
+      CARGO_BUILD_JOBS: 6
+      NEXTEST_TEST_THREADS: 6
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - run: rustup show
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.100
+        env:
+          HOME: ${{ runner.temp }}/install-action-home
+      - run: python3 harness/ci/check-process-leaks.py snapshot "$RUNNER_TEMP/process-baseline.json"
+      - run: mkdir -p "$RUNNER_TEMP/job-tmp" && touch "$RUNNER_TEMP/tmp-leak-marker"
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" bash harness/ci/check-test-timeout.sh
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo nextest run --workspace --profile ci --no-fail-fast
+      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --workspace --doc --no-fail-fast
       - run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"
       - if: always()
         run: python3 harness/ci/check-process-leaks.py check "$RUNNER_TEMP/process-baseline.json" --cleanup
@@ -180,9 +201,8 @@ jobs:
     if: >-
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
-    # The assembled daemon is exercised on Linux at PR time (this job passed there on the trial and
-    # was the one timing out on the busy Macs), and on macOS on a push to main — what ships.
-    runs-on: ${{ github.event_name == 'push' && fromJSON('["self-hosted","macOS","ARM64"]') || fromJSON('["self-hosted","Linux","rhapsody-linux"]') }}
+    # The assembled daemon is exercised on Linux for every event; desktop keeps Mac app parity.
+    runs-on: [self-hosted, Linux, rhapsody-linux]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -205,20 +225,56 @@ jobs:
       github.event_name != 'pull_request' ||
       github.event.pull_request.head.repo.full_name == github.repository
     runs-on: [self-hosted, macOS, ARM64]
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      CARGO_BUILD_JOBS: 6
     steps:
       - uses: actions/checkout@v4
-      - run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - run: rustup show   # installs the toolchain pinned by the shared repo-root rust-toolchain.toml
+      # Keep the required `desktop` job successful for unrelated PRs; skip steps, not the job.
+      # paths-filter reads the PR's changed files via the API, including added/deleted paths.
+      - uses: dorny/paths-filter@v3
+        if: github.event_name == 'pull_request'
+        id: paths
+        with:
+          filters: |
+            desktop:
+              - 'desktop/**'
+              - 'web/**'
+              - 'Cargo.lock'
+              - '.github/workflows/**'
+      - name: Decide desktop coverage
+        id: desktop-run
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          DESKTOP_CHANGED: ${{ steps.paths.outputs.desktop }}
+        run: |
+          if [[ "$EVENT_NAME" == 'push' || "$EVENT_NAME" == 'workflow_dispatch' || "$DESKTOP_CHANGED" == 'true' ]]; then
+            echo 'required=true' >> "$GITHUB_OUTPUT"
+            echo 'Full desktop build/test/parity coverage required.'
+          else
+            echo 'required=false' >> "$GITHUB_OUTPUT"
+            echo 'Desktop heavy steps skipped: no desktop inputs changed (or nightly Darwin-only coverage).'
+          fi
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: rustup show   # installs the toolchain pinned by the shared repo-root rust-toolchain.toml
       # STUDIO-1174: job-private HOME so install-action's fixed `${HOME}/.install-action/tmp`
-      # scratch dir cannot be clobbered by the concurrent `test` job on a sibling runner — see the
+      # scratch dir cannot be clobbered by the concurrent `test-macos` job on a sibling runner — see the
       # long note on the `test` job's install-action step for the full race.
       - uses: taiki-e/install-action@v2
+        if: steps.desktop-run.outputs.required == 'true'
         with:
           tool: nextest@0.9.100
         env:
           HOME: ${{ runner.temp }}/install-action-home
-      - run: python3 harness/ci/check-process-leaks.py snapshot "$RUNNER_TEMP/process-baseline.json"
+      - if: steps.desktop-run.outputs.required == 'true'
+        id: process-baseline
+        run: python3 harness/ci/check-process-leaks.py snapshot "$RUNNER_TEMP/process-baseline.json"
       - uses: actions/setup-node@v4
+        if: steps.desktop-run.outputs.required == 'true'
         with:
           node-version: 22
           # No `cache: npm` on the self-hosted runner (same rationale as the web job).
@@ -227,9 +283,11 @@ jobs:
       # below compile against the committed `.gitkeep` anchor (an empty dist is fine —
       # `tauri::generate_context!` embeds whatever is there); `make app` builds the real bundle. `web/`
       # itself is built + tested by the `web` job.
-      - run: cargo fmt --all --check
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: cargo fmt --all --check
         working-directory: desktop
-      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
         working-directory: desktop
       # Unit + supervisor-lifecycle + packaging-gate tests. Default features build the `fakedaemon`
       # supervisor stub the integration tests need (the packaging build turns it off — see below).
@@ -239,10 +297,13 @@ jobs:
       # STUDIO-1031: same temp-dir leak gate as the root `test` job — the desktop tests rolled
       # their own un-guarded `rhapsody-d2-sup-*` / `rhapsody-d4-*` helpers. A job-private
       # `$TMPDIR` keeps the scan exact (see the `test` job).
-      - run: mkdir -p "$RUNNER_TEMP/job-tmp" && touch "$RUNNER_TEMP/tmp-leak-marker"
-      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo nextest run --locked --config-file ../.config/nextest.toml --profile ci
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: mkdir -p "$RUNNER_TEMP/job-tmp" && touch "$RUNNER_TEMP/tmp-leak-marker"
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo nextest run --locked --config-file ../.config/nextest.toml --profile ci
         working-directory: desktop
-      - run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --locked --doc
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: TMPDIR="$RUNNER_TEMP/job-tmp" cargo test --locked --doc
         working-directory: desktop
       # P7-D5 packaging build gate: the Tauri bundler produces the UNSIGNED Rhapsody.app. The CLI
       # install is idempotent and persists on the self-hosted runner. `make app` (run from the repo
@@ -256,15 +317,19 @@ jobs:
       # already mounted (e.g. the app running from a mounted DMG). The parity e2e consumes the `.app`
       # bundle (Contents/MacOS -> Contents/Resources/rhapsodyd), never the `.dmg`, so `make app` is the
       # correct, collision-free PR gate.
-      - run: command -v cargo-tauri >/dev/null 2>&1 || cargo install tauri-cli --version "^2" --locked
-      - run: TMPDIR="$RUNNER_TEMP/job-tmp" make app
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: command -v cargo-tauri >/dev/null 2>&1 || cargo install tauri-cli --version "^2" --locked
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: TMPDIR="$RUNNER_TEMP/job-tmp" make app
       # P7-D5 parity e2e: the app's supervisor drives the packaged rhapsodyd through
       # start -> healthy -> dashboard -> stop (against the R3 linear-stub + fake-claude harness). Gated
       # by RHAPSODY_PARITY_E2E so only this explicit step runs it (it needs the bundle `make app` built).
-      - run: RHAPSODY_PARITY_E2E=1 TMPDIR="$RUNNER_TEMP/job-tmp" cargo nextest run --locked --config-file ../.config/nextest.toml --profile ci -p rhapsody-desktop --test parity_e2e
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: RHAPSODY_PARITY_E2E=1 TMPDIR="$RUNNER_TEMP/job-tmp" cargo nextest run --locked --config-file ../.config/nextest.toml --profile ci -p rhapsody-desktop --test parity_e2e
         working-directory: desktop
       # The gate runs at the END so it sees the whole job: cargo test, `make app`, and the parity
       # e2e (which drives the real rhapsodyd through a scratch `$TMPDIR` of its own).
-      - run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"
-      - if: always()
+      - if: steps.desktop-run.outputs.required == 'true'
+        run: TMPDIR="$RUNNER_TEMP/job-tmp" harness/ci/check-tmp-leaks.sh "$RUNNER_TEMP/tmp-leak-marker"
+      - if: always() && steps.process-baseline.outcome == 'success'
         run: python3 harness/ci/check-process-leaks.py check "$RUNNER_TEMP/process-baseline.json" --cleanup

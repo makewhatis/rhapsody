@@ -63,15 +63,18 @@ with tempfile.TemporaryDirectory(prefix="install-action-home-") as work:
     # would prove nothing (it could be red for the wrong reason).
     expect("baseline: the shipped ci.yml passes", REAL_WORKFLOW, 0, "PASS")
 
-    assert real.count(ENV_BLOCK) == 2, \
-        f"expected the job-private HOME block twice in ci.yml, found {real.count(ENV_BLOCK)}"
+    assert real.count(ENV_BLOCK) == 3, \
+        f"expected three job-private HOME blocks in ci.yml, found {real.count(ENV_BLOCK)}"
 
-    # Drop one override (revert the `test` step): the check must red and name it.
-    expect("reds when one install-action step loses its HOME",
-           write(real.replace(ENV_BLOCK, "", 1), work), 1, "must set a job-private")
+    # Drop each override separately: every job's action must still be protected.
+    blocks = real.split(ENV_BLOCK)
+    for index, job in enumerate(("test", "test-macos", "desktop")):
+        mutated = ENV_BLOCK.join(blocks[:index + 1]) + ENV_BLOCK.join(blocks[index + 1:])
+        expect(f"reds when {job}'s install-action step loses its HOME",
+               write(mutated, work), 1, f"job '{job}'")
 
-    # Drop both overrides — the exact reviewer mutation: reverting the whole ci.yml diff.
-    expect("reds when both install-action steps lose their HOME",
+    # Drop all overrides — the exact reviewer mutation: reverting the whole HOME fix.
+    expect("reds when all install-action steps lose their HOME",
            write(real.replace(ENV_BLOCK, ""), work), 1, "must set a job-private")
 
     # A HOME that is set but NOT job-private (a fixed shared path) is still the bug.
