@@ -304,6 +304,7 @@ fn collapsible_to_single(c: &Config) -> bool {
         && p.claim_mode.is_empty()
         && p.providers.is_empty()
         && p.enabled.is_none()
+        && p.landing.is_none()
 }
 
 /// Emits a raw field only when it differs from its derived default, so a defaulted value is never
@@ -402,6 +403,7 @@ fn raw_project_from_project(
     default_limits: &crate::providers::BrokerLimits,
 ) -> RawProject {
     let mut rp = RawProject {
+        landing: p.landing.clone(),
         name: p.name.clone(),
         repo: p.repo.clone(),
         slugs: p.slugs.clone(),

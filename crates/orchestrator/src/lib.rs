@@ -51,6 +51,7 @@ pub mod ghsummons;
 pub mod handoff;
 pub mod investigate;
 pub mod issuelog;
+pub mod landingcheck;
 pub mod leaddecision;
 pub mod leadexec;
 pub mod leaditems;

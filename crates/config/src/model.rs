@@ -389,6 +389,8 @@ pub struct ClaudeOverride {
 /// one setting only the fields they need (`Project { slugs, ..Default::default() }`).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Project {
+    /// Opt-in production verification; absent preserves the historical merge lifecycle.
+    pub landing: Option<crate::landing::LandingConfig>,
     pub name: String,
     pub repo: String,
     pub slugs: Vec<String>,
@@ -812,6 +814,7 @@ pub(crate) struct RawMcp {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawProject {
+    pub landing: Option<crate::landing::LandingConfig>,
     pub name: String,
     pub repo: String,
     pub slugs: Vec<String>,

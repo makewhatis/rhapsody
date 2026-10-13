@@ -436,6 +436,7 @@ fn decode_project(rp: RawProject) -> Project {
         promote_from_states: rp.promote_from_states,
         // Mapped verbatim (None preserved) so the enabled default is applied at resolve time.
         enabled: rp.enabled,
+        landing: rp.landing,
         // Per-project provider definitions (STUDIO-984): mapped verbatim (empty ⇒ inherit).
         providers: rp
             .providers
@@ -596,7 +597,7 @@ fn as_int(v: &Value) -> Option<i64> {
 /// each with an optional fraction and a required unit (`ns`, `us`/`µs`/`μs`, `ms`, `s`, `m`, `h`).
 /// `"0"` is the only unitless form. Overflow (past `1<<63` ns) is an error, as in Go. The returned
 /// [`Duration`] is nanosecond-exact; a leading `-` yields a negative duration.
-fn parse_go_duration(orig: &str) -> Result<Duration, String> {
+pub(crate) fn parse_go_duration(orig: &str) -> Result<Duration, String> {
     const MAX: u64 = 1u64 << 63;
     let invalid = || format!("time: invalid duration \"{orig}\"");
     let b = orig.as_bytes();
