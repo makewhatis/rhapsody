@@ -1694,8 +1694,8 @@ where
         let prefetch_handle = handle.clone();
         let deps = rhapsody_orchestrator::PrefetchDeps {
             teams: Arc::new(teams_cfg),
-            // Read lazily each cycle, exactly as triage reads its tracker: the handle is built
-            // before the first reload, so the tracker arrives later.
+            // Read lazily each cycle: the handle exists before the first poll publishes
+            // candidates. Prefetch reuses that answer without spending Linear quota.
             target: move || prefetch_target(&prefetch_handle),
             backend: w.backend,
             cache: w.cache,
