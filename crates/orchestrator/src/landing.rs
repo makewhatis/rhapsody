@@ -548,12 +548,17 @@ impl LandingRuntime {
             .checks
             .values()
             .any(|s| s.failures >= self.config.failure_threshold);
+        let watch_ended = row.watch_until_s.is_some_and(|end| now >= end);
+        // The window is absolute: a tolerated final flap stays in evidence but cannot schedule
+        // another sample beyond it. Only reaching the persisted threshold fails the landing.
         for check in &contract.checks {
             let state = progress.checks.entry(check.name.clone()).or_default();
             if state.failures >= self.config.failure_threshold {
                 continue;
             }
-            if state.ran && (check.every.is_none() && state.pass || now < state.next_s) {
+            if state.ran
+                && (watch_ended || check.every.is_none() && state.pass || now < state.next_s)
+            {
                 continue;
             }
             let outcome = self.checks.check(&row, check).await;
@@ -576,13 +581,11 @@ impl LandingRuntime {
         }
         if failed {
             progress.pending = Some("Reopened".into());
-        } else if row.watch_until_s.is_some_and(|end| now >= end)
-            && contract.checks.iter().all(|c| {
-                progress
-                    .checks
-                    .get(&c.name)
-                    .is_some_and(|s| s.ran && s.pass)
-            })
+        } else if watch_ended
+            && contract
+                .checks
+                .iter()
+                .all(|c| progress.checks.get(&c.name).is_some_and(|s| s.ran))
         {
             progress.pending = Some("Done".into());
         }
@@ -751,6 +754,7 @@ fn landing_group<'a>(row: &'a LandingRow, progress: &'a Progress) -> &'a str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ghsummons::*;
     use crate::testsupport::{TempDir, empty_effective};
     use rhapsody_config::landing::parse_contract;
     use rhapsody_store::{Sqlite, StorePath};
@@ -908,6 +912,33 @@ mod tests {
         }
         assert_eq!(rig.row().phase, LandingPhase::Done);
         assert!(rig.progress().samples.iter().any(|s| !s.pass));
+    }
+    #[tokio::test]
+    async fn under_threshold_failure_at_deadline_does_not_extend_watch_window() {
+        for final_tick in [10, 30] {
+            let mut rig = Rig::new("Done");
+            let mut contract = rig.checks.contract.clone().unwrap().unwrap();
+            contract.checks[0].every = Some(Duration::from_secs(30));
+            let checks = Arc::new(Checks {
+                contract: Ok(Some(contract)),
+                live: Mutex::new(VecDeque::from([("merge".into(), true)])),
+                checks: Mutex::new(VecDeque::from([false, false])),
+                calls: Mutex::new(Vec::new()),
+            });
+            rig.checks = checks.clone();
+            rig.runtime.checks = checks;
+            rig.tick(0).await;
+            assert_eq!(rig.row().phase, LandingPhase::Watching);
+            rig.tick(final_tick).await;
+            assert_eq!(rig.row().phase, LandingPhase::Done);
+            assert_eq!(rig.row().watch_until_s, Some(10));
+            let samples = rig.progress().samples;
+            assert_eq!(samples.iter().filter(|s| s.name == "health").count(), 1);
+            assert!(
+                !samples.last().unwrap().pass,
+                "tolerated failure stays in evidence"
+            );
+        }
     }
     #[tokio::test]
     async fn sustained_failure_reopens_with_review_feedback() {
@@ -1200,6 +1231,9 @@ mod tests {
             };
         }
         fn new(before: Option<&str>, after: Option<&str>) -> Self {
+            Self::build(before, after, true)
+        }
+        fn build(before: Option<&str>, after: Option<&str>, admitted: bool) -> Self {
             let dir = TempDir::new();
             let origin = dir.child("origin");
             std::fs::create_dir(&origin).unwrap();
@@ -1236,19 +1270,23 @@ mod tests {
                 team_id: "TEAM".into(),
                 ..Default::default()
             };
-            let id = store
-                .save_landing(LandingRow {
-                    project_slug: "app".into(),
-                    owner: "o".into(),
-                    repo: "r".into(),
-                    pr: 1,
-                    ticket: "APP-1".into(),
-                    merge_sha: sha,
-                    deploy_deadline_s: 30,
-                    results_json: serde_json::to_string(&progress).unwrap(),
-                    ..Default::default()
-                })
-                .unwrap();
+            let id = if admitted {
+                store
+                    .save_landing(LandingRow {
+                        project_slug: "app".into(),
+                        owner: "o".into(),
+                        repo: "r".into(),
+                        pr: 1,
+                        ticket: "APP-1".into(),
+                        merge_sha: sha,
+                        deploy_deadline_s: 30,
+                        results_json: serde_json::to_string(&progress).unwrap(),
+                        ..Default::default()
+                    })
+                    .unwrap()
+            } else {
+                0
+            };
             let runtime = LandingRuntime {
                 store,
                 tracker,
@@ -1505,14 +1543,210 @@ mod tests {
             }
         }
     }
+    struct ScriptedGh {
+        origin: String,
+        merged: Mutex<BTreeMap<i64, String>>,
+        calls: Mutex<Vec<i64>>,
+    }
+    impl ScriptedGh {
+        fn snapshot(&self, pr: i64) -> PrSnapshot {
+            PrSnapshot {
+                head_sha: git(&self.origin, &["rev-parse", &format!("feature-{pr}")]),
+                status: if self.merged.lock().unwrap().contains_key(&pr) {
+                    PrStatus::Merged
+                } else {
+                    PrStatus::Open
+                },
+                is_draft: Some(false),
+                head_repo: "o/r".into(),
+                merge_state: "CLEAN".into(),
+                merged_at: None,
+            }
+        }
+        fn merge_branch(&self, pr: i64) {
+            git(
+                &self.origin,
+                &["merge", "--squash", &format!("feature-{pr}")],
+            );
+            git(
+                &self.origin,
+                &["commit", "--allow-empty", "-m", &format!("merge {pr}")],
+            );
+            self.merged
+                .lock()
+                .unwrap()
+                .insert(pr, git(&self.origin, &["rev-parse", "HEAD"]));
+        }
+    }
+    #[async_trait::async_trait]
+    impl PrStateSource for ScriptedGh {
+        async fn pr_state(&self, _: &str, _: &str, pr: i64, _: &HeadAllowlist) -> PrStateResult {
+            Ok(PrLookup::Found(self.snapshot(pr)))
+        }
+    }
+    #[async_trait::async_trait]
+    impl MergeStateSource for ScriptedGh {
+        async fn merge_state(&self, _: &str, _: &str, _: i64) -> MergeStateResult {
+            Ok("CLEAN".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl PrChecksSource for ScriptedGh {
+        async fn pr_checks(&self, _: &str, _: &str, _: i64) -> PrChecksResult {
+            Ok(vec![CheckRun {
+                name: "test".into(),
+                state: "SUCCESS".into(),
+            }])
+        }
+    }
+    #[async_trait::async_trait]
+    impl BranchUpdateSource for ScriptedGh {
+        async fn allows_branch_update(&self, _: &str, _: &str) -> BranchUpdateResult {
+            Ok(false)
+        }
+    }
+    #[async_trait::async_trait]
+    impl BranchUpdater for ScriptedGh {
+        async fn update_branch(&self, _: &str, _: &str, _: i64) -> MergeResult {
+            Err("unexpected branch update".into())
+        }
+    }
+    #[async_trait::async_trait]
+    impl MergeSource for ScriptedGh {
+        async fn merge_pr(
+            &self,
+            _: &str,
+            _: &str,
+            pr: i64,
+            method: MergeMethod,
+            auto: bool,
+            head: Option<&str>,
+        ) -> MergeResult {
+            assert_eq!(method, MergeMethod::Squash);
+            assert!(!auto);
+            assert_eq!(head, Some(self.snapshot(pr).head_sha.as_str()));
+            self.calls.lock().unwrap().push(pr);
+            self.merge_branch(pr);
+            Ok("merged".into())
+        }
+    }
+    struct ScriptedChecks {
+        repo: RepoChecks,
+        gh: Arc<ScriptedGh>,
+    }
+    #[async_trait::async_trait]
+    impl LandingChecks for ScriptedChecks {
+        async fn merge_sha(&self, row: &LandingRow) -> Result<String, String> {
+            self.gh
+                .merged
+                .lock()
+                .unwrap()
+                .get(&row.pr)
+                .cloned()
+                .ok_or("not merged".into())
+        }
+        async fn prepare(&self, row: &LandingRow) -> Result<Option<LandingContract>, String> {
+            self.repo.prepare(row).await
+        }
+        async fn live(
+            &self,
+            row: &LandingRow,
+            contract: &LandingContract,
+            fetch: bool,
+        ) -> Result<(String, bool, bool), String> {
+            self.repo.live(row, contract, fetch).await
+        }
+        async fn check(&self, row: &LandingRow, check: &NamedCheck) -> CheckOutcome {
+            self.repo.check(row, check).await
+        }
+    }
+
     #[tokio::test]
     async fn file_tracker_http_app_merge_watches_to_done_then_failure_reopens() {
+        use crate::reviewwatch::{ControlWatchSink, ReviewWatchSink};
         let app = App::new().await;
         let contract = format!(
             "version: 1\nlive:\n  http: {{url: '{}/version', status: 200}}\n  every: 1s\nchecks:\n- name: health\n  http: {{url: '{}/healthz', status: 200}}\n  every: 1s\n",
             app.address, app.address
         );
-        let rig = RepoRig::new(None, Some(&contract));
+        let mut rig = RepoRig::build(None, Some(&contract), false);
+        // Start with two approved but unmerged branches, rather than inserting landing rows.
+        git(&rig.origin, &["reset", "--hard", "HEAD^1"]);
+        git(&rig.origin, &["branch", "feature-1", "feature"]);
+        git(&rig.origin, &["checkout", "-b", "feature-2", "feature"]);
+        git(
+            &rig.origin,
+            &["commit", "--allow-empty", "-m", "second change"],
+        );
+        git(&rig.origin, &["checkout", "main"]);
+        let gh = Arc::new(ScriptedGh {
+            origin: rig.origin.clone(),
+            merged: Mutex::new(BTreeMap::new()),
+            calls: Mutex::new(Vec::new()),
+        });
+        let (mut o, _) = orch(true);
+        o.teams.as_mut().unwrap().review.auto_merge = true;
+        o.human_holds.begin_pass(true);
+        o.set_store(rig.runtime.store.clone());
+        o.now = Box::new(|| DateTime::from_timestamp(0, 0).unwrap());
+        o.store()
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: "APP-1".into(),
+                issue_id: "ID-1".into(),
+                team_id: "TEAM".into(),
+                project_slug: "app".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        for pr in [1, 2] {
+            let mut row = watch_row();
+            row.key.number = pr;
+            row.status = rhapsody_store::REVIEW_STATUS_APPROVED.into();
+            row.last_reviewed_sha = git(&rig.origin, &["rev-parse", &format!("feature-{pr}")]);
+            o.store().save_review_watch(row).unwrap();
+        }
+        let mut events = o.take_events_rx().unwrap();
+        let sink = ControlWatchSink::new(o.control()).with_auto_merge(Arc::new(
+            crate::runautomerge::AutoMergeDeps {
+                prs: gh.clone(),
+                mergestate: gh.clone(),
+                policy: gh.clone(),
+                updater: gh.clone(),
+                checks: gh.clone(),
+                merger: gh.clone(),
+                allow: HeadAllowlist::none(),
+                approvals: None,
+                ledger: Arc::new(crate::runautomerge::AutoMergeLedger::default()),
+            },
+        ));
+        let observation = |pr| crate::prstate::PrObservation {
+            pr: PrCoord::new("o", "r", pr),
+            lookup: crate::ghsummons::PrLookup::Found(gh.snapshot(pr)),
+            unchanged_from: Vec::new(),
+            head_patch_id: String::new(),
+        };
+        let report = o.handle_review_sweep(&[observation(1), observation(2)]);
+        assert_eq!(
+            report.merge.len(),
+            1,
+            "real merge admission serializes the project"
+        );
+        assert!(o.store().load_open_landings().unwrap().is_empty());
+        sink.merge(report.merge[0].clone()).await;
+        o.drive_event(events.recv().await.unwrap()).await;
+        assert_eq!(*gh.calls.lock().unwrap(), vec![1]);
+        assert!(o.handle_review_sweep(&[observation(2)]).merge.is_empty());
+        // GitHub's merged observation creates the durable lock, before any ticket move.
+        o.handle_review_sweep(&[observation(1)]);
+        rig.id = o.store().load_open_landings().unwrap()[0].id;
+        rig.runtime.checks = Arc::new(ScriptedChecks {
+            repo: RepoChecks {
+                manager: crate::testsupport::mk_workspace(&rig._dir.child("workspaces")),
+                repo_url: rig.origin.clone(),
+                config: config(),
+            },
+            gh: gh.clone(),
+        });
         rig.tick(0).await;
         assert_eq!(
             rig.row().phase,
@@ -1523,7 +1757,32 @@ mod tests {
         app.state.lock().unwrap().0 = rig.row().merge_sha;
         rig.tick(1).await;
         assert_eq!(rig.row().phase, LandingPhase::Watching);
-        rig.tick(11).await;
+        assert!(o.handle_review_sweep(&[observation(2)]).merge.is_empty());
+
+        // Human merges bypass auto-merge and queue behind the live landing. They consume no
+        // deploy/watch window while queued, even when a tick arrives after their original deadline.
+        git(&rig.origin, &["checkout", "-b", "feature-3"]);
+        git(
+            &rig.origin,
+            &["commit", "--allow-empty", "-m", "human change"],
+        );
+        git(&rig.origin, &["checkout", "main"]);
+        gh.merge_branch(3);
+        let mut human = watch_row();
+        human.key.number = 3;
+        o.store().save_review_watch(human).unwrap();
+        o.handle_review_sweep(&[observation(3)]);
+        let queued = o.store().load_open_landings().unwrap()[1].clone();
+        rig.runtime.advance(queued.clone(), 100).await.unwrap();
+        assert_eq!(
+            o.store()
+                .get_landing(queued.id)
+                .unwrap()
+                .unwrap()
+                .watch_until_s,
+            None
+        );
+        rig.tick(100).await;
         assert_eq!(rig.row().phase, LandingPhase::Done);
         assert_eq!(
             rig.runtime
@@ -1539,32 +1798,47 @@ mod tests {
         assert_eq!(comments.len(), 1);
         assert!(comments[0].body.contains("status=200"));
 
-        git(
-            &rig.origin,
-            &["commit", "--allow-empty", "-m", "next change"],
-        );
-        let sha = git(&rig.origin, &["rev-parse", "HEAD"]);
-        let mut row = rig.row();
-        row.id = 0;
-        row.pr = 2;
-        row.merge_sha = sha.clone();
-        row.phase = LandingPhase::WaitingForDeploy;
-        row.watch_until_s = None;
-        row.deploy_deadline_s = 60;
-        row.results_json = serde_json::to_string(&Progress {
-            issue_id: "ID-1".into(),
-            team_id: "TEAM".into(),
-            ..Default::default()
-        })
-        .unwrap();
-        let id = rig.runtime.store.save_landing(row).unwrap();
-        *app.state.lock().unwrap() = (sha, false);
+        assert!(o.handle_review_sweep(&[observation(2)]).merge.is_empty());
+        app.state.lock().unwrap().0 = gh.merged.lock().unwrap()[&3].clone();
         rig.runtime
-            .advance(rig.runtime.store.get_landing(id).unwrap().unwrap(), 12)
+            .advance(o.store().get_landing(queued.id).unwrap().unwrap(), 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            o.store()
+                .get_landing(queued.id)
+                .unwrap()
+                .unwrap()
+                .watch_until_s,
+            Some(110)
+        );
+        rig.runtime
+            .advance(o.store().get_landing(queued.id).unwrap().unwrap(), 110)
+            .await
+            .unwrap();
+        assert_eq!(
+            o.store().get_landing(queued.id).unwrap().unwrap().phase,
+            LandingPhase::Done
+        );
+        o.now = Box::new(|| DateTime::from_timestamp(111, 0).unwrap());
+        let report = o.handle_review_sweep(&[observation(2)]);
+        assert_eq!(
+            report.merge.len(),
+            1,
+            "terminal landings release auto-merge admission"
+        );
+        sink.merge(report.merge[0].clone()).await;
+        o.drive_event(events.recv().await.unwrap()).await;
+        assert_eq!(*gh.calls.lock().unwrap(), vec![1, 2]);
+        o.handle_review_sweep(&[observation(2)]);
+        let id = o.store().load_open_landings().unwrap()[0].id;
+        *app.state.lock().unwrap() = (gh.merged.lock().unwrap()[&2].clone(), false);
+        rig.runtime
+            .advance(rig.runtime.store.get_landing(id).unwrap().unwrap(), 111)
             .await
             .unwrap();
         rig.runtime
-            .advance(rig.runtime.store.get_landing(id).unwrap().unwrap(), 13)
+            .advance(rig.runtime.store.get_landing(id).unwrap().unwrap(), 112)
             .await
             .unwrap();
         assert_eq!(

@@ -204,6 +204,10 @@ the `Orchestrator` struct itself. Concretely:
     NotificationsState. The JoinHandle prevents overlapping sweeps and aborts on drop; cancellation
     releases its WaitGroup registration. Absolute deadlines, check cadence/counters and pending
     effects are stored in `rhapsody_landing`, with stable tracker-comment markers for restart dedupe.
+    Landing-enabled auto-merge admission reservations are loop-confined (`landing_merges`). The
+    off-loop ControlWatchSink reports attempt completion through `Event::LandingMergeFinished`;
+    successful/ambiguous attempts remain reserved until a fresh watcher observation admits the row
+    or confirms no merge. Boot reconciliation refuses merges past unobserved watched siblings.
 
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from

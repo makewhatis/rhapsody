@@ -601,13 +601,28 @@ impl ReviewWatchSink for ControlWatchSink {
     async fn merge(&self, plan: crate::automerge::AutoMergePlan) {
         let Some(deps) = self.automerge.as_ref() else {
             tracing::warn!(pr = %plan.pr, "auto-merge: no GitHub source is configured; not merging");
+            self.control.landing_merge_finished(plan.pr, None);
             return;
         };
         // Infallible by contract: no outcome has a caller with anything to do about it, and every
         // one of them is logged — the two that CHANGED something where the change happens, in
         // `runautomerge`, which holds the fields describing it, and the three that changed nothing
         // here. A refusal is re-considered on the next tick.
-        match crate::runautomerge::perform_auto_merge(&plan, deps).await {
+        let outcome = crate::runautomerge::perform_auto_merge(&plan, deps).await;
+        let state = match &outcome {
+            crate::runautomerge::AutoMergeOutcome::Merged(_) => {
+                Some(crate::automerge::LandingMergeState::Merged)
+            }
+            crate::runautomerge::AutoMergeOutcome::Failed(_)
+            | crate::runautomerge::AutoMergeOutcome::Declined(
+                "the pull request is no longer open",
+            )
+            | crate::runautomerge::AutoMergeOutcome::Held("the pull request is no longer open") => {
+                Some(crate::automerge::LandingMergeState::AwaitingObservation)
+            }
+            _ => None,
+        };
+        match outcome {
             crate::runautomerge::AutoMergeOutcome::Merged(_) => {}
             crate::runautomerge::AutoMergeOutcome::Updated => {}
             crate::runautomerge::AutoMergeOutcome::Declined(why) => {
@@ -622,6 +637,7 @@ impl ReviewWatchSink for ControlWatchSink {
                 tracing::warn!(pr = %plan.pr, %err, "auto-merge: a gate could not be read; not merging")
             }
         }
+        self.control.landing_merge_finished(plan.pr, state);
     }
     async fn finish(&self, plan: crate::reviewdone::ReviewDonePlan) {
         self.control.finish_review_ticket(plan).await
@@ -1451,11 +1467,15 @@ impl Orchestrator {
             match &obs.lookup {
                 // GitHub cannot resolve it any more: deleted, transferred, or never there. Nothing
                 // is left to observe, so it leaves the watch set for good.
-                PrLookup::Gone => report.retired += self.retire_review_pr(&obs.pr, "gone"),
+                PrLookup::Gone => {
+                    self.landing_merges.remove(&obs.pr);
+                    report.retired += self.retire_review_pr(&obs.pr, "gone");
+                }
                 // The head repository is neither the base's nor allowlisted. A review of it would
                 // check out and execute a stranger's code (§14.1 F-SEC), so it can never be
                 // dispatched — and re-asking every tick forever is not a plan.
                 PrLookup::Untrusted => {
+                    self.landing_merges.remove(&obs.pr);
                     report.retired += self.retire_review_pr(&obs.pr, "untrusted head repository")
                 }
                 PrLookup::Found(snap) if snap.status != PrStatus::Open => {
@@ -1491,9 +1511,15 @@ impl Orchestrator {
                         "closed_unmerged"
                     };
                     self.record_manager_proposal_outcomes(&churn_key(&obs.pr), outcome);
+                    self.landing_merges.remove(&obs.pr);
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
                 PrLookup::Found(snap) => {
+                    if self.landing_merges.get(&obs.pr)
+                        == Some(&crate::automerge::LandingMergeState::AwaitingObservation)
+                    {
+                        self.landing_merges.remove(&obs.pr);
+                    }
                     // The observed-head memo for this coordinate was already updated above the store
                     // read (STUDIO-1005), so a failed local read cannot leave the reconciliation
                     // sweep comparing against a stale head.
@@ -4095,6 +4121,10 @@ impl Orchestrator {
         }
         match crate::automerge::auto_merge_verdict_with_proof(mine, head, proven) {
             Ok(approved_by) => {
+                if !self.landing_merge_groups(pr).is_empty() {
+                    self.landing_merges
+                        .insert(pr.clone(), crate::automerge::LandingMergeState::InFlight);
+                }
                 // At INFO when it is news, and at DEBUG for as long as it stays the same plan.
                 // The gate is re-decided from the watch rows on EVERY tick and the plan is handed
                 // out on every tick — a pull request held by a gate on the other side of the seam
@@ -4588,6 +4618,14 @@ pub(crate) const CAPACITY_HOLD_TTL: std::time::Duration = std::time::Duration::f
 pub(crate) const UNREADABLE_ATTEMPTS_TO_DROP_HOLD: u32 = 2;
 
 impl ControlHandle {
+    fn landing_merge_finished(
+        &self,
+        pr: PrCoord,
+        state: Option<crate::automerge::LandingMergeState>,
+    ) {
+        let _ = self.events.send(Event::LandingMergeFinished { pr, state });
+    }
+
     /// The pull requests the watcher should ask GitHub about, each with the head SHAs its rows have
     /// already had read. Empty when the subsystem is off or the control task is gone — an empty
     /// poll list, never a guess.
@@ -8021,6 +8059,160 @@ mod tests {
             1,
             "once the hold is gone the approved merge is proposed"
         );
+    }
+
+    #[test]
+    fn one_sweep_does_not_propose_two_merges_for_one_landing_project() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        enable_landing(&mut o);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        introduce(&o, approved_row(65, "bob", HEAD_A));
+        let report = o.handle_review_sweep(&[open_at(64, HEAD_A), open_at(65, HEAD_A)]);
+        assert_eq!(
+            report.merge.len(),
+            1,
+            "only one merge may enter landing per project"
+        );
+    }
+
+    fn enable_landing(o: &mut Orchestrator) {
+        let slug = o.eff.as_ref().unwrap().projects[0].slug.clone();
+        o.eff.as_mut().unwrap().cfg.projects = vec![rhapsody_config::model::Project {
+            slugs: vec![slug],
+            landing: Some(serde_yaml_ng::from_str("enabled: true").unwrap()),
+            ..Default::default()
+        }];
+    }
+
+    #[test]
+    fn landing_merge_reservation_spans_handbacks_until_attempt_is_observed() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        enable_landing(&mut o);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        introduce(&o, approved_row(65, "bob", HEAD_A));
+        // The first observation cannot merge past a sibling not reconciled since boot.
+        assert!(
+            o.handle_review_sweep_slots(&[open_at(64, HEAD_A)], None)
+                .0
+                .merge
+                .is_empty()
+        );
+        let (first, slots) = o.handle_review_sweep_slots(&[open_at(65, HEAD_A)], Some(10));
+        assert_eq!(first.merge.len(), 1);
+        assert!(
+            o.handle_review_sweep_slots(&[open_at(64, HEAD_A)], Some(slots))
+                .0
+                .merge
+                .is_empty()
+        );
+        // Even a re-observation of the reserved PR cannot release a still-executing attempt.
+        assert!(
+            o.handle_review_sweep(&[open_at(65, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        // An ambiguous outcome (including success) needs the reserved PR to answer, not a sibling.
+        o.landing_merge_finished(
+            &coord(65),
+            Some(crate::automerge::LandingMergeState::Merged),
+        );
+        assert!(
+            o.handle_review_sweep(&[open_at(65, HEAD_A)])
+                .merge
+                .is_empty(),
+            "a stale open answer cannot release a known merge"
+        );
+        o.landing_merge_finished(
+            &coord(65),
+            Some(crate::automerge::LandingMergeState::AwaitingObservation),
+        );
+        assert!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        o.handle_review_unreadable(&[coord(65)]);
+        assert!(
+            o.handle_review_sweep(&[open_at(64, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        assert_eq!(o.handle_review_sweep(&[open_at(65, HEAD_A)]).merge.len(), 1);
+        // A definite refusal releases admission, allowing the other approved PR to try.
+        o.landing_merge_finished(&coord(65), None);
+        assert_eq!(o.handle_review_sweep(&[open_at(64, HEAD_A)]).merge.len(), 1);
+    }
+
+    #[test]
+    fn landing_restart_reconciles_merged_sibling_before_proposing_another_merge() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        enable_landing(&mut o);
+        introduce(&o, approved_row(64, "bob", HEAD_A));
+        introduce(&o, approved_row(65, "bob", HEAD_A));
+        o.store()
+            .start_run(rs::RunStart {
+                issue_identifier: "STUDIO-721".into(),
+                issue_id: "ID".into(),
+                team_id: "TEAM".into(),
+                project_slug: o.eff.as_ref().unwrap().projects[0].slug.clone(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            o.handle_review_sweep(&[open_at(65, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        // Open is listed first deliberately: a terminal sibling must be admitted before it merges.
+        let report = o.handle_review_sweep(&[open_at(65, HEAD_A), observed(64, merged_at(HEAD_A))]);
+        assert!(report.merge.is_empty());
+        assert_eq!(o.store().load_open_landings().unwrap().len(), 1);
+        assert!(
+            o.handle_review_sweep(&[open_at(65, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn landing_merge_reservations_do_not_serialize_other_projects_or_disabled_landing() {
+        for enabled in [false, true] {
+            let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+            if enabled {
+                enable_landing(&mut o);
+            }
+            introduce(&o, approved_row(64, "bob", HEAD_A));
+            let mut row = approved_row(65, "bob", HEAD_A);
+            if enabled {
+                let tracker = Arc::new(Fake::new());
+                let mut project = empty_resolved_project("other", tracker);
+                project.group = "other".into();
+                project.repo = "https://github.com/makewhatis/other.git".into();
+                o.eff.as_mut().unwrap().projects.push(project);
+                o.eff
+                    .as_mut()
+                    .unwrap()
+                    .cfg
+                    .projects
+                    .push(rhapsody_config::model::Project {
+                        slugs: vec!["other".into()],
+                        landing: Some(serde_yaml_ng::from_str("enabled: true").unwrap()),
+                        ..Default::default()
+                    });
+                row.key.repo = "other".into();
+            }
+            introduce(&o, row);
+            let mut second = open_at(65, HEAD_A);
+            if enabled {
+                second.pr.repo = "other".into();
+            }
+            let report = o.handle_review_sweep(&[open_at(64, HEAD_A), second]);
+            assert_eq!(
+                report.merge.len(),
+                2,
+                "independent projects and disabled landing retain throughput"
+            );
+        }
     }
 
     #[test]

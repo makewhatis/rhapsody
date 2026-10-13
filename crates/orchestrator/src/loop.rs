@@ -436,6 +436,12 @@ pub enum Event {
     ReviewUnreadable {
         failed: Vec<crate::prstate::PrCoord>,
     },
+    /// An off-loop merge attempt completed. Ambiguous failures and successful merges retain
+    /// landing admission until the watcher confirms the PR; definite refusals release it.
+    LandingMergeFinished {
+        pr: crate::prstate::PrCoord,
+        state: Option<crate::automerge::LandingMergeState>,
+    },
     /// The authenticated console's read of the ticketless review watch set (STUDIO-722, slice 8;
     /// NEW beyond Go v0.4.0). Loop-confined for [`Event::ReviewWatchList`]'s reason: the HTTP task
     /// never reads the store the control task is the single writer of.
@@ -945,6 +951,9 @@ impl Orchestrator {
             }
             Event::ReviewUnreadable { failed } => {
                 self.handle_review_unreadable(&failed);
+            }
+            Event::LandingMergeFinished { pr, state } => {
+                self.landing_merge_finished(&pr, state);
             }
             Event::ReviewConsoleList { reply } => {
                 let _ = reply.send(self.review_console_list());
