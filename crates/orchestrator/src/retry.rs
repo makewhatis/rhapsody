@@ -328,6 +328,56 @@ impl Orchestrator {
         }
     }
 
+    /// Reuse the ordinary board poll's snapshots for local waiting-slot checks. A ticket moved to
+    /// another state must not keep waiting on its old state's cap. Filtered-out in-flight work keeps
+    /// its last-known snapshot until capacity allows the existing relocation reads.
+    pub(crate) fn refresh_waiting_retry_issues<'a>(
+        &mut self,
+        issues: impl Iterator<Item = &'a Issue>,
+    ) {
+        for iss in issues {
+            for re in self.retry_attempts.values_mut() {
+                if re.err == "no available orchestrator slots"
+                    && if re.recovered {
+                        re.identifier == iss.identifier
+                    } else {
+                        re.issue_id == iss.id
+                    }
+                {
+                    re.issue = iss.clone();
+                }
+            }
+        }
+    }
+
+    fn retry_slots_full(&self, cfg: &RetryConfig, iss: &Issue) -> bool {
+        global_slots(cfg.global_cap, self.implementation_pool_holders()) <= 0
+            || cfg
+                .rp_group
+                .as_ref()
+                .is_some_and(|g| self.running_in_project_group(g) >= cfg.project_cap)
+            || self
+                .running_state_counts()
+                .get(&normalize_state(&iss.state))
+                .copied()
+                .unwrap_or(0)
+                >= state_limit(&iss.state, &cfg.per_state, cfg.global_cap)
+    }
+
+    fn park_retry_for_slots(&mut self, key: &str, mut re: RetryEntry) {
+        tracing::debug!(issue_id = %key, issue_identifier = %re.identifier, attempt = re.attempt, project_slug = %re.project_slug, "parking retry: no available orchestrator slots");
+        re.err = "no available orchestrator slots".into();
+        self.persist_retry(
+            &re.identifier,
+            re.attempt,
+            re.due_at_ms,
+            &re.err,
+            &re.project_slug,
+        );
+        self.retry_attempts.insert(key.to_string(), re);
+        self.arm_retry_timer(key, crate::drain::DRAIN_REQUEUE_DELAY_MS);
+    }
+
     /// Claims the issue, records a running entry, and hands it to the worker-spawn seam (upstream
     /// §16.4). `route` is the owning resolved project's snapshot (`None` => legacy single-project /
     /// test-injected path); `stack_context` is the graphite-mode predecessor stacking hint (INF-318),
@@ -1456,6 +1506,14 @@ impl Orchestrator {
             RetryRouting::Config(cfg) => *cfg,
         };
 
+        // B1: a waiting retry cannot use a slot this process already knows is full. Check local
+        // capacity BEFORE any tracker read, including relocation, so short wakeups do not spend
+        // Linear quota rediscovering the same full pool. Once capacity is free, revalidate below.
+        if re.err == "no available orchestrator slots" && self.retry_slots_full(&cfg, &re.issue) {
+            self.park_retry_for_slots(&e.issue_id, re);
+            return;
+        }
+
         let candidates = match cfg.tracker.fetch_candidate_issues().await {
             Ok(c) => c,
             Err(_) => {
@@ -1629,38 +1687,20 @@ impl Orchestrator {
             return;
         }
 
-        let st = normalize_state(&iss.state);
         // STUDIO-950: this is the THIRD implementation draw (the two `select` ladders are the
         // others), and it is easy to miss because a due retry dispatches straight from here,
         // bypassing the tick. With `agent.max_concurrent_reviews` set, a ticketless review draws its
         // own pool and must NOT occupy an implementation slot here either, or a continuation mid-work
         // is requeued (and escalates to `failure_backoff_ms`) for a slot that is in fact free.
-        let no_global = global_slots(cfg.global_cap, self.implementation_pool_holders()) <= 0;
-        let no_project = cfg
-            .rp_group
-            .as_ref()
-            .is_some_and(|g| self.running_in_project_group(g) >= cfg.project_cap);
         // The per-state cap is a shared GLOBAL ceiling (runningStateCounts spans all projects), so its
         // fallback is the GLOBAL cap, not the per-project cap (consistent with selectDispatchMulti).
-        let no_state = self.running_state_counts().get(&st).copied().unwrap_or(0)
-            >= state_limit(&iss.state, &cfg.per_state, cfg.global_cap);
-        if no_global || no_project || no_state {
+        if self.retry_slots_full(&cfg, &iss) {
             // STUDIO-1263: capacity is not a failure. Like drain parking, only re-arm a short
             // timer; preserve the attempt, due time, identity and recovered key. Keep the refreshed
             // issue and reason for relocation/restart, without moving this retry behind newer work.
-            tracing::debug!(issue_id = %e.issue_id, issue_identifier = %iss.identifier, attempt = re.attempt, project_slug = %re.project_slug, "parking retry: no available orchestrator slots");
             let mut re = re;
-            re.err = "no available orchestrator slots".into();
             re.issue = iss;
-            self.persist_retry(
-                &re.identifier,
-                re.attempt,
-                re.due_at_ms,
-                &re.err,
-                &re.project_slug,
-            );
-            self.retry_attempts.insert(e.issue_id.clone(), re);
-            self.arm_retry_timer(&e.issue_id, crate::drain::DRAIN_REQUEUE_DELAY_MS);
+            self.park_retry_for_slots(&e.issue_id, re);
             return;
         }
 
@@ -3336,6 +3376,125 @@ mod tests {
                 "no available orchestrator slots"
             );
         }
+    }
+
+    // B1: retry wakeups must not spend Linear calls merely to rediscover local capacity. Ticks
+    // still make their ordinary one board poll, but add no reads for each parked ticket.
+    // MUTATION: move the local waiting-slot gate below fetch_candidate_issues; the call count rises.
+    #[tokio::test]
+    async fn slot_waiting_retries_make_no_tracker_calls_while_the_pool_is_full() {
+        let base = utc(2026, 10, 13, 15, 0, 0);
+        let mut f = Fake::new();
+        f.candidates = vec![issue("busy", "A-9", "In Progress")];
+        for n in 1..=3 {
+            f.candidates
+                .push(issue(&format!("wait{n}"), &format!("A-{n}"), "In Progress"));
+        }
+        f.by_id.insert("busy".into(), f.candidates[0].clone());
+        let tr = Arc::new(f);
+        for gate in ["global", "project group", "state"] {
+            let mut a = proj_with_tracker("a", tr.clone(), "");
+            if gate == "project group" {
+                a.max_concurrent = 1;
+            }
+            if gate == "state" {
+                a.per_state_limits.insert("in progress".into(), 1);
+            }
+            let (mut o, dispatched) =
+                orch_for_retry_multi(vec![a], if gate == "global" { 1 } else { 10 });
+            o.now = Box::new(move || base);
+            o.running.insert(
+                "busy".into(),
+                running_entry(tr.candidates[0].clone(), "a", "a"),
+            );
+            for n in 1..=3 {
+                let key = format!("wait{n}");
+                let mut re = retry_entry(&key, &format!("A-{n}"), 3);
+                re.project_slug = "a".into();
+                re.issue = tr.candidates[n].clone();
+                re.err = "no available orchestrator slots".into();
+                re.due_at = base - Duration::minutes(4 - n as i64);
+                re.due_at_ms = re.due_at.timestamp_millis();
+                o.retry_attempts.insert(key.clone(), re);
+                o.claimed.insert(key);
+            }
+            let before = tr.candidate_calls();
+            let before_ids = tr.by_id_calls();
+            for _ in 0..4 {
+                o.drive_event(Event::Retry(EvRetry {
+                    issue_id: "wait3".into(),
+                }))
+                .await;
+            }
+            assert_eq!(
+                tr.candidate_calls(),
+                before,
+                "{gate}: full pool makes no retry fetches"
+            );
+            assert_eq!(
+                tr.by_id_calls(),
+                before_ids,
+                "{gate}: no relocation reads either"
+            );
+            o.on_tick().await;
+            assert_eq!(
+                tr.candidate_calls(),
+                before + 1,
+                "{gate}: only the ordinary board poll"
+            );
+            assert!(dispatched.lock().unwrap().is_empty());
+            assert!(o.retry_attempts.values().all(|re| re.attempt == 3));
+            o.running.clear();
+            o.drive_event(Event::Retry(EvRetry {
+                issue_id: "wait3".into(),
+            }))
+            .await;
+            assert_eq!(
+                dispatched.lock().unwrap()[0].issue.id,
+                "wait1",
+                "{gate}: oldest gets first free slot"
+            );
+        }
+    }
+
+    // A local per-state check must observe state changes from the ordinary poll without extra I/O.
+    #[tokio::test]
+    async fn waiting_retry_reuses_board_snapshot_after_a_state_change() {
+        let base = utc(2026, 10, 13, 15, 0, 0);
+        let busy = issue("busy", "A-2", "In Progress");
+        let mut f = Fake::new();
+        f.candidates = vec![issue("old", "A-1", "Todo")];
+        f.by_id.insert("busy".into(), busy.clone());
+        let tr = Arc::new(f);
+        let mut a = proj_with_tracker("a", tr.clone(), "");
+        a.per_state_limits.insert("in progress".into(), 1);
+        let (mut o, dispatched) = orch_for_retry_multi(vec![a], 10);
+        o.now = Box::new(move || base);
+        o.running
+            .insert("busy".into(), running_entry(busy, "a", "a"));
+        let mut re = retry_entry("old", "A-1", 3);
+        re.project_slug = "a".into();
+        re.issue = issue("old", "A-1", "In Progress");
+        re.err = "no available orchestrator slots".into();
+        re.due_at = base;
+        re.due_at_ms = base.timestamp_millis();
+        o.retry_attempts.insert("old".into(), re);
+        o.claimed.insert("old".into());
+        o.on_tick().await;
+        assert_eq!(tr.candidate_calls(), 1, "ordinary board poll only");
+        assert!(dispatched.lock().unwrap().is_empty());
+        assert_eq!(o.retry_attempts["old"].issue.state, "Todo");
+        o.drive_event(Event::Retry(EvRetry {
+            issue_id: "old".into(),
+        }))
+        .await;
+        assert_eq!(dispatched.lock().unwrap()[0].issue.id, "old");
+        assert_eq!(dispatched.lock().unwrap()[0].issue.state, "Todo");
+        assert_eq!(
+            tr.candidate_calls(),
+            2,
+            "revalidate once when capacity is free"
+        );
     }
 
     // Mirrors Go `TestOnRetryDispatchesWhenEligible`.

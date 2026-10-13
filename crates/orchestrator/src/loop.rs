@@ -1308,6 +1308,7 @@ impl Orchestrator {
             // so a recall rendered during THIS tick's dispatch can attach a ticket's current state
             // without asking the tracker anything (§5.2). In-memory, and a no-op with Teams off.
             self.record_issue_states(tagged.iter().map(|t| &t.iss));
+            self.refresh_waiting_retry_issues(tagged.iter().map(|t| &t.iss));
             // Rhapsody Teams review quorum (STUDIO-659, T7): the same snapshot, for the other
             // consumer — per-identity load and each ticket's open PR / marker label, so a handoff
             // arriving between ticks can choose reviewers without a tracker read. A hard no-op with
@@ -1436,6 +1437,7 @@ impl Orchestrator {
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
+        self.refresh_waiting_retry_issues(issues.iter());
         self.record_quorum_state(issues.iter());
         self.observe_lead_review_departures(issues.iter().map(|iss| (iss, None)), true);
         // The legacy ladder's half of the adoption sweep (STUDIO-838). Untagged, so each candidate

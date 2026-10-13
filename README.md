@@ -105,6 +105,9 @@ each poll tick; retry timer events use the same ordering. The frozen Go schedule
 compete with independently backed-off retries, which can starve already-started work. A slot wait
 now preserves the attempt and original due time (including across restart), and re-arms a fixed
 five-second timer like drain parking instead of charging another failure or growing backoff.
+Waiting retries check local capacity before making any tracker read; a full pool consumes no retry
+polls. The ordinary board poll refreshes waiting snapshots without extra reads, and admission still
+revalidates the ticket and all caps once capacity is free.
 Future genuine-failure backoffs and account-limit waits retain their existing deadlines. Global
 implementation, per-project-group and shared per-state caps remain enforced, including preparation
 reservations. No configuration, schema, API shape or golden fixture changes.
