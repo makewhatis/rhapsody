@@ -57,7 +57,6 @@ use chrono::{DateTime, Utc};
 use rhapsody_config::memory::{Fact, MemoryBackend};
 use rhapsody_config::teams::{MemoryBackend as BackendKind, Teams};
 use rhapsody_core::Issue;
-use rhapsody_tracker::Tracker;
 
 use crate::backoff::failure_backoff_ms;
 use crate::control_loop::CancelWait;
@@ -364,11 +363,14 @@ fn insert_bounded(
     out.insert(key, entry);
 }
 
-/// The enabled project trackers one cycle reads candidates from. Mirrors
-/// [`TriageTarget`](crate::triage::TriageTarget), and for the same reason: the
-/// handle exists before the first config load, so the tracker arrives later.
+/// Candidates already fetched by the poll loop, in first-project-wins order.
+/// Carries no tracker handle: prefetch must never spend additional Linear quota.
+#[derive(Clone)]
 pub struct PrefetchTarget {
-    pub trackers: Vec<Arc<dyn Tracker>>,
+    pub issues: Vec<Issue>,
+    /// Start of the candidate fetch, not publication time, so slow polls cannot
+    /// make old candidates look newly fetched.
+    pub fetched_at: DateTime<Utc>,
 }
 
 /// Everything [`run_prefetch_schedule`] runs against. The absence of an
@@ -379,7 +381,7 @@ pub struct PrefetchDeps<TF> {
     /// scope for this slice, as for T3b), so this is captured once at the
     /// composition root.
     pub teams: Arc<Teams>,
-    /// Yields the enabled project trackers, or `None` when no config has loaded yet.
+    /// Yields the last complete poll's candidates, or `None` before one is published.
     pub target: TF,
     /// The remote bank. A `dyn MemoryBackend` rather than a concrete
     /// `HindsightBackend` **because this is the off-loop side**: nothing here
@@ -406,22 +408,17 @@ pub struct PrefetchDeps<TF> {
 /// surface for the degradation tests.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CycleOutcome {
-    /// Nothing to do: no config loaded yet, or no candidate routed anywhere.
+    /// Nothing to do: absent/stale candidates, or no candidate routed anywhere.
     Idle,
     /// This many `(identity, ticket)` pairs were cached.
     Prefetched(usize),
-    /// A tracker read failed. Back off; the cache keeps serving what it has.
-    TrackerFailure,
     /// The bank failed or timed out. Back off; dispatch degrades to `none`.
     BankFailure,
 }
 
 impl CycleOutcome {
     fn is_failure(self) -> bool {
-        matches!(
-            self,
-            CycleOutcome::TrackerFailure | CycleOutcome::BankFailure
-        )
+        matches!(self, CycleOutcome::BankFailure)
     }
 }
 
@@ -432,7 +429,7 @@ impl CycleOutcome {
 /// nothing — which is what makes "byte-identical everything" true of those
 /// configurations rather than merely likely. An empty roster is included here
 /// rather than left to the cycle because [`route`] answers `None` for every
-/// candidate without one, so every cycle would be a no-op that still fetched.
+/// candidate without one, so every cycle would be a no-op.
 pub fn prefetch_enabled(teams: &Teams) -> bool {
     teams.enabled && teams.memory.backend == BackendKind::Hindsight && !teams.roster.is_empty()
 }
@@ -440,7 +437,7 @@ pub fn prefetch_enabled(teams: &Teams) -> bool {
 /// Runs the prefetch pass on its own cadence until `ctx` is cancelled.
 ///
 /// The first thing it does is **wait**: a cycle at t=0 would race the daemon's
-/// first config load for a tracker and find none. Cancellation is checked on both
+/// first candidate publication and find none. Cancellation is checked on both
 /// sides of the sleep, so a shutdown never waits out a cycle.
 pub async fn run_prefetch_schedule<TF>(mut ctx: CancelWait, deps: PrefetchDeps<TF>)
 where
@@ -497,7 +494,7 @@ where
     }
 }
 
-/// One prefetch pass: fetch candidates, route each with the **existing pure
+/// One prefetch pass: read published candidates, route each with the **existing pure
 /// [`route`]**, recall from the remote bank for a rotating window of them, and
 /// sync the cache to the live candidate set.
 ///
@@ -523,23 +520,18 @@ where
     TF: Fn() -> Option<PrefetchTarget>,
 {
     let Some(target) = (deps.target)() else {
-        return CycleOutcome::Idle; // no config loaded yet
+        return CycleOutcome::Idle;
     };
-    // Account-level clients can have an empty slug under `projects:` and see no work.
-    // Use the poll loop's enabled project clients, with its first-project-wins deduplication.
-    let mut issues = Vec::new();
-    let mut seen = HashSet::new();
-    for tracker in target.trackers {
-        match tracker.fetch_candidate_issues().await {
-            Ok(candidates) => {
-                issues.extend(candidates.into_iter().filter(|i| seen.insert(i.id.clone())));
-            }
-            Err(e) => {
-                tracing::warn!(err = %e, "teams memory prefetch could not fetch candidates");
-                return CycleOutcome::TrackerFailure;
-            }
-        }
+    if is_stale(target.fetched_at, (deps.now)()) {
+        return CycleOutcome::Idle;
     }
+    // Poll order is first-project-wins. Preserve that for injected publications too.
+    let mut seen = HashSet::new();
+    let issues: Vec<Issue> = target
+        .issues
+        .into_iter()
+        .filter(|i| seen.insert(i.id.clone()))
+        .collect();
     let routed = routed_candidates(&deps.teams, &issues);
     if routed.is_empty() {
         // Nothing routes anywhere: clear the cache rather than leaving
@@ -683,7 +675,6 @@ mod tests {
     use async_trait::async_trait;
     use rhapsody_config::memory::{MemoryError, Query, Recalled, Record};
     use rhapsody_config::teams::{Identity, Manager, ManagerMode, Memory, Teams};
-    use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
     use std::sync::Mutex;
 
@@ -811,13 +802,6 @@ mod tests {
         Arc::new(f)
     }
 
-    /// The same, but every candidate fetch fails — "Linear is down".
-    fn broken_tracker() -> Arc<Fake> {
-        let mut f = Fake::new();
-        f.candidates_err = Some(TrackerError::Other("linear is down".to_string()));
-        Arc::new(f)
-    }
-
     fn deps(
         t: Teams,
         bank: Arc<FakeBank>,
@@ -825,13 +809,23 @@ mod tests {
         cache: Arc<PrefetchCache>,
         now: i64,
     ) -> PrefetchDeps<impl Fn() -> Option<PrefetchTarget>> {
+        let o = crate::Orchestrator::new("WORKFLOW.md");
+        o.set_reads_target(tracker.clone(), "");
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: vec![crate::reads::ProjectTracker {
+                slug: "work".into(),
+                tracker: tracker.clone(),
+            }],
+            ..Default::default()
+        });
+        o.set_reads_candidates(PrefetchTarget {
+            issues: tracker.candidates.clone(),
+            fetched_at: at(now),
+        });
+        let handle = o.control();
         PrefetchDeps {
             teams: Arc::new(t),
-            target: move || {
-                Some(PrefetchTarget {
-                    trackers: vec![Arc::clone(&tracker) as Arc<dyn Tracker>],
-                })
-            },
+            target: move || handle.reads_candidates(),
             backend: bank as Arc<dyn MemoryBackend>,
             cache,
             interval: Duration::from_millis(5),
@@ -888,21 +882,36 @@ mod tests {
     // ── the cycle ───────────────────────────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn a_cycle_recalls_all_projects_and_deduplicates_first_project_wins() {
-        let bank = bank_with(&[]);
-        let first = tracker(vec![issue("1", "MT-1", &["rust"])]);
-        let second = tracker(vec![
-            issue("1", "MT-1", &["web"]),
-            issue("2", "MT-2", &["web"]),
-        ]);
+    async fn prefetch_cycle_makes_no_tracker_calls_when_candidates_are_published() {
+        let bank = bank_with(&[("alice", vec![fact("f1", "x")])]);
+        let account = tracker(Vec::new());
+        let first = tracker(vec![issue("9", "MT-9", &["rust"])]);
+        let second = tracker(Vec::new());
         let cache = Arc::new(PrefetchCache::new());
+        let o = crate::Orchestrator::new("WORKFLOW.md");
+        o.set_reads_target(account.clone(), "");
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: vec![
+                crate::reads::ProjectTracker {
+                    slug: "first".into(),
+                    tracker: first.clone(),
+                },
+                crate::reads::ProjectTracker {
+                    slug: "second".into(),
+                    tracker: second.clone(),
+                },
+            ],
+            ..Default::default()
+        });
+        // The publication, not what another query would return, is authoritative.
+        o.set_reads_candidates(PrefetchTarget {
+            issues: vec![issue("1", "MT-1", &["rust"]), issue("2", "MT-2", &["rust"])],
+            fetched_at: at(0),
+        });
+        let handle = o.control();
         let d = PrefetchDeps {
             teams: Arc::new(teams(true, BackendKind::Hindsight)),
-            target: || {
-                Some(PrefetchTarget {
-                    trackers: vec![first.clone(), second.clone()],
-                })
-            },
+            target: || handle.reads_candidates(),
             backend: bank.clone() as Arc<dyn MemoryBackend>,
             cache: cache.clone(),
             interval: PREFETCH_INTERVAL,
@@ -913,8 +922,115 @@ mod tests {
             prefetch_cycle(&CancelWait::default(), &d, &mut 0).await,
             CycleOutcome::Prefetched(2)
         );
-        assert_eq!(first.candidate_calls(), 1);
-        assert_eq!(second.candidate_calls(), 1);
+        for tracker in [account, first, second] {
+            assert_eq!(
+                tracker.candidate_calls(),
+                0,
+                "prefetch must spend no Linear quota"
+            );
+        }
+        assert_eq!(
+            *bank.asked.lock().unwrap(),
+            vec![
+                ("alice".into(), "MT-1".into()),
+                ("alice".into(), "MT-2".into())
+            ]
+        );
+        assert_eq!(cache.try_get("alice", "MT-1", at(1)).unwrap()[0].id, "f1");
+        assert_eq!(cache.try_get("alice", "MT-2", at(1)).unwrap()[0].id, "f1");
+    }
+
+    #[tokio::test]
+    async fn prefetch_cycle_is_idle_when_published_candidates_are_stale_or_absent() {
+        let bank = bank_with(&[]);
+        let tracker = tracker(vec![issue("1", "MT-1", &["rust"])]);
+        let cache = Arc::new(PrefetchCache::new());
+        cache.replace(
+            vec![(PrefetchKey::new("alice", "MT-2"), vec![fact("old", "x")])],
+            at(600),
+        );
+        for fetched_at in [None, Some(at(0))] {
+            let d = PrefetchDeps {
+                teams: Arc::new(teams(true, BackendKind::Hindsight)),
+                target: || {
+                    fetched_at.map(|fetched_at| PrefetchTarget {
+                        issues: tracker.candidates.clone(),
+                        fetched_at,
+                    })
+                },
+                backend: bank.clone() as Arc<dyn MemoryBackend>,
+                cache: cache.clone(),
+                interval: PREFETCH_INTERVAL,
+                max_backoff_ms: MAX_PREFETCH_BACKOFF_MS,
+                now: Box::new(|| at(PREFETCH_TTL.as_secs() as i64 + 1)),
+            };
+            let mut cursor = 3;
+            assert_eq!(
+                prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await,
+                CycleOutcome::Idle
+            );
+            assert_eq!(
+                cursor, 3,
+                "an unread board does not advance the recall window"
+            );
+            assert!(
+                cache.try_get("alice", "MT-2", at(601)).is_some(),
+                "missing/stale candidates do not imply departure"
+            );
+        }
+        assert_eq!(tracker.candidate_calls(), 0);
+        assert!(bank.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cycle_recalls_all_projects_and_deduplicates_first_project_wins() {
+        let bank = bank_with(&[]);
+        let first = tracker(vec![issue("1", "MT-1", &["rust"])]);
+        let second = tracker(vec![
+            issue("1", "MT-1", &["web"]),
+            issue("2", "MT-2", &["web"]),
+        ]);
+        let cache = Arc::new(PrefetchCache::new());
+        let o = crate::Orchestrator::new("WORKFLOW.md");
+        o.set_reads_target(first.clone(), "");
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot {
+            trackers: vec![
+                crate::reads::ProjectTracker {
+                    slug: "first".into(),
+                    tracker: first.clone(),
+                },
+                crate::reads::ProjectTracker {
+                    slug: "second".into(),
+                    tracker: second.clone(),
+                },
+            ],
+            ..Default::default()
+        });
+        o.set_reads_candidates(PrefetchTarget {
+            issues: first
+                .candidates
+                .iter()
+                .chain(&second.candidates)
+                .cloned()
+                .collect(),
+            fetched_at: at(0),
+        });
+        let handle = o.control();
+        let d = PrefetchDeps {
+            teams: Arc::new(teams(true, BackendKind::Hindsight)),
+            target: || handle.reads_candidates(),
+            backend: bank.clone() as Arc<dyn MemoryBackend>,
+            cache: cache.clone(),
+            interval: PREFETCH_INTERVAL,
+            max_backoff_ms: MAX_PREFETCH_BACKOFF_MS,
+            now: Box::new(|| at(0)),
+        };
+        assert_eq!(
+            prefetch_cycle(&CancelWait::default(), &d, &mut 0).await,
+            CycleOutcome::Prefetched(2)
+        );
+        assert_eq!(first.candidate_calls(), 0);
+        assert_eq!(second.candidate_calls(), 0);
         assert_eq!(
             *bank.asked.lock().unwrap(),
             vec![
@@ -1187,10 +1303,9 @@ mod tests {
         );
     }
 
-    /// A tracker outage is a failure too, and leaves the cache alone: what was
-    /// prefetched is still valid until it goes stale.
+    /// The published set is usable right up to the TTL boundary.
     #[tokio::test]
-    async fn a_failing_tracker_leaves_the_cache_serving() {
+    async fn candidates_at_the_ttl_boundary_are_still_recalled() {
         let bank = bank_with(&[("alice", vec![fact("f1", "x")])]);
         let cache = Arc::new(PrefetchCache::new());
         let ok = deps(
@@ -1202,18 +1317,13 @@ mod tests {
         );
         prefetch_cycle(&CancelWait::default(), &ok, &mut 0).await;
 
-        let broken = deps(
-            teams(true, BackendKind::Hindsight),
-            bank,
-            broken_tracker(),
-            Arc::clone(&cache),
-            1,
-        );
+        let mut boundary = ok;
+        boundary.now = Box::new(|| at(PREFETCH_TTL.as_secs() as i64));
         assert_eq!(
-            prefetch_cycle(&CancelWait::default(), &broken, &mut 0).await,
-            CycleOutcome::TrackerFailure
+            prefetch_cycle(&CancelWait::default(), &boundary, &mut 0).await,
+            CycleOutcome::Prefetched(1)
         );
-        assert!(cache.try_get("alice", "MT-1", at(2)).is_some());
+        assert_eq!(bank.asked.lock().unwrap().len(), 2);
     }
 
     /// A cycle that fails partway keeps what it already recalled, so one bad
@@ -1261,10 +1371,8 @@ mod tests {
             teams: Arc::new(teams(true, BackendKind::Hindsight)),
             target: || {
                 Some(PrefetchTarget {
-                    trackers: vec![tracker(vec![
-                        issue("1", "MT-1", &["rust"]),
-                        issue("2", "MT-2", &["rust"]),
-                    ]) as Arc<dyn Tracker>],
+                    issues: vec![issue("1", "MT-1", &["rust"]), issue("2", "MT-2", &["rust"])],
+                    fetched_at: at(0),
                 })
             },
             backend: Arc::new(FlakyBank {

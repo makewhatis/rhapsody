@@ -2222,9 +2222,7 @@ struct PrefetchWiring {
 fn prefetch_target(
     handle: &rhapsody_orchestrator::ControlHandle,
 ) -> Option<rhapsody_orchestrator::PrefetchTarget> {
-    handle
-        .reads_project_trackers()
-        .map(|trackers| rhapsody_orchestrator::PrefetchTarget { trackers })
+    handle.reads_candidates()
 }
 
 fn install_teams_memory(
@@ -4379,7 +4377,7 @@ mod tests {
     }
 
     #[test]
-    fn prefetch_uses_enabled_project_clients_instead_of_the_account_client() {
+    fn prefetch_uses_published_candidates_instead_of_tracker_clients() {
         use rhapsody_orchestrator::reads::{ProjectTracker, TriageSnapshot};
         use rhapsody_tracker::{Tracker, fake::Fake};
         let o = rhapsody_orchestrator::Orchestrator::new("WORKFLOW.md");
@@ -4402,17 +4400,25 @@ mod tests {
             ],
             ..Default::default()
         });
-        let target = prefetch_target(&handle).unwrap();
-        assert_eq!(target.trackers.len(), 2);
         assert!(
-            Arc::ptr_eq(&target.trackers[0], &project),
-            "an empty-slug account client sees no candidates, so no recall or warning can happen"
+            prefetch_target(&handle).is_none(),
+            "config alone is not a fetched board"
         );
-        assert!(Arc::ptr_eq(&target.trackers[1], &second));
+        let fetched_at = chrono::Utc::now();
+        o.set_reads_candidates(rhapsody_orchestrator::PrefetchTarget {
+            issues: vec![rhapsody_core::Issue {
+                identifier: "MT-1".into(),
+                ..Default::default()
+            }],
+            fetched_at,
+        });
+        let target = prefetch_target(&handle).unwrap();
+        assert_eq!(target.issues[0].identifier, "MT-1");
+        assert_eq!(target.fetched_at, fetched_at);
         o.set_reads_triage_snapshot(TriageSnapshot::default());
         assert!(
-            prefetch_target(&handle).unwrap().trackers.is_empty(),
-            "all projects paused must not fall back to the account client"
+            prefetch_target(&handle).is_none(),
+            "reload clears published candidates without falling back to a tracker"
         );
     }
 

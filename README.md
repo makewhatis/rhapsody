@@ -88,9 +88,11 @@ Off-loop Hindsight recall searches allow 15 seconds for the whole request, inclu
 reads; asynchronous retains and other calls keep their four-second deadline, and connecting still
 times out after two seconds. Lead operator/team recall failures carry a closed reason (`timeout`,
 `connect`, `http <status>` or `decode`, with `request` for other transport failures) in the warning
-and case packet, without copying backend URLs or bodies into prompts. Worker prefetch reads every
-enabled project's tracker, deduplicating candidates first-project-wins, rather than the account
-client whose project slug may be empty. These memory paths have no frozen Go counterpart; API
+and case packet, without copying backend URLs or bodies into prompts. Worker prefetch reuses the
+poll loop's complete, first-project-wins candidate publication rather than querying Linear again
+or reading the account client whose project slug may be empty. Absent publications or those older
+than the ten-minute prefetch TTL leave the cycle idle; reload invalidates the publication, and
+failed polls never refresh its timestamp. These memory paths have no frozen Go counterpart; API
 payloads, configuration defaults and parity goldens are unchanged.
 
 ### Bounded Claude post-result cleanup (STUDIO-1231)
