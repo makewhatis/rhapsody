@@ -3436,12 +3436,18 @@ mod tests {
                 before_ids,
                 "{gate}: no relocation reads either"
             );
-            o.on_tick().await;
-            assert_eq!(
-                tr.candidate_calls(),
-                before + 1,
-                "{gate}: only the ordinary board poll"
-            );
+            for tick in 1..=4 {
+                o.on_tick().await;
+                o.drive_event(Event::Retry(EvRetry {
+                    issue_id: "wait3".into(),
+                }))
+                .await;
+                assert_eq!(
+                    tr.candidate_calls(),
+                    before + tick,
+                    "{gate}: only one ordinary board poll per tick"
+                );
+            }
             assert!(dispatched.lock().unwrap().is_empty());
             assert!(o.retry_attempts.values().all(|re| re.attempt == 3));
             o.running.clear();
@@ -3453,6 +3459,12 @@ mod tests {
                 dispatched.lock().unwrap()[0].issue.id,
                 "wait1",
                 "{gate}: oldest gets first free slot"
+            );
+            assert_eq!(dispatched.lock().unwrap().len(), 1, "{gate}: one free slot");
+            assert_eq!(
+                tr.candidate_calls(),
+                before + 5,
+                "{gate}: four board polls plus exactly one admission fetch"
             );
         }
     }
@@ -3481,13 +3493,6 @@ mod tests {
         o.retry_attempts.insert("old".into(), re);
         o.claimed.insert("old".into());
         o.on_tick().await;
-        assert_eq!(tr.candidate_calls(), 1, "ordinary board poll only");
-        assert!(dispatched.lock().unwrap().is_empty());
-        assert_eq!(o.retry_attempts["old"].issue.state, "Todo");
-        o.drive_event(Event::Retry(EvRetry {
-            issue_id: "old".into(),
-        }))
-        .await;
         assert_eq!(dispatched.lock().unwrap()[0].issue.id, "old");
         assert_eq!(dispatched.lock().unwrap()[0].issue.state, "Todo");
         assert_eq!(
@@ -3495,6 +3500,59 @@ mod tests {
             2,
             "revalidate once when capacity is free"
         );
+    }
+
+    // B2: an ordinary poll can refresh a waiter's capped state while one global slot is free.
+    // MUTATION: omit the retry pass after snapshot refresh; fresh work steals that last slot.
+    #[tokio::test]
+    async fn changed_state_waiter_keeps_priority_over_fresh_work() {
+        for ladder in ["legacy", "projects"] {
+            let base = utc(2026, 10, 13, 15, 0, 0);
+            let busy = issue("busy", "A-2", "In Progress");
+            let mut f = Fake::new();
+            f.candidates = vec![issue("fresh", "A-3", "Todo"), issue("old", "A-1", "Todo")];
+            f.by_id.insert("busy".into(), busy.clone());
+            let tr = Arc::new(f);
+            let (mut o, dispatched) = orch_for_retry(tr.clone(), 2);
+            if ladder == "projects" {
+                let mut a = proj_with_tracker("a", tr.clone(), "");
+                a.per_state_limits.insert("in progress".into(), 1);
+                o.eff.as_mut().unwrap().projects = vec![a];
+            } else {
+                o.eff
+                    .as_mut()
+                    .unwrap()
+                    .per_state_limits
+                    .insert("in progress".into(), 1);
+            }
+            o.now = Box::new(move || base);
+            o.running
+                .insert("busy".into(), running_entry(busy, "a", "a"));
+            let mut re = retry_entry("old", "A-1", 3);
+            if ladder == "projects" {
+                re.project_slug = "a".into();
+            }
+            re.issue = issue("old", "A-1", "In Progress");
+            re.err = "no available orchestrator slots".into();
+            re.due_at = base;
+            re.due_at_ms = base.timestamp_millis();
+            o.retry_attempts.insert("old".into(), re);
+            o.claimed.insert("old".into());
+            o.on_tick().await;
+            assert_eq!(
+                *dispatched.lock().unwrap(),
+                vec!["old"],
+                "{ladder}: refreshed waiter claims the last slot before fresh work"
+            );
+            assert_eq!(o.running["old"].issue.state, "Todo");
+            assert_eq!(o.running["old"].retry_attempt, 3);
+            assert_eq!(o.running.len(), 2);
+            assert_eq!(
+                tr.candidate_calls(),
+                2,
+                "one board poll and one admission fetch"
+            );
+        }
     }
 
     // Mirrors Go `TestOnRetryDispatchesWhenEligible`.

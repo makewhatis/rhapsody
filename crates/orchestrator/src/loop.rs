@@ -1309,6 +1309,9 @@ impl Orchestrator {
             // without asking the tracker anything (§5.2). In-memory, and a no-op with Teams off.
             self.record_issue_states(tagged.iter().map(|t| &t.iss));
             self.refresh_waiting_retry_issues(tagged.iter().map(|t| &t.iss));
+            // A waiter parked against its old state may now have capacity. Reconsider it before
+            // fresh selection can spend that slot; saturated waiters still make no tracker read.
+            self.dispatch_ready_retries().await;
             // Rhapsody Teams review quorum (STUDIO-659, T7): the same snapshot, for the other
             // consumer — per-identity load and each ticket's open PR / marker label, so a handoff
             // arriving between ticks can choose reviewers without a tracker read. A hard no-op with
@@ -1438,6 +1441,8 @@ impl Orchestrator {
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
         self.refresh_waiting_retry_issues(issues.iter());
+        // The legacy ladder must give refreshed waiters the same first claim as the project path.
+        self.dispatch_ready_retries().await;
         self.record_quorum_state(issues.iter());
         self.observe_lead_review_departures(issues.iter().map(|iss| (iss, None)), true);
         // The legacy ladder's half of the adoption sweep (STUDIO-838). Untagged, so each candidate
