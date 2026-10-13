@@ -127,6 +127,17 @@ impl crate::orchestrator::Orchestrator {
             })
             .map(|p| &p.group)
             .collect();
+        // Operator actions run off-loop with deterministic checks. Reserve admission before
+        // handing them out, so a Held retry cannot race an auto-merge between its read and save.
+        for id in &self.landing_operator_pending {
+            if let Some(row) = self.store().get_landing(*id).map_err(|e| e.to_string())?
+                && eff
+                    .project_by_slug(&row.project_slug)
+                    .is_some_and(|p| groups.contains(&&p.group))
+            {
+                return Err("a landing operator action is in progress for this project".into());
+            }
+        }
         for project in &eff.projects {
             if groups.contains(&&project.group)
                 && self

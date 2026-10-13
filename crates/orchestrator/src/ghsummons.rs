@@ -276,6 +276,58 @@ impl GH {
 
 #[async_trait]
 impl crate::landingrevert::RevertGithub for GH {
+    async fn stop(
+        &self,
+        row: &rhapsody_store::LandingRow,
+        pr: i64,
+    ) -> Result<(), crate::landingrevert::RevertError> {
+        let value = self.landing_pr_json(row, pr, "state,comments").await?;
+        if value["state"] == "MERGED" {
+            return Err(crate::landingrevert::RevertError::Merged);
+        }
+        let marker = format!("<!-- rhapsody:landing-stop:{} -->", row.id);
+        let comment = format!(
+            "{marker}\nRevert stopped by operator for landing {}.",
+            row.id
+        );
+        let coord = format!("{}/{}", row.owner, row.repo);
+        let args = if value["state"] == "OPEN" {
+            vec![
+                "pr".into(),
+                "close".into(),
+                pr.to_string(),
+                "--repo".into(),
+                coord,
+                "--comment".into(),
+                comment,
+            ]
+        } else if value["state"] == "CLOSED" {
+            if value["comments"].as_array().is_some_and(|comments| {
+                comments
+                    .iter()
+                    .any(|c| c["body"].as_str().is_some_and(|b| b.contains(&marker)))
+            }) {
+                return Ok(());
+            }
+            vec![
+                "pr".into(),
+                "comment".into(),
+                pr.to_string(),
+                "--repo".into(),
+                coord,
+                "--body".into(),
+                comment,
+            ]
+        } else {
+            return Err(crate::landingrevert::RevertError::Other(
+                "unknown revert PR state".into(),
+            ));
+        };
+        self.run_off_task(args)
+            .await
+            .map_err(|e| crate::landingrevert::RevertError::Other(e.to_string()))?;
+        Ok(())
+    }
     async fn original(
         &self,
         row: &rhapsody_store::LandingRow,

@@ -203,6 +203,7 @@ pub enum WorkerError {
 /// Dropped-from-Go fields are telemetry (P6): `Logger`, `Tracer`, `Metrics`, `Model`,
 /// `DispatchSpanContext`, and the `RunID` that fed the unported `SetRunID` (see the module docs).
 pub struct WorkerDeps {
+    pub landing: Option<crate::landing::LandingRun>,
     pub workspace: Arc<Manager>,
     /// The selected harness. `Harness: Runner`, so every turn still runs through the same
     /// `Runner`/`Session` boundary; the extra trait is what lets the worker READ the harness's
@@ -928,6 +929,9 @@ pub async fn run_agent_attempt(
     if let Some(mgr) = deps.manager.clone() {
         return run_manager_attempt(deps, issue, mgr, messages, on_event, on_transcript).await;
     }
+    if let Some(landing) = deps.landing.clone() {
+        return run_lander_attempt(deps, issue, landing, messages, on_event, on_transcript).await;
+    }
     // Review mode provisions a DETACHED worktree at the head SHA pinned at dispatch: a review reads
     // one pull request's commit and creates no branch to push (STUDIO-715). Checked first because it
     // overrides `workspace_mode` — a review is never a `symphony/<key>` checkout in either shape.
@@ -1290,6 +1294,83 @@ pub async fn run_agent_attempt(
         },
         loop_err,
     )
+}
+
+async fn run_lander_attempt(
+    deps: &WorkerDeps,
+    mut issue: Issue,
+    landing: crate::landing::LandingRun,
+    messages: Option<&mut mpsc::Receiver<String>>,
+    on_event: &(dyn Fn(Event) + Send + Sync),
+    on_transcript: Option<&(dyn Fn(&str) + Send + Sync)>,
+) -> (String, WorkerDeclaration, Option<WorkerError>) {
+    let result = async {
+        let ws = deps
+            .workspace
+            .ensure_review_worktree(
+                &deps.repo_url,
+                &deps.project_slug,
+                &issue.identifier,
+                landing.row.pr,
+                &landing.row.merge_sha,
+            )
+            .await?;
+        let mut transcript = None;
+        let mut log_guard = None;
+        if let Some(store) = &deps.transcripts {
+            match store.open(&issue.identifier) {
+                Ok(run) => {
+                    if let (Ok(stdout), Ok(stderr)) = (run.stdout(), run.stderr()) {
+                        transcript = Some(Transcript {
+                            stdout: Some(Box::new(stdout)),
+                            stderr: Some(Box::new(stderr)),
+                        });
+                        if let Some(callback) = on_transcript {
+                            callback(run.path());
+                        }
+                        log_guard = Some(run);
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "landing transcript could not be opened"),
+            }
+        }
+        let session = deps
+            .agent
+            .start_lander_session(&ws.path, issue.clone(), transcript)?;
+        session.set_run_id(deps.run_id);
+        session.set_model_override(deps.model_override.clone());
+        issue.description = Some(landing.prompt);
+        let (state, text, error) = deps
+            .run_turns(
+                session.as_ref(),
+                "{{ issue.description }}",
+                issue.clone(),
+                None,
+                messages,
+                on_event,
+            )
+            .await;
+        let _ = session.stop().await;
+        drop(log_guard);
+        Ok::<_, WorkerError>((
+            state,
+            WorkerDeclaration {
+                verdict_text: Some(text),
+                ..Default::default()
+            },
+            error,
+        ))
+    }
+    .await;
+    // No app lifecycle hooks or PR labeler: acceptance owns no writes to the repo or GitHub.
+    if let Err(error) = deps
+        .workspace
+        .remove_worktree(&deps.repo_url, &deps.project_slug, &issue.identifier)
+        .await
+    {
+        tracing::warn!(%error, "landing worktree cleanup failed");
+    }
+    result.unwrap_or_else(|error| (issue.state, WorkerDeclaration::default(), Some(error)))
 }
 
 impl WorkerDeps {
@@ -1861,6 +1942,7 @@ fi
         max_turns: i64,
     ) -> WorkerDeps {
         WorkerDeps {
+            landing: None,
             lead_enabled: false,
             lead_progress_dir: None,
             workspace: ws,

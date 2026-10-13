@@ -26,6 +26,14 @@ pub(crate) enum Admission {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct Progress {
+    held_from: Option<String>,
+    contract_hold: bool,
+    phase_since_s: Option<i64>,
+    evidence_epoch: u32,
+    skipped: bool,
+    acceptance_items: Vec<String>,
+    acceptance_run: Option<i64>,
+    acceptance_done: bool,
     project_group: String,
     resume_pending: bool,
     issue_id: String,
@@ -63,6 +71,95 @@ struct CheckState {
 
 /// An owned off-loop sweep. Drop aborts it before the daemon's workspace dependencies disappear.
 pub(crate) struct LandingTask(tokio::task::JoinHandle<()>);
+
+pub enum LandingCommand {
+    Action(LandingAction),
+    Acceptance {
+        run_id: i64,
+        text: String,
+        failed: bool,
+    },
+}
+pub struct LandingRequest {
+    pub id: i64,
+    pub command: LandingCommand,
+    pub reply: Option<tokio::sync::oneshot::Sender<LandingActionOutcome>>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct LandingRun {
+    pub row: LandingRow,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LandingsView {
+    pub landings: Vec<LandingView>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LandingView {
+    pub id: i64,
+    pub project_slug: String,
+    pub ticket: String,
+    pub pr: String,
+    pub phase: String,
+    pub phase_since_s: Option<i64>,
+    pub phase_age_s: Option<i64>,
+    pub first_failing_check: Option<String>,
+    pub hold_reason: Option<String>,
+    pub revert_of: Option<i64>,
+    pub pausing_auto_merge: Vec<String>,
+}
+
+pub fn is_landing_key(key: &str) -> bool {
+    key.starts_with("land:")
+}
+fn land_key(row: &LandingRow) -> String {
+    format!("land:{}/{}#{}", row.owner, row.repo, row.pr)
+}
+
+impl crate::stop::ControlHandle {
+    pub async fn landings(&self) -> Result<LandingsView, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.events
+            .send(crate::control_loop::Event::LandingsList { reply: tx })
+            .map_err(|e| e.to_string())?;
+        let mut ctx = self.ctx.clone();
+        tokio::select! { result = rx => result.map_err(|e| e.to_string())?, _ = ctx.cancelled() => Err("daemon is stopping".into()) }
+    }
+    pub async fn landing_action(&self, id: i64, action: LandingAction) -> LandingActionOutcome {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self
+            .events
+            .send(crate::control_loop::Event::LandingRequest(LandingRequest {
+                id,
+                command: LandingCommand::Action(action),
+                reply: Some(tx),
+            }))
+            .is_err()
+        {
+            return LandingActionOutcome::Failed("control loop is unavailable".into());
+        }
+        let mut ctx = self.ctx.clone();
+        tokio::select! {
+            result = rx => result.unwrap_or_else(|_| LandingActionOutcome::Failed("landing task is unavailable".into())),
+            _ = ctx.cancelled() => LandingActionOutcome::Failed("daemon is stopping".into()),
+        }
+    }
+
+    async fn dispatch_landing(&self, run: LandingRun) -> Result<Option<i64>, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.events
+            .send(crate::control_loop::Event::LandingDispatch { run, reply: tx })
+            .map_err(|e| e.to_string())?;
+        let mut ctx = self.ctx.clone();
+        tokio::select! {
+            result = rx => result.map_err(|e| e.to_string()),
+            _ = ctx.cancelled() => Err("daemon is stopping".into()),
+        }
+    }
+}
 impl Drop for LandingTask {
     fn drop(&mut self) {
         self.0.abort();
@@ -70,6 +167,159 @@ impl Drop for LandingTask {
 }
 
 impl Orchestrator {
+    pub(crate) fn teardown_landing_worktree(&self, run: &LandingRun) {
+        let Some(project) = self
+            .eff
+            .as_ref()
+            .and_then(|e| e.project_by_slug(&run.row.project_slug))
+        else {
+            return;
+        };
+        let workspace = project.workspace.clone();
+        let repo = project.repo.clone();
+        let slug = project.slug.clone();
+        let key = land_key(&run.row);
+        let guard = self.wg.add();
+        tokio::spawn(async move {
+            let _guard = guard;
+            if let Err(error) = workspace.remove_worktree(&repo, &slug, &key).await {
+                tracing::warn!(%error, "landing worktree cleanup failed after cancellation");
+            }
+        });
+    }
+    pub(crate) fn landings_view(&self, now: i64) -> Result<LandingsView, String> {
+        let watches = self
+            .store()
+            .load_live_review_watch()
+            .map_err(|e| e.to_string())?;
+        let mut landings = Vec::new();
+        for row in self.store().list_landings().map_err(|e| e.to_string())? {
+            let progress: Progress =
+                serde_json::from_str(&row.results_json).map_err(|e| e.to_string())?;
+            let open = !matches!(
+                row.phase,
+                LandingPhase::Done | LandingPhase::Held | LandingPhase::Reopened
+            );
+            let group = self
+                .eff
+                .as_ref()
+                .and_then(|e| e.project_by_slug(&row.project_slug))
+                .map(|p| &p.group);
+            let mut paused = std::collections::BTreeSet::new();
+            if open && self.landing_config(&row.project_slug).is_some() {
+                for watch in &watches {
+                    if !watch.open
+                        || (watch.key.owner.eq_ignore_ascii_case(&row.owner)
+                            && watch.key.repo.eq_ignore_ascii_case(&row.repo)
+                            && (watch.key.number == row.pr
+                                || Some(watch.key.number) == row.revert_pr))
+                    {
+                        continue;
+                    }
+                    let pr = PrCoord::new(&watch.key.owner, &watch.key.repo, watch.key.number);
+                    if self.review_auto_merge_for_repo(&watch.key.owner, &watch.key.repo)
+                        && group.is_some_and(|group| self.landing_merge_groups(&pr).contains(group))
+                    {
+                        paused.insert(pr.to_string());
+                    }
+                }
+            }
+            let first_failing_check = progress
+                .samples
+                .iter()
+                .find(|sample| {
+                    progress
+                        .checks
+                        .get(&sample.name)
+                        .is_some_and(|check| check.ran && !check.pass)
+                })
+                .map(|sample| sample.name.clone());
+            landings.push(LandingView {
+                id: row.id,
+                project_slug: row.project_slug,
+                ticket: row.ticket,
+                pr: format!("{}/{}#{}", row.owner, row.repo, row.pr),
+                phase: row.phase.as_str().into(),
+                phase_since_s: progress.phase_since_s,
+                phase_age_s: progress
+                    .phase_since_s
+                    .map(|at| now.saturating_sub(at).max(0)),
+                first_failing_check,
+                hold_reason: row.hold_reason,
+                revert_of: row.revert_of,
+                pausing_auto_merge: paused.into_iter().collect(),
+            });
+        }
+        Ok(LandingsView { landings })
+    }
+    pub(crate) fn dispatch_landing(&mut self, run: LandingRun) -> Option<i64> {
+        if self.drain.is_draining() {
+            return None;
+        }
+        let row = match self.store().get_landing(run.row.id) {
+            Ok(Some(row)) => row,
+            Ok(None) => return None,
+            Err(error) => {
+                tracing::warn!(landing_id = run.row.id, %error, "landing dispatch could not read its row");
+                return None;
+            }
+        };
+        let progress: Progress = match serde_json::from_str(&row.results_json) {
+            Ok(progress) => progress,
+            Err(error) => {
+                tracing::warn!(landing_id = row.id, %error, "landing dispatch progress is invalid");
+                return None;
+            }
+        };
+        if row.phase != LandingPhase::AwaitingAcceptance
+            || progress.acceptance_items.is_empty()
+            || row.revert_of.is_some()
+        {
+            return None;
+        }
+        let key = land_key(&row);
+        if let Some(existing) = self.running.get(&key) {
+            return Some(existing.run_id);
+        }
+        if self.claimed.contains(&key) {
+            return None;
+        }
+        let eff = self.eff.as_ref()?;
+        let project = eff.project_by_slug(&row.project_slug)?;
+        if (eff.max_concurrent > 0 && self.implementation_pool_holders() >= eff.max_concurrent)
+            || (project.max_concurrent > 0
+                && self
+                    .running
+                    .values()
+                    .filter(|re| re.project_group == project.group)
+                    .count() as i64
+                    >= project.max_concurrent)
+        {
+            return None;
+        }
+        let route = crate::retry::DispatchRoute {
+            slug: project.slug.clone(),
+            group: project.group.clone(),
+            repo: project.repo.clone(),
+            model: project.mcfg.claude.model.clone(),
+            workspace_mode: project.workspace_mode.clone(),
+        };
+        let issue = rhapsody_core::Issue {
+            id: key.clone(),
+            identifier: key.clone(),
+            title: format!("Landing acceptance {}/{}#{}", row.owner, row.repo, row.pr),
+            description: Some(run.prompt.clone()),
+            ..Default::default()
+        };
+        self.pending_landing.insert(key.clone(), run);
+        self.dispatch_issue(issue, None, Some(route), String::new());
+        self.pending_landing.remove(&key);
+        self.running
+            .get(&key)
+            .map(|re| re.run_id)
+            .filter(|id| *id > 0)
+    }
+
     pub(crate) fn reserve_landing_merge(
         &self,
         rows: &[&rhapsody_store::ReviewWatchRow],
@@ -125,6 +375,7 @@ impl Orchestrator {
         let progress = Progress {
             project_group: group,
             merge_pending: true,
+            phase_since_s: Some(now),
             ..Default::default()
         };
         let id = self
@@ -276,6 +527,7 @@ impl Orchestrator {
             issue_id: run.issue_id,
             team_id: run.team_id,
             queued,
+            phase_since_s: Some(now),
             ..Default::default()
         };
         let id = self
@@ -302,12 +554,14 @@ impl Orchestrator {
     /// Only dependency snapshots and local reads run on control. Git, HTTP, commands and tracker
     /// effects belong to the owned task. Deterministic checks continue while draining.
     pub(crate) async fn landing_tick(&mut self, now: DateTime<Utc>) {
-        if !self.eff.as_ref().is_some_and(|e| {
-            e.cfg
-                .projects
-                .iter()
-                .any(|p| p.landing.as_ref().is_some_and(|c| c.enabled))
-        }) {
+        if self.landing_requests.is_empty()
+            && !self.eff.as_ref().is_some_and(|e| {
+                e.cfg
+                    .projects
+                    .iter()
+                    .any(|p| p.landing.as_ref().is_some_and(|c| c.enabled))
+            })
+        {
             return;
         }
         if self
@@ -318,25 +572,71 @@ impl Orchestrator {
             return;
         }
         self.landing_task = None;
-        let rows = match self.store().load_open_landings() {
+        let mut rows = match self.store().load_open_landings() {
             Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(err = %e, "landing rows could not be read");
+                for request in std::mem::take(&mut self.landing_requests) {
+                    self.landing_operator_pending.remove(&request.id);
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(LandingActionOutcome::Failed(e.to_string()));
+                    }
+                }
                 return;
             }
         };
+        let requests = std::mem::take(&mut self.landing_requests);
+        let mut pending = BTreeMap::<i64, Vec<LandingRequest>>::new();
+        for request in requests {
+            match self.store().get_landing(request.id) {
+                Ok(Some(row)) => {
+                    if !rows.iter().any(|r| r.id == row.id) {
+                        rows.push(row);
+                    }
+                    pending.entry(request.id).or_default().push(request);
+                }
+                result => {
+                    self.landing_operator_pending.remove(&request.id);
+                    if let Some(reply) = request.reply {
+                        let outcome = match result {
+                            Ok(None) => LandingActionOutcome::NotFound,
+                            Err(e) => LandingActionOutcome::Failed(e.to_string()),
+                            _ => LandingActionOutcome::Failed("landing unavailable".into()),
+                        };
+                        let _ = reply.send(outcome);
+                    }
+                }
+            }
+        }
         let mut work = Vec::new();
         for row in rows {
             let Some(config) = self.landing_config(&row.project_slug) else {
+                self.landing_operator_pending.remove(&row.id);
+                for request in pending.remove(&row.id).unwrap_or_default() {
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(LandingActionOutcome::Refused(
+                            "landing is disabled for this project".into(),
+                        ));
+                    }
+                }
                 continue;
             };
             let Some(eff) = &self.eff else {
                 continue;
             };
             let Some(project) = eff.project_by_slug(&row.project_slug) else {
+                self.landing_operator_pending.remove(&row.id);
+                for request in pending.remove(&row.id).unwrap_or_default() {
+                    if let Some(reply) = request.reply {
+                        let _ = reply.send(LandingActionOutcome::Refused(
+                            "the landing project is unavailable".into(),
+                        ));
+                    }
+                }
                 continue;
             };
             let runtime = LandingRuntime {
+                control: Some(self.control()),
                 store: self.store.clone(),
                 tracker: project.tracker.clone(),
                 checks: Arc::new(RepoChecks {
@@ -376,26 +676,43 @@ impl Orchestrator {
                         .unwrap_or_default(),
                 ))),
             };
-            work.push((runtime, row));
+            let requests = pending.remove(&row.id).unwrap_or_default();
+            work.push((runtime, row, requests));
         }
         if work.is_empty() {
             return;
         }
         let mut ctx = self.ctx.clone().unwrap_or_default();
         let guard = self.wg.add();
+        let events = self.events.clone();
         self.landing_task = Some(LandingTask(tokio::spawn(async move {
             let _guard = guard;
             tokio::select! {
                 _ = ctx.cancelled() => {},
                 _ = async {
-                    for (runtime, row) in work {
+                    for (runtime, row, requests) in work {
                         let id = row.id;
-                        if let Err(err) = runtime.advance(row, now.timestamp()).await {
+                        for request in requests {
+                            let operator = matches!(request.command, LandingCommand::Action(_));
+                            let outcome = match request.command {
+                                LandingCommand::Action(action) => runtime.action(id, action, now.timestamp()).await,
+                                LandingCommand::Acceptance { run_id, text, failed } => match runtime.acceptance_finished(id, run_id, &text, failed, now.timestamp()).await {
+                                    Ok(()) => LandingActionOutcome::Applied,
+                                    Err(err) => LandingActionOutcome::Failed(err),
+                                },
+                            };
+                            if let Some(reply) = request.reply { let _ = reply.send(outcome); }
+                            else if let LandingActionOutcome::Failed(err) = outcome { tracing::warn!(landing_id = id, %err, "landing completion failed"); }
+                            if operator { let _ = events.send(crate::control_loop::Event::LandingActionFinished { id }); }
+                        }
+                        let current = match runtime.store.get_landing(id) { Ok(Some(row)) => row, Ok(None) => continue, Err(error) => { tracing::warn!(landing_id = id, %error, "landing row could not be refreshed"); continue; } };
+                        if let Err(err) = runtime.advance(current, now.timestamp()).await {
                             tracing::warn!(landing_id = id, %err, "landing tick failed; durable work retained for retry");
                         }
                     }
                 } => {}
             }
+            let _ = events.send(crate::control_loop::Event::LandingWake);
         })));
     }
 }
@@ -504,7 +821,7 @@ impl LandingChecks for RepoChecks {
         }
         parse_contract(&blob.content)
             .map(Some)
-            .map_err(|e| e.to_string())
+            .map_err(|e| format!("landing contract invalid: {e}"))
     }
     async fn live(
         &self,
@@ -548,6 +865,7 @@ impl LandingChecks for RepoChecks {
 }
 
 pub(crate) struct LandingRuntime {
+    control: Option<crate::stop::ControlHandle>,
     pub(crate) store: Arc<dyn Store + Send + Sync>,
     pub(crate) tracker: Arc<dyn Tracker>,
     checks: Arc<dyn LandingChecks>,
@@ -557,7 +875,356 @@ pub(crate) struct LandingRuntime {
     pub(crate) notifications: Option<Arc<crate::breaker::NotificationsState>>,
     pub(crate) reverter: Option<Arc<crate::landingrevert::Reverter>>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandingAction {
+    Retry,
+    Skip,
+    Stop,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LandingActionOutcome {
+    Applied,
+    NotFound,
+    Refused(String),
+    Failed(String),
+}
+
 impl LandingRuntime {
+    async fn acceptance(
+        &self,
+        row: &mut LandingRow,
+        progress: &mut Progress,
+        now: i64,
+    ) -> Result<(), String> {
+        if progress.acceptance_items.is_empty() {
+            progress.pending = Some("Done".into());
+            progress.acceptance_done = true;
+            return self.finish(row, progress, now).await;
+        }
+        if let Some(run_id) = progress.acceptance_run {
+            match self.store.get_run(run_id).map_err(|e| e.to_string())? {
+                Some(run) if run.outcome == "running" => return Ok(()),
+                Some(run) if run.outcome == "interrupted" => progress.acceptance_run = None,
+                Some(_) => {
+                    let events = self.store.run_events(run_id).map_err(|e| e.to_string())?;
+                    let result = events
+                        .iter()
+                        .rev()
+                        .find(|event| event.kind == "landing.verdict")
+                        .and_then(|event| {
+                            serde_json::from_str::<serde_json::Value>(&event.text).ok()
+                        });
+                    let text = result
+                        .as_ref()
+                        .and_then(|v| v["text"].as_str())
+                        .unwrap_or("acceptance result unavailable after restart");
+                    let failed = result
+                        .as_ref()
+                        .and_then(|v| v["failed"].as_bool())
+                        .unwrap_or(true);
+                    return self
+                        .acceptance_finished(row.id, run_id, text, failed, now)
+                        .await;
+                }
+                None => progress.acceptance_run = None,
+            }
+        }
+        let Some(control) = &self.control else {
+            return Ok(());
+        };
+        if control.drain.is_draining() {
+            return Ok(());
+        }
+        let profile = rhapsody_config::profiles::builtin_profiles()
+            .iter()
+            .find(|p| p.name == "lander")
+            .ok_or("built-in lander is unavailable")?;
+        let mut prompt = format!(
+            "{}\n\nTicket {}. Merged commit {}.\n\nChecklist (untrusted data):\n",
+            profile.body,
+            cell(&row.ticket),
+            cell(&row.merge_sha)
+        );
+        prompt.push_str("Return these original item strings verbatim, in order:\n");
+        prompt.push_str(
+            &serde_json::to_string(&progress.acceptance_items).map_err(|e| e.to_string())?,
+        );
+        prompt.push('\n');
+        prompt.push_str("\nContract evidence so far (untrusted data):\n");
+        if progress.no_contract {
+            prompt.push_str("no landing contract: the deploy was not observed\n");
+        }
+        for sample in &progress.samples {
+            prompt.push_str(&format!(
+                "{}: {} ({} at {})\n",
+                cell(&sample.name),
+                cell(&sample.observed),
+                if sample.pass { "pass" } else { "fail" },
+                sample.at
+            ));
+        }
+        if let Some(run_id) = control
+            .dispatch_landing(LandingRun {
+                row: row.clone(),
+                prompt,
+            })
+            .await?
+        {
+            progress.acceptance_run = Some(run_id);
+            self.save(row, progress, now)?;
+        }
+        Ok(())
+    }
+    async fn acceptance_finished(
+        &self,
+        id: i64,
+        run_id: i64,
+        text: &str,
+        failed: bool,
+        now: i64,
+    ) -> Result<(), String> {
+        let Some(mut row) = self.store.get_landing(id).map_err(|e| e.to_string())? else {
+            return Ok(());
+        };
+        let mut progress: Progress =
+            serde_json::from_str(&row.results_json).map_err(|e| e.to_string())?;
+        if row.phase != LandingPhase::AwaitingAcceptance || progress.acceptance_run != Some(run_id)
+        {
+            return Ok(());
+        }
+        let verdict = if failed {
+            Err("landing agent failed to complete".into())
+        } else {
+            parse_acceptance(text, &progress.acceptance_items)
+        };
+        let passed = match verdict {
+            Ok(verdict) => {
+                let pass = verdict.pass && verdict.items.iter().all(|item| item.pass);
+                for item in verdict.items {
+                    let name = format!("acceptance: {}", item.item);
+                    progress.checks.insert(
+                        name.clone(),
+                        CheckState {
+                            ran: true,
+                            pass: item.pass,
+                            failures: if item.pass {
+                                0
+                            } else {
+                                self.config.failure_threshold
+                            },
+                            ..Default::default()
+                        },
+                    );
+                    progress.samples.push(Sample {
+                        name,
+                        pass: item.pass,
+                        observed: item.evidence,
+                        at: now,
+                    });
+                }
+                pass
+            }
+            Err(reason) => {
+                progress.checks.insert(
+                    "acceptance".into(),
+                    CheckState {
+                        ran: true,
+                        pass: false,
+                        failures: self.config.failure_threshold,
+                        ..Default::default()
+                    },
+                );
+                progress.samples.push(Sample {
+                    name: "acceptance".into(),
+                    observed: reason,
+                    pass: false,
+                    at: now,
+                });
+                false
+            }
+        };
+        progress.acceptance_done = true;
+        progress.evidence_sent = false;
+        progress.evidence_epoch = progress.evidence_epoch.saturating_add(1);
+        progress.pending = Some(
+            if passed {
+                "Done"
+            } else if self.config.auto_revert {
+                "Reverting"
+            } else {
+                "Reopened"
+            }
+            .into(),
+        );
+        self.save(&mut row, &progress, now)?;
+        self.finish(&mut row, &mut progress, now).await
+    }
+    async fn action(&self, id: i64, action: LandingAction, now: i64) -> LandingActionOutcome {
+        match self.apply_action(id, action, now).await {
+            Ok(outcome) => outcome,
+            Err(error) => LandingActionOutcome::Failed(error),
+        }
+    }
+
+    async fn apply_action(
+        &self,
+        id: i64,
+        action: LandingAction,
+        now: i64,
+    ) -> Result<LandingActionOutcome, String> {
+        if let Some(file) = (self.tracker.as_ref() as &dyn std::any::Any)
+            .downcast_ref::<rhapsody_tracker::file::Tracker>()
+        {
+            file.enable_landing_comments();
+        }
+        let Some(mut row) = self.store.get_landing(id).map_err(|e| e.to_string())? else {
+            return Ok(LandingActionOutcome::NotFound);
+        };
+        let mut progress: Progress =
+            serde_json::from_str(&row.results_json).map_err(|e| e.to_string())?;
+        let refused = |reason: &str| Ok(LandingActionOutcome::Refused(reason.into()));
+        if progress.merge_pending {
+            return refused("the merge has not been observed yet");
+        }
+        match action {
+            LandingAction::Retry => {
+                if row.phase != LandingPhase::Held {
+                    return refused("retry requires Held");
+                }
+                if progress.contract_hold {
+                    return refused("the merged commit has a contract problem; skip it instead");
+                }
+                let phase = match progress.held_from.as_deref() {
+                    Some("WaitingForDeploy") => LandingPhase::WaitingForDeploy,
+                    Some("Watching") => LandingPhase::Watching,
+                    Some("Reverting") => LandingPhase::Reverting,
+                    Some("AwaitingAcceptance") => LandingPhase::AwaitingAcceptance,
+                    _ => return refused("the phase held from is unknown"),
+                };
+                if self
+                    .store
+                    .load_open_landings()
+                    .map_err(|e| e.to_string())?
+                    .iter()
+                    .any(|other| {
+                        if other.id == id || row.revert_of == Some(other.id) {
+                            return false;
+                        }
+                        serde_json::from_str::<Progress>(&other.results_json)
+                            .map(|p| landing_group(other, &p) == landing_group(&row, &progress))
+                            .unwrap_or(true)
+                    })
+                {
+                    return refused("another landing holds the project lock");
+                }
+                row.phase = phase;
+                row.hold_reason = None;
+                progress.phase_since_s = Some(now);
+                progress.pending = None;
+                progress.fetched = false;
+                progress.next_live_s = now;
+                progress.evidence_sent = false;
+                progress.evidence_epoch = progress.evidence_epoch.saturating_add(1);
+                progress.skipped = false;
+                if phase == LandingPhase::AwaitingAcceptance {
+                    progress.acceptance_run = None;
+                    progress.acceptance_done = false;
+                }
+                match phase {
+                    LandingPhase::WaitingForDeploy => {
+                        row.deploy_deadline_s = deadline(now, self.config.deploy_timeout)
+                    }
+                    LandingPhase::Watching => {
+                        row.watch_until_s = Some(deadline(now, self.config.watch));
+                        progress.checks.clear();
+                    }
+                    LandingPhase::Reverting => progress.revert_opened_at_s = Some(now),
+                    _ => {}
+                }
+                if let Some(parent_id) = row.revert_of
+                    && let Some(mut parent) = self
+                        .store
+                        .get_landing(parent_id)
+                        .map_err(|e| e.to_string())?
+                {
+                    let mut parent_progress: Progress =
+                        serde_json::from_str(&parent.results_json).map_err(|e| e.to_string())?;
+                    if parent.phase == LandingPhase::Held
+                        && parent_progress.held_from.as_deref() == Some("Reverting")
+                        && parent_progress.revert_landing == Some(id)
+                    {
+                        parent.phase = LandingPhase::Reverting;
+                        parent.hold_reason = None;
+                        parent_progress.phase_since_s = Some(now);
+                        parent_progress.pending = None;
+                        self.save(&mut parent, &parent_progress, now)?;
+                    }
+                }
+                self.save(&mut row, &progress, now)?;
+            }
+            LandingAction::Skip => {
+                if !matches!(
+                    row.phase,
+                    LandingPhase::WaitingForDeploy
+                        | LandingPhase::Watching
+                        | LandingPhase::AwaitingAcceptance
+                        | LandingPhase::Held
+                ) {
+                    return refused(
+                        "skip requires WaitingForDeploy, Watching, AwaitingAcceptance or Held; use stop while Reverting",
+                    );
+                }
+                progress.skipped = true;
+                progress.evidence_sent = false;
+                progress.evidence_epoch = progress.evidence_epoch.saturating_add(1);
+                progress.pending = Some("Done".into());
+                self.save(&mut row, &progress, now)?;
+                self.finish(&mut row, &mut progress, now).await?;
+            }
+            LandingAction::Stop => {
+                if row.phase != LandingPhase::Reverting {
+                    return refused("stop requires Reverting");
+                }
+                if progress.revert_landing.is_some() {
+                    return refused("the revert PR has already merged");
+                }
+                let Some(pr) = row.revert_pr else {
+                    return refused("no pending revert PR has been opened");
+                };
+                let reverter = self
+                    .reverter
+                    .as_ref()
+                    .ok_or("landing revert dependencies are unavailable")?;
+                let snapshot = reverter
+                    .github
+                    .snapshot(&row, pr)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if snapshot.status == crate::ghsummons::PrStatus::Merged {
+                    return refused("the revert PR has already merged");
+                }
+                if let Err(error) = reverter.github.stop(&row, pr).await {
+                    if matches!(error, crate::landingrevert::RevertError::Merged)
+                        || reverter
+                            .github
+                            .snapshot(&row, pr)
+                            .await
+                            .is_ok_and(|snapshot| {
+                                snapshot.status == crate::ghsummons::PrStatus::Merged
+                            })
+                    {
+                        return refused("the revert PR has already merged");
+                    }
+                    return Err(error.to_string());
+                }
+                self.hold(&mut row, &mut progress, "revert stopped by operator", now)
+                    .await?;
+            }
+        }
+        Ok(LandingActionOutcome::Applied)
+    }
     fn save(&self, row: &mut LandingRow, progress: &Progress, now: i64) -> Result<(), String> {
         row.results_json = serde_json::to_string(progress).map_err(|e| e.to_string())?;
         row.updated_at_s = now;
@@ -574,10 +1241,7 @@ impl LandingRuntime {
         }
         if matches!(
             row.phase,
-            LandingPhase::Done
-                | LandingPhase::Held
-                | LandingPhase::Reopened
-                | LandingPhase::AwaitingAcceptance
+            LandingPhase::Done | LandingPhase::Held | LandingPhase::Reopened
         ) {
             return Ok(());
         }
@@ -590,6 +1254,9 @@ impl LandingRuntime {
         }
         if progress.pending.is_some() {
             return self.finish(&mut row, &mut progress, now).await;
+        }
+        if row.phase == LandingPhase::AwaitingAcceptance {
+            return self.acceptance(&mut row, &mut progress, now).await;
         }
         if row.phase == LandingPhase::Reverting {
             return self.revert(&mut row, &mut progress, now).await;
@@ -646,7 +1313,12 @@ impl LandingRuntime {
         }
         let contract = match self.checks.prepare(&row).await {
             Ok(contract) => contract,
-            Err(reason) => return self.hold(&mut row, &mut progress, &reason, now).await,
+            Err(reason) => {
+                progress.contract_hold = reason.starts_with("landing contract invalid:")
+                    || reason == "landing contract removed by this change"
+                    || reason == "landing contract must be a regular file";
+                return self.hold(&mut row, &mut progress, &reason, now).await;
+            }
         };
         let Some(contract) = contract else {
             progress.no_contract = true;
@@ -681,6 +1353,7 @@ impl LandingRuntime {
                     });
                     if live {
                         row.phase = LandingPhase::Watching;
+                        progress.phase_since_s = Some(now);
                         row.watch_until_s = Some(deadline(now, self.config.watch));
                     }
                 }
@@ -866,6 +1539,7 @@ impl LandingRuntime {
                     project_group: progress.project_group.clone(),
                     state_moved: true,
                     started: true,
+                    phase_since_s: Some(now),
                     ..Default::default()
                 };
                 let id = self
@@ -1021,6 +1695,7 @@ impl LandingRuntime {
         now: i64,
     ) -> Result<(), String> {
         row.hold_reason = Some(reason.into());
+        progress.held_from = Some(row.phase.as_str().into());
         if row.phase == LandingPhase::Reverting {
             progress.evidence_sent = false;
         }
@@ -1038,19 +1713,35 @@ impl LandingRuntime {
             .pending
             .clone()
             .ok_or("landing has no pending outcome")?;
-        if target == "Done" && row.revert_of.is_none() {
+        if target == "Done"
+            && row.revert_of.is_none()
+            && !progress.skipped
+            && !progress.acceptance_done
+        {
             let description = self
                 .tracker
                 .fetch_issue_description_by_identifier(&row.ticket)
                 .await
                 .map_err(|e| e.to_string())?;
             if description.as_deref().is_some_and(has_acceptance) {
+                progress.acceptance_items = acceptance_items(description.as_deref().unwrap_or(""));
                 target = "AwaitingAcceptance".into();
                 progress.pending = Some(target.clone());
                 self.save(row, progress, now)?;
             }
         }
-        let marker = if row.phase == LandingPhase::Reverting {
+        if target == "AwaitingAcceptance" {
+            row.phase = LandingPhase::AwaitingAcceptance;
+            progress.phase_since_s = Some(now);
+            progress.pending = None;
+            return self.save(row, progress, now);
+        }
+        let marker = if progress.evidence_epoch > 0 {
+            format!(
+                "<!-- rhapsody:landing:{}:{}:{target} -->",
+                row.id, progress.evidence_epoch
+            )
+        } else if row.phase == LandingPhase::Reverting {
             format!("<!-- rhapsody:landing:{}:{target} -->", row.id)
         } else {
             format!("<!-- rhapsody:landing:{} -->", row.id)
@@ -1078,6 +1769,28 @@ impl LandingRuntime {
                 }
                 if progress.no_contract {
                     body.push_str("\nno landing contract: the deploy was not observed\n");
+                }
+                if progress.skipped {
+                    body.push_str("\nOperator evidence: skipped by operator (checks were not asserted passed).\n");
+                }
+                if progress.acceptance_done {
+                    body.push_str("\n## Post-deploy acceptance\n");
+                    for item in &progress.acceptance_items {
+                        let name = format!("acceptance: {item}");
+                        let sample = progress.samples.iter().rev().find(|s| s.name == name);
+                        body.push_str(&format!(
+                            "- [{}] {} — {}\n",
+                            if sample.is_some_and(|s| s.pass) {
+                                "x"
+                            } else {
+                                " "
+                            },
+                            cell(item),
+                            sample
+                                .map(|s| cell(&s.observed))
+                                .unwrap_or_else(|| "not verified".into())
+                        ));
+                    }
                 }
                 if let Some(reason) = &row.hold_reason {
                     body.push_str(&format!("\nHeld: {}\n", cell(reason)));
@@ -1146,6 +1859,7 @@ impl LandingRuntime {
             _ => return Err("unknown landing outcome".into()),
         };
         progress.pending = None;
+        progress.phase_since_s = Some(now);
         self.save(row, progress, now)
     }
 }
@@ -1163,16 +1877,82 @@ fn failed_samples(progress: &Progress, threshold: u32) -> Vec<&Sample> {
         .collect()
 }
 fn has_acceptance(description: &str) -> bool {
-    description
-        .split("## Post-deploy acceptance")
-        .nth(1)
-        .is_some_and(|s| {
-            s.split("\n## ")
-                .next()
-                .unwrap_or("")
-                .lines()
-                .any(|l| l.trim_start().starts_with("- ["))
-        })
+    !acceptance_items(description).is_empty()
+}
+
+fn acceptance_items(description: &str) -> Vec<String> {
+    let mut section = false;
+    let mut fenced = false;
+    let mut items = Vec::new();
+    for line in description.lines() {
+        let line = line.trim();
+        if line.starts_with("```") || line.starts_with("~~~") {
+            fenced = !fenced;
+            continue;
+        }
+        if fenced {
+            continue;
+        }
+        if line == "## Post-deploy acceptance" {
+            section = true;
+            continue;
+        }
+        if section && line.starts_with('#') {
+            break;
+        }
+        if section {
+            let item = ["- [ ] ", "- [x] ", "- [X] "]
+                .iter()
+                .find_map(|prefix| line.strip_prefix(prefix));
+            if let Some(item) = item.filter(|item| !item.trim().is_empty()) {
+                items.push(item.trim().into());
+            }
+        }
+    }
+    items
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptanceVerdict {
+    pass: bool,
+    items: Vec<AcceptanceItem>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AcceptanceItem {
+    item: String,
+    pass: bool,
+    evidence: String,
+}
+
+fn parse_acceptance(text: &str, expected: &[String]) -> Result<AcceptanceVerdict, String> {
+    let marker = "```rhapsody-landing-verdict\n";
+    if text.matches(marker).count() != 1 {
+        return Err("acceptance requires one structured verdict".into());
+    }
+    let block = text
+        .split_once(marker)
+        .and_then(|(_, rest)| rest.split_once("```"))
+        .map(|(block, _)| block)
+        .ok_or("acceptance verdict fence is incomplete")?;
+    let verdict: AcceptanceVerdict =
+        serde_json::from_str(block).map_err(|e| format!("invalid acceptance verdict: {e}"))?;
+    if expected.is_empty()
+        || verdict.items.len() != expected.len()
+        || verdict
+            .items
+            .iter()
+            .zip(expected)
+            .any(|(item, expected)| &item.item != expected || item.evidence.trim().is_empty())
+    {
+        return Err("acceptance must report every checklist item in order with evidence".into());
+    }
+    if verdict.pass != verdict.items.iter().all(|item| item.pass) {
+        return Err("acceptance verdict contradicts its checklist".into());
+    }
+    Ok(verdict)
 }
 
 fn landing_group<'a>(row: &'a LandingRow, progress: &'a Progress) -> &'a str {
@@ -1279,6 +2059,7 @@ pub(crate) mod tests {
                 .unwrap();
             Self {
                 runtime: LandingRuntime {
+                    control: None,
                     store,
                     tracker: tracker.clone(),
                     checks: checks.clone(),
@@ -1305,6 +2086,481 @@ pub(crate) mod tests {
         }
         fn progress(&self) -> Progress {
             serde_json::from_str(&self.row().results_json).unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn land_worker_completes_and_restart_consumes_its_durable_verdict_once() {
+        let rig = RepoRig::new(None, None);
+        let mut o = enabled_orchestrator_for_view(rig.runtime.store.clone());
+        let root = rig._dir.child("acceptance-workers");
+        let workspace = crate::testsupport::mk_workspace(&root);
+        let verdict = "```rhapsody-landing-verdict\n{\"pass\":true,\"items\":[{\"item\":\"live UI is healthy\",\"pass\":true,\"evidence\":\"GET /healthz returned 200\"}]}\n```";
+        let result = serde_json::json!({"type":"result", "subtype":"success", "is_error":false, "session_id":"s", "result":verdict});
+        let script = rig._dir.child("lander.sh");
+        std::fs::write(&script, format!("#!/bin/bash\nread -r first\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}}' '{result}'\n")).unwrap();
+        let project = &mut o.eff.as_mut().unwrap().projects[0];
+        project.repo = rig.origin.clone();
+        project.workspace = workspace.clone();
+        project.agents.insert(
+            "claude".into(),
+            Arc::new(rhapsody_agent::claude::Runner::new(
+                rhapsody_agent::claude::Config {
+                    command: format!("bash {script}"),
+                    workspace_root: root,
+                    turn_timeout: Duration::from_secs(5),
+                    ..Default::default()
+                },
+            )),
+        );
+        let mut row = rig.row();
+        row.phase = LandingPhase::AwaitingAcceptance;
+        let mut progress: Progress = serde_json::from_str(&row.results_json).unwrap();
+        progress.no_contract = true;
+        progress.acceptance_items = vec!["live UI is healthy".into()];
+        rig.runtime.save(&mut row, &progress, 1).unwrap();
+        let run_id = o
+            .dispatch_landing(LandingRun {
+                row: row.clone(),
+                prompt: "verify live UI is healthy".into(),
+            })
+            .unwrap();
+        progress.acceptance_run = Some(run_id);
+        rig.runtime.save(&mut row, &progress, 1).unwrap();
+        let mut rx = o.events_rx.lock().unwrap().take().unwrap();
+        let exit = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(crate::control_loop::Event::WorkerExit(exit)) = rx.recv().await {
+                    break exit;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!exit.failed, "{}", exit.err_msg);
+        assert_eq!(exit.verdict_text.as_deref(), Some(verdict));
+        o.on_worker_exit(exit);
+        assert!(!o.claimed.contains("land:o/r#1"));
+        assert!(o.retry_attempts.is_empty());
+        assert_eq!(
+            rig.runtime.store.get_run(run_id).unwrap().unwrap().outcome,
+            "completed"
+        );
+        // Drop the volatile completion request, as a daemon restart would. Only the ledger remains.
+        o.landing_requests.clear();
+        rig.tick(2).await;
+        rig.tick(3).await;
+        assert_eq!(rig.row().phase, LandingPhase::Done);
+        let comments = rig.runtime.tracker.list_comments("ID-1").await.unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].body.contains("- [x] live UI is healthy"));
+        assert!(!Path::new(&workspace.path_for(&rig.origin, "land:o/r#1")).exists());
+    }
+
+    #[tokio::test]
+    async fn checklist_dispatches_land_run_with_read_only_profile() {
+        let rig = Rig::new("Done");
+        let mut o = enabled_orchestrator_for_view(rig.runtime.store.clone());
+        o.spawn = Some(Box::new(|_, _, re| {
+            assert_eq!(re.harness, "claude");
+            assert!(re.landing.is_some());
+            assert!(re.capabilities_section.is_empty());
+        }));
+        let mut row = rig.row();
+        row.phase = LandingPhase::AwaitingAcceptance;
+        let mut progress = rig.progress();
+        progress.acceptance_items = vec!["dashboard shows activities".into()];
+        rig.runtime.save(&mut row, &progress, 1).unwrap();
+        let run = LandingRun {
+            row,
+            prompt: "dashboard shows activities; health: status=200".into(),
+        };
+        assert!(o.dispatch_landing(run.clone()).is_some());
+        let re = o.running.get("land:o/r#1").unwrap();
+        assert_eq!(re.issue.description.as_deref(), Some(run.prompt.as_str()));
+        let run_id = re.run_id;
+        assert_eq!(o.running.len(), 1);
+        assert_eq!(o.dispatch_landing(run), Some(run_id));
+    }
+
+    #[tokio::test]
+    async fn drain_pauses_land_dispatch_but_not_deterministic_checks() {
+        let rig = Rig::new("Done");
+        let mut o = enabled_orchestrator_for_view(rig.runtime.store.clone());
+        o.drain.arm(Utc::now(), crate::drain::DrainReason::Operator);
+        let mut row = rig.row();
+        row.phase = LandingPhase::AwaitingAcceptance;
+        let mut progress = rig.progress();
+        progress.acceptance_items = vec!["item".into()];
+        rig.runtime.save(&mut row, &progress, 1).unwrap();
+        assert_eq!(
+            o.dispatch_landing(LandingRun {
+                row,
+                prompt: "item".into()
+            }),
+            None
+        );
+        assert!(o.running.is_empty());
+        // Same armed signal, normal deterministic runtime; the drain never gates its checks.
+        let mut row = rig.row();
+        row.phase = LandingPhase::WaitingForDeploy;
+        rig.runtime.store.save_landing(row).unwrap();
+        rig.tick(2).await;
+        assert_eq!(rig.row().phase, LandingPhase::Watching);
+        assert!(rig.progress().samples.iter().any(|s| s.name == "health"));
+    }
+
+    #[tokio::test]
+    async fn landings_api_names_the_prs_a_landing_is_pausing() {
+        let rig = Rig::new("Done");
+        let mut orchestrator = enabled_orchestrator_for_view(rig.runtime.store.clone());
+        orchestrator
+            .store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    number: 7,
+                    reviewer: "alice".into(),
+                },
+                open: true,
+                ..Default::default()
+            })
+            .unwrap();
+        let mut row = rig.row();
+        row.phase = LandingPhase::AwaitingAcceptance;
+        let mut progress = rig.progress();
+        progress.phase_since_s = Some(5);
+        rig.runtime.save(&mut row, &progress, 50).unwrap();
+        let view = orchestrator.landings_view(65).unwrap();
+        assert_eq!(view.landings[0].pausing_auto_merge, vec!["o/r#7"]);
+        assert_eq!(view.landings[0].phase_age_s, Some(60));
+        orchestrator.eff.as_mut().unwrap().cfg.projects[0].landing = None;
+        assert!(
+            orchestrator.landings_view(65).unwrap().landings[0]
+                .pausing_auto_merge
+                .is_empty()
+        );
+    }
+
+    fn enabled_orchestrator_for_view(store: Arc<dyn Store + Send + Sync>) -> Orchestrator {
+        let mut o = Orchestrator::new("");
+        o.store = store;
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        let mut p = crate::testsupport::empty_resolved_project("app", Arc::new(Fake::new()));
+        p.repo = "https://github.com/o/r.git".into();
+        eff.projects.push(p);
+        eff.cfg.projects.push(rhapsody_config::Project {
+            slugs: vec!["app".into()],
+            repo: "https://github.com/o/r.git".into(),
+            landing: Some(config()),
+            ..Default::default()
+        });
+        o.eff = Some(eff);
+        let mut teams = rhapsody_config::teams::Teams::disabled();
+        teams.enabled = true;
+        teams.review.auto_merge = true;
+        teams.review.mode = rhapsody_config::teams::ReviewMode::Ticketless;
+        o.teams = Some(teams);
+        o
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_revert_linkage_and_never_opens_a_second_revert() {
+        let mut rig = RepoRig::new(None, Some(GOOD));
+        let gh = crate::landingrevert::tests::Github::new();
+        rig.runtime.reverter = Some(crate::landingrevert::tests::reverter(&rig, gh.clone()));
+        let mut row = rig.row();
+        row.phase = LandingPhase::Reverting;
+        rig.runtime.store.save_landing(row).unwrap();
+        rig.tick(5).await;
+        rig.tick(35).await;
+        assert_eq!(rig.row().phase, LandingPhase::Held);
+        assert_eq!(
+            rig.runtime.action(rig.id, LandingAction::Retry, 100).await,
+            LandingActionOutcome::Applied
+        );
+        rig.tick(101).await;
+        assert_eq!(rig.row().phase, LandingPhase::Reverting);
+        assert_eq!(rig.row().revert_pr, Some(2));
+        assert_eq!(gh.opened.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn retry_revert_child_reopens_parent_reverting() {
+        let rig = Rig::new("Done");
+        let mut parent = rig.row();
+        parent.phase = LandingPhase::Held;
+        let mut child = parent.clone();
+        child.id = 0;
+        child.pr = 2;
+        child.revert_of = Some(parent.id);
+        let child_progress = Progress {
+            held_from: Some("Watching".into()),
+            ..rig.progress()
+        };
+        child.results_json = serde_json::to_string(&child_progress).unwrap();
+        let child_id = rig.runtime.store.save_landing(child).unwrap();
+        let mut progress = rig.progress();
+        progress.held_from = Some("Reverting".into());
+        progress.revert_landing = Some(child_id);
+        rig.runtime.save(&mut parent, &progress, 5).unwrap();
+        assert_eq!(
+            rig.runtime
+                .action(child_id, LandingAction::Retry, 100)
+                .await,
+            LandingActionOutcome::Applied
+        );
+        assert_eq!(rig.row().phase, LandingPhase::Reverting);
+        assert_eq!(rig.progress().revert_landing, Some(child_id));
+        assert_eq!(
+            rig.runtime
+                .store
+                .get_landing(child_id)
+                .unwrap()
+                .unwrap()
+                .revert_of,
+            Some(parent.id)
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_closes_unmerged_revert_and_holds() {
+        let mut rig = RepoRig::new(None, Some(GOOD));
+        let gh = crate::landingrevert::tests::Github::new();
+        rig.runtime.reverter = Some(crate::landingrevert::tests::reverter(&rig, gh.clone()));
+        let mut row = rig.row();
+        row.phase = LandingPhase::Reverting;
+        row.revert_pr = Some(2);
+        rig.runtime.store.save_landing(row).unwrap();
+        assert_eq!(
+            rig.runtime.action(rig.id, LandingAction::Stop, 10).await,
+            LandingActionOutcome::Applied
+        );
+        assert_eq!(gh.state.lock().unwrap().0, PrStatus::Closed);
+        assert_eq!(rig.row().phase, LandingPhase::Held);
+        assert_eq!(
+            rig.row().hold_reason.as_deref(),
+            Some("revert stopped by operator")
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_refused_after_revert_merged() {
+        for racing in [false, true] {
+            let mut rig = RepoRig::new(None, Some(GOOD));
+            let gh = crate::landingrevert::tests::Github::new();
+            if racing {
+                gh.merged_during_stop
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                gh.state.lock().unwrap().0 = PrStatus::Merged;
+            }
+            rig.runtime.reverter = Some(crate::landingrevert::tests::reverter(&rig, gh.clone()));
+            let mut row = rig.row();
+            row.phase = LandingPhase::Reverting;
+            row.revert_pr = Some(2);
+            rig.runtime.store.save_landing(row).unwrap();
+            assert!(matches!(
+                rig.runtime.action(rig.id, LandingAction::Stop, 10).await,
+                LandingActionOutcome::Refused(_)
+            ));
+            assert_eq!(rig.row().phase, LandingPhase::Reverting);
+            assert_eq!(gh.state.lock().unwrap().0, PrStatus::Merged);
+        }
+    }
+
+    #[tokio::test]
+    async fn no_checklist_means_no_landing_agent_dispatch() {
+        let rig = Rig::new("Done");
+        rig.tick(0).await;
+        rig.tick(10).await;
+        assert_eq!(rig.row().phase, LandingPhase::Done);
+        assert!(rig.progress().acceptance_items.is_empty());
+        assert!(rig.progress().acceptance_run.is_none());
+        assert!(
+            rig.runtime
+                .store
+                .list_issue_runs(RunFilter {
+                    issue: "land:o/r#1".into(),
+                    ..Default::default()
+                })
+                .unwrap()
+                .is_empty()
+        );
+        let mut o = enabled_orchestrator_for_view(rig.runtime.store.clone());
+        o.spawn = Some(Box::new(|_, _, _| {}));
+        let mut row = rig.row();
+        row.phase = LandingPhase::AwaitingAcceptance;
+        rig.runtime.store.save_landing(row.clone()).unwrap();
+        assert_eq!(
+            o.dispatch_landing(LandingRun {
+                row,
+                prompt: "no checklist".into()
+            }),
+            None
+        );
+        assert!(o.running.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unmet_acceptance_item_fails_the_landing() {
+        let mut rig = Rig::new("Done");
+        let mut fake = Fake::new();
+        fake.candidates = vec![rhapsody_core::Issue {
+            id: "ID-1".into(),
+            identifier: "APP-1".into(),
+            description: Some(
+                "## Post-deploy acceptance\n- [ ] dashboard shows activities\n".into(),
+            ),
+            ..Default::default()
+        }];
+        rig.runtime.tracker = Arc::new(fake);
+        rig.runtime.config.auto_revert = true;
+        rig.tick(0).await;
+        rig.tick(10).await;
+        assert_eq!(rig.row().phase, LandingPhase::AwaitingAcceptance);
+        let mut progress = rig.progress();
+        progress.acceptance_run = Some(42);
+        let mut row = rig.row();
+        rig.runtime.save(&mut row, &progress, 10).unwrap();
+        rig.runtime.acceptance_finished(rig.id, 42, r#"```rhapsody-landing-verdict
+{"pass":false,"items":[{"item":"dashboard shows activities","pass":false,"evidence":"GET /activities returned zero"}]}
+```"#, false, 11).await.unwrap();
+        assert_eq!(rig.row().phase, LandingPhase::Reverting);
+        assert!(
+            rig.progress()
+                .samples
+                .iter()
+                .any(|s| s.name == "acceptance: dashboard shows activities"
+                    && !s.pass
+                    && s.observed.contains("zero"))
+        );
+    }
+
+    #[test]
+    fn acceptance_requires_exact_checklist_and_evidence() {
+        let items = vec!["dashboard shows activities".into()];
+        for text in [
+            "passed",
+            r#"```rhapsody-landing-verdict
+{"pass":true,"items":[]}
+```"#,
+            r#"```rhapsody-landing-verdict
+{"pass":true,"items":[{"item":"dashboard shows activities","pass":true,"evidence":""}]}
+```"#,
+        ] {
+            assert!(parse_acceptance(text, &items).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn retry_held_deploy_timeout_restores_waiting_with_fresh_deadline() {
+        let rig = Rig::new("Done");
+        rig.tick(30).await;
+        assert_eq!(
+            rig.progress().held_from.as_deref(),
+            Some("WaitingForDeploy")
+        );
+        assert_eq!(
+            rig.runtime.action(rig.id, LandingAction::Retry, 100).await,
+            LandingActionOutcome::Applied
+        );
+        assert_eq!(rig.row().phase, LandingPhase::WaitingForDeploy);
+        assert_eq!(rig.row().deploy_deadline_s, 130);
+        assert_eq!(rig.row().hold_reason, None);
+        assert!(!rig.progress().fetched);
+        assert_eq!(rig.progress().phase_since_s, Some(100));
+    }
+
+    #[tokio::test]
+    async fn retry_refused_when_project_lock_taken_or_contract_problem() {
+        let rig = Rig::new("Done");
+        rig.tick(30).await;
+        let mut sibling = rig.row();
+        sibling.id = 0;
+        sibling.pr = 2;
+        sibling.phase = LandingPhase::Watching;
+        let sibling_id = rig.runtime.store.save_landing(sibling).unwrap();
+        assert!(matches!(
+            rig.runtime.action(rig.id, LandingAction::Retry, 100).await,
+            LandingActionOutcome::Refused(_)
+        ));
+        let mut sibling = rig.runtime.store.get_landing(sibling_id).unwrap().unwrap();
+        sibling.phase = LandingPhase::Done;
+        rig.runtime.store.save_landing(sibling).unwrap();
+        let mut progress = rig.progress();
+        progress.contract_hold = true;
+        let mut row = rig.row();
+        rig.runtime.save(&mut row, &progress, 30).unwrap();
+        assert!(matches!(
+            rig.runtime.action(rig.id, LandingAction::Retry, 100).await,
+            LandingActionOutcome::Refused(_)
+        ));
+        assert_eq!(rig.row().phase, LandingPhase::Held);
+    }
+
+    #[tokio::test]
+    async fn skip_marks_done_with_operator_evidence() {
+        let rig = Rig::new("Done");
+        assert_eq!(
+            rig.runtime.action(rig.id, LandingAction::Skip, 5).await,
+            LandingActionOutcome::Applied
+        );
+        assert_eq!(rig.row().phase, LandingPhase::Done);
+        let comments = rig.tracker.create_comment_calls();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].body.contains("skipped by operator"));
+        assert!(!comments[0].body.contains("skipped by operator | pass"));
+        assert_eq!(rig.tracker.move_calls()[0].state_name, "Done");
+    }
+
+    #[tokio::test]
+    async fn actions_return_not_found_and_refuse_wrong_phases() {
+        let rig = Rig::new("Done");
+        for action in [
+            LandingAction::Retry,
+            LandingAction::Skip,
+            LandingAction::Stop,
+        ] {
+            assert_eq!(
+                rig.runtime.action(999, action, 1).await,
+                LandingActionOutcome::NotFound
+            );
+            for phase in [
+                LandingPhase::WaitingForDeploy,
+                LandingPhase::Watching,
+                LandingPhase::AwaitingAcceptance,
+                LandingPhase::Reverting,
+                LandingPhase::Done,
+                LandingPhase::Held,
+                LandingPhase::Reopened,
+            ] {
+                let allowed = match action {
+                    LandingAction::Retry => phase == LandingPhase::Held,
+                    LandingAction::Skip => matches!(
+                        phase,
+                        LandingPhase::WaitingForDeploy
+                            | LandingPhase::Watching
+                            | LandingPhase::AwaitingAcceptance
+                            | LandingPhase::Held
+                    ),
+                    LandingAction::Stop => phase == LandingPhase::Reverting,
+                };
+                if allowed {
+                    continue;
+                }
+                let mut row = rig.row();
+                row.phase = phase;
+                rig.runtime.store.save_landing(row).unwrap();
+                assert!(
+                    matches!(
+                        rig.runtime.action(rig.id, action, 1).await,
+                        LandingActionOutcome::Refused(_)
+                    ),
+                    "{action:?} {phase:?}"
+                );
+            }
         }
     }
 
@@ -2131,6 +3387,7 @@ pub(crate) mod tests {
     impl RepoRig {
         fn restart(&mut self) {
             self.runtime = LandingRuntime {
+                control: None,
                 store: Arc::new(
                     Sqlite::open(StorePath::Disk(self._dir.child("landing.db").into())).unwrap(),
                 ),
@@ -2210,6 +3467,7 @@ pub(crate) mod tests {
                 0
             };
             let runtime = LandingRuntime {
+                control: None,
                 store,
                 tracker,
                 checks: Arc::new(RepoChecks {
@@ -2328,6 +3586,22 @@ pub(crate) mod tests {
             assert_eq!(rig.row().watch_until_s, None);
             let progress: Progress = serde_json::from_str(&rig.row().results_json).unwrap();
             assert!(progress.samples.is_empty());
+            if checklist {
+                assert!(
+                    rig.runtime
+                        .tracker
+                        .list_comments("ID-1")
+                        .await
+                        .unwrap()
+                        .is_empty()
+                );
+                let mut progress = progress;
+                progress.acceptance_run = Some(42);
+                let mut row = rig.row();
+                rig.runtime.save(&mut row, &progress, 0).unwrap();
+                rig.runtime.acceptance_finished(rig.id, 42, "```rhapsody-landing-verdict\n{\"pass\":true,\"items\":[{\"item\":\"see the change\",\"pass\":true,\"evidence\":\"GET /change shows it\"}]}\n```", false, 1).await.unwrap();
+                assert_eq!(rig.row().phase, LandingPhase::Done);
+            }
             let comments = rig.runtime.tracker.list_comments("ID-1").await.unwrap();
             assert_eq!(comments.len(), 1);
             assert!(
