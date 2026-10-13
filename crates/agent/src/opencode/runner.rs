@@ -843,11 +843,14 @@ impl Drop for OpencodeSession {
 
 #[async_trait]
 impl Session for OpencodeSession {
+    fn reset_conversation(&self) -> Result<(), AgentError> {
+        self.locked_session_id().clear();
+        self.turn_n.store(0, Ordering::SeqCst);
+        Ok(())
+    }
     fn resume_from(&self, thread_id: &str) -> Result<(), AgentError> {
         if thread_id.is_empty() || *self.locked_session_id() != thread_id {
-            return Err(AgentError::Other(
-                "parked OpenCode session could not be restored from retained state".into(),
-            ));
+            return Err(AgentError::ResumeUnavailable);
         }
         Ok(())
     }
@@ -1769,6 +1772,9 @@ impl OpencodeSession {
         // and an `isRetryable` boolean directly, so both are carried into the message rather than
         // re-derived from its text (design §7.1).
         if let Some(f) = failure {
+            if f.name == "ResumeUnavailable" && !session_announced {
+                return (failed(usage), Some(AgentError::ResumeUnavailable));
+            }
             // Only the legacy path owns a credential to re-seed; a brokered 401 is the broker's.
             self.auth_failed
                 .store(self.brokered.is_none() && f.is_auth(), Ordering::SeqCst);

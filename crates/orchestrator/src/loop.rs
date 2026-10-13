@@ -694,6 +694,7 @@ fn worker_deps_for(
         prepared_harness: None,
         engine: None,
         resume_session: String::new(),
+        resume_after_drain: false,
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -2120,6 +2121,10 @@ impl Orchestrator {
             .get(&iss.id)
             .map(|r| r.resume_session.clone())
             .unwrap_or_default();
+        deps.resume_after_drain = self
+            .running
+            .get(&iss.id)
+            .is_some_and(|r| r.resume_after_drain);
         // ⚠️ The routed teammate's HARNESS (STUDIO-902): swap in that backend's already-built
         // runner. Empty — every profile that names none — leaves `deps.agent` exactly as
         // `worker_deps_for` set it, which is what keeps every existing dispatch byte-identical.

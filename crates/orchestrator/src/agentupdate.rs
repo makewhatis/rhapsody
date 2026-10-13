@@ -57,6 +57,30 @@ impl Orchestrator {
     /// Folds one agent event into the running entry's live state and the aggregate token totals
     /// (upstream §13.5). A no-op for an unknown issue (already terminated). Mirrors Go `onAgentUpdate`.
     pub fn on_agent_update(&mut self, e: AgentUpdate) {
+        if e.ev.event_type == crate::drain::EVENT_DRAIN_PARKED {
+            if let Some(re) = self.running.get(&e.issue_id) {
+                let identifier = re.issue.identifier.clone();
+                let project = re.project_slug.clone();
+                self.drain_continuations.insert(
+                    identifier.clone(),
+                    crate::drain::DrainContinuation {
+                        session: e.ev.message,
+                        harness: re.credential_harness.clone(),
+                        issue: re.issue.clone(),
+                        engine: re.engine.clone(),
+                    },
+                );
+                // Commit before post-run cleanup: even a restart before WorkerExit keeps the thread.
+                self.persist_retry(
+                    &identifier,
+                    1,
+                    (self.now)().timestamp_millis(),
+                    "",
+                    &project,
+                );
+            }
+            return;
+        }
         // Operator-message delivery (INF-250) is synthesized by the runner when a message is actually
         // written to the live turn's stdin. Mark the oldest still-"sent" row delivered with its turn
         // (FIFO matches mailbox order) and return: this synthetic event must NOT be folded into the
