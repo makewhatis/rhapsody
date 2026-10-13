@@ -41,6 +41,7 @@ struct Progress {
     no_contract: bool,
     pending: Option<String>,
     evidence_sent: bool,
+    revert_landing: Option<i64>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Sample {
@@ -195,6 +196,22 @@ impl Orchestrator {
         }) {
             return Ok(Admission::Disabled);
         }
+        // A recovery's parent already owns admission. Its off-loop poll resolves the actual merge
+        // SHA and creates the child. Never let a watch origin finish the original ticket instead.
+        if self
+            .store()
+            .load_open_landings()
+            .map_err(|e| e.to_string())?
+            .iter()
+            .any(|r| {
+                r.phase == LandingPhase::Reverting
+                    && r.revert_pr == Some(pr.number)
+                    && r.owner.eq_ignore_ascii_case(&pr.owner)
+                    && r.repo.eq_ignore_ascii_case(&pr.repo)
+            })
+        {
+            return Ok(Admission::Admitted);
+        }
         let Some(ticket) = rows
             .iter()
             .filter(|r| crate::reviewwatch::row_is(r, pr))
@@ -338,6 +355,23 @@ impl Orchestrator {
                     .unwrap_or("In Progress")
                     .into(),
                 notifications: Some(self.notifications.clone()),
+                reverter: Some(Arc::new(crate::landingrevert::Reverter::production(
+                    project.workspace.clone(),
+                    project.repo.clone(),
+                    self.review_auto_merge_for_repo(&row.owner, &row.repo),
+                    self.control(),
+                    self.human_holds.clone(),
+                    self.teams
+                        .as_ref()
+                        .map(|t| {
+                            t.roster
+                                .iter()
+                                .take(t.review.effective_reviewers())
+                                .map(|i| i.name.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                ))),
             };
             work.push((runtime, row));
         }
@@ -510,14 +544,15 @@ impl LandingChecks for RepoChecks {
     }
 }
 
-struct LandingRuntime {
-    store: Arc<dyn Store + Send + Sync>,
-    tracker: Arc<dyn Tracker>,
+pub(crate) struct LandingRuntime {
+    pub(crate) store: Arc<dyn Store + Send + Sync>,
+    pub(crate) tracker: Arc<dyn Tracker>,
     checks: Arc<dyn LandingChecks>,
     config: LandingConfig,
     done_state: String,
     changes_state: String,
-    notifications: Option<Arc<crate::breaker::NotificationsState>>,
+    pub(crate) notifications: Option<Arc<crate::breaker::NotificationsState>>,
+    pub(crate) reverter: Option<Arc<crate::landingrevert::Reverter>>,
 }
 impl LandingRuntime {
     fn save(&self, row: &mut LandingRow, progress: &Progress, now: i64) -> Result<(), String> {
@@ -540,7 +575,6 @@ impl LandingRuntime {
                 | LandingPhase::Held
                 | LandingPhase::Reopened
                 | LandingPhase::AwaitingAcceptance
-                | LandingPhase::Reverting
         ) {
             return Ok(());
         }
@@ -554,6 +588,9 @@ impl LandingRuntime {
         if progress.pending.is_some() {
             return self.finish(&mut row, &mut progress, now).await;
         }
+        if row.phase == LandingPhase::Reverting {
+            return self.revert(&mut row, &mut progress, now).await;
+        }
         if !progress.state_moved {
             if !self.config.state.is_empty() {
                 self.tracker
@@ -564,7 +601,7 @@ impl LandingRuntime {
             progress.state_moved = true;
             self.save(&mut row, &progress, now)?;
         }
-        if !progress.started {
+        if !progress.started && row.revert_of.is_none() {
             // A human's second merge waits in the queue without consuming its deploy timeout.
             // An immediately admitted first landing retains the deadline set on admission.
             if self
@@ -689,7 +726,17 @@ impl LandingRuntime {
             self.save(&mut row, &progress, now)?;
         }
         if failed {
-            progress.pending = Some("Reopened".into());
+            if row.revert_of.is_some() {
+                return self.hold(&mut row, &mut progress, "revert landing failed; no second automatic revert; operator attention required", now).await;
+            }
+            progress.pending = Some(
+                if self.config.auto_revert {
+                    "Reverting"
+                } else {
+                    "Reopened"
+                }
+                .into(),
+            );
         } else if row.watch_until_s.is_some_and(|end| now >= end)
             && contract.checks.iter().all(|c| {
                 progress
@@ -706,6 +753,182 @@ impl LandingRuntime {
         }
         Ok(())
     }
+    async fn revert(
+        &self,
+        row: &mut LandingRow,
+        progress: &mut Progress,
+        now: i64,
+    ) -> Result<(), String> {
+        if row.revert_of.is_some() {
+            return self
+                .hold(
+                    row,
+                    progress,
+                    "revert landing failed; no second automatic revert",
+                    now,
+                )
+                .await;
+        }
+        if let Some(id) = progress.revert_landing {
+            let child = self
+                .store
+                .get_landing(id)
+                .map_err(|e| e.to_string())?
+                .ok_or("revert landing disappeared")?;
+            match child.phase {
+                LandingPhase::Done => {
+                    progress.pending = Some("Reopened".into());
+                    progress.evidence_sent = false;
+                    self.save(row, progress, now)?;
+                    return self.finish(row, progress, now).await;
+                }
+                LandingPhase::Held => {
+                    return self
+                        .hold(
+                            row,
+                            progress,
+                            &format!(
+                                "revert landing failed: {}; operator attention required",
+                                child.hold_reason.as_deref().unwrap_or("unknown failure")
+                            ),
+                            now,
+                        )
+                        .await;
+                }
+                _ => return Ok(()),
+            }
+        }
+        let Some(reverter) = &self.reverter else {
+            return Err("landing revert dependencies are unavailable".into());
+        };
+        if row.revert_pr.is_none() {
+            let failed = failed_samples(progress, self.config.failure_threshold)
+                .into_iter()
+                .map(|s| {
+                    (
+                        s.name.clone(),
+                        CheckOutcome {
+                            pass: false,
+                            observed: s.observed.clone(),
+                            duration: Duration::ZERO,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            match reverter.open_revert(row, &failed).await {
+                Ok(pr) => {
+                    row.revert_pr = Some(pr);
+                    self.save(row, progress, now)?;
+                }
+                Err(crate::landingrevert::RevertError::Conflict(reason)) => return self.hold(row, progress, &format!("git revert conflicts: {reason}; no PR opened; operator attention required"), now).await,
+                Err(err) => return Err(err.to_string()),
+            }
+        }
+        let pr = row.revert_pr.ok_or("revert PR was not recorded")?;
+        let snapshot = reverter
+            .github
+            .snapshot(row, pr)
+            .await
+            .map_err(|e| e.to_string())?;
+        match snapshot.status {
+            crate::ghsummons::PrStatus::Closed => {
+                return self
+                    .hold(
+                        row,
+                        progress,
+                        "revert PR closed without merging; operator attention required",
+                        now,
+                    )
+                    .await;
+            }
+            crate::ghsummons::PrStatus::Merged => {
+                if !(7..=64).contains(&snapshot.merge_sha.len())
+                    || !snapshot.merge_sha.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    return Err("merged revert has no valid merge SHA".into());
+                }
+                let child_progress = Progress {
+                    issue_id: progress.issue_id.clone(),
+                    team_id: progress.team_id.clone(),
+                    project_group: progress.project_group.clone(),
+                    state_moved: true,
+                    started: true,
+                    ..Default::default()
+                };
+                let id = self
+                    .store
+                    .save_landing(LandingRow {
+                        owner: row.owner.clone(),
+                        repo: row.repo.clone(),
+                        project_slug: row.project_slug.clone(),
+                        ticket: row.ticket.clone(),
+                        pr,
+                        merge_sha: snapshot.merge_sha,
+                        revert_of: Some(row.id),
+                        deploy_deadline_s: deadline(now, self.config.deploy_timeout),
+                        results_json: serde_json::to_string(&child_progress)
+                            .map_err(|e| e.to_string())?,
+                        updated_at_s: now,
+                        ..Default::default()
+                    })
+                    .map_err(|e| e.to_string())?;
+                if id == 0 {
+                    return Err("revert landing requires persistence".into());
+                }
+                progress.revert_landing = Some(id);
+                self.save(row, progress, now)
+            }
+            crate::ghsummons::PrStatus::Open => {
+                if self.config.revert_review {
+                    reverter.introduce_review(row, pr).await?;
+                }
+                if !reverter.auto_merge {
+                    return Ok(());
+                }
+                let (held, primed) = reverter.holds.labelled_and_primed();
+                if !primed || held.contains(&row.ticket.to_ascii_lowercase()) {
+                    return Ok(());
+                }
+                let watches = self
+                    .store
+                    .load_live_review_watch()
+                    .map_err(|e| e.to_string())?;
+                let mine: Vec<_> = watches
+                    .iter()
+                    .filter(|w| {
+                        w.key.number == pr
+                            && w.key.owner.eq_ignore_ascii_case(&row.owner)
+                            && w.key.repo.eq_ignore_ascii_case(&row.repo)
+                    })
+                    .collect();
+                if let Ok(approved_by) = crate::automerge::revert_merge_verdict(
+                    row,
+                    snapshot.labelled,
+                    self.config.revert_review,
+                    &mine,
+                    &snapshot.head,
+                ) {
+                    let plan = crate::automerge::AutoMergePlan {
+                        pr: PrCoord::new(&row.owner, &row.repo, pr),
+                        head: snapshot.head,
+                        approved_by,
+                        manager_approval: None,
+                    };
+                    match crate::runautomerge::perform_auto_merge(&plan, &reverter.merges).await {
+                        crate::runautomerge::AutoMergeOutcome::Failed(err) => return Err(err),
+                        crate::runautomerge::AutoMergeOutcome::Declined(reason)
+                        | crate::runautomerge::AutoMergeOutcome::Held(reason) => tracing::debug!(
+                            landing_id = row.id,
+                            reason,
+                            "revert merge gates refused; waiting"
+                        ),
+                        _ => {}
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
     async fn hold(
         &self,
         row: &mut LandingRow,
@@ -714,6 +937,9 @@ impl LandingRuntime {
         now: i64,
     ) -> Result<(), String> {
         row.hold_reason = Some(reason.into());
+        if row.phase == LandingPhase::Reverting {
+            progress.evidence_sent = false;
+        }
         progress.pending = Some("Held".into());
         self.save(row, progress, now)?;
         self.finish(row, progress, now).await
@@ -728,7 +954,7 @@ impl LandingRuntime {
             .pending
             .clone()
             .ok_or("landing has no pending outcome")?;
-        if target == "Done" {
+        if target == "Done" && row.revert_of.is_none() {
             let description = self
                 .tracker
                 .fetch_issue_description_by_identifier(&row.ticket)
@@ -740,7 +966,11 @@ impl LandingRuntime {
                 self.save(row, progress, now)?;
             }
         }
-        let marker = format!("<!-- rhapsody:landing:{} -->", row.id);
+        let marker = if row.phase == LandingPhase::Reverting {
+            format!("<!-- rhapsody:landing:{}:{target} -->", row.id)
+        } else {
+            format!("<!-- rhapsody:landing:{} -->", row.id)
+        };
         if !progress.evidence_sent {
             // A successful comment followed by a crash before the local save is reconciled by its
             // stable marker, rather than posting the same evidence again after restart.
@@ -800,13 +1030,8 @@ impl LandingRuntime {
                 let description = issue.description.unwrap_or_default();
                 let feedback_marker = format!("<!-- rhapsody:landing-feedback:{} -->", row.id);
                 if !description.contains(&feedback_marker) {
-                    let failed = progress
-                        .checks
-                        .iter()
-                        .filter(|(_, s)| s.failures >= self.config.failure_threshold)
-                        .filter_map(|(name, _)| {
-                            progress.samples.iter().rev().find(|s| &s.name == name)
-                        })
+                    let failed = failed_samples(progress, self.config.failure_threshold)
+                        .into_iter()
                         .map(|s| format!("- {}: {}", cell(&s.name), cell(&s.observed)))
                         .collect::<Vec<_>>()
                         .join("\n");
@@ -821,7 +1046,7 @@ impl LandingRuntime {
                 LandingPhase::Reopened
             }
             "Done" => {
-                if !self.done_state.is_empty() {
+                if row.revert_of.is_none() && !self.done_state.is_empty() {
                     self.tracker
                         .move_issue_state(&progress.issue_id, &progress.team_id, &self.done_state)
                         .await
@@ -830,16 +1055,25 @@ impl LandingRuntime {
                 LandingPhase::Done
             }
             "AwaitingAcceptance" => LandingPhase::AwaitingAcceptance,
+            "Reverting" => LandingPhase::Reverting,
             _ => return Err("unknown landing outcome".into()),
         };
         progress.pending = None;
         self.save(row, progress, now)
     }
 }
-fn cell(text: &str) -> String {
+pub(crate) fn cell(text: &str) -> String {
     crate::managerapply::strip_summon_tokens(text)
         .replace('|', "\\|")
         .replace(['\r', '\n'], " ")
+}
+fn failed_samples(progress: &Progress, threshold: u32) -> Vec<&Sample> {
+    progress
+        .checks
+        .iter()
+        .filter(|(_, state)| state.failures >= threshold)
+        .filter_map(|(name, _)| progress.samples.iter().rev().find(|s| &s.name == name))
+        .collect()
 }
 fn has_acceptance(description: &str) -> bool {
     description
@@ -863,7 +1097,7 @@ fn landing_group<'a>(row: &'a LandingRow, progress: &'a Progress) -> &'a str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ghsummons::*;
     use crate::testsupport::{TempDir, empty_effective};
@@ -917,7 +1151,7 @@ mod tests {
         tracker: Arc<Fake>,
         id: i64,
     }
-    fn config() -> LandingConfig {
+    pub(crate) fn config() -> LandingConfig {
         LandingConfig {
             enabled: true,
             auto_revert: true,
@@ -961,10 +1195,14 @@ mod tests {
                     store,
                     tracker: tracker.clone(),
                     checks: checks.clone(),
-                    config: config(),
+                    config: LandingConfig {
+                        auto_revert: false,
+                        ..config()
+                    },
                     done_state: done.into(),
                     changes_state: "In Progress".into(),
                     notifications: None,
+                    reverter: None,
                 },
                 checks,
                 tracker,
@@ -1074,6 +1312,61 @@ mod tests {
         }
     }
     #[tokio::test]
+    async fn failure_with_auto_revert_enters_reverting_before_reopening() {
+        let mut rig = Rig::new("Done");
+        let mut fake = Fake::new();
+        fake.candidates = vec![rhapsody_core::Issue {
+            id: "ID-1".into(),
+            identifier: "APP-1".into(),
+            ..Default::default()
+        }];
+        rig.runtime.tracker = Arc::new(fake);
+        rig.runtime.config.auto_revert = true;
+        *rig.checks.checks.lock().unwrap() = VecDeque::from([false, false]);
+        rig.tick(0).await;
+        rig.tick(1).await;
+        assert_eq!(rig.row().phase, LandingPhase::Reverting);
+        assert!(!rig.runtime.store.subject_resume_pending("APP-1").unwrap());
+    }
+    #[tokio::test]
+    async fn failed_revert_landing_holds_and_never_reverts_again() {
+        let mut rig = Rig::new("Done");
+        rig.runtime.notifications = Some(Arc::new(crate::breaker::NotificationsState::default()));
+        let mut fake = Fake::new();
+        fake.candidates = vec![rhapsody_core::Issue {
+            id: "ID-1".into(),
+            identifier: "APP-1".into(),
+            ..Default::default()
+        }];
+        rig.runtime.tracker = Arc::new(fake);
+        rig.runtime.config.auto_revert = true;
+        let mut row = rig.row();
+        row.revert_of = Some(99);
+        rig.runtime.store.save_landing(row).unwrap();
+        *rig.checks.checks.lock().unwrap() = VecDeque::from([false, false]);
+        rig.tick(0).await;
+        rig.tick(1).await;
+        assert_eq!(rig.row().phase, LandingPhase::Held);
+        assert_eq!(rig.row().revert_pr, None);
+        assert!(
+            rig.row()
+                .hold_reason
+                .unwrap()
+                .contains("revert landing failed")
+        );
+        assert!(
+            rig.runtime.tracker.list_comments("ID-1").await.unwrap()[0]
+                .body
+                .contains("health")
+        );
+        assert!(!rig.runtime.store.subject_resume_pending("APP-1").unwrap());
+        rig.tick(2).await;
+        assert_eq!(
+            rig.runtime.notifications.as_ref().unwrap().pending().len(),
+            1
+        );
+    }
+    #[tokio::test]
     async fn sustained_failure_reopens_with_review_feedback() {
         let mut rig = Rig::new("Done");
         let mut fake = Fake::new();
@@ -1096,6 +1389,169 @@ mod tests {
         assert!(descriptions[0].1.contains("health: status=503"));
         assert!(descriptions[0].1.ends_with("Original acceptance"));
         assert_eq!(rig.tracker.move_calls()[0].state_name, "In Progress");
+    }
+    #[tokio::test]
+    async fn auto_revert_false_reopens_without_revert() {
+        let mut rig = Rig::new("Done");
+        rig.runtime.config.auto_revert = false;
+        let mut fake = Fake::new();
+        fake.candidates = vec![rhapsody_core::Issue {
+            id: "ID-1".into(),
+            identifier: "APP-1".into(),
+            ..Default::default()
+        }];
+        rig.runtime.tracker = Arc::new(fake);
+        *rig.checks.checks.lock().unwrap() = VecDeque::from([false, false]);
+        rig.tick(0).await;
+        rig.tick(1).await;
+        assert_eq!(rig.row().phase, LandingPhase::Reopened);
+        assert_eq!(rig.row().revert_pr, None);
+    }
+    #[tokio::test]
+    async fn revert_gets_its_own_landing_and_original_reopens_after_it_passes() {
+        let mut rig = RepoRig::new(Some(GOOD), Some(GOOD));
+        let gh = crate::landingrevert::tests::Github::new();
+        *gh.state.lock().unwrap() = (
+            PrStatus::Merged,
+            rig.row().merge_sha.clone(),
+            rig.row().merge_sha.clone(),
+        );
+        *gh.existing.lock().unwrap() = Some(2);
+        rig.runtime.reverter = Some(crate::landingrevert::tests::reverter(&rig, gh));
+        let mut row = rig.row();
+        row.phase = LandingPhase::Reverting;
+        let mut progress: Progress = serde_json::from_str(&row.results_json).unwrap();
+        progress.checks.insert(
+            "health".into(),
+            CheckState {
+                failures: 2,
+                ..Default::default()
+            },
+        );
+        progress.samples.push(Sample {
+            name: "health".into(),
+            observed: "status=503".into(),
+            pass: false,
+            at: 0,
+        });
+        row.results_json = serde_json::to_string(&progress).unwrap();
+        rig.runtime.store.save_landing(row).unwrap();
+        rig.runtime
+            .tracker
+            .update_issue_description("ID-1", "## Post-deploy acceptance\n- [ ] original feature")
+            .await
+            .unwrap();
+        // A human merge queued before the revert must not keep recovery behind its own parent.
+        let queued_id = rig
+            .runtime
+            .store
+            .save_landing(LandingRow {
+                pr: 3,
+                results_json: serde_json::to_string(&Progress {
+                    queued: true,
+                    issue_id: "ID-1".into(),
+                    team_id: "TEAM".into(),
+                    ..Default::default()
+                })
+                .unwrap(),
+                id: 0,
+                phase: LandingPhase::WaitingForDeploy,
+                ..rig.row()
+            })
+            .unwrap();
+        rig.tick(1).await;
+        let child = rig
+            .runtime
+            .store
+            .load_open_landings()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.revert_of == Some(rig.id))
+            .expect("revert's own landing");
+        assert_eq!(child.pr, 2);
+        assert_eq!(child.merge_sha, rig.row().merge_sha);
+        rig.runtime
+            .advance(
+                rig.runtime.store.get_landing(queued_id).unwrap().unwrap(),
+                2,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.runtime
+                .store
+                .get_landing(queued_id)
+                .unwrap()
+                .unwrap()
+                .watch_until_s,
+            None
+        );
+        let revert = rig.runtime.reverter.clone();
+        rig.restart();
+        rig.runtime.reverter = revert;
+        rig.runtime.advance(child.clone(), 2).await.unwrap();
+        rig.runtime
+            .advance(
+                rig.runtime.store.get_landing(child.id).unwrap().unwrap(),
+                12,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            rig.runtime
+                .store
+                .get_landing(child.id)
+                .unwrap()
+                .unwrap()
+                .phase,
+            LandingPhase::Done
+        );
+        assert_eq!(
+            rig.runtime
+                .tracker
+                .fetch_issue_by_identifier("APP-1")
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            "In Review",
+            "the recovery must not finish the original ticket"
+        );
+        rig.tick(13).await;
+        assert_eq!(rig.row().phase, LandingPhase::Reopened);
+        let ticket = rig
+            .runtime
+            .tracker
+            .fetch_issue_by_identifier("APP-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ticket.state, "In Progress");
+        assert!(ticket.description.unwrap().contains("health: status=503"));
+        assert!(rig.runtime.store.subject_resume_pending("APP-1").unwrap());
+    }
+    #[test]
+    fn watching_a_merged_revert_cannot_finish_the_original_ticket() {
+        let (mut o, tracker) = orch(true);
+        o.store()
+            .save_landing(LandingRow {
+                project_slug: "app".into(),
+                owner: "o".into(),
+                repo: "r".into(),
+                pr: 1,
+                phase: LandingPhase::Reverting,
+                revert_pr: Some(2),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut watch = watch_row();
+        watch.key.number = 2;
+        o.store().save_review_watch(watch).unwrap();
+        let mut observation = merged_observation();
+        observation.pr.number = 2;
+        assert!(o.handle_review_sweep(&[observation]).done.is_empty());
+        assert!(tracker.move_calls().is_empty());
+        assert_eq!(o.store().load_open_landings().unwrap().len(), 1);
     }
     #[tokio::test]
     async fn threshold_recorded_before_crash_still_reopens_without_another_check() {
@@ -1380,13 +1836,13 @@ mod tests {
         assert_eq!(restarted.store().load_open_landings().unwrap().len(), 1);
     }
 
-    struct RepoRig {
-        _dir: TempDir,
-        origin: String,
-        runtime: LandingRuntime,
+    pub(crate) struct RepoRig {
+        pub(crate) _dir: TempDir,
+        pub(crate) origin: String,
+        pub(crate) runtime: LandingRuntime,
         id: i64,
     }
-    fn git(path: &str, args: &[&str]) -> String {
+    pub(crate) fn git(path: &str, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
             .args(args)
             .current_dir(path)
@@ -1424,9 +1880,10 @@ mod tests {
                 done_state: self.runtime.done_state.clone(),
                 changes_state: self.runtime.changes_state.clone(),
                 notifications: None,
+                reverter: None,
             };
         }
-        fn new(before: Option<&str>, after: Option<&str>) -> Self {
+        pub(crate) fn new(before: Option<&str>, after: Option<&str>) -> Self {
             Self::build(before, after, true)
         }
         fn build(before: Option<&str>, after: Option<&str>, admitted: bool) -> Self {
@@ -1491,10 +1948,14 @@ mod tests {
                     repo_url: origin.clone(),
                     config: config(),
                 }),
-                config: config(),
+                config: LandingConfig {
+                    auto_revert: false,
+                    ..config()
+                },
                 done_state: "Done".into(),
                 changes_state: "In Progress".into(),
                 notifications: None,
+                reverter: None,
             };
             Self {
                 _dir: dir,
@@ -1503,10 +1964,10 @@ mod tests {
                 id,
             }
         }
-        fn row(&self) -> LandingRow {
+        pub(crate) fn row(&self) -> LandingRow {
             self.runtime.store.get_landing(self.id).unwrap().unwrap()
         }
-        async fn tick(&self, now: i64) {
+        pub(crate) async fn tick(&self, now: i64) {
             self.runtime.advance(self.row(), now).await.unwrap();
         }
     }
@@ -1743,11 +2204,22 @@ mod tests {
         origin: String,
         merged: Mutex<BTreeMap<i64, String>>,
         calls: Mutex<Vec<i64>>,
+        branches: Mutex<BTreeMap<i64, String>>,
+        app: Option<Arc<Mutex<(String, bool)>>>,
+        ci_green: std::sync::atomic::AtomicBool,
     }
     impl ScriptedGh {
+        fn branch(&self, pr: i64) -> String {
+            self.branches
+                .lock()
+                .unwrap()
+                .get(&pr)
+                .cloned()
+                .unwrap_or_else(|| format!("feature-{pr}"))
+        }
         fn snapshot(&self, pr: i64) -> PrSnapshot {
             PrSnapshot {
-                head_sha: git(&self.origin, &["rev-parse", &format!("feature-{pr}")]),
+                head_sha: git(&self.origin, &["rev-parse", &self.branch(pr)]),
                 status: if self.merged.lock().unwrap().contains_key(&pr) {
                     PrStatus::Merged
                 } else {
@@ -1760,10 +2232,7 @@ mod tests {
             }
         }
         fn merge_branch(&self, pr: i64) {
-            git(
-                &self.origin,
-                &["merge", "--squash", &format!("feature-{pr}")],
-            );
+            git(&self.origin, &["merge", "--squash", &self.branch(pr)]);
             git(
                 &self.origin,
                 &["commit", "--allow-empty", "-m", &format!("merge {pr}")],
@@ -1772,6 +2241,12 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert(pr, git(&self.origin, &["rev-parse", "HEAD"]));
+            if let Some(app) = &self.app {
+                *app.lock().unwrap() = (
+                    git(&self.origin, &["rev-parse", "HEAD"]),
+                    git(&self.origin, &["show", "HEAD:health"]) == "healthy",
+                );
+            }
         }
     }
     #[async_trait::async_trait]
@@ -1791,7 +2266,12 @@ mod tests {
         async fn pr_checks(&self, _: &str, _: &str, _: i64) -> PrChecksResult {
             Ok(vec![CheckRun {
                 name: "test".into(),
-                state: "SUCCESS".into(),
+                state: if self.ci_green.load(std::sync::atomic::Ordering::Relaxed) {
+                    "SUCCESS"
+                } else {
+                    "FAILURE"
+                }
+                .into(),
             }])
         }
     }
@@ -1829,6 +2309,240 @@ mod tests {
     struct ScriptedChecks {
         repo: RepoChecks,
         gh: Arc<ScriptedGh>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::landingrevert::RevertGithub for ScriptedGh {
+        async fn original(
+            &self,
+            _: &LandingRow,
+        ) -> Result<(String, String), crate::landingrevert::RevertError> {
+            Ok(("break health".into(), "main".into()))
+        }
+        async fn find(
+            &self,
+            _: &LandingRow,
+            _: &str,
+        ) -> Result<Option<i64>, crate::landingrevert::RevertError> {
+            Ok(self
+                .branches
+                .lock()
+                .unwrap()
+                .contains_key(&99)
+                .then_some(99))
+        }
+        async fn open(
+            &self,
+            _: &LandingRow,
+            branch: &str,
+            _: &str,
+            title: &str,
+            body: &str,
+        ) -> Result<i64, crate::landingrevert::RevertError> {
+            assert_eq!(title, "revert: break health (landing failed: health)");
+            assert!(body.contains("status=503"));
+            self.branches.lock().unwrap().insert(99, branch.into());
+            Ok(99)
+        }
+        async fn snapshot(
+            &self,
+            _: &LandingRow,
+            pr: i64,
+        ) -> Result<crate::landingrevert::RevertSnapshot, crate::landingrevert::RevertError>
+        {
+            let snap = self.snapshot(pr);
+            Ok(crate::landingrevert::RevertSnapshot {
+                head: snap.head_sha,
+                status: snap.status,
+                labelled: true,
+                merge_sha: self
+                    .merged
+                    .lock()
+                    .unwrap()
+                    .get(&pr)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn file_tracker_http_app_failed_merge_revert_restores_health_and_reopens() {
+        use crate::reviewwatch::{ControlWatchSink, ReviewWatchSink};
+        let app = App::new().await;
+        let contract = format!(
+            "version: 1\nlive:\n  http: {{url: '{}/version', status: 200}}\n  every: 1s\nchecks:\n- name: health\n  http: {{url: '{}/healthz', status: 200}}\n  every: 1s\n",
+            app.address, app.address
+        );
+        let mut rig = RepoRig::build(Some(&contract), Some(&contract), false);
+        git(&rig.origin, &["reset", "--hard", "HEAD^1"]);
+        std::fs::write(Path::new(&rig.origin).join("health"), "healthy\n").unwrap();
+        git(&rig.origin, &["add", "-A"]);
+        git(&rig.origin, &["commit", "-m", "healthy base"]);
+        git(&rig.origin, &["checkout", "-b", "feature-1"]);
+        std::fs::write(Path::new(&rig.origin).join("health"), "broken\n").unwrap();
+        git(&rig.origin, &["add", "-A"]);
+        git(&rig.origin, &["commit", "-m", "break health"]);
+        git(&rig.origin, &["checkout", "main"]);
+        let gh = Arc::new(ScriptedGh {
+            origin: rig.origin.clone(),
+            merged: Mutex::new(BTreeMap::new()),
+            calls: Mutex::new(Vec::new()),
+            branches: Mutex::new(BTreeMap::new()),
+            app: Some(app.state.clone()),
+            ci_green: std::sync::atomic::AtomicBool::new(true),
+        });
+        let merges = Arc::new(crate::runautomerge::AutoMergeDeps {
+            prs: gh.clone(),
+            mergestate: gh.clone(),
+            policy: gh.clone(),
+            updater: gh.clone(),
+            checks: gh.clone(),
+            merger: gh.clone(),
+            allow: HeadAllowlist::none(),
+            approvals: None,
+            ledger: Arc::new(crate::runautomerge::AutoMergeLedger::default()),
+        });
+        let (mut o, _) = orch(true);
+        o.teams.as_mut().unwrap().review.auto_merge = true;
+        o.human_holds.begin_pass(true);
+        o.set_store(rig.runtime.store.clone());
+        o.now = Box::new(|| DateTime::from_timestamp(0, 0).unwrap());
+        o.store()
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: "APP-1".into(),
+                issue_id: "ID-1".into(),
+                team_id: "TEAM".into(),
+                project_slug: "app".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut watch = watch_row();
+        watch.status = rhapsody_store::REVIEW_STATUS_APPROVED.into();
+        watch.last_reviewed_sha = gh.snapshot(1).head_sha;
+        o.store().save_review_watch(watch).unwrap();
+        let observation = || crate::prstate::PrObservation {
+            pr: PrCoord::new("o", "r", 1),
+            lookup: PrLookup::Found(gh.snapshot(1)),
+            unchanged_from: Vec::new(),
+            head_patch_id: String::new(),
+        };
+        let plan = o.handle_review_sweep(&[observation()]).merge.remove(0);
+        let sink = ControlWatchSink::new(o.control()).with_auto_merge(merges.clone());
+        let mut events = o.take_events_rx().unwrap();
+        sink.merge(plan).await;
+        o.drive_event(events.recv().await.unwrap()).await;
+        o.handle_review_sweep(&[observation()]);
+        rig.id = o.store().load_open_landings().unwrap()[0].id;
+        rig.runtime.config.auto_revert = true;
+        let repo = RepoChecks {
+            manager: crate::testsupport::mk_workspace(&rig._dir.child("workspaces")),
+            repo_url: rig.origin.clone(),
+            config: rig.runtime.config.clone(),
+        };
+        rig.runtime.checks = Arc::new(ScriptedChecks {
+            repo,
+            gh: gh.clone(),
+        });
+        rig.runtime.reverter = Some(Arc::new(crate::landingrevert::Reverter {
+            manager: crate::testsupport::mk_workspace(&rig._dir.child("reverts")),
+            repo_url: rig.origin.clone(),
+            github: gh.clone(),
+            merges,
+            auto_merge: true,
+            control: None,
+            reviewers: Vec::new(),
+            holds: o.human_holds.clone(),
+        }));
+        assert!(
+            !app.state.lock().unwrap().1,
+            "merging the broken code breaks /healthz"
+        );
+        rig.tick(0).await;
+        rig.tick(1).await;
+        assert_eq!(rig.row().phase, LandingPhase::Reverting);
+        gh.ci_green
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        rig.tick(2).await;
+        assert_eq!(rig.row().revert_pr, Some(99));
+        assert_eq!(
+            *gh.calls.lock().unwrap(),
+            vec![1],
+            "a labelled recovery must not merge with red CI"
+        );
+        assert!(!app.state.lock().unwrap().1);
+        gh.ci_green
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        rig.tick(3).await;
+        assert_eq!(
+            *gh.calls.lock().unwrap(),
+            vec![1, 99],
+            "revert passes the actual green-CI merge path"
+        );
+        assert!(
+            app.state.lock().unwrap().1,
+            "the merged git revert restores /healthz"
+        );
+        rig.tick(4).await;
+        let child = o
+            .store()
+            .load_open_landings()
+            .unwrap()
+            .into_iter()
+            .find(|r| r.revert_of == Some(rig.id))
+            .unwrap();
+        rig.runtime.advance(child.clone(), 4).await.unwrap();
+        rig.runtime
+            .advance(o.store().get_landing(child.id).unwrap().unwrap(), 14)
+            .await
+            .unwrap();
+        assert_eq!(
+            o.store().get_landing(child.id).unwrap().unwrap().phase,
+            LandingPhase::Done
+        );
+        rig.tick(15).await;
+        assert_eq!(rig.row().phase, LandingPhase::Reopened);
+        let ticket = rig
+            .runtime
+            .tracker
+            .fetch_issue_by_identifier("APP-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(ticket.state, "In Progress");
+        assert!(
+            ticket
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("REVIEW FEEDBACK")
+        );
+        assert!(
+            ticket
+                .description
+                .as_deref()
+                .unwrap()
+                .contains("health: status=503")
+        );
+        let mut linked = ticket;
+        linked.linked_pr = true;
+        assert!(
+            !o.pr_suppressed(&linked),
+            "the author is eligible without a summon"
+        );
+        assert!(o.store().subject_resume_pending("APP-1").unwrap());
+        o.eff.as_mut().unwrap().workspace =
+            crate::testsupport::mk_workspace(&rig._dir.child("author"));
+        o.eff.as_mut().unwrap().tracker = rig.runtime.tracker.clone();
+        o.dispatch_issue(linked, None, None, String::new());
+        assert!(
+            o.running.contains_key("ID-1"),
+            "the reopened author is dispatched through the real admission path"
+        );
+        assert!(
+            !o.store().subject_resume_pending("APP-1").unwrap(),
+            "one author admission only"
+        );
     }
     #[async_trait::async_trait]
     impl LandingChecks for ScriptedChecks {
@@ -1879,6 +2593,9 @@ mod tests {
             origin: rig.origin.clone(),
             merged: Mutex::new(BTreeMap::new()),
             calls: Mutex::new(Vec::new()),
+            branches: Mutex::new(BTreeMap::new()),
+            app: None,
+            ci_green: std::sync::atomic::AtomicBool::new(true),
         });
         let (mut o, _) = orch(true);
         o.teams.as_mut().unwrap().review.auto_merge = true;
