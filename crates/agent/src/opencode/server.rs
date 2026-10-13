@@ -267,6 +267,10 @@ impl Http {
         body: Option<Value>,
         redactor: &CapabilityRedactor,
     ) -> Result<Value, AgentError> {
+        let resume_lookup = method == reqwest::Method::GET
+            && path
+                .strip_prefix("/session/")
+                .is_some_and(|id| !id.is_empty() && !id.contains('/'));
         let mut request = self.request(method, path);
         if !path.ends_with("/message") && !path.ends_with("/command") {
             request = request.timeout(Duration::from_secs(10));
@@ -288,6 +292,11 @@ impl Http {
             .await
             .map_err(|_| error("HTTP request failed"))?;
         let status = response.status();
+        // Only the retained-session GET can authorize a fresh fallback. A missing prompt/tool
+        // endpoint (or a provider failure) must not replay a turn that may already have done work.
+        if status == reqwest::StatusCode::NOT_FOUND && resume_lookup {
+            return Err(AgentError::ResumeUnavailable);
+        }
         let bytes = bounded(response).await?;
         let bytes = redact(redactor, &bytes);
         let doc: Value =
@@ -373,7 +382,13 @@ pub(super) fn stream(
     let (reader, mut writer) = tokio::io::duplex(64 * 1024);
     let task = tokio::spawn(async move {
         if let Err(e) = execute(control, request, redactor, &mut writer).await {
-            let line = json!({"type":"error", "error":{"name":"ObservationError", "data":{"message":e.to_string()}}});
+            let name = if e == AgentError::ResumeUnavailable {
+                "ResumeUnavailable"
+            } else {
+                "ObservationError"
+            };
+            let line =
+                json!({"type":"error", "error":{"name":name, "data":{"message":e.to_string()}}});
             let _ = write(&mut writer, &line).await;
         }
     });
@@ -963,6 +978,53 @@ mod tests {
             !request.auto,
             "operator literal false must override managed auto approval"
         );
+    }
+
+    #[tokio::test]
+    async fn only_a_missing_retained_session_get_allows_fresh_fallback() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let _server = Task(tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                loop {
+                    let n = socket.read(&mut chunk).await.unwrap();
+                    assert!(n > 0, "request headers ended early");
+                    request.extend_from_slice(&chunk[..n]);
+                    if request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                socket.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}").await.unwrap();
+            }
+        }));
+        let http = Http::new(
+            Control {
+                url,
+                password: "private-test-password".into(),
+            },
+            "/ws".into(),
+        )
+        .unwrap();
+        for (method, path, unavailable) in [
+            (reqwest::Method::GET, "/session/missing", true),
+            (reqwest::Method::GET, "/session/missing/message", false),
+            (reqwest::Method::POST, "/session/missing", false),
+            (reqwest::Method::GET, "/agent", false),
+        ] {
+            let error = http
+                .json(method, path, None, &CapabilityRedactor::new("", ""))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error == AgentError::ResumeUnavailable,
+                unavailable,
+                "{path}: {error}"
+            );
+        }
     }
 
     /// Runs the actual adapter against the pinned executable and a synthetic
