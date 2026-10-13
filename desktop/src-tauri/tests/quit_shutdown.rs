@@ -159,9 +159,11 @@ fn quit_scenario(
         };
         let (main_tx, main_rx) = mpsc::channel::<Job>();
         let main = MainThread { rx: main_rx };
-        spawn_tray_refresh(&runtime, main_tx);
         let app = before_exit(&runtime, &main);
         let _guard = app.get_sup().map(|sup| SupervisorGuard::new(&sup));
+        // Startup uses block_on before the fake main loop pumps. A tray setter here would starve
+        // readiness instead of testing Exit (the false "quit hung" in STUDIO-1268).
+        spawn_tray_refresh(&runtime, main_tx);
         // Idle a few tray ticks so the loop is demonstrably healthy before the quit.
         main.pump_for(TRAY_TICK * 4);
 
