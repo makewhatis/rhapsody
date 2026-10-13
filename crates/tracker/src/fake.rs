@@ -226,6 +226,7 @@ pub struct Fake {
 /// Recorded state guarded by [`Fake::inner`].
 #[derive(Default)]
 struct Inner {
+    description_updates: Vec<(String, String)>,
     move_calls: Vec<MoveCall>,
     move_to_type_calls: Vec<MoveToTypeCall>,
     create_comment_calls: Vec<CommentCall>,
@@ -333,6 +334,9 @@ impl Fake {
     pub fn create_comment_calls(&self) -> Vec<CommentCall> {
         self.lock().create_comment_calls.clone()
     }
+    pub fn description_update_calls(&self) -> Vec<(String, String)> {
+        self.lock().description_updates.clone()
+    }
     /// Every `assign_issue` invocation, in order.
     pub fn assign_calls(&self) -> Vec<AssignCall> {
         self.lock().assign_calls.clone()
@@ -419,9 +423,12 @@ impl Tracker for Fake {
     }
     async fn update_issue_description(
         &self,
-        _id: &str,
-        _description: &str,
+        id: &str,
+        description: &str,
     ) -> Result<(), TrackerError> {
+        self.lock()
+            .description_updates
+            .push((id.into(), description.into()));
         Ok(())
     }
     async fn fetch_parked_issue(&self, id: &str) -> Result<Option<Issue>, TrackerError> {

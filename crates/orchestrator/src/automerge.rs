@@ -64,6 +64,114 @@ use rhapsody_store::{
 use crate::managerapproval::ApprovalScope;
 use crate::prstate::PrCoord;
 
+/// Loop-owned landing admission across an off-loop merge attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LandingMergeState {
+    InFlight,
+    AwaitingObservation,
+    Merged,
+}
+
+impl crate::orchestrator::Orchestrator {
+    pub(crate) fn landing_merge_groups(&self, pr: &PrCoord) -> Vec<String> {
+        let Some(eff) = &self.eff else {
+            return Vec::new();
+        };
+        eff.projects
+            .iter()
+            .filter(|p| {
+                crate::ghsummons::parse_repo(&p.repo).is_some_and(|(o, r)| {
+                    o.eq_ignore_ascii_case(&pr.owner) && r.eq_ignore_ascii_case(&pr.repo)
+                }) && eff.cfg.projects.iter().any(|c| {
+                    c.slugs.contains(&p.slug) && c.landing.as_ref().is_some_and(|l| l.enabled)
+                })
+            })
+            .map(|p| p.group.clone())
+            .collect()
+    }
+
+    pub(crate) fn landing_merge_finished(
+        &mut self,
+        pr: &PrCoord,
+        state: Option<LandingMergeState>,
+    ) {
+        if let Some(state) = state {
+            if let Some(confirming) = self.landing_merges.get_mut(pr) {
+                *confirming = state;
+            }
+        } else {
+            if let Err(err) = self.cancel_landing_merge(pr) {
+                tracing::warn!(pr = %pr, %err, "landing reservation could not be cancelled; retained for retry");
+                if let Some(state) = self.landing_merges.get_mut(pr) {
+                    *state = LandingMergeState::AwaitingObservation;
+                }
+                return;
+            }
+            self.landing_merges.remove(pr);
+        }
+    }
+
+    /// Every configured slug in the owning project group participates in the lock. A read error
+    /// refuses merging too: inability to prove there is no landing must not bypass attribution.
+    pub(crate) fn landing_merge_gate(&self, pr: &PrCoord) -> Result<(), String> {
+        let Some(eff) = &self.eff else {
+            return Ok(());
+        };
+        let groups: Vec<_> = eff
+            .projects
+            .iter()
+            .filter(|p| {
+                crate::ghsummons::parse_repo(&p.repo).is_some_and(|(o, r)| {
+                    o.eq_ignore_ascii_case(&pr.owner) && r.eq_ignore_ascii_case(&pr.repo)
+                })
+            })
+            .map(|p| &p.group)
+            .collect();
+        for project in &eff.projects {
+            if groups.contains(&&project.group)
+                && self
+                    .store()
+                    .open_landing_for_project(&project.slug)
+                    .map_err(|e| e.to_string())?
+                    .is_some()
+            {
+                return Err("a landing is in progress for this project".into());
+            }
+        }
+        let landing_groups = self.landing_merge_groups(pr);
+        if !landing_groups.is_empty() {
+            if self.landing_merges.keys().any(|reserved| {
+                self.landing_merge_groups(reserved)
+                    .iter()
+                    .any(|g| landing_groups.contains(g))
+            }) {
+                return Err("a landing is in progress for this project".into());
+            }
+            // On restart there may be a completed merge without a landing row yet. Reconcile all
+            // watched siblings first, including any terminal observation not yet durably admitted.
+            for row in self
+                .store()
+                .load_live_review_watch()
+                .map_err(|e| e.to_string())?
+            {
+                let sibling = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
+                if self
+                    .landing_merge_groups(&sibling)
+                    .iter()
+                    .any(|g| landing_groups.contains(g))
+                    && !self
+                        .review_observed_head
+                        .get(&sibling)
+                        .is_some_and(|h| h.open)
+                {
+                    return Err("landing merge observations are not yet reconciled".into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// The provenance of an `effective` manager approval an [`AutoMergePlan`] counted (STUDIO-1011;
 /// design record `manager-agent-design.md` §6.5, §8.3).
 ///

@@ -199,6 +199,19 @@ the `Orchestrator` struct itself. Concretely:
     transaction as attempts/generations. Executor notifications wake the reporting task over a
     channel; pages/digests are independent of launch admission and never perform I/O on control.
 
+  - `landing.rs` (STUDIO-1249) snapshots owned project dependencies on control and runs deterministic
+    git/check/tracker effects in one owned `LandingTask`. It shares only the existing Store and
+    NotificationsState. The JoinHandle prevents overlapping sweeps and aborts on drop; cancellation
+    releases its WaitGroup registration. Absolute deadlines, check cadence/counters and pending
+    effects are stored in `rhapsody_landing`, with stable tracker-comment markers for restart dedupe.
+    Landing-enabled auto-merge admission reservations are loop-confined (`landing_merges`). The
+    off-loop ControlWatchSink reports attempt completion through `Event::LandingMergeFinished`;
+    successful/ambiguous attempts remain reserved until a fresh watcher observation admits the row
+    or confirms no merge. Boot reconciliation refuses merges past unobserved watched siblings.
+    A `merge_pending` marker in `rhapsody_landing` persists admission before GitHub is invoked;
+    deterministic ticks skip it until confirmed merge admission clears that flag. Cancellation is
+    restricted to pre-merge markers, so a delayed refusal cannot delete a confirmed landing.
+
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from
   worker code; add an event variant instead.

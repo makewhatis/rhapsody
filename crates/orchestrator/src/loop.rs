@@ -436,6 +436,12 @@ pub enum Event {
     ReviewUnreadable {
         failed: Vec<crate::prstate::PrCoord>,
     },
+    /// An off-loop merge attempt completed. Ambiguous failures and successful merges retain
+    /// landing admission until the watcher confirms the PR; definite refusals release it.
+    LandingMergeFinished {
+        pr: crate::prstate::PrCoord,
+        state: Option<crate::automerge::LandingMergeState>,
+    },
     /// The authenticated console's read of the ticketless review watch set (STUDIO-722, slice 8;
     /// NEW beyond Go v0.4.0). Loop-confined for [`Event::ReviewWatchList`]'s reason: the HTTP task
     /// never reads the store the control task is the single writer of.
@@ -946,6 +952,9 @@ impl Orchestrator {
             Event::ReviewUnreadable { failed } => {
                 self.handle_review_unreadable(&failed);
             }
+            Event::LandingMergeFinished { pr, state } => {
+                self.landing_merge_finished(&pr, state);
+            }
             Event::ReviewConsoleList { reply } => {
                 let _ = reply.send(self.review_console_list());
             }
@@ -1130,6 +1139,7 @@ impl Orchestrator {
         // has quietly stopped, and that is when this report is worth the most. It also runs before
         // the publish so the snapshot below carries the same tick's verdict.
         self.reconcile_review_divergence();
+        self.landing_tick((self.now)()).await;
         // STUDIO-1015: the manager intervention pass. The sweep above has just enqueued or merged
         // any stall signal the manager owns; this recovers dead leases (§7.5) and tries to launch
         // every candidate whose §10.2 gates pass, each at its own entry point. Local writes only —
