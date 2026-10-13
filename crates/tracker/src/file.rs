@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Display prefix of Go's `file.ErrLoad` sentinel — any failure to read or parse the source file.
@@ -90,6 +90,7 @@ pub struct Config {
 /// (the read-modify-write of the write methods must be atomic across the orchestrator's shared
 /// tasks, exactly as Go guards it with `sync.Mutex`).
 pub struct Tracker {
+    landing_comments_enabled: AtomicBool,
     /// Guards every touch of the source file. `()` because the file itself — not any in-memory
     /// value — is the shared state; this is the "right to read/rewrite the file" lock.
     mu: Mutex<()>,
@@ -102,6 +103,7 @@ pub struct Tracker {
 /// uses are retained; the rest of [`Config`] is parity-only (see its docs).
 pub fn new(config: Config) -> Tracker {
     Tracker {
+        landing_comments_enabled: AtomicBool::new(false),
         mu: Mutex::new(()),
         source: config.source,
         active_states: config.active_states,
@@ -110,6 +112,11 @@ pub fn new(config: Config) -> Tracker {
 }
 
 impl Tracker {
+    /// Enabled by the landing runtime alone. Default file-tracker comment behaviour stays identical
+    /// to Go, including no reads/errors from list_comments on an unreadable source.
+    pub fn enable_landing_comments(&self) {
+        self.landing_comments_enabled.store(true, Ordering::Relaxed);
+    }
     /// Acquires the file lock, recovering a poisoned mutex rather than panicking (the adapter is
     /// non-test-cfg code; a panic in one task must not poison-crash the others — same policy as
     /// [`fake`](crate::fake)).
@@ -245,6 +252,9 @@ where
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Doc {
+    /// Landing's opt-in evidence only. Absent on the Go/file smoke path, preserving its bytes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    rhapsody_landing_comments: BTreeMap<String, Vec<Comment>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     viewer: Option<ViewerJson>,
     #[serde(
@@ -773,14 +783,44 @@ impl crate::Tracker for Tracker {
         Ok(String::new())
     }
 
-    /// Unsupported by the file tracker (pool claiming is Linear-only; INF-477).
-    async fn create_comment(&self, _issue_id: &str, _body: &str) -> Result<String, TrackerError> {
-        Err(TrackerError::Other(ERR_CLAIM_UNSUPPORTED.to_string()))
+    /// Claim comments remain unsupported. Landing evidence is an opt-in Rhapsody extension,
+    /// committed with the same atomic write as tracker state for the hermetic landing e2e.
+    async fn create_comment(&self, issue_id: &str, body: &str) -> Result<String, TrackerError> {
+        if !self.landing_comments_enabled.load(Ordering::Relaxed)
+            || !body.starts_with("<!-- rhapsody:landing:")
+        {
+            return Err(TrackerError::Other(ERR_CLAIM_UNSUPPORTED.to_string()));
+        }
+        let _guard = self.lock();
+        let mut doc = self.load_locked()?;
+        if !doc.issues.iter().any(|i| i.id == issue_id) {
+            return Err(issue_not_found_err(issue_id));
+        }
+        let comments = doc
+            .rhapsody_landing_comments
+            .entry(issue_id.into())
+            .or_default();
+        let id = format!("landing-{}", comments.len() + 1);
+        comments.push(Comment {
+            id: id.clone(),
+            body: body.into(),
+            created_at: Utc::now(),
+        });
+        self.write_locked(&doc)?;
+        Ok(id)
     }
 
-    /// Returns no comments for the file tracker (INF-477).
-    async fn list_comments(&self, _issue_id: &str) -> Result<Vec<Comment>, TrackerError> {
-        Ok(Vec::new())
+    /// No comments on the parity path; opted-in landing evidence survives adapter/daemon restarts.
+    async fn list_comments(&self, issue_id: &str) -> Result<Vec<Comment>, TrackerError> {
+        if !self.landing_comments_enabled.load(Ordering::Relaxed) {
+            return Ok(Vec::new());
+        }
+        let _guard = self.lock();
+        Ok(self
+            .load_locked()?
+            .rhapsody_landing_comments
+            .remove(issue_id)
+            .unwrap_or_default())
     }
 
     /// A no-op for the file tracker (INF-477).
@@ -982,6 +1022,35 @@ fn mint_identifier(doc: &Doc, team_id: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn landing_comments_are_explicitly_opt_in_and_claims_stay_unsupported() {
+        let tracker = new(Config {
+            source: "/nonexistent-rhapsody-landing-test".into(),
+            ..Default::default()
+        });
+        assert!(
+            crate::Tracker::list_comments(&tracker, "ID")
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            crate::Tracker::create_comment(&tracker, "ID", "<!-- rhapsody:landing:1 -->")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains(ERR_CLAIM_UNSUPPORTED)
+        );
+        tracker.enable_landing_comments();
+        assert!(
+            crate::Tracker::create_comment(&tracker, "ID", "claim")
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains(ERR_CLAIM_UNSUPPORTED)
+        );
+        assert!(crate::Tracker::list_comments(&tracker, "ID").await.is_err());
+    }
     use super::*;
     use crate::Tracker as _;
     use chrono::TimeZone;
