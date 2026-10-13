@@ -162,6 +162,9 @@ fn raw_from_config(c: &Config) -> Raw {
     r.claude.setting_sources = c.claude.setting_sources.clone();
     r.claude.add_dirs = c.claude.add_dirs.clone();
     r.claude.turn_timeout_ms = Some(c.claude.turn_timeout_ms);
+    if c.claude.result_grace_ms != 30000 {
+        r.claude.result_grace_ms = Some(c.claude.result_grace_ms);
+    }
     r.claude.read_timeout_ms = Some(c.claude.read_timeout_ms);
     r.claude.stall_timeout_ms = Some(c.claude.stall_timeout_ms);
     r.claude.extra_args = c.claude.extra_args.clone();
@@ -855,6 +858,22 @@ mod tests {
             None
         );
         assert_eq!(re_encode_decode(&default).agent.stall_cpu_threshold, 0.05);
+    }
+
+    #[test]
+    fn claude_result_grace_round_trips_without_materializing_the_default() {
+        let configured = decode_map("claude:\n  result_grace_ms: 200\n", "body");
+        assert_eq!(re_encode_decode(&configured).claude.result_grace_ms, 200);
+        let default = decode_map("", "body");
+        assert_eq!(
+            nested(
+                &encode(&default).unwrap().config,
+                "claude",
+                "result_grace_ms"
+            ),
+            None
+        );
+        assert_eq!(re_encode_decode(&default).claude.result_grace_ms, 30000);
     }
 
     /// Look up a nested `config[outer][inner]` value in an encoded front-matter map.

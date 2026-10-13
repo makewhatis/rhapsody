@@ -295,6 +295,8 @@ pub struct Claude {
     pub setting_sources: String,
     pub add_dirs: Vec<String>,
     pub turn_timeout_ms: i64,
+    /// Positive post-result exit grace (Rhapsody-only); default 30 seconds.
+    pub result_grace_ms: i64,
     pub read_timeout_ms: i64,
     pub stall_timeout_ms: i64,
     pub extra_args: Vec<String>,
@@ -756,6 +758,7 @@ pub(crate) struct RawClaude {
     pub setting_sources: String,
     pub add_dirs: Vec<String>,
     pub turn_timeout_ms: Option<i64>,
+    pub result_grace_ms: Option<i64>,
     pub read_timeout_ms: Option<i64>,
     pub stall_timeout_ms: Option<i64>,
     pub extra_args: Vec<String>,

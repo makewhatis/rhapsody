@@ -345,6 +345,7 @@ pub fn manager_config(base: &Config, mcp_config_path: &str) -> Config {
         add_dirs: Vec::new(),
         workspace_root: base.workspace_root.clone(),
         turn_timeout: base.turn_timeout,
+        result_grace: base.result_grace,
         extra_args: Vec::new(),
         billing_guard: base.billing_guard,
         ultracode: false,

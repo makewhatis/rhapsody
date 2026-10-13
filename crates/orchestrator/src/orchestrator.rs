@@ -198,6 +198,8 @@ pub struct RunningEntry {
     /// Open calls in the current turn; never persisted or inherited by a retry.
     pub open_tool_calls: HashSet<String>,
     pub tool_turn_finished: bool,
+    /// A captured result is awaiting runner cleanup, not stalled model work. Reset every turn.
+    pub terminal_result_seen: bool,
 
     pub recent_events: Vec<EventRecord>,
 
@@ -284,6 +286,7 @@ impl RunningEntry {
             cpu_failure_logged: false,
             open_tool_calls: HashSet::new(),
             tool_turn_finished: true,
+            terminal_result_seen: false,
             recent_events: Vec::new(),
         }
     }

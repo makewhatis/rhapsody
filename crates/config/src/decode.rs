@@ -53,6 +53,12 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     let bytes =
         serde_yaml_ng::to_string(&def.config).map_err(|e| ConfigError::Parse(e.to_string()))?;
     let r: Raw = serde_yaml_ng::from_str(&bytes).map_err(|e| ConfigError::Parse(e.to_string()))?;
+    let result_grace_ms = r.claude.result_grace_ms.unwrap_or(30000);
+    if result_grace_ms <= 0 {
+        return Err(ConfigError::Parse(
+            "claude.result_grace_ms: must be positive".into(),
+        ));
+    }
     let limits = r.limits.clone().unwrap_or_default();
     limits.validate().map_err(ConfigError::Parse)?;
     let credential_canary_interval_ms = r.agent.credential_canary_interval_ms.unwrap_or(1_800_000);
@@ -213,6 +219,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         setting_sources: r.claude.setting_sources,
         add_dirs: r.claude.add_dirs,
         turn_timeout_ms: or_int(r.claude.turn_timeout_ms, 3600000),
+        result_grace_ms,
         read_timeout_ms: or_int(r.claude.read_timeout_ms, 5000),
         stall_timeout_ms: or_int(r.claude.stall_timeout_ms, 300000),
         extra_args: r.claude.extra_args,
@@ -936,6 +943,23 @@ mod tests {
                 err.to_string().contains("agent.stall_cpu_threshold"),
                 "{value}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn decode_claude_result_grace_defaults_overrides_and_rejects_nonpositive() {
+        assert_eq!(decode_yaml("", "body").claude.result_grace_ms, 30000);
+        assert_eq!(
+            decode_yaml("claude:\n  result_grace_ms: 200\n", "body")
+                .claude
+                .result_grace_ms,
+            200
+        );
+        for value in [0, -1] {
+            let yaml = format!("claude:\n  result_grace_ms: {value}\n");
+            let err =
+                try_decode_yaml(&yaml, "body").expect_err("nonpositive exit grace must be refused");
+            assert!(err.to_string().contains("claude.result_grace_ms"));
         }
     }
 
