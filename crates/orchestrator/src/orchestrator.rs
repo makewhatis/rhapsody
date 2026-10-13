@@ -45,7 +45,7 @@ pub struct EventRecord {
 /// The worker-machinery fields Go carries here — the cancellation handle (`cancel`), the per-run
 /// operator-message mailbox (`mailbox`, INF-250), and the dispatch span context
 /// (`dispatchSpanContext`) — need types that arrive with the worker (O3) and telemetry (P6); they
-/// are added by those tickets. Every field below is control-task-owned.
+/// are added by those tickets. Fields are control-task-owned except the worker emission watermark.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunningEntry {
     pub issue: rhapsody_core::Issue,
@@ -152,12 +152,15 @@ pub struct RunningEntry {
     pub engine_index: usize,
     pub engine: Option<crate::dispatch::DispatchEngine>,
     pub resume_session: String,
+    pub(crate) resume_after_drain: bool,
     pub turn_count: i64,
     /// The last observed agent event type (one of `rhapsody_agent`'s `EVENT_*` values; Go's
     /// `agent.EventType`).
     pub last_event: String,
     pub last_message: String,
     pub last_event_at: DateTime<Utc>,
+    /// Worker-stamped liveness, independent of the control loop's applied event/history time.
+    pub(crate) worker_emit_time: crate::liveness::WorkerEmitTime,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub total_tokens: i64,
@@ -266,10 +269,12 @@ impl RunningEntry {
             engine_index: 0,
             engine: None,
             resume_session: String::new(),
+            resume_after_drain: false,
             turn_count: 0,
             last_event: String::new(),
             last_message: String::new(),
             last_event_at: zero_time(),
+            worker_emit_time: crate::liveness::WorkerEmitTime::default(),
             input_tokens: 0,
             output_tokens: 0,
             total_tokens: 0,
@@ -1086,6 +1091,8 @@ pub struct Orchestrator {
     /// when the previous tick found the drain armed, which is what makes the cancel transition
     /// observable. Mutated only by `on_tick` on the single control task, like [`Self::probe_cache`].
     pub(crate) drain_gate: Option<crate::drain::DrainGateLog>,
+    /// Retry-backed drain continuations, keyed by the store's human identifier.
+    pub(crate) drain_continuations: HashMap<String, crate::drain::DrainContinuation>,
 
     // --- STUDIO-988: asynchronous prepared-dispatch + zero-turn refusal (Rhapsody-only; `prepare.rs`). ---
     /// The loop-owned `preparing` reservations — the duplicate/concurrency gate that exists before a
@@ -1313,6 +1320,7 @@ impl Orchestrator {
             chatgpt_queued: false,
             limit_policy: crate::limitpolicy::LimitPolicy::default(),
             drain_gate: None,
+            drain_continuations: HashMap::new(),
             // STUDIO-988: no resolver, no reservations, an empty gate → preparation is inert by
             // default and every dispatch path is byte-identical to a daemon built before the feature.
             preparing: crate::prepare::PreparingReservations::default(),

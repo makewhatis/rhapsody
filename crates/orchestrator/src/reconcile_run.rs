@@ -8,8 +8,8 @@
 //! releases the claim; a non-terminal move only refreshes the in-memory snapshot (INF-266 — the
 //! worker keeps running and its exit is classified by [`Orchestrator::on_worker_exit`]).
 //!
-//! Intentional liveness divergences (STUDIO-1177 / STUDIO-1208): thresholded CPU activity,
-//! portable in-flight tool lifecycle and bounded sampling failure grace; see README Divergences.
+//! Intentional liveness divergences (STUDIO-1177 / STUDIO-1208 / STUDIO-1262): thresholded CPU activity,
+//! portable tool lifecycle, worker emission time and widened sampling failure grace; see README.
 //!
 //! Other deviations from the Go source, all behavior-preserving:
 //!   * `reconcile` snapshots each group's reconcile inputs (slug tracker, canceled/terminal sets,
@@ -52,6 +52,16 @@ struct GroupInputs {
     workspace: Arc<Manager>,
 }
 
+fn event_liveness_at(re: &RunningEntry) -> DateTime<Utc> {
+    // Entries with no worker emission yet retain the startup / legacy event fallback.
+    let last = re.worker_emit_time.get().unwrap_or(re.last_event_at);
+    if last == zero_time() {
+        re.started_at
+    } else {
+        last
+    }
+}
+
 /// Measures CPU work over at least one second (STUDIO-1177). Failed sampling keeps
 /// the bounded event fallback; tool liveness comes from the harness, not children.
 fn sample_cpu(
@@ -78,7 +88,7 @@ fn sample_cpu(
             re.cpu_sampled = false;
             if !re.cpu_failure_logged {
                 tracing::warn!(run_id = re.run_id, issue_identifier = %re.issue.identifier,
-                    pgid = re.pgid, "CPU sampler unavailable; falling back to events after one stall window");
+                    pgid = re.pgid, "CPU sampler unavailable; using events with twice the stall window (CPU sampling requires Linux /proc)");
                 re.cpu_failure_logged = true;
             }
         }
@@ -259,7 +269,7 @@ impl Orchestrator {
             .map(|(id, re)| (id.clone(), self.stall_timeout_for(re)))
             .collect();
 
-        let mut wedged: Vec<String> = Vec::new();
+        let mut wedged = Vec::new();
         for (id, re) in self.running.iter_mut() {
             if re.terminal_result_seen {
                 continue; // runner owns bounded post-result cleanup; never retry a captured result
@@ -280,11 +290,13 @@ impl Orchestrator {
                 continue;
             }
 
-            let mut last = re.last_event_at;
-            if last == zero_time() {
-                last = re.started_at;
-            }
+            let mut last = event_liveness_at(re);
             let stall = chrono::Duration::from_std(stall).unwrap_or(chrono::Duration::MAX);
+            let stall = if re.cpu_failure_since.is_some() {
+                stall.checked_mul(2).unwrap_or(chrono::Duration::MAX)
+            } else {
+                stall
+            };
             if re.cpu_failure_since.is_none() && re.last_cpu_active_at > last {
                 last = re.last_cpu_active_at;
             }
@@ -294,11 +306,20 @@ impl Orchestrator {
                 continue;
             }
             if now - last > stall {
-                wedged.push(id.clone());
+                wedged.push((id.clone(), stall));
             }
         }
 
-        for id in wedged {
+        for (id, stall) in wedged {
+            // Other groups' CPU scans can delay this action after the first verdict. Re-read
+            // the shared watermark at the cancellation boundary so intervening work wins.
+            if self
+                .running
+                .get(&id)
+                .is_some_and(|re| now - event_liveness_at(re) <= stall)
+            {
+                continue;
+            }
             let Some(re) = self.terminate(&id) else {
                 continue;
             };
@@ -880,6 +901,150 @@ mod tests {
         std::sync::Arc::new(FakeSampler::new(ok, map))
     }
 
+    // Exercise the production worker callback while control deliberately leaves its channel
+    // unapplied. MUTATION: read re.last_event_at in event_liveness_at and the first verdict reds.
+    #[tokio::test]
+    async fn stall_check_uses_worker_emit_time_not_control_loop_apply_time() {
+        let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+        let mut ag = agent::fake::Fake::new();
+        ag.turns = vec![agent::fake::TurnScript {
+            events: vec![agent::Event {
+                event_type: agent::EVENT_NOTIFICATION.into(),
+                message: "queued work".into(),
+                ..Default::default()
+            }],
+            result: agent::TurnResult {
+                status: agent::TURN_SUCCEEDED.into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        let eff = o.eff.as_mut().unwrap();
+        eff.agent = Arc::new(ag);
+        eff.max_turns = 1;
+        eff.cpu_sampler = sampler(true, &[(42, &[100])]);
+        o.spawn = None; // real worker wiring, with an in-process harness
+        let base = Utc::now() - chrono::Duration::hours(1);
+        let clock = install_clock(&mut o, base);
+        o.dispatch_issue(issue("1", "MT-1", "In Progress"), None, None, String::new());
+        o.running.get_mut("1").unwrap().pgid = 42;
+        o.reconcile_stalled(); // establish idle CPU baseline
+        tokio::time::timeout(std::time::Duration::from_secs(10), o.wg.wait())
+            .await
+            .expect("worker did not finish");
+        let emitted_by = Utc::now();
+        assert_eq!(o.running["1"].last_event_at, zero_time());
+        let mut rx = o.events_rx.lock().unwrap().take().unwrap();
+        assert!(!rx.is_empty());
+
+        *clock.lock().unwrap() = emitted_by + chrono::Duration::seconds(2);
+        o.reconcile_stalled();
+        assert!(
+            o.running.contains_key("1"),
+            "a queued event emitted two seconds ago must prevent a wedge verdict"
+        );
+        assert!(!o.retry_attempts.contains_key("1"));
+
+        // Applying the backlog later must not buy another full silence window.
+        *clock.lock().unwrap() = emitted_by + chrono::Duration::seconds(100);
+        let mut applied = 0;
+        while let Ok(event) = rx.try_recv() {
+            if let crate::control_loop::Event::AgentUpdate(update) = event {
+                o.on_agent_update(update);
+                applied += 1;
+            }
+        }
+        assert_eq!(applied, 1, "the worker emitted the expected notification");
+        assert_eq!(o.running["1"].last_message, "queued work");
+        *clock.lock().unwrap() = emitted_by + chrono::Duration::seconds(301);
+        o.reconcile_stalled();
+        assert!(
+            !o.running.contains_key("1"),
+            "applying an old event must not renew worker liveness"
+        );
+        assert_eq!(o.retry_attempts["1"].err, "stalled");
+    }
+
+    #[tokio::test]
+    async fn sampler_unavailable_widens_the_stall_window() {
+        let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+        o.eff.as_mut().unwrap().cpu_sampler = sampler(false, &[]);
+        let base = utc(2026, 5, 29, 12, 0, 0);
+        let clock = install_clock(&mut o, base);
+        add_running(&mut o, "1", "MT-1", "In Progress", base);
+        o.running.get_mut("1").unwrap().pgid = 42;
+        o.reconcile_stalled(); // first failure starts bounded grace
+        advance(&clock, chrono::Duration::seconds(601));
+        o.on_agent_update(AgentUpdate {
+            issue_id: "1".into(),
+            ev: agent::Event {
+                event_type: agent::EVENT_NOTIFICATION.into(),
+                ..Default::default()
+            },
+        });
+        advance(&clock, chrono::Duration::seconds(301));
+        o.reconcile_stalled();
+        assert!(
+            o.running.contains_key("1"),
+            "after initial grace expires, an event still gets twice the stall window"
+        );
+        advance(&clock, chrono::Duration::seconds(299));
+        o.reconcile_stalled();
+        assert!(o.running.contains_key("1"), "strict 2x boundary");
+        advance(&clock, chrono::Duration::seconds(1));
+        o.reconcile_stalled();
+        assert!(!o.running.contains_key("1"));
+        assert_eq!(o.retry_attempts["1"].err, "stalled");
+    }
+
+    #[tokio::test]
+    async fn stall_check_rechecks_emission_before_terminating_candidates() {
+        // Sampling the second group can block long enough for the first worker to emit. Each
+        // sample stamps the OTHER run, so this pins the race independent of HashMap iteration.
+        struct EmittingSampler {
+            times: Vec<(i32, crate::liveness::WorkerEmitTime)>,
+            now: DateTime<Utc>,
+        }
+        impl Sampler for EmittingSampler {
+            fn group_cpu(&self, pgid: i32) -> Option<u64> {
+                for (id, time) in &self.times {
+                    if *id != pgid {
+                        time.record(self.now);
+                    }
+                }
+                Some(0)
+            }
+            fn ticks_per_second(&self) -> Option<u64> {
+                Some(100)
+            }
+        }
+        let (mut o, _dir) = liveness_orch(std::time::Duration::from_secs(300));
+        let now = utc(2026, 5, 29, 12, 0, 0);
+        install_clock(&mut o, now);
+        let mut times = Vec::new();
+        for (id, pgid) in [("1", 42), ("2", 43)] {
+            add_running(
+                &mut o,
+                id,
+                &format!("MT-{id}"),
+                "In Progress",
+                now - chrono::Duration::hours(1),
+            );
+            let re = o.running.get_mut(id).unwrap();
+            re.pgid = pgid;
+            re.worker_emit_time.record(re.started_at);
+            times.push((pgid, re.worker_emit_time.clone()));
+        }
+        o.eff.as_mut().unwrap().cpu_sampler = Arc::new(EmittingSampler { times, now });
+        o.reconcile_stalled();
+        assert_eq!(
+            o.running.len(),
+            2,
+            "both workers emitted before termination"
+        );
+        assert!(o.retry_attempts.is_empty());
+    }
+
     // Both real harness shapes, with /proc explicitly unavailable. The tool has no
     // event or CPU heartbeat while waiting; its matching result ends the exemption.
     async fn portable_open_tool_case(harness: &str) {
@@ -932,7 +1097,7 @@ mod tests {
                 issue_id: "1".into(),
                 ev: end,
             });
-            advance(&clock, chrono::Duration::seconds(301));
+            advance(&clock, chrono::Duration::seconds(601));
             o.reconcile_stalled();
             assert!(
                 !o.running.contains_key("1"),
@@ -1134,7 +1299,7 @@ mod tests {
         );
         advance(&clock, chrono::Duration::seconds(301));
         o.reconcile_stalled();
-        advance(&clock, chrono::Duration::seconds(301));
+        advance(&clock, chrono::Duration::seconds(601));
         o.reconcile_stalled();
         assert!(!o.running.contains_key("1"));
     }
@@ -1185,9 +1350,9 @@ mod tests {
         o.reconcile_stalled();
         assert!(
             o.running.contains_key("1"),
-            "first failure grants one bounded grace window"
+            "first failure grants two bounded stall windows"
         );
-        advance(&clock, chrono::Duration::seconds(300));
+        advance(&clock, chrono::Duration::seconds(600));
         o.reconcile_stalled();
         assert!(o.running.contains_key("1"));
         advance(&clock, chrono::Duration::seconds(1));
@@ -1264,7 +1429,7 @@ mod tests {
                 o.running.contains_key("1"),
                 "recovery must retain the original grace window"
             );
-            advance(&clock, chrono::Duration::seconds(100));
+            advance(&clock, chrono::Duration::seconds(200));
         }
         o.eff.as_mut().unwrap().cpu_sampler = sampler(false, &[]);
         o.reconcile_stalled();

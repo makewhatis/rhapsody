@@ -37,6 +37,8 @@ pub struct Fake {
     pub turns: Vec<TurnScript>,
     /// When set, returned by `start_session` (the call is still recorded).
     pub start_err: Option<AgentError>,
+    /// When set, returned by `resume_from` before any scripted turn.
+    pub resume_err: Option<AgentError>,
     /// The capabilities this fake declares (STUDIO-978). Settable so a test can parameterize the
     /// capability-validator behaviour — a fake harness that claims no MCP, no resume, or
     /// [`crate::harness::McpSandboxCoupling::MutuallyExclusive`] is how the refusal path is driven
@@ -98,6 +100,9 @@ struct Recorded {
     /// test can assert the manager provisioning produced the expected empty cwd / config dir / run
     /// timeout (STUDIO-1049).
     last_manager_start: Option<crate::manager::ManagerSessionStart>,
+    last_resume: Option<String>,
+    retained_calls: i64,
+    fresh_resets: i64,
 }
 
 impl Fake {
@@ -107,6 +112,7 @@ impl Fake {
             thread_id_value: "thread-fake".to_string(),
             turns: Vec::new(),
             start_err: None,
+            resume_err: None,
             capabilities: default_capabilities(),
             recorded: Arc::new(Mutex::new(Recorded::default())),
         }
@@ -156,6 +162,18 @@ impl Fake {
         self.lock().last_manager_start.clone()
     }
 
+    pub fn last_resume(&self) -> Option<String> {
+        self.lock().last_resume.clone()
+    }
+
+    pub fn retained_calls(&self) -> i64 {
+        self.lock().retained_calls
+    }
+
+    pub fn fresh_resets(&self) -> i64 {
+        self.lock().fresh_resets
+    }
+
     fn lock(&self) -> MutexGuard<'_, Recorded> {
         // Recover a poisoned lock rather than panic: the fake is library (non-test-cfg) code.
         self.recorded.lock().unwrap_or_else(PoisonError::into_inner)
@@ -185,7 +203,10 @@ impl Fake {
             return Err(e.clone());
         }
         Ok(Box::new(FakeSession {
-            thread_id: self.thread_id_value.clone(),
+            thread_id: Mutex::new(self.thread_id_value.clone()),
+            resumable: self.capabilities.resume != Resume::None,
+            resume_err: self.resume_err.clone(),
+            fresh_thread_id: self.thread_id_value.clone(),
             turns: self.turns.clone(),
             turn_n: AtomicI64::new(0),
             recorded: Arc::clone(&self.recorded),
@@ -246,7 +267,10 @@ impl Harness for Fake {
 /// starts at 0 and `run_turn` advances it, so `id()` reports `<thread>-<n>` — e.g. `<thread>-1`
 /// after one turn (the mirror of Go's `s.turnN++`).
 struct FakeSession {
-    thread_id: String,
+    thread_id: Mutex<String>,
+    resumable: bool,
+    resume_err: Option<AgentError>,
+    fresh_thread_id: String,
     turns: Vec<TurnScript>,
     turn_n: AtomicI64,
     recorded: Arc<Mutex<Recorded>>,
@@ -255,11 +279,55 @@ struct FakeSession {
 #[async_trait]
 impl Session for FakeSession {
     fn id(&self) -> String {
-        format!("{}-{}", self.thread_id, self.turn_n.load(Ordering::SeqCst))
+        format!(
+            "{}-{}",
+            self.thread_id(),
+            self.turn_n.load(Ordering::SeqCst)
+        )
     }
 
     fn thread_id(&self) -> String {
-        self.thread_id.clone()
+        self.thread_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    fn resume_from(&self, thread_id: &str) -> Result<(), AgentError> {
+        if let Some(error) = &self.resume_err {
+            return Err(error.clone());
+        }
+        if !self.resumable || thread_id.is_empty() {
+            return Err(AgentError::ResumeUnavailable);
+        }
+        *self
+            .thread_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = thread_id.into();
+        self.recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_resume = Some(thread_id.into());
+        Ok(())
+    }
+
+    fn reset_conversation(&self) -> Result<(), AgentError> {
+        *self
+            .thread_id
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = self.fresh_thread_id.clone();
+        self.recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fresh_resets += 1;
+        Ok(())
+    }
+
+    fn retain_for_limit(&self) {
+        self.recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retained_calls += 1;
     }
 
     fn set_run_id(&self, id: i64) {

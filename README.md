@@ -98,6 +98,19 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Durable drain continuations (STUDIO-1259)
+
+Retry-backed ticket runs parked at a drain boundary retain their harness's resumable conversation,
+including OpenCode's private session state. The existing retry queue stores `drain continuation:`
+JSON containing the thread ID, harness, issue snapshot and pinned fallback engine; restart recovery
+restores it and does not suppress in-flight work for a PR it already opened. Admission delays keep
+the metadata until dispatch, and release/completion clears it. Non-resumable harnesses start fresh.
+Every drain continuation prompt identifies the drain and requires inspecting `git status`,
+`git log <base>..HEAD` and the ticket's progress file before new writes. A missing/expired session
+refused before model/tool work falls back once to a fresh conversation with one warning; unrelated
+turn, authentication and billing failures retain normal error handling. Ticketless review/manager
+exit policies, Go-owned schemas, payload shapes and parity fixtures are unchanged.
+
 ### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1252)
 
 Landing is **Rhapsody-only, with no Go counterpart**. Per-project `projects[].landing` in
@@ -239,7 +252,7 @@ watch rows stay dismissed. Lead/manager suppression and ticket stop/resume's mov
 are unchanged. This review-only behavior has no frozen Go counterpart; API shapes, schema and
 goldens are unchanged.
 
-### Bounded CPU-based stall liveness and tool waits (STUDIO-1177, STUDIO-1208)
+### Bounded CPU-based stall liveness and tool waits (STUDIO-1177, STUDIO-1208, STUDIO-1262)
 
 Silent workers now renew CPU liveness only when positive process-group CPU time exceeds
 `agent.stall_cpu_threshold` of elapsed wall time (default `0.05`, 5% of one core; valid range
@@ -258,15 +271,24 @@ event-silence rule applies again. Outcomes, reason strings and retries are uncha
 Once STUDIO-1208 ships, the operator can restore `stall_timeout_ms` to `300000` from the temporary
 `2700000` mitigation in WORKFLOW.md. This change does not rewrite that operator-owned configuration.
 
-A failed sampler logs once per run and grants one stall window from the first failed sample.
-Persistent failure then uses stream events alone, rather than Go's perpetual assume-alive rule.
+A failed sampler logs once per run and grants **twice** the configured stall window from the first
+failed sample. Persistent failure then uses stream events with the same doubled silence window,
+rather than Go's perpetual assume-alive rule. This gives saturated hosts extra time without granting
+unbounded liveness; successful measured recovery restores the configured window.
 Recovery establishes a fresh baseline, retaining the original bounded failure grace until a full
 CPU interval can be measured; new process groups also establish fresh baselines. CPU sampling is
-an extra signal on Linux; macOS uses events and open tools. Descendant presence alone is not liveness:
-an idle MCP server can exist while the model stream is dead.
-Event timestamps, disabled stall detection, persisted `failed` / `stalled` taxonomy and exponential
-failure retries are unchanged. The threshold round-trips through config encode/decode but is omitted
-from the Go-owned config JSON view; schemas, payload goldens and fixtures are untouched.
+an extra signal on **Linux only**: the sampler reads `/proc/<pid>/stat`, which macOS does not provide.
+Sampler-unavailable warnings on macOS are expected, independent of permissions or whether the PID is
+a group leader; macOS uses events and open tools with the doubled fallback window. Descendant presence
+alone is not liveness: an idle MCP server can exist while the model stream is dead.
+Stall detection reads a per-run timestamp stamped by the worker **before** queuing each real agent
+event, so a control-loop backlog cannot hide recent work. Applying old queued events does not renew
+that watermark. Synthetic delivery acknowledgements and account/limit-only observations still grant
+no event liveness. API/history event timestamps retain their control-apply semantics; the emission
+watermark is process-local and fresh for every retry. Disabled stall detection, persisted `failed` /
+`stalled` taxonomy and exponential failure retries are unchanged. The threshold round-trips through
+config encode/decode but is omitted from the Go-owned config JSON view; schemas, payload goldens and
+fixtures are untouched.
 
 ### Turn-owned OpenCode HTTP executor (STUDIO-1208; amends STUDIO-1001)
 
@@ -410,6 +432,17 @@ Desktop sidecars are killed on child-handle drop if their supervisor task/runtim
 normal SIGTERM/graceful-stop behavior stays the same. Test guards request stop before signaling,
 preventing the restart loop from relaunching a daemon during failure cleanup. No configuration,
 API payload, schema or golden changes.
+
+### Desktop quit and child-stop deadlines (STUDIO-1116, STUDIO-1268)
+
+The Tauri main thread's final Quit waits on a standard channel for at most twelve seconds rather
+than blocking on a runtime timer. It requests stop before scheduling async teardown, so a blocked
+tray setter cannot prevent the sidecar from receiving SIGTERM. A per-launch standard-thread
+backstop observes child exit and escalates to process-group SIGKILL after `stop_grace` (five seconds
+by default), independently of Tokio's driver. Signaling and reaping share the owned child handle,
+preventing a delayed backstop from signaling a recycled PID. Go's goroutines and `time.After` need
+no UI/runtime driver; these explicit backstops preserve that lifecycle guarantee in the Tauri port.
+No configuration, API payload, schema or golden changes.
 
 ### Manager findings and tracker documents (STUDIO-1146)
 
