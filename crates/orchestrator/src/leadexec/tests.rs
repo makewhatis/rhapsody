@@ -1975,12 +1975,26 @@ async fn operator_stub(status: u16) -> OperatorStub {
 }
 
 async fn memory_stub(status: u16, bank: &str) -> OperatorStub {
+    memory_stub_delayed(status, bank, std::time::Duration::ZERO).await
+}
+
+async fn memory_stub_delayed(status: u16, bank: &str, delay: std::time::Duration) -> OperatorStub {
+    memory_stub_body(status, bank, delay, r#"{"results":[{"id":"pref-1","text":"Prefer diagnosis before spending credits.","metadata":{"by":"David"}}]}"#).await
+}
+
+async fn memory_stub_body(
+    status: u16,
+    bank: &str,
+    delay: std::time::Duration,
+    body: &str,
+) -> OperatorStub {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let sink = requests.clone();
     let bank = bank.to_string();
+    let body = body.to_string();
     let task = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let mut bytes = Vec::new();
@@ -2007,12 +2021,12 @@ async fn memory_stub(status: u16, bank: &str) -> OperatorStub {
             let request = String::from_utf8(bytes).unwrap();
             assert!(request.contains(&format!("/banks/{bank}")), "{request}");
             sink.lock().unwrap().push(request);
-            let body = r#"{"results":[{"id":"pref-1","text":"Prefer diagnosis before spending credits.","metadata":{"by":"David"}}]}"#;
+            tokio::time::sleep(delay).await;
             let response = format!(
                 "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
-            stream.write_all(response.as_bytes()).await.unwrap();
+            let _ = stream.write_all(response.as_bytes()).await;
         }
     });
     OperatorStub {
@@ -2164,6 +2178,113 @@ async fn bank_unavailable_degrades_not_fails() {
         })
         .await
         .expect("memory must not fail an otherwise complete paper trail");
+    }
+}
+
+#[tokio::test]
+async fn lead_operator_recall_error_is_not_discarded() {
+    let stub = operator_stub(503).await;
+    let (store, _, _) = setup("memory is down");
+    let runtime = memory_runtime(store, Some(stub.memory.clone()));
+    let text = runtime.prefetch_memory("TEST-100", "memory is down").await;
+    assert!(
+        text.contains("Operator memory unavailable (http 503)"),
+        "{text}"
+    );
+    assert!(text.contains("decide without memory and say so in your reasoning summary"));
+}
+
+#[tokio::test]
+async fn lead_memory_unavailable_reason_names_timeout() {
+    use rhapsody_config::hindsight::{HindsightBackend, OperatorMemory, Timeouts};
+    let timeouts = Timeouts {
+        recall: std::time::Duration::from_millis(100),
+        ..Timeouts::default()
+    };
+    let operator =
+        memory_stub_delayed(200, "scratch-lead", std::time::Duration::from_secs(10)).await;
+    let team = memory_stub_delayed(200, "scratch-team", std::time::Duration::from_secs(10)).await;
+    let (store, _, _) = setup("memory is slow");
+    let mut runtime = memory_runtime(
+        store,
+        Some(Arc::new(
+            OperatorMemory::for_bank_with_timeouts(
+                &operator.endpoint,
+                "",
+                "scratch-lead",
+                timeouts,
+            )
+            .unwrap(),
+        )),
+    );
+    runtime.memory = Some(Arc::new(
+        HindsightBackend::new_with_timeouts(&team.endpoint, "agent-", "", timeouts).unwrap(),
+    ));
+    let text = runtime.prefetch_memory("TEST-100", "memory is slow").await;
+    assert!(
+        text.contains("Operator memory unavailable (timeout)"),
+        "{text}"
+    );
+    assert!(
+        text.contains("Team memory unavailable (bank=scratch-team, timeout)"),
+        "{text}"
+    );
+    assert!(!text.contains("backend request failed"), "{text}");
+    assert_eq!(operator.requests.lock().unwrap().len(), 1);
+    assert_eq!(team.requests.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn lead_recall_reasons_classify_http_and_decode_without_raw_backend_text() {
+    use rhapsody_config::hindsight::HindsightBackend;
+    for (status, body, reason) in [
+        (503, "private backend detail", "http 503"),
+        (200, "private invalid JSON", "decode"),
+    ] {
+        let operator =
+            memory_stub_body(status, "scratch-lead", std::time::Duration::ZERO, body).await;
+        let team = memory_stub_body(status, "scratch-team", std::time::Duration::ZERO, body).await;
+        let (store, _, _) = setup("memory is broken");
+        let mut runtime = memory_runtime(store, Some(operator.memory.clone()));
+        runtime.memory = Some(Arc::new(
+            HindsightBackend::new(&team.endpoint, "agent-", "").unwrap(),
+        ));
+        let text = runtime
+            .prefetch_memory("TEST-100", "memory is broken")
+            .await;
+        assert!(
+            text.contains(&format!("Operator memory unavailable ({reason})")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("bank=scratch-team, {reason}")),
+            "{text}"
+        );
+        assert!(
+            !text.contains("private")
+                && !text.contains(&team.endpoint)
+                && !text.contains(&operator.endpoint),
+            "{text}"
+        );
+        if reason == "decode" {
+            runtime.teams.enabled = true;
+            let memory = crate::teamsmemory::TeamsMemory::new(
+                Arc::new(runtime.teams.clone()),
+                runtime.memory.clone().unwrap(),
+            );
+            assert!(
+                matches!(
+                    memory.recall_team("TEST-100", "").await,
+                    Err(crate::teamsmemory::TeamsMemoryError::Invalid(_))
+                ),
+                "classified decode failures must preserve the Teams API's invalid-response category"
+            );
+            assert_eq!(
+                team.requests.lock().unwrap().len(),
+                2,
+                "the boundary regression must reach the backend"
+            );
+        }
     }
 }
 
@@ -2334,7 +2455,7 @@ async fn team_memory_unavailability_identifies_the_bank_and_failure() {
         .await;
     assert!(text.contains("Team memory unavailable"));
     assert!(
-        text.contains("bank=team") && text.contains("backend request failed"),
+        text.contains("bank=team") && text.contains("connect"),
         "{text}"
     );
 }

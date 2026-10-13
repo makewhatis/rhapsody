@@ -27,6 +27,9 @@ the `Orchestrator` struct itself. Concretely:
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
     future HTTP layer.
+    It also publishes the poll's last complete candidate set and fetch timestamp for Teams memory
+    prefetch (STUDIO-1253), which makes no tracker calls. Reload clears that publication; failed
+    polls preserve its original timestamp so it expires rather than appearing refreshed.
     It also publishes the reload's configured log root for `rawtranscript.rs` (STUDIO-1155).
     HTTP reads only the run row and confined file descriptors on its blocking pool; paging and
     downloads never round-trip the control task.

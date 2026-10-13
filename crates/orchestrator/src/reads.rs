@@ -127,6 +127,9 @@ pub struct ReadsTarget {
     /// wedge STUDIO-671 reported. Anything that must see the daemon's WORK — as opposed to the
     /// account — reads these instead, the same clients the poll loop fans out over.
     pub project_trackers: Vec<ProjectTracker>,
+    /// Last complete candidate fetch, for memory prefetch without spending Linear quota.
+    /// Cleared on reload; a failed poll never refreshes its timestamp.
+    pub candidates: Option<crate::teamsprefetch::PrefetchTarget>,
     /// The reload's dispatchable-state sets (STUDIO-672), for the off-loop readers that must ask
     /// "would the selection gate hold this ticket?" without holding the `Effective` that answers
     /// it. Published beside `project_trackers`, from the same reload, for the same reason.
@@ -194,6 +197,14 @@ impl Orchestrator {
         w.project_facts = snapshot.facts;
         w.summon_token = snapshot.summon_token;
         w.reviewer_exclusions = snapshot.reviewer_exclusions;
+        w.candidates = None;
+    }
+
+    /// Publishes an already-fetched candidate set. Build it before taking the lock;
+    /// readers clone plain data and never ask the tracker for another copy.
+    pub fn set_reads_candidates(&self, candidates: crate::teamsprefetch::PrefetchTarget) {
+        let mut w = self.reads.write().unwrap_or_else(PoisonError::into_inner);
+        w.candidates = Some(candidates);
     }
 
     /// Lists the workspace's Linear projects for the add-agent picker (INF-224), reusing the
@@ -261,6 +272,13 @@ impl ControlHandle {
                 .map(|p| p.tracker.clone())
                 .collect(),
         )
+    }
+
+    /// The last complete poll's candidates and fetch time, or `None` before a
+    /// successful poll (including immediately after reload). No tracker I/O.
+    pub fn reads_candidates(&self) -> Option<crate::teamsprefetch::PrefetchTarget> {
+        let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
+        r.candidates.clone()
     }
 
     /// Everything the off-loop review quorum needs from the last reload, under **ONE** lock
