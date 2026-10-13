@@ -206,7 +206,7 @@ impl Orchestrator {
                 .and_then(|e| e.project_by_slug(&row.project_slug))
                 .map(|p| &p.group);
             let mut paused = std::collections::BTreeSet::new();
-            if open && self.landing_config(&row.project_slug).is_some() {
+            if open {
                 for watch in &watches {
                     if !watch.open
                         || (watch.key.owner.eq_ignore_ascii_case(&row.owner)
@@ -218,7 +218,7 @@ impl Orchestrator {
                     }
                     let pr = PrCoord::new(&watch.key.owner, &watch.key.repo, watch.key.number);
                     if self.review_auto_merge_for_repo(&watch.key.owner, &watch.key.repo)
-                        && group.is_some_and(|group| self.landing_merge_groups(&pr).contains(group))
+                        && group.is_some_and(|group| self.landing_lock_groups(&pr).contains(group))
                     {
                         paused.insert(pr.to_string());
                     }
@@ -919,27 +919,32 @@ impl LandingRuntime {
         if let Some(run_id) = progress.acceptance_run {
             match self.store.get_run(run_id).map_err(|e| e.to_string())? {
                 Some(run) if run.outcome == "running" => return Ok(()),
-                Some(run) if run.outcome == "interrupted" => progress.acceptance_run = None,
-                Some(_) => {
+                Some(run) => {
                     let events = self.store.run_events(run_id).map_err(|e| e.to_string())?;
-                    let result = events
+                    let event = events
                         .iter()
                         .rev()
-                        .find(|event| event.kind == "landing.verdict")
-                        .and_then(|event| {
+                        .find(|event| event.kind == "landing.verdict");
+                    // Boot may interrupt a run after its verdict was saved but before end_run.
+                    // Only an interrupted run with no durable verdict needs another agent.
+                    if event.is_none() && run.outcome == "interrupted" {
+                        progress.acceptance_run = None;
+                    } else {
+                        let result = event.and_then(|event| {
                             serde_json::from_str::<serde_json::Value>(&event.text).ok()
                         });
-                    let text = result
-                        .as_ref()
-                        .and_then(|v| v["text"].as_str())
-                        .unwrap_or("acceptance result unavailable after restart");
-                    let failed = result
-                        .as_ref()
-                        .and_then(|v| v["failed"].as_bool())
-                        .unwrap_or(true);
-                    return self
-                        .acceptance_finished(row.id, run_id, text, failed, now)
-                        .await;
+                        let text = result
+                            .as_ref()
+                            .and_then(|v| v["text"].as_str())
+                            .unwrap_or("acceptance result unavailable after restart");
+                        let failed = result
+                            .as_ref()
+                            .and_then(|v| v["failed"].as_bool())
+                            .unwrap_or(true);
+                        return self
+                            .acceptance_finished(row.id, run_id, text, failed, now)
+                            .await;
+                    }
                 }
                 None => progress.acceptance_run = None,
             }
@@ -2211,6 +2216,107 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_run_with_durable_verdict_is_consumed() {
+        for passed in [true, false] {
+            let mut rig = Rig::new("Done");
+            let mut tracker = Fake::new();
+            tracker.candidates = vec![rhapsody_core::Issue {
+                id: "ID-1".into(),
+                identifier: "APP-1".into(),
+                description: Some("## Post-deploy acceptance\n- [ ] live UI is healthy".into()),
+                ..Default::default()
+            }];
+            rig.tracker = Arc::new(tracker);
+            rig.runtime.tracker = rig.tracker.clone();
+            let run_id = rig
+                .runtime
+                .store
+                .start_run(rhapsody_store::RunStart {
+                    issue_identifier: "land:o/r#1".into(),
+                    ..Default::default()
+                })
+                .unwrap();
+            let mut row = rig.row();
+            row.phase = LandingPhase::AwaitingAcceptance;
+            let mut progress = rig.progress();
+            progress.acceptance_items = vec!["live UI is healthy".into()];
+            progress.acceptance_run = Some(run_id);
+            rig.runtime.save(&mut row, &progress, 1).unwrap();
+            let text = format!(
+                "```rhapsody-landing-verdict\n{{\"pass\":{passed},\"items\":[{{\"item\":\"live UI is healthy\",\"pass\":{passed},\"evidence\":\"GET /healthz returned {}\"}}]}}\n```",
+                if passed { 200 } else { 503 }
+            );
+            rig.runtime
+                .store
+                .append_events(
+                    run_id,
+                    &[rhapsody_store::EventRow {
+                        seq: 1,
+                        kind: "landing.verdict".into(),
+                        text: serde_json::json!({"text": text, "failed": false}).to_string(),
+                        ..Default::default()
+                    }],
+                )
+                .unwrap();
+            // Crash after the verdict write but before end_run: boot interrupts the run.
+            assert_eq!(rig.runtime.store.mark_running_interrupted().unwrap(), 1);
+            rig.tick(2).await;
+            rig.tick(3).await;
+            assert_eq!(
+                rig.row().phase,
+                if passed {
+                    LandingPhase::Done
+                } else {
+                    LandingPhase::Reopened
+                }
+            );
+            let comments = rig.tracker.create_comment_calls();
+            assert_eq!(comments.len(), 1, "recovered evidence is posted once");
+            assert!(comments[0].body.contains(if passed {
+                "returned 200"
+            } else {
+                "returned 503"
+            }));
+            assert_eq!(
+                rig.runtime
+                    .store
+                    .list_runs(RunFilter::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn interrupted_run_without_durable_verdict_allows_acceptance_retry() {
+        let rig = Rig::new("Done");
+        let run_id = rig
+            .runtime
+            .store
+            .start_run(rhapsody_store::RunStart {
+                issue_identifier: "land:o/r#1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut row = rig.row();
+        row.phase = LandingPhase::AwaitingAcceptance;
+        let mut progress = rig.progress();
+        progress.acceptance_items = vec!["live UI is healthy".into()];
+        progress.acceptance_run = Some(run_id);
+        rig.runtime.save(&mut row, &progress, 1).unwrap();
+        rig.runtime.store.mark_running_interrupted().unwrap();
+        rig.runtime
+            .acceptance(&mut row, &mut progress, 2)
+            .await
+            .unwrap();
+        assert!(progress.acceptance_run.is_none());
+        assert_eq!(rig.row().phase, LandingPhase::AwaitingAcceptance);
+        assert!(rig.tracker.move_calls().is_empty());
+        assert!(rig.tracker.create_comment_calls().is_empty());
+    }
+
+    #[tokio::test]
     async fn checklist_dispatches_land_run_with_read_only_profile() {
         let rig = Rig::new("Done");
         let mut o = enabled_orchestrator_for_view(rig.runtime.store.clone());
@@ -2290,9 +2396,14 @@ pub(crate) mod tests {
         assert_eq!(view.landings[0].phase_age_s, Some(60));
         orchestrator.eff.as_mut().unwrap().cfg.projects[0].landing = None;
         assert!(
-            orchestrator.landings_view(65).unwrap().landings[0]
-                .pausing_auto_merge
-                .is_empty()
+            orchestrator
+                .landing_merge_gate(&PrCoord::new("o", "r", 7))
+                .is_err()
+        );
+        assert_eq!(
+            orchestrator.landings_view(65).unwrap().landings[0].pausing_auto_merge,
+            vec!["o/r#7"],
+            "disabling landing does not release the durable project lock"
         );
     }
 
