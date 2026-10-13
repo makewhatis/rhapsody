@@ -433,6 +433,14 @@ impl ClaudeSession {
 
 #[async_trait]
 impl Session for ClaudeSession {
+    fn reset_conversation(&self) -> Result<(), AgentError> {
+        self.thread_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.turn_n.store(0, Ordering::SeqCst);
+        Ok(())
+    }
     fn resume_from(&self, thread_id: &str) -> Result<(), AgentError> {
         if thread_id.is_empty() {
             return Err(AgentError::Other(
@@ -643,6 +651,7 @@ impl Session for ClaudeSession {
         let mut stderr_open = true;
         let mut mailbox_open = messages.is_some();
         let mut stderr_buf = CappedBuffer::new(MAX_STDERR_CAPTURE);
+        let mut stdout_seen = false;
         let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
         let mut out_chunk = vec![0u8; READ_CHUNK];
         let mut err_chunk = vec![0u8; READ_CHUNK];
@@ -673,6 +682,7 @@ impl Session for ClaudeSession {
                     match r {
                         Ok(0) => break 'outer, // EOF
                         Ok(n) => {
+                            stdout_seen = true;
                             acc.extend_from_slice(&out_chunk[..n]);
                             loop {
                                 let Some(pos) = acc.iter().position(|&b| b == b'\n') else {
@@ -897,6 +907,19 @@ impl Session for ClaudeSession {
         // No terminal result observed.
         let exit_bad = matches!(&wait_res, Ok(s) if !s.success()) || wait_res.is_err();
         if exit_bad {
+            // Claude refuses a missing --resume ID on stderr before emitting any agent result.
+            // Match the requested ID, not an arbitrary tool's "not found" text.
+            if !resume.is_empty()
+                && !stdout_seen
+                && usage == Usage::default()
+                && String::from_utf8_lossy(stderr_buf.bytes())
+                    .lines()
+                    .any(|line| {
+                        line.trim() == format!("No conversation found with session ID: {resume}")
+                    })
+            {
+                return (failed(usage), Some(AgentError::ResumeUnavailable));
+            }
             for line in String::from_utf8_lossy(stderr_buf.bytes()).lines() {
                 if let Some(obs) = crate::ratelimit::parse_claude_limit_error(line) {
                     self.note_limit_auth();

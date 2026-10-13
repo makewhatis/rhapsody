@@ -19,17 +19,10 @@
 //! * **Refuse the NEXT turn.** [`crate::worker::WorkerDeps::run_turns`] returns NORMALLY at its
 //!   boundary, so the run is classified `continued` and its claim is KEPT — not `interrupted`.
 //!
-//! # What a drained run loses (and what it does not)
-//!
-//! It loses the agent's conversation thread, and only that. `--resume` is driven by the session's
-//! IN-MEMORY thread id, seeded from the first turn's stream; a re-dispatch builds a fresh
-//! [`rhapsody_agent::Session`] whose thread id starts empty, and nothing reads a stored id back into
-//! it. (`runs.session_uuid` cannot help: `persist_start_run` leaves that column empty — it is
-//! reserved, never written.) Everything durable survives: the worktree, the branch, the commits, the
-//! claim and the retry row. The continuation prompt is what re-orients the new session.
-//!
-//! That is precisely why the turn boundary is the right cut: it is the point at which the agent has
-//! just finished a unit of work, so the conversation is the cheapest thing on the table.
+//! A retry-backed ticket continuation retains its resumable conversation at that boundary
+//! (STUDIO-1259). Its thread id and harness ride in the existing durable retry record, like limit
+//! parks; a non-resumable harness still starts fresh. Every drain continuation gets an explicit
+//! worktree/progress reconciliation prompt, including the fallback for a missing session.
 //!
 //! # What this type is NOT
 //!
@@ -44,6 +37,60 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, Ordering};
 
 use chrono::{DateTime, TimeZone, Utc};
+
+pub(crate) const EVENT_DRAIN_PARKED: &str = "drain_parked";
+const RETRY_DRAIN_PREFIX: &str = "drain continuation:";
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct DrainContinuation {
+    pub session: String,
+    pub harness: String,
+    pub issue: rhapsody_core::Issue,
+    pub engine: Option<crate::dispatch::DispatchEngine>,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DrainRetry {
+    continuation: DrainContinuation,
+    reason: String,
+}
+
+impl DrainContinuation {
+    pub(crate) fn prompt(&self) -> String {
+        format!(
+            "This run is a continuation after a drain, not a new task. Your worktree contains your \
+             own earlier work, possibly unfinished. Before writing anything new, read `git status`, \
+             `git log <base>..HEAD` (using the task/PR's base branch), and \
+             `~/.rhapsody/docs/{}-progress.md` if it exists. Reconcile those artifacts with the task \
+             before continuing; do not duplicate or renumber work you already created.",
+            self.issue.identifier
+        )
+    }
+
+    pub(crate) fn retry_text(&self, reason: &str) -> String {
+        match serde_json::to_string(&DrainRetry {
+            continuation: self.clone(),
+            reason: reason.into(),
+        }) {
+            Ok(json) => format!("{RETRY_DRAIN_PREFIX}{json}"),
+            Err(error) => {
+                tracing::warn!(%error, "drain: continuation metadata could not be recorded");
+                reason.into()
+            }
+        }
+    }
+}
+
+pub(crate) fn restore_retry(text: &str) -> Option<(DrainContinuation, String)> {
+    let json = text.strip_prefix(RETRY_DRAIN_PREFIX)?;
+    match serde_json::from_str::<DrainRetry>(json) {
+        Ok(record) => Some((record.continuation, record.reason)),
+        Err(error) => {
+            tracing::warn!(%error, "drain: continuation metadata could not be read; starting fresh");
+            None
+        }
+    }
+}
 
 /// The operator advisory surfaced on each project's `/api/v1/projects` status while a drain is armed
 /// — the state-visible half of the "a paused dispatch must be legible" requirement, mirroring

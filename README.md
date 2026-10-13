@@ -98,6 +98,19 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Durable drain continuations (STUDIO-1259)
+
+Retry-backed ticket runs parked at a drain boundary retain their harness's resumable conversation,
+including OpenCode's private session state. The existing retry queue stores `drain continuation:`
+JSON containing the thread ID, harness, issue snapshot and pinned fallback engine; restart recovery
+restores it and does not suppress in-flight work for a PR it already opened. Admission delays keep
+the metadata until dispatch, and release/completion clears it. Non-resumable harnesses start fresh.
+Every drain continuation prompt identifies the drain and requires inspecting `git status`,
+`git log <base>..HEAD` and the ticket's progress file before new writes. A missing/expired session
+refused before model/tool work falls back once to a fresh conversation with one warning; unrelated
+turn, authentication and billing failures retain normal error handling. Ticketless review/manager
+exit policies, Go-owned schemas, payload shapes and parity fixtures are unchanged.
+
 ### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1251)
 
 Landing is **Rhapsody-only, with no Go counterpart**. Per-project `projects[].landing` in

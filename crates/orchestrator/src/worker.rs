@@ -339,6 +339,7 @@ pub struct WorkerDeps {
     /// A limit-policy switch starts fresh and seeds turn 1 with the carried note path.
     pub engine: Option<crate::dispatch::DispatchEngine>,
     pub resume_session: String,
+    pub(crate) resume_after_drain: bool,
     /// Tech-lead detection is opt-in; progress notes are read only on this worker task.
     pub lead_enabled: bool,
     pub lead_progress_dir: Option<std::path::PathBuf>,
@@ -1131,6 +1132,9 @@ pub async fn run_agent_attempt(
     // non-Clone `DispatchRunner` that carries the broker custody; the launch context is frozen here
     // so no late identity setter runs on that path. The legacy path keeps the shared runner and its
     // three late setters — byte-identical to a daemon built before this feature.
+    if deps.agent.capabilities().resume == agent::Resume::None {
+        deps.resume_session.clear();
+    }
     let (sess, broker_turns): (Box<dyn Session>, Option<BrokerLedgerReceiver>) = match prepared {
         Some(spec) => {
             let built = match deps.prepared_harness.clone() {
@@ -1219,11 +1223,33 @@ pub async fn run_agent_attempt(
     if !deps.resume_session.is_empty()
         && let Err(error) = sess.resume_from(&deps.resume_session)
     {
-        return (
-            issue.state.clone(),
-            WorkerDeclaration::default(),
-            Some(error.into()),
-        );
+        if deps.resume_after_drain && error == agent::AgentError::ResumeUnavailable {
+            if let Err(error) = sess.reset_conversation() {
+                let _ = sess.stop().await;
+                let _ = deps
+                    .workspace
+                    .after_run(&ws, &deps.repo_url, &deps.project_slug, &issue.identifier)
+                    .await;
+                return (
+                    issue.state.clone(),
+                    WorkerDeclaration::default(),
+                    Some(error.into()),
+                );
+            }
+            tracing::warn!(issue_identifier = %issue.identifier, "drain: session resume unavailable; continuing with a fresh session");
+            deps.resume_session.clear();
+        } else {
+            let _ = sess.stop().await;
+            let _ = deps
+                .workspace
+                .after_run(&ws, &deps.repo_url, &deps.project_slug, &issue.identifier)
+                .await;
+            return (
+                issue.state.clone(),
+                WorkerDeclaration::default(),
+                Some(error.into()),
+            );
+        }
     }
     // Hand the non-secret ledger receiver to the loop-external supervisor, so an armed receipt
     // survives cancellation (design §10.3).
@@ -1359,6 +1385,7 @@ impl WorkerDeps {
         let broker = self.broker.clone();
         let mut turn: i64 = 1;
         let mut last_result = String::new();
+        let mut resume_fallback = self.resume_after_drain && !self.resume_session.is_empty();
         let mut issue = issue;
         let auth_reported = std::sync::atomic::AtomicBool::new(false);
         loop {
@@ -1497,6 +1524,14 @@ impl WorkerDeps {
                 guard.finalize_armed();
             }
             if let Some(e) = terr {
+                if turn == 1 && resume_fallback && e == agent::AgentError::ResumeUnavailable {
+                    resume_fallback = false;
+                    if let Err(error) = sess.reset_conversation() {
+                        return (issue.state.clone(), last_result, Some(error.into()));
+                    }
+                    tracing::warn!(issue_identifier = %issue.identifier, "drain: session resume unavailable; continuing with a fresh session");
+                    continue;
+                }
                 return (issue.state.clone(), last_result, Some(e.into()));
             }
             // Remember the freshest final result text; the HANDOFF: marker (if any) is on the last
@@ -1633,10 +1668,6 @@ impl WorkerDeps {
                 // issue no longer active → normal exit (winds down, no new turns)
                 return (issue.state.clone(), last_result, None);
             }
-            if turn >= self.max_turns {
-                // turn budget exhausted → normal exit
-                return (issue.state.clone(), last_result, None);
-            }
             // STUDIO-880: the drain's turn boundary. Checked AFTER the state refresh above, so a
             // ticket that left the active set during the final turn still classifies on its real
             // state rather than as a continuation. A normal exit (`None` error) is the whole point:
@@ -1644,6 +1675,23 @@ impl WorkerDeps {
             // restarted daemon picks it up — where an interrupt would have recorded `interrupted`
             // and gone through recovery.
             if self.drained_at_boundary(&issue.identifier, turn) {
+                let resumable = self.agent.capabilities().resume != agent::Resume::None;
+                if resumable {
+                    sess.retain_for_limit();
+                }
+                on_event(Event {
+                    event_type: crate::drain::EVENT_DRAIN_PARKED.into(),
+                    message: if resumable {
+                        sess.thread_id()
+                    } else {
+                        String::new()
+                    },
+                    ..Default::default()
+                });
+                return (issue.state.clone(), last_result, None);
+            }
+            if turn >= self.max_turns {
+                // turn budget exhausted → normal exit
                 return (issue.state.clone(), last_result, None);
             }
             turn += 1;
@@ -1904,6 +1952,7 @@ fi
             prepared_harness: None,
             engine: None,
             resume_session: String::new(),
+            resume_after_drain: false,
         }
     }
 
@@ -1921,6 +1970,318 @@ fi
         let mut ag = agentfake::Fake::new();
         ag.turns = turns;
         Arc::new(ag)
+    }
+
+    async fn park_drain_run(
+        store: Arc<dyn rhapsody_store::Store + Send + Sync>,
+        resume: agent::Resume,
+    ) -> (
+        crate::Orchestrator,
+        WorkerDeps,
+        Arc<agentfake::Fake>,
+        TempDir,
+    ) {
+        let mut fake = agentfake::Fake::new();
+        fake.thread_id_value = "session-before-drain".into();
+        fake.capabilities.resume = resume;
+        fake.turns = vec![succeeded_turn()];
+        let ag = Arc::new(fake);
+        let mut tracker = trackerfake::Fake::new();
+        tracker.candidates = vec![dispatched()];
+        tracker.by_id.insert("1".into(), dispatched());
+        let tr = Arc::new(tracker);
+        let (mut o, _) = crate::testsupport::orch_for_retry(tr.clone(), 10);
+        o.set_store(store);
+        o.eff.as_mut().unwrap().agent = ag.clone();
+        o.dispatch_issue(dispatched(), None, None, String::new());
+        let started_at = o.running["1"].started_at;
+        let (ws, root) = test_workspace(HookScripts::default());
+        // One turn also permits the non-resumable harness through the existing validator.
+        let mut d = make_deps(ws, ag.clone(), tr, "work {{ issue.identifier }}", 1);
+        d.drain = o.drain.clone();
+        d.drain
+            .arm(chrono::Utc::now(), crate::drain::DrainReason::Update);
+        let events = Mutex::new(Vec::new());
+        let (last_state, declaration, err) = run_agent_attempt(
+            &mut d,
+            dispatched(),
+            None,
+            None,
+            &|event| events.lock().unwrap().push(event),
+            None,
+        )
+        .await;
+        assert!(err.is_none(), "drain interrupted the turn: {err:?}");
+        for ev in events.into_inner().unwrap() {
+            o.on_agent_update(crate::agentupdate::AgentUpdate {
+                issue_id: "1".into(),
+                ev,
+            });
+        }
+        // Clearing the flag before exit processing must not erase the boundary's decision.
+        d.drain.disarm();
+        o.on_worker_exit(crate::retry::EvWorkerExit {
+            issue_id: "1".into(),
+            failed: false,
+            started_at,
+            err_msg: String::new(),
+            last_state,
+            declared_handoff: declaration.declared_handoff,
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            auth_needed: false,
+        });
+        assert!(o.claimed.contains("1"));
+        assert!(o.retry_attempts.contains_key("1"));
+        (o, d, ag, root)
+    }
+
+    #[tokio::test]
+    async fn drain_parked_run_resumes_its_session_after_drain_cleared() {
+        let store =
+            Arc::new(rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).unwrap());
+        let (mut o, mut d, ag, _root) = park_drain_run(store, agent::Resume::Flags).await;
+        assert_eq!(ag.retained_calls(), 1);
+        o.drain
+            .arm(chrono::Utc::now(), crate::drain::DrainReason::Update);
+        o.on_retry(crate::retry::EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        assert!(o.running.is_empty());
+        o.drain.disarm();
+        o.on_retry(crate::retry::EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        assert_eq!(o.running["1"].resume_session, "session-before-drain");
+        d.resume_session = o.running["1"].resume_session.clone();
+        d.resume_after_drain = o.running["1"].resume_after_drain;
+        d.stack_context = o.running["1"].stack_context.clone();
+        let (_, _, err) =
+            run_agent_attempt(&mut d, dispatched(), Some(1), None, &noop_event(), None).await;
+        assert!(err.is_none(), "resumed worker failed: {err:?}");
+        assert_eq!(ag.last_resume().as_deref(), Some("session-before-drain"));
+    }
+
+    #[tokio::test]
+    async fn drain_parked_session_survives_restart() {
+        let disk = TempDir::new();
+        let path = disk.child("history.db");
+        let store = Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::Disk(path.clone().into()))
+                .unwrap(),
+        );
+        let (o, d, _ag, _root) = park_drain_run(store.clone(), agent::Resume::Flags).await;
+        drop(o);
+        drop(store);
+        drop(d);
+        for capacity in [0, 10] {
+            let reopened = Arc::new(
+                rhapsody_store::Sqlite::open(rhapsody_store::StorePath::Disk(path.clone().into()))
+                    .unwrap(),
+            );
+            let mut tracker = trackerfake::Fake::new();
+            let mut candidate = dispatched();
+            candidate.linked_pr = true; // the parked author already opened its own PR
+            tracker.candidates = vec![candidate.clone()];
+            let (mut recovered, _) =
+                crate::testsupport::orch_for_retry(Arc::new(tracker), capacity);
+            recovered.set_store(reopened.clone());
+            recovered.boot_recovery();
+            assert!(
+                recovered.pr_suppressed(&candidate),
+                "control: a fresh pickup would be suppressed"
+            );
+            recovered
+                .on_retry(crate::retry::EvRetry {
+                    issue_id: "MT-1".into(),
+                })
+                .await;
+            if capacity == 0 {
+                assert!(recovered.running.is_empty());
+                assert!(recovered.retry_attempts["MT-1"].recovered);
+            } else {
+                assert_eq!(
+                    recovered.running["1"].resume_session,
+                    "session-before-drain"
+                );
+                assert!(
+                    recovered.running["1"]
+                        .stack_context
+                        .contains("continuation after a drain")
+                );
+                assert!(
+                    rhapsody_store::Store::load_recovery(reopened.as_ref())
+                        .unwrap()
+                        .retries
+                        .is_empty(),
+                    "consumed drain metadata must not survive as a stale retry"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_park_without_resume_capability_starts_fresh() {
+        let store =
+            Arc::new(rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).unwrap());
+        let (mut o, _d, ag, _root) = park_drain_run(store, agent::Resume::None).await;
+        assert_eq!(ag.retained_calls(), 0);
+        o.on_retry(crate::retry::EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        assert!(o.running["1"].resume_session.is_empty());
+    }
+
+    #[tokio::test]
+    async fn drain_continuation_prompt_says_it_is_a_continuation() {
+        let store =
+            Arc::new(rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).unwrap());
+        let (mut o, mut d, ag, _root) = park_drain_run(store, agent::Resume::None).await;
+        o.on_retry(crate::retry::EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        d.stack_context = o.running["1"].stack_context.clone();
+        let (_, _, err) =
+            run_agent_attempt(&mut d, dispatched(), Some(1), None, &noop_event(), None).await;
+        assert!(err.is_none(), "fresh continuation failed: {err:?}");
+        let prompt = ag.last_prompt();
+        for required in [
+            "continuation after a drain",
+            "git status",
+            "git log <base>..HEAD",
+            "~/.rhapsody/docs/MT-1-progress.md",
+            "Before writing anything new",
+        ] {
+            assert!(prompt.contains(required), "missing {required:?}: {prompt}");
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_drain_session_falls_back_to_fresh_once() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (logs, subscriber) = recording_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let script = root.child("missing-session.sh");
+        let calls = root.child("calls");
+        std::fs::write(&script, format!(r#"
+printf '%s\n' "$*" >> '{calls}'
+read -r prompt
+case "$prompt" in
+  *'continuation after a drain'*'git status'*'git log <base>..HEAD'*'MT-1-progress.md'*) ;;
+  *) exit 2 ;;
+esac
+case " $* " in
+  *' --resume missing-session '*)
+    printf '%s\n' 'No conversation found with session ID: missing-session' >&2
+    exit 1 ;;
+esac
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"fresh-session","apiKeySource":"none"}}'
+printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"continued","usage":{{"input_tokens":1,"output_tokens":1}}}}'
+"#)).unwrap();
+        let ag = Arc::new(agent::claude::Runner::new(agent::claude::Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path.clone(),
+            turn_timeout: Duration::from_secs(5),
+            ..Default::default()
+        }));
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let mut d = make_deps(ws, ag, tr, "continue safely", 1);
+        d.resume_session = "missing-session".into();
+        // Exercise the same dispatch decoration as a real parked continuation.
+        let store =
+            Arc::new(rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).unwrap());
+        let (mut o, _parked, _fake, _park_root) = park_drain_run(store, agent::Resume::Flags).await;
+        o.on_retry(crate::retry::EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+        d.stack_context = o.running["1"].stack_context.clone();
+        d.resume_after_drain = o.running["1"].resume_after_drain;
+        for _ in 0..2 {
+            // Warm tracing callsites, then repeat to observe the once-only warning.
+            tracing::callsite::rebuild_interest_cache();
+            logs.lock().unwrap().clear();
+            std::fs::write(&calls, "").unwrap();
+            let (_, _, err) =
+                run_agent_attempt(&mut d, dispatched(), Some(1), None, &noop_event(), None).await;
+            assert!(err.is_none(), "missing resume must fall back: {err:?}");
+            let calls = std::fs::read_to_string(&calls).unwrap();
+            let attempts = calls.lines().collect::<Vec<_>>();
+            assert_eq!(
+                attempts.len(),
+                2,
+                "one resume then one fresh start: {calls}"
+            );
+            assert!(attempts[0].contains("--resume missing-session"));
+            assert!(!attempts[1].contains("--resume"));
+        }
+        assert_eq!(
+            logs.lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.message.contains("session resume unavailable"))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn drain_resume_failure_after_session_started_is_not_replayed() {
+        let (ws, root) = test_workspace(HookScripts::default());
+        let calls = root.child("calls");
+        let script = root.child("failed-turn.sh");
+        std::fs::write(&script, format!(r#"
+printf '%s\n' "$*" >> '{calls}'
+read -r prompt
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"saved-session","apiKeySource":"none"}}'
+printf '%s\n' 'No conversation found with session ID: saved-session' >&2
+exit 1
+"#)).unwrap();
+        let ag = Arc::new(agent::claude::Runner::new(agent::claude::Config {
+            command: format!("bash {script}"),
+            workspace_root: root.path.clone(),
+            turn_timeout: Duration::from_secs(5),
+            ..Default::default()
+        }));
+        let mut d = make_deps(ws, ag, fake_tracker_by_id(&[("1", "MT-1", "Done")]), "p", 1);
+        d.resume_session = "saved-session".into();
+        d.resume_after_drain = true;
+        let (_, _, err) =
+            run_agent_attempt(&mut d, dispatched(), Some(1), None, &noop_event(), None).await;
+        assert!(
+            err.is_some(),
+            "an actual failed turn must retain normal error handling"
+        );
+        assert_eq!(std::fs::read_to_string(calls).unwrap().lines().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn drain_resume_refused_before_first_turn_starts_fresh() {
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut fake = agentfake::Fake::new();
+        fake.resume_err = Some(AgentError::ResumeUnavailable);
+        fake.turns = vec![succeeded_turn()];
+        let ag = Arc::new(fake);
+        let mut d = make_deps(
+            ws,
+            ag.clone(),
+            fake_tracker_by_id(&[("1", "MT-1", "Done")]),
+            "p",
+            1,
+        );
+        d.resume_session = "expired-session".into();
+        d.resume_after_drain = true;
+        let (_, _, err) =
+            run_agent_attempt(&mut d, dispatched(), Some(1), None, &noop_event(), None).await;
+        assert!(err.is_none(), "resume refusal must fall back: {err:?}");
+        assert_eq!(ag.fresh_resets(), 1);
+        assert!(d.resume_session.is_empty());
     }
 
     #[tokio::test]
@@ -3572,8 +3933,10 @@ fi
             .arm(chrono::Utc::now(), crate::drain::DrainReason::Operator);
         let turns = Arc::new(AtomicUsize::new(0));
         let turns2 = Arc::clone(&turns);
-        let count = move |_e: Event| {
-            turns2.fetch_add(1, Ordering::SeqCst);
+        let count = move |e: Event| {
+            if e.event_type == EVENT_NOTIFICATION {
+                turns2.fetch_add(1, Ordering::SeqCst);
+            }
         };
         let (_l, _h, err) = run_agent_attempt(&mut d, dispatched(), None, None, &count, None).await;
         assert!(err.is_none(), "expected a normal exit, got {err:?}");

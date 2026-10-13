@@ -550,6 +550,10 @@ impl Session for BrokeredSession {
         self.inner.resume_from(thread_id)
     }
 
+    fn reset_conversation(&self) -> Result<(), AgentError> {
+        self.inner.reset_conversation()
+    }
+
     fn retain_for_limit(&self) {
         self.inner.retain_for_limit();
     }

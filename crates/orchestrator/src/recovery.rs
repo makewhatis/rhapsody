@@ -144,13 +144,27 @@ impl Orchestrator {
     /// `issue_id == ""`, `recovered == true`; the opaque ID is unknown at boot), (re)marks the claim,
     /// and arms the live timer at `max(0, due_at_ms - now)` so a row that came due while the daemon was
     /// down fires immediately. Mirrors Go `reArmRetry`.
-    pub(crate) fn re_arm_retry(&mut self, rr: store::RetryRow) {
+    pub(crate) fn re_arm_retry(&mut self, mut rr: store::RetryRow) {
         let key = if rr.identifier.is_empty() {
             rr.issue_id.clone()
         } else {
             rr.identifier.clone()
         };
         self.claimed.insert(key.clone());
+        let parked_issue = if let Some((record, reason)) = crate::drain::restore_retry(&rr.error) {
+            rr.error = reason;
+            let issue = record.issue.clone();
+            if let Some(engine) = &record.engine {
+                self.limit_policy
+                    .pinned_engines
+                    .insert(issue.id.clone(), engine.clone());
+            }
+            self.drain_continuations.insert(key.clone(), record);
+            self.completed.insert(key.clone());
+            issue
+        } else {
+            Issue::default()
+        };
         let due_at = DateTime::from_timestamp_millis(rr.due_at_ms).unwrap_or_else(zero_time);
         // `due_at_ms` is an unbounded store column: saturate rather than let a corrupt row overflow the
         // subtraction (a debug-build panic on the control task, or a release wrap to a huge POSITIVE
@@ -167,7 +181,7 @@ impl Orchestrator {
                 err: rr.error,
                 project_slug: rr.project_slug,
                 project_repo: String::new(), // not persisted in retry_queue; re-derived on dispatch
-                issue: Issue::default(),
+                issue: parked_issue,
                 identity: String::new(), // not persisted; see `RetryEntry::identity` for the gap
                 recovered: true,
             },
@@ -212,7 +226,7 @@ impl Orchestrator {
                 err: reason.to_string(),
                 project_slug: prev.project_slug.clone(),
                 project_repo: prev.project_repo.clone(),
-                issue: Issue::default(),
+                issue: prev.issue.clone(),
                 identity: String::new(), // not persisted; see `RetryEntry::identity` for the gap
                 recovered: true,
             },
