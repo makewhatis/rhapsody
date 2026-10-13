@@ -16,7 +16,7 @@
 //!   * `o.eff` is `Option<Effective>`; the passes guard `None` (returning no picks — there is
 //!     nothing to schedule without a loaded config) instead of Go's nil-deref-relies-on-invariant.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rhapsody_core::{Issue, normalize_state};
 
@@ -66,7 +66,17 @@ impl Orchestrator {
     /// state seam (`crates/orchestrator/CLAUDE.md`). Always empty with Teams off.
     pub fn select_dispatch_with_reopens(
         &self,
+        issues: Vec<Issue>,
+    ) -> (Vec<Issue>, Vec<Issue>, HashMap<String, i64>) {
+        self.select_dispatch_with_reopens_excluding(issues, &HashSet::new())
+    }
+
+    /// Tick-local retry ownership excludes admission, not board observations: selection must
+    /// still observe human labels on these candidates after the usual ledger clear/prime.
+    pub(crate) fn select_dispatch_with_reopens_excluding(
+        &self,
         mut issues: Vec<Issue>,
+        excluded: &HashSet<String>,
     ) -> (Vec<Issue>, Vec<Issue>, HashMap<String, i64>) {
         // The human-hold set is a per-PASS fact (STUDIO-949): clear it here so a ticket no longer
         // held stops being reported, while the ledger's announced set keeps the log once-per-ticket.
@@ -171,7 +181,7 @@ impl Orchestrator {
                 self.log_capacity_hold(&held, eff.max_concurrent);
                 break;
             }
-            if recovered_claims.contains(&iss.identifier) {
+            if excluded.contains(&iss.identifier) || recovered_claims.contains(&iss.identifier) {
                 continue;
             }
             let st = normalize_state(&iss.state);
@@ -523,8 +533,19 @@ impl Orchestrator {
     /// construction.
     pub fn select_dispatch_multi_after_fetch(
         &self,
+        tagged: Vec<TaggedIssue>,
+        read_the_board: bool,
+    ) -> (Vec<TaggedIssue>, Vec<TaggedIssue>, HashMap<String, i64>) {
+        self.select_dispatch_multi_after_fetch_excluding(tagged, read_the_board, &HashSet::new())
+    }
+
+    /// Multi-project counterpart of [`Self::select_dispatch_with_reopens_excluding`]. The full
+    /// board and fetch verdict retain the existing human-hold observation/priming rules.
+    pub(crate) fn select_dispatch_multi_after_fetch_excluding(
+        &self,
         mut tagged: Vec<TaggedIssue>,
         read_the_board: bool,
+        excluded: &HashSet<String>,
     ) -> (Vec<TaggedIssue>, Vec<TaggedIssue>, HashMap<String, i64>) {
         let Some(eff) = self.eff.as_ref() else {
             return (Vec::new(), Vec::new(), HashMap::new());
@@ -623,7 +644,9 @@ impl Orchestrator {
             let Some(p) = ti.proj.and_then(|i| eff.projects.get(i)) else {
                 continue;
             };
-            if recovered_claims.contains(&ti.iss.identifier) {
+            if excluded.contains(&ti.iss.identifier)
+                || recovered_claims.contains(&ti.iss.identifier)
+            {
                 continue;
             }
             let st = normalize_state(&ti.iss.state);

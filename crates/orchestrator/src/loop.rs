@@ -1286,7 +1286,7 @@ impl Orchestrator {
         self.set_held_for_capacity(HashMap::new());
         let has_projects = self.eff.as_ref().is_some_and(|e| !e.projects.is_empty());
         if has_projects {
-            let (mut tagged, read_the_board) = self.poll_all_projects().await;
+            let (tagged, read_the_board) = self.poll_all_projects().await;
             let queued: Vec<_> = tagged
                 .iter()
                 .map(|t| {
@@ -1350,17 +1350,22 @@ impl Orchestrator {
             }
             // Retry admission can reject a newer ticket and release its claim. Do not let this
             // tick's older board copy override that verdict through fresh or wake admission.
-            tagged.retain(|t| !retry_identifiers.contains(&t.iss.identifier));
             // STUDIO-1017 (§7.9): admit any pending manager wake obligation BEFORE ordinary
             // selection, so the author is dispatched once, with its seed, and selection never sees
             // the ticket as a fresh dispatch.
             let wake_candidates: Vec<crate::managerwake::WakeCandidate<'_>> = tagged
                 .iter()
+                .filter(|t| !retry_identifiers.contains(&t.iss.identifier))
                 .map(|t| (&t.iss, self.route_for(t.proj)))
                 .collect();
             self.pump_manager_wakes(&wake_candidates);
-            let (picked, reopen, held_for_capacity) =
-                self.select_dispatch_multi_after_fetch(tagged, read_the_board);
+            // Selection observes the full board's human labels; the exclusion gates admission only.
+            let (picked, reopen, held_for_capacity) = self
+                .select_dispatch_multi_after_fetch_excluding(
+                    tagged,
+                    read_the_board,
+                    &retry_identifiers,
+                );
             // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
             // the reset at the top of the tick exactly as the single-project path below does — and
             // PUBLISHED through the same setter, because this is the only ladder a `projects:`
@@ -1472,13 +1477,16 @@ impl Orchestrator {
             self.cancel_dropped_preparations(&present);
         }
         // The same tick-local exclusion covers recovered identifier-keyed retries on both ladders.
-        issues.retain(|iss| !retry_identifiers.contains(&iss.identifier));
         // STUDIO-1017 (§7.9): the legacy ladder's half of the wake admission — see the multi-project
         // ladder above for why it runs before selection.
-        let wake_candidates: Vec<crate::managerwake::WakeCandidate<'_>> =
-            issues.iter().map(|iss| (iss, None)).collect();
+        let wake_candidates: Vec<crate::managerwake::WakeCandidate<'_>> = issues
+            .iter()
+            .filter(|iss| !retry_identifiers.contains(&iss.identifier))
+            .map(|iss| (iss, None))
+            .collect();
         self.pump_manager_wakes(&wake_candidates);
-        let (active, reopen, held_for_capacity) = self.select_dispatch_with_reopens(issues);
+        let (active, reopen, held_for_capacity) =
+            self.select_dispatch_with_reopens_excluding(issues, &retry_identifiers);
         // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale
         // over the reset at the top of the tick, so a teammate who has since freed up cannot linger
         // in it.

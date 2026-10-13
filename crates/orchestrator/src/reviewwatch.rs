@@ -8089,6 +8089,103 @@ mod tests {
         );
     }
 
+    // B5: a saturated retry makes no admission read, but its board label must still reach
+    // the watcher. MUTATION: filter retries before selection observes their human labels.
+    #[tokio::test]
+    async fn saturated_retry_human_hold_still_blocks_auto_merge() {
+        use crate::testsupport::{issue, retry_entry, running_entry, utc};
+
+        for ladder in ["legacy", "projects"] {
+            for recovered in [false, true] {
+                for primed in [false, true] {
+                    let base = utc(2026, 10, 13, 15, 0, 0);
+                    let busy = issue("busy", "STUDIO-722", "In Progress");
+                    let reads = std::sync::atomic::AtomicUsize::new(0);
+                    let mut f = Fake::new();
+                    f.by_id.insert("busy".into(), busy.clone());
+                    f.candidates_func = Some(Box::new(move || {
+                        let read = reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if read == 2 {
+                            return Err(rhapsody_tracker::TrackerError::Other(
+                                "poll failed".into(),
+                            ));
+                        }
+                        let mut old = issue("old", "STUDIO-721", "Todo");
+                        if read < 2 {
+                            old.labels = Some(vec!["rhapsody:human".into()]);
+                        }
+                        Ok(vec![old])
+                    }));
+                    let tr = Arc::new(f);
+                    let (mut o, dispatched) =
+                        orch_before_first_pass(ticketless_automerge(&["alice", "bob"]));
+                    introduce(&o, approved_row(64, "bob", HEAD_A));
+                    o.now = Box::new(move || base);
+                    let eff = o.eff.as_mut().unwrap();
+                    eff.tracker = tr.clone();
+                    eff.max_concurrent = 1;
+                    eff.projects[0].tracker = tr.clone();
+                    eff.projects[0].active_states = set_of(&["todo", "in progress"]);
+                    if primed {
+                        o.human_holds.begin_pass(true);
+                        o.human_holds.note_human_label("STUDIO-721");
+                    }
+                    o.running
+                        .insert("busy".into(), running_entry(busy, "rhapsody", "rhapsody"));
+                    let key = if recovered { "STUDIO-721" } else { "old" };
+                    let mut re = retry_entry(if recovered { "" } else { "old" }, "STUDIO-721", 3);
+                    if ladder == "projects" {
+                        re.project_slug = "rhapsody".into();
+                    }
+                    re.recovered = recovered;
+                    re.issue = issue("old", "STUDIO-721", "Todo");
+                    re.err = "no available orchestrator slots".into();
+                    re.due_at = base;
+                    re.due_at_ms = base.timestamp_millis();
+                    o.retry_attempts.insert(key.into(), re);
+                    o.claimed.insert(key.into());
+                    assert!(
+                        o.handle_review_sweep(&[open_at(64, HEAD_A)])
+                            .merge
+                            .is_empty()
+                    );
+
+                    for tick in 1..=4 {
+                        // Legacy effectives are test-injected; the watcher requires the resolved
+                        // repo binding. Restore it after exercising the legacy tick, not its ledger.
+                        let projects = if ladder == "legacy" {
+                            std::mem::take(&mut o.eff.as_mut().unwrap().projects)
+                        } else {
+                            Vec::new()
+                        };
+                        o.on_tick().await;
+                        if ladder == "legacy" {
+                            o.eff.as_mut().unwrap().projects = projects;
+                        }
+                        assert_eq!(tr.candidate_calls(), tick, "ordinary polls only");
+                        assert!(o.retry_attempts.contains_key(key), "retry stays parked");
+                        assert!(dispatched.lock().unwrap().is_empty());
+                        let report = o.handle_review_sweep(&[open_at(64, HEAD_A)]);
+                        if tick < 4 {
+                            assert!(
+                                report.merge.is_empty(),
+                                "{ladder}, recovered={recovered}, primed={primed}, tick={tick}: \
+                                 a saturated or failed poll must preserve the hold: {:?}",
+                                report.merge
+                            );
+                        } else {
+                            assert_eq!(
+                                report.merge.len(),
+                                1,
+                                "a complete unheld poll clears the hold"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn one_sweep_does_not_propose_two_merges_for_one_landing_project() {
         let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
