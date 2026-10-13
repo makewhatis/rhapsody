@@ -2638,6 +2638,52 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn retry_refused_outside_held_even_with_a_stale_held_from() {
+        let rig = Rig::new("Done");
+        rig.tick(30).await;
+        assert_eq!(rig.row().phase, LandingPhase::Held);
+        assert_eq!(
+            rig.runtime.action(rig.id, LandingAction::Retry, 100).await,
+            LandingActionOutcome::Applied
+        );
+        assert_eq!(rig.row().phase, LandingPhase::WaitingForDeploy);
+        assert_eq!(rig.row().deploy_deadline_s, 130);
+        assert_eq!(
+            rig.progress().held_from.as_deref(),
+            Some("WaitingForDeploy")
+        );
+
+        let waiting = rig.row();
+        assert_eq!(
+            rig.runtime.action(rig.id, LandingAction::Retry, 101).await,
+            LandingActionOutcome::Refused("retry requires Held".into())
+        );
+        assert_eq!(
+            rig.row(),
+            waiting,
+            "refusal must not restart the deploy deadline"
+        );
+
+        rig.tick(102).await;
+        assert_eq!(rig.row().phase, LandingPhase::Watching);
+        assert_eq!(rig.row().watch_until_s, Some(112));
+        assert_eq!(
+            rig.progress().held_from.as_deref(),
+            Some("WaitingForDeploy")
+        );
+        let watching = rig.row();
+        assert_eq!(
+            rig.runtime.action(rig.id, LandingAction::Retry, 103).await,
+            LandingActionOutcome::Refused("retry requires Held".into())
+        );
+        assert_eq!(
+            rig.row(),
+            watching,
+            "refusal must not change the watch deadline or phase"
+        );
+    }
+
+    #[tokio::test]
     async fn retry_refused_when_project_lock_taken_or_contract_problem() {
         let rig = Rig::new("Done");
         rig.tick(30).await;
