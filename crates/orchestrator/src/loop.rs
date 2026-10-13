@@ -2200,6 +2200,10 @@ impl Orchestrator {
         let issue_id = iss.id.clone();
         let issue_id_ev = iss.id.clone();
         let issue_id_tr = iss.id.clone();
+        let worker_emit_time = self
+            .running
+            .get(&iss.id)
+            .map(|re| re.worker_emit_time.clone());
         let attempt32 = attempt.map(|a| a as i32);
         let guard = self.wg.add();
         tokio::spawn(async move {
@@ -2229,6 +2233,13 @@ impl Orchestrator {
                     if e.event_type == agent::EVENT_LIMIT_OBSERVED {
                         return;
                     }
+                }
+                // Delivery acknowledgements carry no agent work. Account/limit-only updates
+                // returned above also retain their existing non-liveness semantics.
+                if e.event_type != agent::EVENT_OPERATOR_MESSAGE
+                    && let Some(time) = &worker_emit_time
+                {
+                    time.record(Utc::now());
                 }
                 let _ = events_ev.send(Event::AgentUpdate(AgentUpdate {
                     issue_id: issue_id_ev.clone(),
