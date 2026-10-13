@@ -208,6 +208,9 @@ the `Orchestrator` struct itself. Concretely:
     off-loop ControlWatchSink reports attempt completion through `Event::LandingMergeFinished`;
     successful/ambiguous attempts remain reserved until a fresh watcher observation admits the row
     or confirms no merge. Boot reconciliation refuses merges past unobserved watched siblings.
+    A `merge_pending` marker in `rhapsody_landing` persists admission before GitHub is invoked;
+    deterministic ticks skip it until confirmed merge admission clears that flag. Cancellation is
+    restricted to pre-merge markers, so a delayed refusal cannot delete a confirmed landing.
 
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from

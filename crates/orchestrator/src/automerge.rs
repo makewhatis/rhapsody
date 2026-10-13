@@ -100,6 +100,13 @@ impl crate::orchestrator::Orchestrator {
                 *confirming = state;
             }
         } else {
+            if let Err(err) = self.cancel_landing_merge(pr) {
+                tracing::warn!(pr = %pr, %err, "landing reservation could not be cancelled; retained for retry");
+                if let Some(state) = self.landing_merges.get_mut(pr) {
+                    *state = LandingMergeState::AwaitingObservation;
+                }
+                return;
+            }
             self.landing_merges.remove(pr);
         }
     }

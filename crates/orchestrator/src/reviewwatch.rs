@@ -1468,6 +1468,10 @@ impl Orchestrator {
                 // GitHub cannot resolve it any more: deleted, transferred, or never there. Nothing
                 // is left to observe, so it leaves the watch set for good.
                 PrLookup::Gone => {
+                    if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                        tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed");
+                        continue;
+                    }
                     self.landing_merges.remove(&obs.pr);
                     report.retired += self.retire_review_pr(&obs.pr, "gone");
                 }
@@ -1475,6 +1479,10 @@ impl Orchestrator {
                 // check out and execute a stranger's code (§14.1 F-SEC), so it can never be
                 // dispatched — and re-asking every tick forever is not a plan.
                 PrLookup::Untrusted => {
+                    if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                        tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed");
+                        continue;
+                    }
                     self.landing_merges.remove(&obs.pr);
                     report.retired += self.retire_review_pr(&obs.pr, "untrusted head repository")
                 }
@@ -1489,6 +1497,10 @@ impl Orchestrator {
                     let why = if snap.status == PrStatus::Merged {
                         match self.admit_landing(&rows, &obs.pr, swept_now.timestamp()) {
                             Ok(crate::landing::Admission::Disabled) => {
+                                if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                                    tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed; merge stays watched");
+                                    continue;
+                                }
                                 report.done.extend(self.plan_review_done(&rows, &obs.pr));
                             }
                             Ok(crate::landing::Admission::Admitted) => {}
@@ -1499,6 +1511,10 @@ impl Orchestrator {
                         }
                         "merged"
                     } else {
+                        if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                            tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed");
+                            continue;
+                        }
                         "closed"
                     };
                     // STUDIO-1018 (§9/§11.1): a proposal's PR leaving the watch set is the
@@ -1515,9 +1531,14 @@ impl Orchestrator {
                     report.retired += self.retire_review_pr(&obs.pr, why);
                 }
                 PrLookup::Found(snap) => {
-                    if self.landing_merges.get(&obs.pr)
-                        == Some(&crate::automerge::LandingMergeState::AwaitingObservation)
+                    if !self.landing_merges.contains_key(&obs.pr)
+                        || self.landing_merges.get(&obs.pr)
+                            == Some(&crate::automerge::LandingMergeState::AwaitingObservation)
                     {
+                        if let Err(err) = self.cancel_landing_merge(&obs.pr) {
+                            tracing::warn!(pr = %obs.pr, %err, "landing reservation cancellation failed; retained for retry");
+                            continue;
+                        }
                         self.landing_merges.remove(&obs.pr);
                     }
                     // The observed-head memo for this coordinate was already updated above the store
@@ -4122,6 +4143,11 @@ impl Orchestrator {
         match crate::automerge::auto_merge_verdict_with_proof(mine, head, proven) {
             Ok(approved_by) => {
                 if !self.landing_merge_groups(pr).is_empty() {
+                    if let Err(err) = self.reserve_landing_merge(mine, pr, (self.now)().timestamp())
+                    {
+                        tracing::warn!(pr = %pr, %err, "auto-merge: could not persist landing admission; not merging");
+                        return;
+                    }
                     self.landing_merges
                         .insert(pr.clone(), crate::automerge::LandingMergeState::InFlight);
                 }

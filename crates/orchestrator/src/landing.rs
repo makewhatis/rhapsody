@@ -33,6 +33,7 @@ struct Progress {
     started: bool,
     queued: bool,
     state_moved: bool,
+    merge_pending: bool,
     fetched: bool,
     next_live_s: i64,
     samples: Vec<Sample>,
@@ -65,6 +66,105 @@ impl Drop for LandingTask {
 }
 
 impl Orchestrator {
+    pub(crate) fn reserve_landing_merge(
+        &self,
+        rows: &[&rhapsody_store::ReviewWatchRow],
+        pr: &PrCoord,
+        now: i64,
+    ) -> Result<(), String> {
+        let Some(eff) = &self.eff else {
+            return Ok(());
+        };
+        let Some(project) = eff.projects.iter().find(|p| {
+            self.landing_config(&p.slug).is_some()
+                && crate::ghsummons::parse_repo(&p.repo).is_some_and(|(o, r)| {
+                    o.eq_ignore_ascii_case(&pr.owner) && r.eq_ignore_ascii_case(&pr.repo)
+                })
+        }) else {
+            return Ok(());
+        };
+        let ticket = rows
+            .iter()
+            .find_map(|r| rhapsody_store::origin_ticket(&r.introduced_by))
+            .unwrap_or("");
+        let run = if ticket.is_empty() {
+            None
+        } else {
+            self.store()
+                .list_issue_runs(RunFilter {
+                    issue: ticket.into(),
+                    limit: 1,
+                    ..Default::default()
+                })
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .next()
+        };
+        let slug = run
+            .as_ref()
+            .map(|r| r.project_slug.clone())
+            .filter(|s| {
+                self.landing_config(s).is_some()
+                    && eff
+                        .project_by_slug(s)
+                        .is_some_and(|p| p.group == project.group)
+            })
+            .unwrap_or_else(|| project.slug.clone());
+        let group = eff
+            .cfg
+            .projects
+            .iter()
+            .find(|p| p.slugs.contains(&slug))
+            .and_then(|p| p.slugs.first())
+            .cloned()
+            .unwrap_or_else(|| slug.clone());
+        let progress = Progress {
+            project_group: group,
+            merge_pending: true,
+            ..Default::default()
+        };
+        let id = self
+            .store()
+            .save_landing(LandingRow {
+                project_slug: slug,
+                owner: pr.owner.clone(),
+                repo: pr.repo.clone(),
+                pr: pr.number,
+                ticket: ticket.into(),
+                results_json: serde_json::to_string(&progress).map_err(|e| e.to_string())?,
+                updated_at_s: now,
+                ..Default::default()
+            })
+            .map_err(|e| e.to_string())?;
+        if id == 0 {
+            return Err("landing requires enabled persistence".into());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn cancel_landing_merge(&self, pr: &PrCoord) -> Result<(), String> {
+        if self.landing_merge_groups(pr).is_empty() && !self.landing_merges.contains_key(pr) {
+            return Ok(());
+        }
+        for row in self
+            .store()
+            .load_open_landings()
+            .map_err(|e| e.to_string())?
+        {
+            if row.owner.eq_ignore_ascii_case(&pr.owner)
+                && row.repo.eq_ignore_ascii_case(&pr.repo)
+                && row.pr == pr.number
+                && serde_json::from_str::<Progress>(&row.results_json)
+                    .is_ok_and(|p| p.merge_pending)
+            {
+                self.store()
+                    .delete_landing_reservation(row.id)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
     fn landing_config(&self, slug: &str) -> Option<LandingConfig> {
         self.eff
             .as_ref()?
@@ -133,16 +233,24 @@ impl Orchestrator {
             .and_then(|p| p.slugs.first())
             .cloned()
             .unwrap_or_else(|| run.project_slug.clone());
-        let queued = self
+        let open = self
             .store()
             .load_open_landings()
-            .map_err(|e| e.to_string())?
-            .iter()
-            .any(|r| {
-                serde_json::from_str::<Progress>(&r.results_json)
-                    .map(|p| landing_group(r, &p) == project_group)
-                    .unwrap_or(true)
-            });
+            .map_err(|e| e.to_string())?;
+        let reservation = open.iter().find(|r| {
+            r.owner.eq_ignore_ascii_case(&pr.owner)
+                && r.repo.eq_ignore_ascii_case(&pr.repo)
+                && r.pr == pr.number
+                && serde_json::from_str::<Progress>(&r.results_json).is_ok_and(|p| p.merge_pending)
+        });
+        let queued = open.iter().any(|r| {
+            if reservation.is_some_and(|pending| r.id >= pending.id) {
+                return false;
+            }
+            serde_json::from_str::<Progress>(&r.results_json)
+                .map(|p| landing_group(r, &p) == project_group)
+                .unwrap_or(true)
+        });
         let progress = Progress {
             project_group,
             issue_id: run.issue_id,
@@ -153,6 +261,7 @@ impl Orchestrator {
         let id = self
             .store()
             .save_landing(LandingRow {
+                id: reservation.map(|r| r.id).unwrap_or(0),
                 project_slug: run.project_slug,
                 owner: pr.owner.clone(),
                 repo: pr.repo.clone(),
@@ -437,6 +546,11 @@ impl LandingRuntime {
         }
         let mut progress: Progress = serde_json::from_str(&row.results_json)
             .map_err(|e| format!("invalid landing progress: {e}"))?;
+        // A persisted admission marker precedes GitHub's merge. It owns the lock, but cannot
+        // move a ticket or observe a deploy until the watcher has confirmed the merge.
+        if progress.merge_pending {
+            return Ok(());
+        }
         if progress.pending.is_some() {
             return self.finish(&mut row, &mut progress, now).await;
         }
@@ -548,17 +662,12 @@ impl LandingRuntime {
             .checks
             .values()
             .any(|s| s.failures >= self.config.failure_threshold);
-        let watch_ended = row.watch_until_s.is_some_and(|end| now >= end);
-        // The window is absolute: a tolerated final flap stays in evidence but cannot schedule
-        // another sample beyond it. Only reaching the persisted threshold fails the landing.
         for check in &contract.checks {
             let state = progress.checks.entry(check.name.clone()).or_default();
             if state.failures >= self.config.failure_threshold {
                 continue;
             }
-            if state.ran
-                && (watch_ended || check.every.is_none() && state.pass || now < state.next_s)
-            {
+            if state.ran && (check.every.is_none() && state.pass || now < state.next_s) {
                 continue;
             }
             let outcome = self.checks.check(&row, check).await;
@@ -581,11 +690,13 @@ impl LandingRuntime {
         }
         if failed {
             progress.pending = Some("Reopened".into());
-        } else if watch_ended
-            && contract
-                .checks
-                .iter()
-                .all(|c| progress.checks.get(&c.name).is_some_and(|s| s.ran))
+        } else if row.watch_until_s.is_some_and(|end| now >= end)
+            && contract.checks.iter().all(|c| {
+                progress
+                    .checks
+                    .get(&c.name)
+                    .is_some_and(|s| s.ran && s.pass)
+            })
         {
             progress.pending = Some("Done".into());
         }
@@ -914,30 +1025,52 @@ mod tests {
         assert!(rig.progress().samples.iter().any(|s| !s.pass));
     }
     #[tokio::test]
-    async fn under_threshold_failure_at_deadline_does_not_extend_watch_window() {
-        for final_tick in [10, 30] {
+    async fn under_threshold_failure_at_deadline_resolves_on_the_next_sample() {
+        for recovers in [true, false] {
             let mut rig = Rig::new("Done");
+            let mut fake = Fake::new();
+            fake.candidates = vec![rhapsody_core::Issue {
+                id: "ID-1".into(),
+                identifier: "APP-1".into(),
+                ..Default::default()
+            }];
+            rig.tracker = Arc::new(fake);
+            rig.runtime.tracker = rig.tracker.clone();
             let mut contract = rig.checks.contract.clone().unwrap().unwrap();
             contract.checks[0].every = Some(Duration::from_secs(30));
             let checks = Arc::new(Checks {
                 contract: Ok(Some(contract)),
                 live: Mutex::new(VecDeque::from([("merge".into(), true)])),
-                checks: Mutex::new(VecDeque::from([false, false])),
+                checks: Mutex::new(VecDeque::from([false, recovers])),
                 calls: Mutex::new(Vec::new()),
             });
             rig.checks = checks.clone();
             rig.runtime.checks = checks;
             rig.tick(0).await;
             assert_eq!(rig.row().phase, LandingPhase::Watching);
-            rig.tick(final_tick).await;
-            assert_eq!(rig.row().phase, LandingPhase::Done);
+            rig.tick(10).await;
+            rig.tick(29).await;
+            assert_eq!(rig.row().phase, LandingPhase::Watching);
+            assert_eq!(
+                rig.progress()
+                    .samples
+                    .iter()
+                    .filter(|s| s.name == "health")
+                    .count(),
+                1
+            );
+            rig.tick(30).await;
+            assert_eq!(
+                rig.row().phase,
+                if recovers {
+                    LandingPhase::Done
+                } else {
+                    LandingPhase::Reopened
+                }
+            );
             assert_eq!(rig.row().watch_until_s, Some(10));
             let samples = rig.progress().samples;
-            assert_eq!(samples.iter().filter(|s| s.name == "health").count(), 1);
-            assert!(
-                !samples.last().unwrap().pass,
-                "tolerated failure stays in evidence"
-            );
+            assert_eq!(samples.iter().filter(|s| s.name == "health").count(), 2);
         }
     }
     #[tokio::test]
@@ -1182,6 +1315,69 @@ mod tests {
                 .pr,
             1
         );
+    }
+
+    #[tokio::test]
+    async fn merge_to_admission_window_blocks_a_second_auto_merge() {
+        let dir = TempDir::new();
+        let store =
+            Arc::new(Sqlite::open(StorePath::Disk(dir.child("landing.db").into())).unwrap());
+        let (mut o, _) = orch(true);
+        o.set_store(store.clone());
+        o.teams.as_mut().unwrap().review.auto_merge = true;
+        o.human_holds.begin_pass(true);
+        let mut observations = Vec::new();
+        for pr in [1, 2] {
+            let mut watch = watch_row();
+            watch.key.number = pr;
+            watch.status = rhapsody_store::REVIEW_STATUS_APPROVED.into();
+            watch.last_reviewed_sha = "head".into();
+            o.store().save_review_watch(watch).unwrap();
+            let mut obs = merged_observation();
+            obs.pr.number = pr;
+            if let PrLookup::Found(snap) = &mut obs.lookup {
+                snap.status = PrStatus::Open;
+                snap.head_sha = "head".into();
+            }
+            observations.push(obs);
+        }
+        let plans = o.handle_review_sweep(&observations).merge;
+        assert_eq!(plans.len(), 1);
+        // Before invoking GitHub, admission must already survive loss of the control process.
+        let reopened =
+            Arc::new(Sqlite::open(StorePath::Disk(dir.child("landing.db").into())).unwrap());
+        let marker = reopened
+            .open_landing_for_project("app")
+            .unwrap()
+            .expect("durable merge-time lock");
+        let rig = Rig::new("Done");
+        let runtime = LandingRuntime {
+            store: reopened.clone(),
+            ..rig.runtime
+        };
+        runtime.advance(marker.clone(), i64::MAX).await.unwrap();
+        assert_eq!(
+            reopened
+                .get_landing(marker.id)
+                .unwrap()
+                .unwrap()
+                .watch_until_s,
+            None
+        );
+        assert!(rig.tracker.move_calls().is_empty());
+        assert!(rig.tracker.create_comment_calls().is_empty());
+        assert!(rig.checks.calls.lock().unwrap().is_empty());
+        let (mut restarted, _) = orch(true);
+        restarted.set_store(reopened);
+        restarted.teams.as_mut().unwrap().review.auto_merge = true;
+        restarted.human_holds.begin_pass(true);
+        assert!(
+            restarted
+                .handle_review_sweep(&[observations[1].clone()])
+                .merge
+                .is_empty()
+        );
+        assert_eq!(restarted.store().load_open_landings().unwrap().len(), 1);
     }
 
     struct RepoRig {
@@ -1731,7 +1927,14 @@ mod tests {
             1,
             "real merge admission serializes the project"
         );
-        assert!(o.store().load_open_landings().unwrap().is_empty());
+        assert_eq!(o.store().load_open_landings().unwrap().len(), 1);
+        assert!(
+            serde_json::from_str::<Progress>(
+                &o.store().load_open_landings().unwrap()[0].results_json
+            )
+            .unwrap()
+            .merge_pending
+        );
         sink.merge(report.merge[0].clone()).await;
         o.drive_event(events.recv().await.unwrap()).await;
         assert_eq!(*gh.calls.lock().unwrap(), vec![1]);

@@ -1510,6 +1510,14 @@ impl Store for Sqlite {
         )?;
         Ok(row.id)
     }
+    fn delete_landing_reservation(&self, id: i64) -> Result<(), StoreError> {
+        self.lock().execute(
+            "DELETE FROM rhapsody_landing WHERE id=?1 AND phase='WaitingForDeploy'
+            AND merge_sha='' AND json_extract(results_json, '$.merge_pending')=1",
+            [id],
+        )?;
+        Ok(())
+    }
     fn load_open_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(&format!(
@@ -5256,6 +5264,31 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn cancelling_landing_reservation_never_deletes_a_confirmed_landing() {
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        for (pr, pending, sha, phase, cancelled) in [
+            (1, true, "", LandingPhase::WaitingForDeploy, true),
+            (2, false, "", LandingPhase::WaitingForDeploy, false),
+            (3, true, "merge", LandingPhase::WaitingForDeploy, false),
+            (4, true, "", LandingPhase::Watching, false),
+        ] {
+            let id = store
+                .save_landing(LandingRow {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    pr,
+                    merge_sha: sha.into(),
+                    phase,
+                    results_json: format!("{{\"merge_pending\":{pending}}}"),
+                    ..Default::default()
+                })
+                .unwrap();
+            store.delete_landing_reservation(id).unwrap();
+            assert_eq!(store.get_landing(id).unwrap().is_none(), cancelled);
+        }
+    }
+
     #[test]
     fn dispute_adjudication_enqueue_failure_is_atomic_and_retryable() {
         for mode in [None, Some(MANAGER_MODE_ACT)] {

@@ -129,6 +129,10 @@ pub trait Store {
     fn save_landing(&self, _row: LandingRow) -> Result<i64, StoreError> {
         Ok(0)
     }
+    /// Cancel only a pre-merge admission marker; confirmed landing rows are never deleted.
+    fn delete_landing_reservation(&self, _id: i64) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn load_open_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
         Ok(Vec::new())
     }

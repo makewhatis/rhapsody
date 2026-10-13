@@ -15,6 +15,9 @@ impl Store for Noop {
     fn save_landing(&self, _row: LandingRow) -> Result<i64, StoreError> {
         Ok(0)
     }
+    fn delete_landing_reservation(&self, _id: i64) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn load_open_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
         Ok(Vec::new())
     }
