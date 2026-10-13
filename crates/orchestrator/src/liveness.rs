@@ -8,13 +8,42 @@
 //! `sampler_stub.go` is the `!linux` no-op. This Rust port keeps ONE always-compiled `/proc` reader
 //! ([`group_cpu`] / [`parse_stat`]): on a host without a readable `/proc` (macOS — the CI/target
 //! platform — has none) it returns `None`, byte-for-byte the same observable behavior as Go's
-//! `!linux` `stubSampler` (`GroupCPU → (0, false)`). STUDIO-1177 bounds that fallback to one stall
-//! window, then uses events alone. Compiling the reader on every target lets the
-//! `/proc`-parsing parity tests (`sampler_linux_test.go`) run under the macOS CI via a synthetic
-//! proc root — exactly as Go's linux tests override `procRoot` — instead of being skipped.
+//! `!linux` `stubSampler` (`GroupCPU → (0, false)`). CPU sampling is Linux-only: macOS has no
+//! `/proc`, regardless of process-group leadership or permissions. STUDIO-1262 grants two stall
+//! windows on sampling failure, then uses events with a doubled silence window. Compiling the
+//! reader on every target lets the `/proc`-parsing parity tests (`sampler_linux_test.go`) run under
+//! the macOS CI via a synthetic proc root — exactly as Go's linux tests override `procRoot` —
+//! instead of being skipped.
 
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+
+use chrono::{DateTime, Utc};
+
+/// Per-run emission watermark, shared only by the worker callback and stall detector. The
+/// control channel can lag behind emission under load; applying its backlog is not new work.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct WorkerEmitTime(Arc<AtomicI64>);
+
+impl WorkerEmitTime {
+    pub(crate) fn record(&self, now: DateTime<Utc>) {
+        self.0.fetch_max(now.timestamp_micros(), Ordering::SeqCst);
+    }
+
+    pub(crate) fn get(&self) -> Option<DateTime<Utc>> {
+        let micros = self.0.load(Ordering::SeqCst);
+        (micros != 0)
+            .then(|| DateTime::from_timestamp_micros(micros))
+            .flatten()
+    }
+}
+
+impl PartialEq for WorkerEmitTime {
+    fn eq(&self, other: &Self) -> bool {
+        self.get() == other.get()
+    }
+}
 
 /// The `/proc` mount point read by the platform sampler. Mirrors Go's `procRoot` package var; the
 /// parity tests pass their own synthetic root to [`group_cpu`] directly (Go overrides the var).
@@ -109,6 +138,27 @@ mod tests {
     use super::*;
     use crate::testsupport::TempDir;
 
+    #[test]
+    fn worker_emit_time_is_shared_monotonic_and_run_local() {
+        let time = WorkerEmitTime::default();
+        let worker = time.clone();
+        let retry = WorkerEmitTime::default();
+        let now = DateTime::from_timestamp(1_000_000, 123_456_000).unwrap();
+        assert_eq!(time.get(), None);
+        worker.record(now);
+        worker.record(now - chrono::Duration::seconds(1));
+        assert_eq!(
+            time.get(),
+            Some(now),
+            "an older stamp cannot move liveness back"
+        );
+        assert_eq!(
+            retry.get(),
+            None,
+            "a retry must not inherit the prior run's time"
+        );
+    }
+
     fn write_stat(root: &str, pid: i32, line: &str) {
         let dir = std::path::Path::new(root).join(pid.to_string());
         std::fs::create_dir_all(&dir).expect("mkdir pid dir");
@@ -181,8 +231,8 @@ mod tests {
     }
 
     // The default platform sampler on a host without `/proc` (macOS — the CI/target) reports
-    // unreadable, so stall detection falls back to events — the sampler still mirrors Go's `!linux`
-    // `stubSampler` selection. Gated off Linux, where `/proc` exists and the sampler reads it.
+    // unreadable even for our own PID: the missing filesystem is the cause, not group ownership
+    // or process permissions. This pins darwin's expected event/tool-only fallback.
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn new_sampler_reports_unavailable_without_proc() {
