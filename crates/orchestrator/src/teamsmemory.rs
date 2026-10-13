@@ -290,6 +290,13 @@ impl From<MemoryError> for TeamsMemoryError {
             MemoryError::NotFound(m) => TeamsMemoryError::NotFound(m),
             MemoryError::Invalid(m) => TeamsMemoryError::Invalid(m),
             MemoryError::Io(m) => TeamsMemoryError::Backend(m),
+            MemoryError::Backend {
+                reason: rhapsody_config::memory::BackendFailure::Decode,
+                detail,
+            } => TeamsMemoryError::Invalid(format!("decode: {detail}")),
+            MemoryError::Backend { reason, detail } => {
+                TeamsMemoryError::Backend(format!("{reason}: {detail}"))
+            }
         }
     }
 }

@@ -45,10 +45,10 @@
 //! # Every failure is a degradation
 //!
 //! A retain is "best-effort and never fatal" (§5.1) and a recall failure costs a
-//! prompt its memory section, never a run. So the timeouts here are short and
-//! explicit ([`REQUEST_TIMEOUT`], [`CONNECT_TIMEOUT`]) rather than reqwest's
-//! default of none: with the tailnet down, the correct outcome is a quick error
-//! the caller logs, not a task parked on a connect that will never complete.
+//! prompt its memory section, never a run. Timeouts are explicit rather than
+//! reqwest's default of none: off-loop recalls allow the healthy bank's search
+//! latency ([`RECALL_TIMEOUT`]), while asynchronous retains and other calls keep
+//! [`REQUEST_TIMEOUT`]. [`CONNECT_TIMEOUT`] still fails a down service quickly.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
@@ -60,8 +60,9 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::memory::{
-    Fact, MAX_FACT_CONTENT_BYTES, MAX_RETAIN_CONTENT_BYTES, MemoryBackend, MemoryError, Query,
-    RecallState, Recalled, Record, STATE_INVALIDATED, STATE_VALID, bank_id_for, truncate_bytes,
+    BackendFailure, Fact, MAX_FACT_CONTENT_BYTES, MAX_RETAIN_CONTENT_BYTES, MemoryBackend,
+    MemoryError, Query, RecallState, Recalled, Record, STATE_INVALIDATED, STATE_VALID, bank_id_for,
+    truncate_bytes,
 };
 
 /// The tenant every Rhapsody bank lives in (§5's backend table, and the only
@@ -82,9 +83,18 @@ impl OperatorMemory {
 
     /// Explicit bank for hermetic/scratch callers; never inferred from an identity or bank prefix.
     pub fn for_bank(endpoint: &str, api_key: &str, bank: &str) -> Result<Self, MemoryError> {
+        Self::for_bank_with_timeouts(endpoint, api_key, bank, Timeouts::default())
+    }
+
+    pub fn for_bank_with_timeouts(
+        endpoint: &str,
+        api_key: &str,
+        bank: &str,
+        timeouts: Timeouts,
+    ) -> Result<Self, MemoryError> {
         HindsightBackend::checked_shared_bank(bank)?;
         Ok(Self {
-            backend: HindsightBackend::new(endpoint, "", api_key)?,
+            backend: HindsightBackend::new_with_timeouts(endpoint, "", api_key, timeouts)?,
             bank: bank.into(),
         })
     }
@@ -112,14 +122,33 @@ impl OperatorMemory {
     }
 }
 
-/// The whole-request timeout. Short and explicit: a recall that has not answered
-/// in this long has already missed the prefetch cycle it was fired for, and the
-/// prompt is better off without the section than the task is parked.
+/// Whole-request timeout for asynchronous retain and other non-search calls.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Whole-request timeout for off-loop recall searches, including concurrent lead recalls.
+pub const RECALL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// The connect timeout, kept well under [`REQUEST_TIMEOUT`] so "the tailnet is
 /// down" fails fast and distinctly from "the bank is slow".
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Constructor-injected deadlines for hermetic slow-server tests.
+#[derive(Debug, Clone, Copy)]
+pub struct Timeouts {
+    pub request: Duration,
+    pub recall: Duration,
+    pub connect: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            request: REQUEST_TIMEOUT,
+            recall: RECALL_TIMEOUT,
+            connect: CONNECT_TIMEOUT,
+        }
+    }
+}
 
 /// `RecallRequest.types[0]` — the extractor's classification for an agent's own
 /// authored note.
@@ -188,6 +217,7 @@ pub struct HindsightBackend {
     /// header is not sent at all.
     authorization: String,
     http: reqwest::Client,
+    recall_timeout: Duration,
     /// Bank ids whose `enable_observations: false` has already been applied in
     /// this process (§5's backend table). Guards a once-per-bank config write,
     /// never held across an `await`.
@@ -212,10 +242,19 @@ impl HindsightBackend {
         bank_prefix: impl Into<String>,
         api_key: &str,
     ) -> Result<Self, MemoryError> {
+        Self::new_with_timeouts(endpoint, bank_prefix, api_key, Timeouts::default())
+    }
+
+    pub fn new_with_timeouts(
+        endpoint: &str,
+        bank_prefix: impl Into<String>,
+        api_key: &str,
+        timeouts: Timeouts,
+    ) -> Result<Self, MemoryError> {
         let base = normalize_base(endpoint)?;
         let http = reqwest::Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(timeouts.request)
+            .connect_timeout(timeouts.connect)
             .build()
             .map_err(|e| MemoryError::Invalid(format!("build hindsight http client: {e}")))?;
         Ok(Self {
@@ -224,6 +263,7 @@ impl HindsightBackend {
             banks: HashMap::new(),
             authorization: authorization_value(&crate::resolve::resolve_var(api_key)),
             http,
+            recall_timeout: timeouts.recall,
             configured: Mutex::new(HashSet::new()),
         })
     }
@@ -314,9 +354,9 @@ impl HindsightBackend {
             .authorized(rb)
             .send()
             .await
-            .map_err(|e| MemoryError::Io(format!("{what}: {e}")))?;
+            .map_err(|e| request_error(e, what))?;
         let status = resp.status();
-        let body = resp.text().await.unwrap_or_default();
+        let body = resp.text().await.map_err(|e| request_error(e, what))?;
         Ok(HindsightResponse {
             status: status.as_u16(),
             body,
@@ -567,7 +607,13 @@ impl HindsightBackend {
             "max_tokens": RECALL_MAX_TOKENS,
         });
         let resp = self
-            .send(self.http.post(&url).json(&body), "hindsight recall")
+            .send(
+                self.http
+                    .post(&url)
+                    .timeout(self.recall_timeout)
+                    .json(&body),
+                "hindsight recall",
+            )
             .await?
             .ok("recall")?;
         let recalled: RecallResponse = decode_json(&resp, "recall")?;
@@ -785,17 +831,19 @@ struct HindsightResponse {
 }
 
 impl HindsightResponse {
-    /// The body, or an [`MemoryError::Io`] naming the status and a bounded slice
+    /// The body, or a [`MemoryError::Backend`] naming the status and a bounded slice
     /// of what the service said.
     fn ok(self, what: &str) -> Result<String, MemoryError> {
         if self.status < 400 {
             return Ok(self.body);
         }
-        Err(MemoryError::Io(format!(
-            "hindsight {what}: HTTP {} — {}",
-            self.status,
-            truncate_bytes(self.body.trim(), MAX_ERROR_BODY)
-        )))
+        Err(MemoryError::Backend {
+            reason: BackendFailure::Http(self.status),
+            detail: format!(
+                "hindsight {what}: {}",
+                truncate_bytes(self.body.trim(), MAX_ERROR_BODY)
+            ),
+        })
     }
 
     /// As [`ok`](Self::ok), but a 404 becomes [`MemoryError::NotFound`] so the
@@ -811,8 +859,27 @@ impl HindsightResponse {
 /// Decodes a JSON body, naming the call in the error rather than leaking a bare
 /// serde message with no context.
 fn decode_json<T: serde::de::DeserializeOwned>(body: &str, what: &str) -> Result<T, MemoryError> {
-    serde_json::from_str(body)
-        .map_err(|e| MemoryError::Invalid(format!("hindsight {what}: decode response: {e}")))
+    serde_json::from_str(body).map_err(|e| MemoryError::Backend {
+        reason: BackendFailure::Decode,
+        detail: format!("hindsight {what}: decode response: {e}"),
+    })
+}
+
+fn request_error(error: reqwest::Error, what: &str) -> MemoryError {
+    // A connect deadline is also a timeout; name the deadline rather than hiding it as connect.
+    let reason = if error.is_timeout() {
+        BackendFailure::Timeout
+    } else if error.is_connect() {
+        BackendFailure::Connect
+    } else if error.is_decode() {
+        BackendFailure::Decode
+    } else {
+        BackendFailure::Request
+    };
+    MemoryError::Backend {
+        reason,
+        detail: format!("{what}: {error}"),
+    }
 }
 
 /// `RecallResponse` — only the field this backend reads. Unknown fields (traces,
@@ -1084,6 +1151,8 @@ mod tests {
     struct Reply {
         status: u16,
         body: String,
+        delay: Duration,
+        body_delay: Duration,
     }
 
     impl Reply {
@@ -1091,6 +1160,8 @@ mod tests {
             Reply {
                 status: 200,
                 body: body.to_string(),
+                delay: Duration::ZERO,
+                body_delay: Duration::ZERO,
             }
         }
 
@@ -1098,6 +1169,8 @@ mod tests {
             Reply {
                 status,
                 body: body.to_string(),
+                delay: Duration::ZERO,
+                body_delay: Duration::ZERO,
             }
         }
     }
@@ -1138,6 +1211,7 @@ mod tests {
                     if let Ok(mut v) = recorder.lock() {
                         v.push(req);
                     }
+                    tokio::time::sleep(reply.delay).await;
                     write_response(&mut stream, &reply).await;
                 }
             });
@@ -1229,19 +1303,133 @@ mod tests {
     }
 
     async fn write_response(stream: &mut TcpStream, reply: &Reply) {
-        let payload = format!(
+        let headers = format!(
             "HTTP/1.1 {} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: \
-             close\r\n\r\n{}",
+             close\r\n\r\n",
             reply.status,
             reply.body.len(),
-            reply.body
         );
-        let _ = stream.write_all(payload.as_bytes()).await;
+        let _ = stream.write_all(headers.as_bytes()).await;
+        tokio::time::sleep(reply.body_delay).await;
+        let _ = stream.write_all(reply.body.as_bytes()).await;
         let _ = stream.flush().await;
     }
 
     fn backend(stub: &Stub) -> HindsightBackend {
         HindsightBackend::new(&stub.url, "agent-", "k-123").expect("backend")
+    }
+
+    #[tokio::test]
+    async fn recall_succeeds_when_backend_answers_after_5s() {
+        let stub = Stub::start(|_| Reply {
+            delay: Duration::from_secs(5),
+            ..Reply::ok(&recall_body("Slow recall still reaches the prompt."))
+        })
+        .await;
+        let recalled = backend(&stub)
+            .recall("jerry", &ticket_query("STUDIO-1253"))
+            .await
+            .expect("a healthy five-second recall must not hit the four-second write timeout");
+        assert_eq!(
+            recalled.facts[0].content,
+            "Slow recall still reaches the prompt."
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_times_out_at_recall_timeout_not_request_timeout() {
+        let stub = Stub::start(|r| Reply {
+            delay: if r.method == "POST" {
+                Duration::from_millis(300)
+            } else {
+                Duration::ZERO
+            },
+            ..Reply::ok(&recall_body(
+                "Returned between the write and recall deadlines.",
+            ))
+        })
+        .await;
+        let b = HindsightBackend::new_with_timeouts(
+            &stub.url,
+            "agent-",
+            "",
+            Timeouts {
+                request: Duration::from_millis(100),
+                recall: Duration::from_millis(800),
+                ..Timeouts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            b.recall("jerry", &ticket_query("TEST-1"))
+                .await
+                .unwrap()
+                .facts
+                .len(),
+            1
+        );
+        let err = b.retain(&record("jerry", "slow retain")).await.unwrap_err();
+        assert_eq!(err.reason(), "timeout");
+        stub.request("POST", "/memories");
+
+        let hanging = Stub::start(|_| Reply {
+            delay: Duration::from_secs(10),
+            ..Reply::ok("{}")
+        })
+        .await;
+        let b = HindsightBackend::new_with_timeouts(
+            &hanging.url,
+            "agent-",
+            "",
+            Timeouts {
+                request: Duration::from_millis(100),
+                recall: Duration::from_millis(300),
+                ..Timeouts::default()
+            },
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let err = b
+            .recall("jerry", &ticket_query("TEST-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.reason(), "timeout");
+        assert!(
+            started.elapsed() >= Duration::from_millis(250),
+            "recall used the shorter request timeout"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "injected recall timeout was ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_body_timeout_is_not_swallowed_as_a_decode_failure() {
+        let stub = Stub::start(|_| Reply {
+            body_delay: Duration::from_secs(10),
+            ..Reply::ok(&recall_body("body arrives too late"))
+        })
+        .await;
+        let b = HindsightBackend::new_with_timeouts(
+            &stub.url,
+            "agent-",
+            "",
+            Timeouts {
+                recall: Duration::from_millis(100),
+                ..Timeouts::default()
+            },
+        )
+        .unwrap();
+        let err = b
+            .recall("jerry", &ticket_query("TEST-1"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.reason(),
+            "timeout",
+            "the response body is part of the whole-request deadline"
+        );
     }
 
     #[tokio::test]
@@ -1733,7 +1921,7 @@ mod tests {
             .recall("alice", &ticket_query("STUDIO-660"))
             .await
             .expect_err("nothing listening");
-        assert!(matches!(err, MemoryError::Io(_)), "got {err:?}");
+        assert_eq!(err.reason(), "connect", "got {err:?}");
         assert!(
             started.elapsed() < REQUEST_TIMEOUT * 2,
             "took {:?}",
@@ -1741,16 +1929,20 @@ mod tests {
         );
     }
 
-    /// A body that is not the shape we expect is an [`MemoryError::Invalid`]
+    /// A body that is not the shape we expect is a decode failure
     /// naming the call, not a panic — and unknown fields are ignored, so a
     /// service that grows one does not break a released daemon.
     #[tokio::test]
     async fn an_unexpected_body_is_an_error_and_extra_fields_are_ignored() {
         let stub = Stub::start(|_| Reply::ok("not json at all")).await;
-        assert!(matches!(
-            backend(&stub).recall("alice", &ticket_query("X")).await,
-            Err(MemoryError::Invalid(_))
-        ));
+        assert_eq!(
+            backend(&stub)
+                .recall("alice", &ticket_query("X"))
+                .await
+                .unwrap_err()
+                .reason(),
+            "decode"
+        );
 
         let stub = Stub::start(|_| {
             Reply::ok(r#"{"results":[{"id":"f1","text":"t","brand_new_field":1}],"also_new":true}"#)
