@@ -82,6 +82,19 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Hindsight recall deadlines and failure diagnostics (STUDIO-1253)
+
+Off-loop Hindsight recall searches allow 15 seconds for the whole request, including response-body
+reads; asynchronous retains and other calls keep their four-second deadline, and connecting still
+times out after two seconds. Lead operator/team recall failures carry a closed reason (`timeout`,
+`connect`, `http <status>` or `decode`, with `request` for other transport failures) in the warning
+and case packet, without copying backend URLs or bodies into prompts. Worker prefetch reuses the
+poll loop's complete, first-project-wins candidate publication rather than querying Linear again
+or reading the account client whose project slug may be empty. Absent publications or those older
+than the ten-minute prefetch TTL leave the cycle idle; reload invalidates the publication, and
+failed polls never refresh its timestamp. These memory paths have no frozen Go counterpart; API
+payloads, configuration defaults and parity goldens are unchanged.
+
 ### Bounded Claude post-result cleanup (STUDIO-1231)
 
 After Claude emits its terminal `result`, the runner waits up to `claude.result_grace_ms`

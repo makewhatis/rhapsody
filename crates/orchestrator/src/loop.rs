@@ -1327,6 +1327,7 @@ impl Orchestrator {
         let Some(tracker) = self.eff.as_ref().map(|e| Arc::clone(&e.tracker)) else {
             return;
         };
+        let fetched_at = (self.now)();
         let issues = match tracker
             .fetch_candidate_issues()
             .instrument(tracing::info_span!("symphony.fetch_candidates"))
@@ -1338,6 +1339,10 @@ impl Orchestrator {
                 return;
             }
         };
+        self.set_reads_candidates(crate::teamsprefetch::PrefetchTarget {
+            issues: issues.clone(),
+            fetched_at,
+        });
         // github-summons enrichment (AIE-299): advance latest_summon_at from unmerged linked-PR summon
         // comments before eligibility selection. Gated on the legacy flag AND a non-nil source, so the
         // feature being off is byte-identical. Owner/repo derive from the legacy top-level repo (O6).
@@ -1584,6 +1589,7 @@ impl Orchestrator {
             // once a project on it has contributed a surviving candidate, which is exactly when Go's
             // interleaved fetch fired.
             let mut wanted: Vec<(String, String, String)> = Vec::new();
+            let fetched_at = (self.now)();
             for p in projs {
                 let issues = match p.tracker.fetch_candidate_issues().await {
                     Ok(i) => {
@@ -1631,6 +1637,15 @@ impl Orchestrator {
             // that comes OFF keeps refusing until every enabled project answers again. That is the
             // conservative direction, and it is named in the README/`begin_pass` docs.
             let read_the_board = enabled_projects > 0 && answered_projects == enabled_projects;
+            // Prefetch reuses this complete answer, never another Linear fan-out.
+            // A partial outage keeps the previous set and its original timestamp;
+            // otherwise missing rows would evict the failed project's cached memory.
+            if answered_projects == enabled_projects {
+                self.set_reads_candidates(crate::teamsprefetch::PrefetchTarget {
+                    issues: tagged.iter().map(|t| t.iss.clone()).collect(),
+                    fetched_at,
+                });
+            }
 
             // --- Pass 2: the bounded, rotated per-repo fetch. ------------------------------------
             let deadline = tokio::time::Instant::now() + budget;
@@ -3267,6 +3282,64 @@ mod tests {
         assert!(rec.exists(), "and its record must survive");
     }
 
+    #[tokio::test]
+    async fn poll_publishes_candidates_without_extra_tracker_calls() {
+        let mut first = Fake::new();
+        first.candidates = vec![issue("1", "MT-1", "Todo")];
+        let first = Arc::new(first);
+        let mut second = Fake::new();
+        second.candidates = vec![issue("1", "MT-1", "In Review"), issue("2", "MT-2", "Todo")];
+        let second = Arc::new(second);
+        let paused = Arc::new(Fake::new());
+        let mut paused_project = proj_with_tracker("paused", paused.clone(), "p");
+        paused_project.disabled = true;
+        let (mut o, _) = orch_for_retry_multi(
+            vec![
+                proj_with_tracker("first", first.clone(), "p"),
+                proj_with_tracker("second", second.clone(), "p"),
+                paused_project,
+            ],
+            10,
+        );
+        let at = Utc::now();
+        o.now = Box::new(move || at);
+        let handle = o.control();
+        assert!(handle.reads_candidates().is_none());
+        o.poll_all_projects().await;
+        let published = handle
+            .reads_candidates()
+            .expect("the poll publishes its answer");
+        assert_eq!(published.fetched_at, at);
+        assert_eq!(published.issues.len(), 2);
+        assert_eq!(published.issues[0].state, "Todo", "first project wins");
+        assert_eq!(published.issues[1].identifier, "MT-2");
+        assert_eq!(first.candidate_calls(), 1);
+        assert_eq!(second.candidate_calls(), 1);
+        assert_eq!(paused.candidate_calls(), 0);
+
+        // A partial outage cannot imply departures or refresh the old answer.
+        let mut broken = Fake::new();
+        broken.candidates_err = Some(TrackerError::Other("down".into()));
+        o.eff.as_mut().unwrap().projects[0].tracker = Arc::new(broken);
+        o.now = Box::new(move || at + chrono::Duration::minutes(1));
+        o.poll_all_projects().await;
+        let old = handle.reads_candidates().unwrap();
+        assert_eq!(old.fetched_at, at);
+        assert_eq!(old.issues[0].state, "Todo");
+
+        // An all-paused install is a known empty prefetch set, not a fallback query.
+        for p in &mut o.eff.as_mut().unwrap().projects {
+            p.disabled = true;
+        }
+        o.poll_all_projects().await;
+        assert!(handle.reads_candidates().unwrap().issues.is_empty());
+        o.set_reads_triage_snapshot(crate::reads::TriageSnapshot::default());
+        assert!(
+            handle.reads_candidates().is_none(),
+            "reload invalidates the old board"
+        );
+    }
+
     // Mirrors Go `TestOnTickPollsAllProjectsAndDispatches`: onTick polls EVERY resolved project's
     // slug-bound tracker exactly once and dispatches each candidate stamped with its owning project.
     #[tokio::test(flavor = "multi_thread")]
@@ -3671,6 +3744,12 @@ mod tests {
             t.abort();
         }
         let entries = sink.lock().expect("dispatched lock");
+        let published = o
+            .control()
+            .reads_candidates()
+            .expect("legacy poll publishes too");
+        assert_eq!(published.issues.len(), 1);
+        assert_eq!(published.issues[0].identifier, "MT-1");
         assert_eq!(
             entries.len(),
             1,

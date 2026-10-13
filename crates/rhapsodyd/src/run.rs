@@ -1694,13 +1694,9 @@ where
         let prefetch_handle = handle.clone();
         let deps = rhapsody_orchestrator::PrefetchDeps {
             teams: Arc::new(teams_cfg),
-            // Read lazily each cycle, exactly as triage reads its tracker: the handle is built
-            // before the first reload, so the tracker arrives later.
-            target: move || {
-                prefetch_handle
-                    .reads_tracker()
-                    .map(|tracker| rhapsody_orchestrator::PrefetchTarget { tracker })
-            },
+            // Read lazily each cycle: the handle exists before the first poll publishes
+            // candidates. Prefetch reuses that answer without spending Linear quota.
+            target: move || prefetch_target(&prefetch_handle),
             backend: w.backend,
             cache: w.cache,
             interval: rhapsody_orchestrator::PREFETCH_INTERVAL,
@@ -2221,6 +2217,12 @@ fn triage_agent_env(cfg: Option<&Config>) -> (String, bool, String) {
 struct PrefetchWiring {
     backend: Arc<dyn rhapsody_config::memory::MemoryBackend>,
     cache: Arc<rhapsody_orchestrator::PrefetchCache>,
+}
+
+fn prefetch_target(
+    handle: &rhapsody_orchestrator::ControlHandle,
+) -> Option<rhapsody_orchestrator::PrefetchTarget> {
+    handle.reads_candidates()
 }
 
 fn install_teams_memory(
@@ -4372,6 +4374,52 @@ mod tests {
         // And what `run` gives the off-loop tasks is a clone of that same allocation.
         let triage_room = room.clone().expect("some");
         assert!(Arc::ptr_eq(installed, &triage_room));
+    }
+
+    #[test]
+    fn prefetch_uses_published_candidates_instead_of_tracker_clients() {
+        use rhapsody_orchestrator::reads::{ProjectTracker, TriageSnapshot};
+        use rhapsody_tracker::{Tracker, fake::Fake};
+        let o = rhapsody_orchestrator::Orchestrator::new("WORKFLOW.md");
+        let handle = o.control();
+        assert!(prefetch_target(&handle).is_none());
+        let account: Arc<dyn Tracker> = Arc::new(Fake::new());
+        let project: Arc<dyn Tracker> = Arc::new(Fake::new());
+        let second: Arc<dyn Tracker> = Arc::new(Fake::new());
+        o.set_reads_target(account, "");
+        o.set_reads_triage_snapshot(TriageSnapshot {
+            trackers: vec![
+                ProjectTracker {
+                    slug: "work".into(),
+                    tracker: project.clone(),
+                },
+                ProjectTracker {
+                    slug: "second".into(),
+                    tracker: second.clone(),
+                },
+            ],
+            ..Default::default()
+        });
+        assert!(
+            prefetch_target(&handle).is_none(),
+            "config alone is not a fetched board"
+        );
+        let fetched_at = chrono::Utc::now();
+        o.set_reads_candidates(rhapsody_orchestrator::PrefetchTarget {
+            issues: vec![rhapsody_core::Issue {
+                identifier: "MT-1".into(),
+                ..Default::default()
+            }],
+            fetched_at,
+        });
+        let target = prefetch_target(&handle).unwrap();
+        assert_eq!(target.issues[0].identifier, "MT-1");
+        assert_eq!(target.fetched_at, fetched_at);
+        o.set_reads_triage_snapshot(TriageSnapshot::default());
+        assert!(
+            prefetch_target(&handle).is_none(),
+            "reload clears published candidates without falling back to a tracker"
+        );
     }
 
     // STUDIO-645 (Teams T4), §5.4 + §2.4 row 8: which memory handles a boot installs is decided by

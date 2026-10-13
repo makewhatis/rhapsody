@@ -283,6 +283,38 @@ pub enum MemoryError {
     Invalid(String),
     #[error("memory_not_found: {0}")]
     NotFound(String),
+    #[error("memory_backend_error: {reason}: {detail}")]
+    Backend {
+        reason: BackendFailure,
+        detail: String,
+    },
+}
+
+/// Closed, non-secret diagnostics for a remote backend. Raw errors stay out of prompts.
+#[derive(thiserror::Error, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackendFailure {
+    #[error("timeout")]
+    Timeout,
+    #[error("connect")]
+    Connect,
+    #[error("http {0}")]
+    Http(u16),
+    #[error("decode")]
+    Decode,
+    #[error("request")]
+    Request,
+}
+
+impl MemoryError {
+    /// A safe failure class for logs and model context, without endpoint or backend text.
+    pub fn reason(&self) -> String {
+        match self {
+            Self::Backend { reason, .. } => reason.to_string(),
+            Self::Io(_) => "io".into(),
+            Self::Invalid(_) => "invalid".into(),
+            Self::NotFound(_) => "not found".into(),
+        }
+    }
 }
 
 /// The pluggable memory backend (§5) — **the off-loop surface**.
