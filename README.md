@@ -82,6 +82,8 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+Landing (opt-in, schema 38): see docs/landing.md (guide follows in L5).
+
 ### Bounded Claude post-result cleanup (STUDIO-1231)
 
 After Claude emits its terminal `result`, the runner waits up to `claude.result_grace_ms`

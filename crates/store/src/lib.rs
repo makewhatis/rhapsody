@@ -126,6 +126,18 @@ impl From<rusqlite::Error> for StoreError {
 /// err)` triple for a single lookup becomes `Result<Option<_>, _>`, and Go pointer fields map to
 /// [`Option`].
 pub trait Store {
+    fn save_landing(&self, _row: LandingRow) -> Result<i64, StoreError> {
+        Ok(0)
+    }
+    fn load_open_landings(&self) -> Result<Vec<LandingRow>, StoreError> {
+        Ok(Vec::new())
+    }
+    fn get_landing(&self, _id: i64) -> Result<Option<LandingRow>, StoreError> {
+        Ok(None)
+    }
+    fn open_landing_for_project(&self, _slug: &str) -> Result<Option<LandingRow>, StoreError> {
+        Ok(None)
+    }
     /// Persist an authoritative, configured terminal/live observation. Terminal releases parks.
     fn observe_subject_state(&self, _subject: &str, _terminal: bool) -> Result<(), StoreError> {
         Ok(())

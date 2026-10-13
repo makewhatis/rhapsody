@@ -7,6 +7,52 @@
 //! tags on the read-side/wire types are preserved as the snake_case field names here (the HTTP API
 //! wire mapping lands with rhapsody-httpapi in a later phase).
 
+/// Landing lifecycle (STUDIO-1249; no Go counterpart).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum LandingPhase {
+    #[default]
+    WaitingForDeploy,
+    Watching,
+    AwaitingAcceptance,
+    Done,
+    Held,
+    Reverting,
+    Reopened,
+}
+
+impl LandingPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WaitingForDeploy => "WaitingForDeploy",
+            Self::Watching => "Watching",
+            Self::AwaitingAcceptance => "AwaitingAcceptance",
+            Self::Done => "Done",
+            Self::Held => "Held",
+            Self::Reverting => "Reverting",
+            Self::Reopened => "Reopened",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LandingRow {
+    pub id: i64,
+    pub project_slug: String,
+    pub owner: String,
+    pub repo: String,
+    pub pr: i64,
+    pub ticket: String,
+    pub merge_sha: String,
+    pub phase: LandingPhase,
+    pub deploy_deadline_s: i64,
+    pub watch_until_s: Option<i64>,
+    pub results_json: String,
+    pub revert_of: Option<i64>,
+    pub revert_pr: Option<i64>,
+    pub hold_reason: Option<String>,
+    pub updated_at_s: i64,
+}
+
 // --- tech-lead queue (STUDIO-1134; no Go counterpart) -----------------------------------------
 /// A durable admission stop and (for escalation) one operator-notice episode. Released rows stay
 /// in the ledger; only an open episode can be updated by a repeated escalation (STUDIO-1156).
