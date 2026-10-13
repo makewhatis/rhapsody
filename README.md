@@ -98,6 +98,17 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Retry admission before fresh work (STUDIO-1263)
+
+Due retries and retries waiting for capacity are served oldest-first before fresh candidates on
+each poll tick; retry timer events use the same ordering. The frozen Go scheduler lets fresh polls
+compete with independently backed-off retries, which can starve already-started work. A slot wait
+now preserves the attempt and original due time (including across restart), and re-arms a fixed
+five-second timer like drain parking instead of charging another failure or growing backoff.
+Future genuine-failure backoffs and account-limit waits retain their existing deadlines. Global
+implementation, per-project-group and shared per-state caps remain enforced, including preparation
+reservations. No configuration, schema, API shape or golden fixture changes.
+
 ### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1251)
 
 Landing is **Rhapsody-only, with no Go counterpart**. Per-project `projects[].landing` in

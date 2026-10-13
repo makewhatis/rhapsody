@@ -843,7 +843,20 @@ impl Orchestrator {
             Event::TranscriptOpened { issue_id, path } => {
                 self.on_transcript_opened(&issue_id, &path)
             }
-            Event::Retry(e) => self.on_retry(e).await,
+            Event::Retry(e) => {
+                if e.issue_id.starts_with("limit:")
+                    || self.retry_attempts.get(&e.issue_id).is_some_and(|re| {
+                        re.err.starts_with(crate::limitpolicy::RETRY_LIMIT_PREFIX)
+                    })
+                {
+                    self.on_retry(e).await;
+                } else {
+                    // Timers may arrive in any order, or remain queued after a tick has served
+                    // their retry. Re-read the ready queue rather than bypassing its age order
+                    // (or pulling a newly re-armed failure backoff forward on a stale event).
+                    self.dispatch_ready_retries().await;
+                }
+            }
             Event::Reload => self.on_reload(),
             Event::DispatchPrepared {
                 id,
@@ -1194,6 +1207,7 @@ impl Orchestrator {
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
         async {
+            self.dispatch_ready_retries().await;
             self.dispatch_decisions().await;
             // DAG auto-promote (INF-318): AFTER the normal dispatch decisions, flip any enabled-mode
             // Backlog dependent whose blockers are cleared Backlog→Todo (O6 `promote.rs`). A no-op for
