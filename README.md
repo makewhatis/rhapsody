@@ -420,6 +420,17 @@ normal SIGTERM/graceful-stop behavior stays the same. Test guards request stop b
 preventing the restart loop from relaunching a daemon during failure cleanup. No configuration,
 API payload, schema or golden changes.
 
+### Desktop quit and child-stop deadlines (STUDIO-1116, STUDIO-1268)
+
+The Tauri main thread's final Quit waits on a standard channel for at most twelve seconds rather
+than blocking on a runtime timer. It requests stop before scheduling async teardown, so a blocked
+tray setter cannot prevent the sidecar from receiving SIGTERM. A per-launch standard-thread
+backstop observes child exit and escalates to process-group SIGKILL after `stop_grace` (five seconds
+by default), independently of Tokio's driver. Signaling and reaping share the owned child handle,
+preventing a delayed backstop from signaling a recycled PID. Go's goroutines and `time.After` need
+no UI/runtime driver; these explicit backstops preserve that lifecycle guarantee in the Tauri port.
+No configuration, API payload, schema or golden changes.
+
 ### Manager findings and tracker documents (STUDIO-1146)
 
 The isolated manager role adds `docs_read(path)`, `docs_list(glob)` and
