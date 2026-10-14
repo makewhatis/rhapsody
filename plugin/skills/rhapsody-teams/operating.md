@@ -38,6 +38,38 @@ labels the body as a form, and the guard refuses form posts. Reads (`GET`) need 
 - Cross-check `GET /api/v1/teams/room` and, under `review.mode: ticketless`, the
   `rhapsody_review_watch` row's `status`.
 
+## Two independent merge locks on a pull request
+
+A pull request that is green, approved and open may still not merge, and there are **two independent
+reasons**, either of which alone is enough:
+
+- **It is a draft.** Auto-merge refuses a draft outright, however green and however approved —
+  `runautomerge` declines it, and nothing in the pipeline ever marks one ready. The daemon instead
+  pokes the author (a summons comment, see `SKILL.md`), because un-drafting is the author's own
+  declaration that the work is ready.
+- **Its origin ticket carries `rhapsody:human`.** Auto-merge refuses a held ticket's pull request on
+  every tick, logging:
+
+  ```
+  auto-merge: the origin ticket is held for a human; not merging
+  ```
+
+  It fails **closed**: a daemon that has not yet completed a selection pass treats the hold set as
+  unknown and refuses the merge too, so a daemon gated since boot never merges a held ticket's pull
+  request either.
+
+That is why gating a high-blast-radius pull request takes **both** settings. The draft holds back the
+merge; the label additionally stops **every dispatch**, the draft-poke summons included — a poked
+author's run is refused by the reopen ladder while the label is present. Setting only the draft
+leaves the summons able to re-engage an agent; setting only the label leaves a non-draft pull request
+free to merge once its reviewers approve.
+
+⚠️ **Resuming a held ticket lifts the hold but does not reset the breaker.** The job page's "Human
+step done → resume" removes `rhapsody:human`, records the operator's note and requeues the ticket,
+but it deliberately leaves the durable breaker-crossing row in place (`resumehold.rs`): the breaker's
+counters are not reset, so a ticket held by the runaway breaker that is resumed and then crosses the
+same limit again is **re-held**.
+
 ## Closing tickets
 
 **`review.done_state` owns closure.** Do not hand-close a merged ticket; the daemon moves it,
