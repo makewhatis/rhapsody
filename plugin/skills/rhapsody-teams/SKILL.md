@@ -72,6 +72,25 @@ planning, `rhapsody:@<name>`, `rhapsody:solo` and topic labels all decide WHO ru
 this one decides that NOBODY does. A ticket without it behaves byte-identically to before the
 label existed.
 
+⚠️ **It is also a merge lock, and the one that also refuses the run a draft-poke summons would
+start.** A pull request whose **origin ticket** currently wears `rhapsody:human` is never merged by
+`review.auto_merge`, whatever its review state: the watcher logs `auto-merge: the origin ticket is
+held for a human; not merging` on every tick. That is the second of a pull request's **two
+independent merge locks** — the first being the draft state — and it is why an operator gating a
+high-blast-radius pull request sets **both**: the draft withholds it from auto-merge, and the label
+refuses every dispatch that could re-engage the author, including the **draft-poke summons** (a
+still-draft pull request whose author has stopped is poked with a comment that summons that run; the
+poke comment is still posted, but the reopen ladder refuses to start a run for a held ticket). The
+lock bites only for a pull request that traces back to an **origin ticket** — the daemon's own join
+from `introduced_by` — so one with no origin ticket has only the draft lock. Remove the label to
+release both the dispatch and the merge.
+
+⚠️ **`resume-hold` lifts the hold but does not raise the ceiling.** The job page's "Human step done →
+resume" removes the label, records the operator's note and requeues the ticket, but it deliberately
+leaves the durable breaker-crossing row alone (`resumehold.rs`): the breaker's counters are not
+reset, so a ticket held by the runaway breaker that is resumed and then crosses the same limit again
+is **re-held**. Resuming unblocks the work; it does not reset what tripped the breaker.
+
 ## What a teammate's run gets
 
 The turn-1 prompt gains one budgeted prepend (`prompt_budget_bytes`, default 16000):
@@ -342,10 +361,20 @@ use is therefore **not** a refusal today — nothing consumes it yet.
 **A cleared review can merge itself.** `review.auto_merge` (default `false`) lets the daemon merge
 a pull request once every reviewer has recorded a non-blocking verdict at its current head and CI
 is green. It never arms GitHub's own auto-merge — it checks green once and merges immediately or
-not at all — and it refuses a draft pull request outright. A branch that has fallen behind is never
-merged on its existing approval either: if the repository allows it, the daemon updates the branch
-itself, which moves the head and arms a fresh review round rather than merging (see `operating.md`
-for the two GitHub repository settings this depends on).
+not at all. A branch that has fallen behind is never merged on its existing approval either: if the
+repository allows it, the daemon updates the branch itself, which moves the head and arms a fresh
+review round rather than merging (see `operating.md` for the two GitHub repository settings this
+depends on).
+
+⚠️ **A pull request has two independent merge locks, and auto-merge honours both.** The first is the
+pull request being a **draft** — auto-merge refuses a draft outright, however green and however
+approved. The second is its **origin ticket** carrying `rhapsody:human` — auto-merge refuses a held
+ticket's pull request on every tick, logging `auto-merge: the origin ticket is held for a human; not
+merging` (`reviewwatch.rs`), and it fails **closed**: a daemon that has not yet completed a selection
+pass treats the hold set as unknown and refuses the merge too. Either lock alone stops the merge. The
+label is the stronger of the two, because it also refuses **every dispatch** — the draft-poke summons
+included — so an operator who wants a high-blast-radius pull request left entirely to a human sets
+**both** (see the `rhapsody:human` section above).
 
 **`auto_merge` can be scoped per project.** The top-level `teams.review.auto_merge` is the
 installation-wide default; a top-level `projects:` entry overrides it for the Linear project
