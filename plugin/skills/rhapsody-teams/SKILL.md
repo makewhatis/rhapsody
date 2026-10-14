@@ -358,10 +358,10 @@ use is therefore **not** a refusal today — nothing consumes it yet.
 **A cleared review can merge itself.** `review.auto_merge` (default `false`) lets the daemon merge
 a pull request once every reviewer has recorded a non-blocking verdict at its current head and CI
 is green. It never arms GitHub's own auto-merge — it checks green once and merges immediately or
-not at all. A branch that has fallen behind is never
-merged on its existing approval either: if the repository allows it, the daemon updates the branch
-itself, which moves the head and arms a fresh review round rather than merging (see `operating.md`
-for the two GitHub repository settings this depends on).
+not at all. A branch that has fallen behind is never merged on its existing approval either: if the
+repository allows it, the daemon updates the branch itself, which moves the head and arms a fresh
+review round rather than merging (see `operating.md` for the two GitHub repository settings this
+depends on).
 
 ⚠️ **A pull request has two independent merge locks, and auto-merge honours both.** The first is the
 pull request being a **draft** — auto-merge refuses a draft outright, however green and however
