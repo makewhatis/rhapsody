@@ -12,6 +12,35 @@ pub struct Thresholds {
     pub handoff: f64,
 }
 
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn claude_probe_knobs_default_validate_and_round_trip() {
+        let defaults = super::Limits::default();
+        assert_eq!(defaults.claude_probe_interval_s, 600);
+        assert_eq!(defaults.claude_probe_timeout_s, 60);
+        for interval in [0, 42] {
+            let text = format!(
+                "---\nlimits:\n  claude_probe_interval_s: {interval}\n  claude_probe_timeout_s: 7\n---\nprompt"
+            );
+            let def = crate::workflow::parse(&text).unwrap();
+            let cfg = crate::decode::decode(&def).unwrap();
+            let encoded = crate::encode::encode(&cfg).unwrap();
+            let next = crate::decode::decode(&encoded).unwrap();
+            assert_eq!(next.limits.claude_probe_interval_s, interval);
+            assert_eq!(next.limits.claude_probe_timeout_s, 7);
+        }
+        assert!(
+            super::Limits {
+                claude_probe_timeout_s: 0,
+                ..defaults
+            }
+            .validate()
+            .is_err()
+        );
+    }
+}
+
 impl Default for Thresholds {
     fn default() -> Self {
         Self {
@@ -39,6 +68,8 @@ pub struct AccountLimits {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Limits {
+    pub claude_probe_interval_s: u64,
+    pub claude_probe_timeout_s: u64,
     pub credits: String,
     pub credits_daily_usd: f64,
     pub wait_max_minutes: i64,
@@ -50,6 +81,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            claude_probe_interval_s: 600,
+            claude_probe_timeout_s: 60,
             credits: "never".into(),
             credits_daily_usd: 0.0,
             wait_max_minutes: 30,
@@ -72,6 +105,9 @@ impl Limits {
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.claude_probe_timeout_s == 0 {
+            return Err("limits.claude_probe_timeout_s: must be positive".into());
+        }
         if !matches!(
             self.credits.as_str(),
             "never" | "daily_cap" | "manager_urgent" | "always"

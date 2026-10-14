@@ -180,10 +180,13 @@ impl Orchestrator {
             if waiting > 0 {
                 details.push(format!("{waiting} waiting for a decision"));
             }
+            let usage = window.as_ref().map_or_else(
+                || "usage unknown".into(),
+                |w| format!("{} {:.0}%", w.window, w.utilization * 100.0),
+            );
             let body = format!(
-                "{} {:.0}%: {label}; {count} run{} handing off{}",
+                "{} {usage}: {label}; {count} run{} handing off{}",
                 view.account,
-                utilization * 100.0,
                 if count == 1 { "" } else { "s" },
                 if details.is_empty() {
                     String::new()

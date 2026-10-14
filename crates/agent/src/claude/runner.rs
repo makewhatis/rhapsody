@@ -1052,7 +1052,7 @@ async fn recv_opt(messages: &mut Option<&mut mpsc::Receiver<String>>) -> Option<
 /// Frames one stream-json user-message INPUT line (newline-terminated). String content is the
 /// proven-working shape (INF-250): a held-open stdin folds a second user message into the ongoing
 /// turn at the next step boundary.
-fn encode_user_message(text: &str) -> Result<Vec<u8>, serde_json::Error> {
+pub(crate) fn encode_user_message(text: &str) -> Result<Vec<u8>, serde_json::Error> {
     #[derive(serde::Serialize)]
     struct UserMsg<'a> {
         #[serde(rename = "type")]

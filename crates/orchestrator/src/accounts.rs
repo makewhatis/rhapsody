@@ -60,6 +60,11 @@ pub struct CredentialView {
     pub checked_at_s: i64,
 }
 
+pub struct ClaudeProbeRequest {
+    pub command: String,
+    pub timeout: std::time::Duration,
+}
+
 #[derive(Default)]
 pub struct AccountLedger {
     state: Mutex<LedgerState>,
@@ -112,6 +117,7 @@ impl AccountLedger {
     }
 
     pub fn observe(&self, account: &str, obs: LimitObs) {
+        let claude_subscription = account == "claude-subscription";
         if account.is_empty() {
             return;
         }
@@ -199,7 +205,7 @@ impl AccountLedger {
         if accepted && obs.observed_at_s >= account.last_seen_s {
             account.last_seen_s = obs.observed_at_s;
             account.source = obs.source.into();
-            if obs.source == "probe" {
+            if obs.source == "probe" || obs.source == "stream" && claude_subscription {
                 account.probe_failure = None;
             }
         }
@@ -264,13 +270,11 @@ impl AccountLedger {
                             && (account.windows.is_empty()
                                 || now_s.saturating_sub(account.last_seen_s) >= 1800)),
                     stale_reason: account.probe_failure.clone(),
-                    // The passive WHAM probe was measured successfully. The detection capability
-                    // stays probe even when the latest observation is a stream rejection.
-                    detection: if name == "chatgpt-subscription" {
-                        "probe"
-                    } else if name == "claude-subscription" {
-                        "stream"
-                    } else if account.source == "probe" {
+                    // Detection capability stays probe even when the latest reading is passive.
+                    detection: if name == "chatgpt-subscription"
+                        || name == "claude-subscription"
+                        || account.source == "probe"
+                    {
                         "probe"
                     } else {
                         "budget"
@@ -290,15 +294,12 @@ impl AccountLedger {
             .max_by(|a, b| a.utilization.total_cmp(&b.utilization))
     }
 
-    pub fn probe_failed(&self, reason: &str) {
+    pub fn probe_failed(&self, account: &str, reason: &str) {
         let mut state = self
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let account = state
-            .accounts
-            .entry("chatgpt-subscription".into())
-            .or_default();
+        let account = state.accounts.entry(account.into()).or_default();
         account.probe_failure = Some(reason.into());
         if account.source.is_empty() {
             account.source = "probe".into();
@@ -389,6 +390,80 @@ pub(crate) fn run_key(issue_id: &str, started_at: chrono::DateTime<chrono::Utc>)
 }
 
 impl crate::Orchestrator {
+    fn claude_run_live(&self) -> bool {
+        self.running
+            .values()
+            .any(|run| self.effective_harness(&run.harness) == "claude")
+    }
+
+    pub(crate) fn claude_probe_request(&mut self, boot: bool) -> Option<ClaudeProbeRequest> {
+        let cfg = &self.eff.as_ref()?.cfg;
+        let interval = cfg.limits.claude_probe_interval_s;
+        let now = (self.now)().timestamp();
+        let recent = |at: i64| now.saturating_sub(at) < i64::try_from(interval).unwrap_or(i64::MAX);
+        if interval == 0
+            || self.claude_probe_in_flight
+            || self.claude_run_live()
+            || (!boot
+                && !self.claude_queued
+                && !self
+                    .limit_policy
+                    .suspended
+                    .values()
+                    .any(|s| self.effective_harness(&s.run.harness) == "claude"))
+            || self.claude_probe_last_attempt_s.is_some_and(recent)
+            || self.accounts.snapshot(now).iter().any(|a| {
+                a.account == "claude-subscription" && a.last_seen_s > 0 && recent(a.last_seen_s)
+            })
+        {
+            return None;
+        }
+        let request = ClaudeProbeRequest {
+            command: cfg.claude.command.clone(),
+            timeout: std::time::Duration::from_secs(cfg.limits.claude_probe_timeout_s),
+        };
+        self.claude_probe_in_flight = true;
+        self.claude_probe_last_attempt_s = Some(now);
+        Some(request)
+    }
+
+    pub(crate) fn record_claude_probe(&mut self, result: Result<Vec<LimitObs>, &'static str>) {
+        self.claude_probe_in_flight = false;
+        // A run may have started after admission; its passive stream is the fresher signal.
+        if (result.is_ok() && self.claude_run_live())
+            || self.claude_probe_last_attempt_s.is_some_and(|started| {
+                self.accounts
+                    .snapshot((self.now)().timestamp())
+                    .iter()
+                    .any(|a| {
+                        a.account == "claude-subscription"
+                            && a.source == "stream"
+                            && a.last_seen_s >= started
+                    })
+            })
+        {
+            if let Err(reason) = result {
+                tracing::warn!(
+                    reason,
+                    "Claude usage probe failed; live/passive Claude signal takes precedence"
+                );
+            }
+            return;
+        }
+        match result {
+            Ok(observations) => {
+                for obs in observations {
+                    self.accounts.observe("claude-subscription", obs);
+                }
+            }
+            Err(reason) => {
+                self.accounts.probe_failed("claude-subscription", reason);
+                tracing::warn!(reason, "Claude usage probe failed; account marked stale");
+            }
+        }
+        self.enforce_limits();
+    }
+
     /// Dispatch gates must not hide work that arrived while they were closed. This read-only
     /// pass observes the queue without selecting, claiming, enriching or priming decision ledgers.
     /// Successful dispatch passes already observe their candidate set and need no extra reads.
@@ -466,17 +541,23 @@ impl crate::Orchestrator {
     /// Called before selection discards candidates held by capacity, labels, budgets or limits.
     pub(crate) fn record_chatgpt_queue<'a>(
         &mut self,
-        mut issues: impl Iterator<Item = (&'a rhapsody_core::Issue, &'a str)>,
+        issues: impl Iterator<Item = (&'a rhapsody_core::Issue, &'a str)>,
         complete: bool,
     ) {
-        let queued = issues.any(|(issue, project)| {
+        let mut queued = false;
+        let mut claude_queued = false;
+        for (issue, project) in issues {
             let run = self.limit_projection(issue, project);
             let (harness, model) =
                 self.resolved_harness_model(&run.harness, &run.model_override, project);
-            harness == "opencode" && model.starts_with("openai/")
-        });
+            queued |= harness == "opencode" && model.starts_with("openai/");
+            claude_queued |= harness == "claude";
+        }
         if complete || queued {
             self.chatgpt_queued = queued;
+        }
+        if complete || claude_queued {
+            self.claude_queued = claude_queued;
         }
     }
     pub(crate) fn bind_account(
@@ -519,6 +600,19 @@ impl crate::Orchestrator {
 }
 
 impl crate::ControlHandle {
+    pub async fn claude_probe_request(&self, boot: bool) -> Option<ClaudeProbeRequest> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.events
+            .send(crate::control_loop::Event::ClaudeProbeRequest { boot, reply })
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
+    pub fn record_claude_probe(&self, result: Result<Vec<LimitObs>, &'static str>) {
+        let _ = self
+            .events
+            .send(crate::control_loop::Event::ClaudeProbeResult(result));
+    }
     pub async fn chatgpt_probe_path(&self, boot: bool) -> Option<std::path::PathBuf> {
         let (reply, rx) = tokio::sync::oneshot::channel();
         self.events
@@ -601,13 +695,263 @@ mod tests {
     use rhapsody_agent::ratelimit::{LimitStatus, WindowObs};
 
     #[test]
+    fn claude_probe_fires_only_when_claude_work_waits_and_reading_is_stale() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.claude.command = "bash /configured/wrapper.sh".into();
+        o.eff = Some(eff);
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(1000, 0).unwrap());
+        assert!(o.claude_probe_request(false).is_none());
+        assert_eq!(
+            o.claude_probe_request(true).unwrap().command,
+            "bash /configured/wrapper.sh"
+        );
+        assert!(o.claude_probe_request(true).is_none(), "single flight");
+        o.record_claude_probe(Err("usage_missing"));
+        let issue = rhapsody_core::Issue {
+            id: "queued".into(),
+            ..Default::default()
+        };
+        o.record_chatgpt_queue(std::iter::once((&issue, "")), true);
+        assert!(o.claude_probe_request(false).is_none(), "failures back off");
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(1601, 0).unwrap());
+        assert!(
+            o.claude_probe_request(false).is_some(),
+            "idle work refreshes usage without passive events"
+        );
+        let mut reading = obs(0.05, 5000, 1601);
+        reading.source = "probe";
+        o.record_claude_probe(Ok(vec![reading]));
+        o.claude_probe_last_attempt_s = None;
+        assert!(o.claude_probe_request(false).is_none(), "fresh reading");
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(2202, 0).unwrap());
+        o.running
+            .insert("live".into(), crate::RunningEntry::empty(issue.clone()));
+        assert!(o.claude_probe_request(false).is_none(), "Claude live");
+        o.running.clear();
+        o.eff.as_mut().unwrap().cfg.limits.claude_probe_interval_s = 0;
+        assert!(
+            o.claude_probe_request(true).is_none(),
+            "disabled even at boot"
+        );
+        o.eff.as_mut().unwrap().cfg.limits.claude_probe_interval_s = 600;
+        o.record_chatgpt_queue(std::iter::empty(), true);
+        assert!(o.claude_probe_request(false).is_none(), "no work");
+    }
+
+    #[tokio::test]
+    async fn dropped_probe_request_reply_does_not_release_an_existing_flight() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.eff = Some(crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        )));
+        assert!(o.claude_probe_request(true).is_some());
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        o.drive_event(crate::control_loop::Event::ClaudeProbeRequest { boot: true, reply })
+            .await;
+        assert!(o.claude_probe_in_flight);
+        o.record_claude_probe(Err("usage_missing"));
+        o.claude_probe_last_attempt_s = None;
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        drop(rx);
+        o.drive_event(crate::control_loop::Event::ClaudeProbeRequest { boot: true, reply })
+            .await;
+        assert!(
+            !o.claude_probe_in_flight,
+            "undelivered admission is released"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_probe_feeds_subscription_account_from_rate_limit_event() {
+        let dir = crate::testsupport::TempDir::new();
+        let script = std::path::PathBuf::from(dir.child("probe.sh"));
+        std::fs::write(
+            &script,
+            format!(
+                "printf '%s\\n' '{}'",
+                include_str!("../../agent/testdata/limits/allowed.jsonl")
+            ),
+        )
+        .unwrap();
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(1791312000, 0).unwrap());
+        let result = rhapsody_agent::claude::limits::probe(
+            &format!("bash {}", script.display()),
+            std::time::Duration::from_secs(10),
+            std::path::Path::new(&dir.child(".rhapsody")),
+        )
+        .await;
+        o.record_claude_probe(result);
+        let view = &o.accounts.snapshot((o.now)().timestamp())[0];
+        assert_eq!(view.account, "claude-subscription");
+        assert_eq!(view.source, "probe");
+        assert_eq!(view.detection, "probe");
+        assert_eq!(
+            view.windows
+                .iter()
+                .find(|w| w.window == "five_hour")
+                .unwrap()
+                .utilization,
+            0.05
+        );
+        assert_eq!(
+            view.windows
+                .iter()
+                .find(|w| w.window == "seven_day")
+                .unwrap()
+                .utilization,
+            0.02
+        );
+        assert!(!view.stale);
+    }
+
+    #[tokio::test]
+    async fn claude_probe_failure_marks_stale_with_reason_and_does_not_wall_dispatch() {
+        let dir = crate::testsupport::TempDir::new();
+        let script = std::path::PathBuf::from(dir.child("probe.sh"));
+        let mut o = crate::Orchestrator::new("not-read.md");
+        for (body, reason, timeout) in [
+            ("exit 7", "usage_exit", std::time::Duration::from_secs(10)),
+            (
+                "exec sleep 30",
+                "usage_timeout",
+                std::time::Duration::from_millis(100),
+            ),
+            (
+                "printf '%s\\n' no-event",
+                "usage_missing",
+                std::time::Duration::from_secs(10),
+            ),
+        ] {
+            std::fs::write(&script, body).unwrap();
+            o.record_claude_probe(
+                rhapsody_agent::claude::limits::probe(
+                    &format!("bash {}", script.display()),
+                    timeout,
+                    std::path::Path::new(&dir.child(".rhapsody")),
+                )
+                .await,
+            );
+            let view = &o.accounts.snapshot((o.now)().timestamp())[0];
+            assert!(view.stale);
+            assert_eq!(view.stale_reason.as_deref(), Some(reason));
+            assert!(view.windows.is_empty(), "never fabricate zero usage");
+            assert!(o.account_usable("claude-subscription"));
+        }
+    }
+
+    #[test]
+    fn probe_reading_gates_stop_new_at_threshold() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(1000, 0).unwrap());
+        let mut reading = obs(0.91, 5000, 1000);
+        reading.source = "probe";
+        o.record_claude_probe(Ok(vec![reading]));
+        assert_eq!(
+            crate::limitpolicy::level(
+                &o.accounts,
+                "claude-subscription",
+                &rhapsody_config::Limits::default(),
+                1000
+            ),
+            crate::limitpolicy::Level::StopNew
+        );
+        assert!(!o.account_usable("claude-subscription"));
+    }
+
+    #[test]
+    fn probe_notifications_name_unknown_model_window_and_never_invent_zero() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(1000, 0).unwrap());
+        let mut reports = o.open_limit_report_channel();
+        o.record_claude_probe(Err("usage_missing"));
+        let crate::limitreport::Report::Push { body, .. } = reports.try_recv().unwrap() else {
+            panic!("push");
+        };
+        assert!(body.contains("usage unknown"));
+        assert!(!body.contains("0%"));
+        let mut reading = obs(0.97, 5000, 1000);
+        reading.source = "probe";
+        reading.windows[0].window = "seven_day_opus".into();
+        o.record_claude_probe(Ok(vec![reading]));
+        let view = &o.accounts.snapshot(1000)[0];
+        assert_eq!(view.windows[0].window, "seven_day_opus");
+        let crate::limitreport::Report::Push { body, .. } = reports.try_recv().unwrap() else {
+            panic!("push");
+        };
+        assert!(
+            body.contains("claude-subscription seven_day_opus 97%"),
+            "{body}"
+        );
+    }
+
+    #[test]
+    fn passive_claude_reading_repairs_failure_and_wins_over_late_probe() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.claude_probe_last_attempt_s = Some(1000);
+        o.accounts
+            .probe_failed("claude-subscription", "usage_timeout");
+        o.accounts
+            .observe("claude-subscription", obs(0.2, 5000, 1001));
+        assert!(!o.accounts.snapshot(1001)[0].stale);
+        let mut probe = obs(0.9, 5000, 1002);
+        probe.source = "probe";
+        o.record_claude_probe(Ok(vec![probe]));
+        o.record_claude_probe(Err("usage_missing"));
+        let view = &o.accounts.snapshot(1002)[0];
+        assert_eq!(view.source, "stream");
+        assert_eq!(view.windows[0].utilization, 0.2);
+        assert!(!view.stale);
+    }
+
+    #[test]
+    fn probe_failure_during_live_claude_work_stays_visible_until_passive_usage() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.claude_probe_last_attempt_s = Some(1000);
+        let mut run = crate::RunningEntry::empty(rhapsody_core::Issue::default());
+        run.harness = "claude".into();
+        o.running.insert("live".into(), run);
+        o.record_claude_probe(Err("usage_timeout"));
+        let view = &o.accounts.snapshot(1001)[0];
+        assert!(view.stale);
+        assert_eq!(view.stale_reason.as_deref(), Some("usage_timeout"));
+        o.accounts
+            .observe("claude-subscription", obs(0.2, 5000, 1002));
+        assert!(!o.accounts.snapshot(1002)[0].stale);
+    }
+
+    #[test]
+    fn limit_suspended_claude_work_admits_probe_without_queue() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.eff = Some(crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        )));
+        o.limit_policy.suspended.insert(
+            "held".into(),
+            crate::limitpolicy::Suspended {
+                run: crate::RunningEntry::empty(rhapsody_core::Issue::default()),
+                outcome: crate::limitpolicy::HandoffOutcome::Park { resume_at_s: 5000 },
+                park_reason: crate::limitpolicy::ParkReason::Account,
+                note: None,
+                worker_finished: true,
+                account: None,
+            },
+        );
+        assert!(o.claude_probe_request(false).is_some());
+    }
+
+    #[test]
     fn probe_failure_stays_stale_during_active_work_until_success() {
         let ledger = AccountLedger::default();
         let mut usage = obs(0.31, 5000, 1000);
         usage.source = "probe";
         ledger.observe("chatgpt-subscription", usage.clone());
         ledger.bind_run("active", "chatgpt-subscription");
-        ledger.probe_failed("usage_unauthorized");
+        ledger.probe_failed("chatgpt-subscription", "usage_unauthorized");
         let view = &ledger.snapshot(1100)[0];
         assert!(view.stale);
         assert_eq!(view.stale_reason.as_deref(), Some("usage_unauthorized"));
@@ -626,7 +970,7 @@ mod tests {
             "live work cannot keep probe data fresh forever"
         );
         let empty = AccountLedger::default();
-        empty.probe_failed("usage_timeout");
+        empty.probe_failed("chatgpt-subscription", "usage_timeout");
         assert_eq!(empty.snapshot(1000)[0].status, "unknown");
         assert!(empty.snapshot(1000)[0].stale);
     }

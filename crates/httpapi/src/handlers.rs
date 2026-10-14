@@ -266,7 +266,7 @@ mod tests {
                 "windows":[{"window":"five_hour","utilization":0.05,"resets_at_s":1791312600},
                     {"window":"seven_day","utilization":0.02,"resets_at_s":1791680400}],
                 "status":"allowed","using_credits":false,"last_seen_s":1791312000,
-                "source":"stream","stale":false,"detection":"stream"
+                "source":"stream","stale":false,"detection":"probe"
             }]})
         );
         let head = reqwest::Client::new()

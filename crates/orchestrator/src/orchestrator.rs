@@ -1086,6 +1086,9 @@ pub struct Orchestrator {
     /// Account observations written on the control task and read off-loop by HTTP.
     pub(crate) accounts: Arc<crate::accounts::AccountLedger>,
     pub(crate) chatgpt_queued: bool,
+    pub(crate) claude_queued: bool,
+    pub(crate) claude_probe_in_flight: bool,
+    pub(crate) claude_probe_last_attempt_s: Option<i64>,
     pub(crate) limit_policy: crate::limitpolicy::LimitPolicy,
     /// What the last tick observed about the armed drain, for the gate's logging. `Some` exactly
     /// when the previous tick found the drain armed, which is what makes the cancel transition
@@ -1318,6 +1321,9 @@ impl Orchestrator {
             drain: crate::drain::DrainSignal::new(),
             accounts: Arc::new(crate::accounts::AccountLedger::default()),
             chatgpt_queued: false,
+            claude_queued: false,
+            claude_probe_in_flight: false,
+            claude_probe_last_attempt_s: None,
             limit_policy: crate::limitpolicy::LimitPolicy::default(),
             drain_gate: None,
             drain_continuations: HashMap::new(),

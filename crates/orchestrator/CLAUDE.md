@@ -183,7 +183,7 @@ the `Orchestrator` struct itself. Concretely:
   - `accounts.rs`'s `AccountLedger` (STUDIO-1123) is an additional sanctioned seam:
     `Orchestrator::accounts` and `ControlHandle::accounts` share one `Arc`. Observation/activity
     writes belong on the control task; HTTP only reads a synchronous snapshot. The daemon's
-    off-loop ChatGPT scheduler obtains auth/activity context and posts success/failure via control
+    off-loop ChatGPT/Claude schedulers obtain auth/activity or configured-command context and post success/failure via control
     events; queued activity is captured before selection drops held candidates. The ledger's
     mutex protects short map operations and is never held across I/O or an `.await`.
 

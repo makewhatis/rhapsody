@@ -262,6 +262,11 @@ pub enum Event {
         reply: oneshot::Sender<Option<std::path::PathBuf>>,
     },
     ChatgptProbeResult(Result<agent::ratelimit::LimitObs, &'static str>),
+    ClaudeProbeRequest {
+        boot: bool,
+        reply: oneshot::Sender<Option<crate::accounts::ClaudeProbeRequest>>,
+    },
+    ClaudeProbeResult(Result<Vec<agent::ratelimit::LimitObs>, &'static str>),
     /// Explicit operator release, applied on the scheduling task.
     ClearCredentialHold {
         account: String,
@@ -834,6 +839,14 @@ impl Orchestrator {
             Event::ChatgptProbePath { boot, reply } => {
                 let _ = reply.send(self.chatgpt_probe_path(boot));
             }
+            Event::ClaudeProbeRequest { boot, reply } => {
+                let request = self.claude_probe_request(boot);
+                let admitted = request.is_some();
+                if reply.send(request).is_err() && admitted {
+                    self.claude_probe_in_flight = false;
+                }
+            }
+            Event::ClaudeProbeResult(result) => self.record_claude_probe(result),
             Event::ChatgptProbeResult(result) => {
                 match result {
                     Ok(obs) => {
@@ -841,7 +854,7 @@ impl Orchestrator {
                         self.accounts.observe("chatgpt-subscription", obs);
                     }
                     Err(reason) => {
-                        self.accounts.probe_failed(reason);
+                        self.accounts.probe_failed("chatgpt-subscription", reason);
                         tracing::warn!(reason, "ChatGPT usage probe failed; account marked stale");
                     }
                 }
