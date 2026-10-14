@@ -58,11 +58,16 @@ reasons**, either of which alone is enough:
   unknown and refuses the merge too, so a daemon gated since boot never merges a held ticket's pull
   request either.
 
-That is why gating a high-blast-radius pull request takes **both** settings. The draft holds back the
-merge; the label additionally stops **every dispatch**, the draft-poke summons included — a poked
-author's run is refused by the reopen ladder while the label is present. Setting only the draft
-leaves the summons able to re-engage an agent; setting only the label leaves a non-draft pull request
-free to merge once its reviewers approve.
+  The lock bites only when the pull request traces back to an **origin ticket** — one the daemon's own
+  join resolves from `introduced_by` (a `handoff:` or `adopt:` row) — and that ticket was among the
+  labels the last selection pass read. A pull request with no origin ticket has only the draft lock.
+
+That is why gating a high-blast-radius pull request takes **both** settings, each covering a gap the
+other does not. The **draft** is the lock GitHub itself enforces and the one that outlives the label:
+it withholds the pull request from auto-merge and stays in place until the author un-drafts it. The
+**label** is the one that additionally stops **every dispatch** the pull request could trigger, the
+draft-poke summons included — a poked author's run is refused by the reopen ladder while the label is
+present — so setting only the draft leaves the summons able to re-engage an agent.
 
 ⚠️ **Resuming a held ticket lifts the hold but does not reset the breaker.** The job page's "Human
 step done → resume" removes `rhapsody:human`, records the operator's note and requeues the ticket,

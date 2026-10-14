@@ -72,15 +72,18 @@ planning, `rhapsody:@<name>`, `rhapsody:solo` and topic labels all decide WHO ru
 this one decides that NOBODY does. A ticket without it behaves byte-identically to before the
 label existed.
 
-⚠️ **It is also a merge lock, and the one that also refuses the draft-poke summons.** A pull request
-whose **origin ticket** currently wears `rhapsody:human` is never merged by `review.auto_merge`,
-whatever its review state: the watcher logs `auto-merge: the origin ticket is held for a human; not
-merging` on every tick. That is the second of a pull request's **two independent merge locks** — the
-first being the draft state — and it is why an operator gating a high-blast-radius pull request sets
-**both**: the draft withholds it from auto-merge, and the label refuses every dispatch that could
-re-engage the author, including the **draft-poke summons** (a still-draft pull request whose author
-has stopped is poked with a comment that summons that run, and the reopen ladder refuses a held
-ticket). Remove the label to release both the dispatch and the merge.
+⚠️ **It is also a merge lock, and the one that also refuses the run a draft-poke summons would
+start.** A pull request whose **origin ticket** currently wears `rhapsody:human` is never merged by
+`review.auto_merge`, whatever its review state: the watcher logs `auto-merge: the origin ticket is
+held for a human; not merging` on every tick. That is the second of a pull request's **two
+independent merge locks** — the first being the draft state — and it is why an operator gating a
+high-blast-radius pull request sets **both**: the draft withholds it from auto-merge, and the label
+refuses every dispatch that could re-engage the author, including the **draft-poke summons** (a
+still-draft pull request whose author has stopped is poked with a comment that summons that run; the
+poke comment is still posted, but the reopen ladder refuses to start a run for a held ticket). The
+lock bites only for a pull request that traces back to an **origin ticket** — the daemon's own join
+from `introduced_by` — so one with no origin ticket has only the draft lock. Remove the label to
+release both the dispatch and the merge.
 
 ⚠️ **`resume-hold` lifts the hold but does not raise the ceiling.** The job page's "Human step done →
 resume" removes the label, records the operator's note and requeues the ticket, but it deliberately
