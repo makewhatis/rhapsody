@@ -144,6 +144,7 @@ impl crate::Runner for Runner {
             manager_config_dir: None,
             manager_credential: None,
             account_oauth: Mutex::new(None),
+            activity_callback: Mutex::new(None),
         }))
     }
 }
@@ -200,6 +201,7 @@ impl Harness for Runner {
             manager_config_dir: None,
             manager_credential: None,
             account_oauth: Mutex::new(None),
+            activity_callback: Mutex::new(None),
         }))
     }
 
@@ -270,6 +272,7 @@ impl Harness for Runner {
             manager_config_dir: Some(req.config_dir),
             manager_credential: req.model_credential,
             account_oauth: Mutex::new(None),
+            activity_callback: Mutex::new(None),
         }))
     }
 }
@@ -326,6 +329,7 @@ struct ClaudeSession {
     manager_credential: Option<String>,
     /// Nonsecret auth observed from the first system/init; frozen for this run.
     account_oauth: Mutex<Option<bool>>,
+    activity_callback: Mutex<Option<crate::ActivityCallback>>,
 }
 
 impl ClaudeSession {
@@ -411,9 +415,9 @@ impl ClaudeSession {
         cfg
     }
 
-    /// Tees one raw stdout line (+ newline) to the transcript BEFORE classification so even
-    /// unclassified lines are captured at full fidelity (design spec §3). Best-effort: a sink write
-    /// failure is warned once and never aborts the turn.
+    /// Tees one non-partial stdout line (+ newline) at full fidelity, including unclassified
+    /// lines. Partial output is liveness only (STUDIO-1285). Best-effort: a sink write failure
+    /// is warned once and never aborts the turn.
     fn tee_stdout(&self, line: &[u8]) {
         let mut guard = self.transcript.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(w) = guard.as_mut().and_then(|t| t.stdout.as_mut()) {
@@ -459,6 +463,13 @@ impl ClaudeSession {
 
 #[async_trait]
 impl Session for ClaudeSession {
+    fn set_activity_callback(&self, callback: crate::ActivityCallback) {
+        *self
+            .activity_callback
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(callback);
+    }
+
     fn reset_conversation(&self) -> Result<(), AgentError> {
         self.thread_id
             .lock()
@@ -727,12 +738,18 @@ impl Session for ClaudeSession {
                                     scan_err = Some("token too long".to_string());
                                     break 'outer;
                                 }
-                                // Tee the raw line, then classify.
+                                let c = classify(&line);
+                                if c.heartbeat {
+                                    let callback = self.activity_callback.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                                    if let Some(callback) = callback {
+                                        callback();
+                                    }
+                                    continue; // no tee, session metadata, event, usage or logging
+                                }
                                 self.tee_stdout(&line);
                                 resume_refusal_only = resume_refusal_only
                                     && !terminal_seen
                                     && missing_resume_result(&line, &resume);
-                                let c = classify(&line);
                                 // Capture the session id for EVERY classified line, BEFORE the !ok
                                 // gate, so a session id arriving on a non-surfaced line still seeds
                                 // the thread id (else --resume / billing-guard association is lost).
@@ -1246,6 +1263,61 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn partial_output_only_calls_activity_sink_across_turns() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-PARTIAL");
+        let (_script_dir, script) = write_fake_claude(
+            r#"
+read -r prompt
+printf '%s\n' '{"type":"stream_event","session_id":"partial-only","event":{"type":"message_start"}}'
+printf '%s\n' '{"type":"system","subtype":"init","session_id":"complete-session","apiKeySource":"none"}'
+for i in {1..100}; do
+  printf '%s\n' '{"type":"stream_event","session_id":"partial-only","event":{"type":"content_block_delta","delta":{"type":"input_json_delta","partial_json":"partial-secret"}}}'
+done
+printf '%s\n' '{"type":"assistant","session_id":"complete-session","message":{"content":[{"type":"text","text":"complete"}]}}'
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"complete-session","usage":{"input_tokens":1,"output_tokens":2}}'
+"#,
+        );
+        let raw = SharedBuf::new();
+        let sess = new_runner(&script, &root.path())
+            .start_session(
+                &ws,
+                issue("1", "MT-PARTIAL"),
+                Some(Transcript {
+                    stdout: Some(Box::new(raw.clone())),
+                    stderr: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let count = Arc::new(AtomicUsize::new(0));
+        let sink = Arc::clone(&count);
+        sess.set_activity_callback(Arc::new(move || {
+            sink.fetch_add(1, Ordering::SeqCst);
+        }));
+        let (types, on_event) = type_collector();
+        for _ in 0..2 {
+            let (result, error) = sess.run_turn("generate", None, None, &on_event).await;
+            assert!(error.is_none(), "{error:?}");
+            assert_eq!(result.usage.total_tokens, 3);
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 202);
+        assert_eq!(sess.thread_id(), "complete-session");
+        assert_eq!(
+            *types.lock().unwrap(),
+            [
+                EVENT_SESSION_STARTED,
+                crate::EVENT_NOTIFICATION,
+                EVENT_TURN_COMPLETED
+            ]
+            .repeat(2)
+        );
+        assert_eq!(raw.string().lines().count(), 6);
+        assert!(!raw.string().contains("partial"));
     }
 
     /// Collects `on_event` event types into a shared vec, returning (collector, closure).

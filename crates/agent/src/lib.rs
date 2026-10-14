@@ -45,6 +45,9 @@ pub use harness::{
 };
 pub use humanize::{LogEntry, humanize_stream_line};
 
+/// Payload-free liveness notification, independent of agent events and transcripts.
+pub type ActivityCallback = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rhapsody_core::Issue;
@@ -218,6 +221,10 @@ impl ModelOverride {
 /// points and share it between tasks.
 #[async_trait]
 pub trait Session: Send + Sync {
+    /// Installs a run-local liveness sink for partial model output. Backends without partial
+    /// output need no sink; complete messages continue through the ordinary event callback.
+    fn set_activity_callback(&self, _callback: ActivityCallback) {}
+
     /// Authentication actually observed by this session. None means unknown, never inferred
     /// from the model. Read in the worker's event callback; contains no credential or I/O.
     fn account_oauth(&self) -> Option<bool> {

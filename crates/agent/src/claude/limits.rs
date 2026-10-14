@@ -63,8 +63,13 @@ pub async fn probe(
         ..Default::default()
     };
     let mut cmd = tokio::process::Command::new(name);
+    // The probe has its own deadline and output cap, and needs only rate-limit observations.
+    // Keep its argv/output unchanged when the ordinary runner opts into partial liveness.
+    let args = super::build_args(&cfg, "")
+        .into_iter()
+        .filter(|arg| arg != "--include-partial-messages");
     cmd.args(prefix)
-        .args(super::build_args(&cfg, ""))
+        .args(args)
         .current_dir(&scratch.0)
         .process_group(0)
         .kill_on_drop(true)
@@ -159,6 +164,7 @@ mod tests {
         std::fs::write(&script, format!(r#"
 test -z "$(ls -A)" || exit 10
 args=" $* "
+case "$args" in *' --include-partial-messages '*) exit 13 ;; esac
 for pair in '-p' '--output-format stream-json' '--input-format stream-json' '--verbose' '--model haiku' '--max-turns 1' '--no-session-persistence'; do
   case "$args" in *" $pair "*) ;; *) exit 11 ;; esac
 done

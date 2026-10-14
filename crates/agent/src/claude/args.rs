@@ -128,6 +128,8 @@ pub fn build_args(cfg: &Config, resume_id: &str) -> Vec<String> {
         "-p".to_string(),
         "--output-format".to_string(),
         "stream-json".to_string(),
+        // Partial output is liveness only; complete messages remain the accounting contract.
+        "--include-partial-messages".to_string(),
         // stream-json INPUT keeps stdin open as a JSONL channel so operator messages can be folded
         // into a live turn at the next step boundary (INF-250). The initial prompt is sent as one
         // user message; with no operator messages a turn behaves as before.
@@ -222,6 +224,7 @@ mod tests {
             "-p",
             "--output-format",
             "stream-json",
+            "--include-partial-messages",
             "--input-format",
             "stream-json",
             "--verbose",
