@@ -5,7 +5,8 @@ A check nobody has watched fire is not a guard: it converts "nobody checked" int
 and it is clean". This mutation test runs the real check against throwaway copies of
 `.github/workflows/release.yml` with the STUDIO-878 defect reintroduced one rule at a time — the
 exclusive acquisition dropped, the list replaced instead of prepended, the restore made a
-snapshot restore — and asserts the check reds on each and names the rule. The green baseline
+snapshot restore, the LOCK_FILE= assignment pointed at a second lock (STUDIO-1283) — and asserts
+the check reds on each and names the rule. The green baseline
 matters just as much: a red below would prove nothing if the shipped workflow did not pass first.
 
 No dependencies beyond python3. Run from anywhere:
@@ -162,6 +163,27 @@ with tempfile.TemporaryDirectory(prefix="release-keychain-lock-") as work:
         "reds when the lock is not the shared one",
         real.replace("keychain-search-list.lock", "rhapsody-only.lock"),
         work, 1, "not the shared",
+    )
+    # 6. The assignment itself must pin the shared lock (STUDIO-1283). Changing ONLY the
+    #    executable LOCK_FILE= line must red even though the comments still name the shared
+    #    path — the drift the whole-file substring search let through.
+    expect(
+        "reds when only the LOCK_FILE= assignment drifts to a different lock",
+        real.replace(
+            'LOCK_FILE="$HOME/.rhapsody/keychain-search-list.lock"',
+            'LOCK_FILE="$HOME/.rhapsody/rhapsody-release.lock"',
+        ),
+        work, 1, "not the shared",
+    )
+    # 7. The wrapper must be HANDED the shared lock, not merely define it: pointing the perl
+    #    invocation at a different path is the same second-lock defect (STUDIO-1283).
+    expect(
+        "reds when the perl wrapper is not handed $LOCK_FILE",
+        real.replace(
+            '\' "$LOCK_FILE" bash',
+            '\' "$HOME/.rhapsody/rhapsody-release.lock" bash',
+        ),
+        work, 1, "not invoked with the shared lock",
     )
 
     # A vacuous pass is not a pass: a workflow with none of this machinery must not report green.

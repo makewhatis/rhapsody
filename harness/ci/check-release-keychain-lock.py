@@ -31,6 +31,11 @@ A guard nobody has watched fire is not a guard, so `check-release-keychain-lock_
 reintroduces the defect (drops the exclusive acquisition, the prepend, the surgical restore) and
 asserts this scan reds on it.
 
+The scan matches COMMANDS, not prose (STUDIO-1283): comment lines are ignored and the `LOCK_FILE=`
+assignment must pin the shared path exactly, because the shared path is named several times in
+release.yml's own comments — a whole-file substring search passed even when only the executable
+assignment drifted to a different lock.
+
 Usage: check-release-keychain-lock.py [--workflow PATH]
 Exits 0 when the workflow satisfies every rule; 1 when one is violated; 2 on a setup error.
 """
@@ -43,9 +48,19 @@ DEFAULT_WORKFLOW = (
     Path(__file__).resolve().parents[2] / ".github" / "workflows" / "release.yml"
 )
 
+# A full-line comment: `#` after optional whitespace. A structural check must not match prose.
+COMMENT_RE = re.compile(r"^[ \t]*#")
 # The exclusive acquisition: an flock(2) taken through perl, held for the guarded child.
 FLOCK_MODULE_RE = re.compile(r"perl\s+-MFcntl=:flock")
 LOCK_EX_RE = re.compile(r"flock\(\$\w+,\s*LOCK_EX\)")
+# The lock file the wrapper must take, pinned at the ASSIGNMENT and at the CALL (STUDIO-1283).
+# The rule these replace — a substring search for `keychain-search-list.lock` anywhere in the
+# file — matched release.yml's own comments, which name the shared path several times, so a
+# drift that changed only the executable LOCK_FILE= assignment still passed.
+LOCK_FILE_ASSIGN_RE = re.compile(
+    r'\bLOCK_FILE="\$HOME/\.rhapsody/keychain-search-list\.lock"'
+)
+FLOCK_LOCKFILE_RE = re.compile(r'"\$LOCK_FILE"[ \t]+bash[ \t]+-c')
 # The window the lock must be held across: a heredoc handed to `bash -c` inside the locked
 # perl invocation. The marker is captured so the guarded body can be sliced out.
 WINDOW_OPEN_RE = re.compile(r"bash\s+-c\s+\"\$\(cat <<'([A-Za-z_][A-Za-z0-9_]*)'")
@@ -68,6 +83,16 @@ RESTORE_EMPTY_GUARD_RE = re.compile(r'\[\s*"\$\{#remaining\[@\]\}"\s*-eq\s*0\s*\
 # The signing work whose outcome depends on the list order.
 MAKE_RE = re.compile(r"make dmg VERSION=")
 SNAPSHOT_RE = re.compile(r"security list-keychains -d user \|")
+
+
+def code_only(text):
+    """`text` with comment lines (a `#` after optional whitespace) removed.
+
+    release.yml documents the shared lock by name in its comments, so matching the raw file
+    lets a drift that changes only the executable LOCK_FILE= assignment pass on a comment's
+    mention of the path (STUDIO-1283). Comments never run; they are not evidence.
+    """
+    return "\n".join(line for line in text.splitlines() if not COMMENT_RE.match(line))
 
 
 def window_body(text, marker):
@@ -93,20 +118,23 @@ def window_body(text, marker):
 def check_concurrent_safety(text):
     """Return the list of STUDIO-1280 rules the workflow at `text` violates."""
     problems = []
+    # Match the executable workflow only: a comment naming a construct is not that construct,
+    # and release.yml's comments name the shared lock repeatedly (STUDIO-1283).
+    code = code_only(text)
 
     # 1. The shared list must be rewritten by PREPENDING our keychain, preserving the rest —
     #    never replaced by the signing keychain + a hardcoded login (the B1 defect).
-    if REPLACE_RE.search(text):
+    if REPLACE_RE.search(code):
         problems.append(
             "the shared keychain search list is REPLACED (signing keychain + login only), "
             "evicting a concurrent job's keychain"
         )
-    if not PREPEND_SEED_RE.search(text) or not PREPEND_APPEND_RE.search(text):
+    if not PREPEND_SEED_RE.search(code) or not PREPEND_APPEND_RE.search(code):
         problems.append(
             "nothing PREPENDS the signing keychain to the existing search list "
             '(want: new_list=("$SIGNING_KEYCHAIN") then new_list+=("$kc"))'
         )
-    if not SET_RE.search(text):
+    if not SET_RE.search(code):
         problems.append(
             "the preserved list is never written back to the shared search list "
             "(want: security list-keychains -d user -s ${new_list[@]})"
@@ -114,26 +142,35 @@ def check_concurrent_safety(text):
 
     # 2. An exclusive flock(2) on the shared lock, held across the whole rewrite -> make dmg
     #    window. Removing the acquisition must fail here.
-    if not FLOCK_MODULE_RE.search(text) or not LOCK_EX_RE.search(text):
+    if not FLOCK_MODULE_RE.search(code) or not LOCK_EX_RE.search(code):
         problems.append(
             "no exclusive flock(2) is taken on the shared keychain search-list lock "
             "(want: perl -MFcntl=:flock ... flock($fh, LOCK_EX))"
         )
-    if "keychain-search-list.lock" not in text:
+    # The lock must be the shared one Tally takes, pinned at the ASSIGNMENT and at the CALL.
+    # A drift to a second lock would not serialize against Tally's (two different locks would
+    # be no better than none), and the comments still naming the shared path must not mask it.
+    if not LOCK_FILE_ASSIGN_RE.search(code):
         problems.append(
             "the lock is not the shared ~/.rhapsody/keychain-search-list.lock Tally takes "
+            '(want: LOCK_FILE="$HOME/.rhapsody/keychain-search-list.lock") '
             "(two different locks would be no better than none)"
+        )
+    if not FLOCK_LOCKFILE_RE.search(code):
+        problems.append(
+            "the perl flock(2) wrapper is not invoked with the shared lock "
+            '(want: perl ... "$LOCK_FILE" bash -c ...)'
         )
 
     window = None
-    open_match = WINDOW_OPEN_RE.search(text)
+    open_match = WINDOW_OPEN_RE.search(code)
     if open_match is None:
         problems.append(
             "the search-list rewrite is not run inside the locked window "
             "(want: bash -c \"$(cat <<'MARKER' ... MARKER)\" under the flock)"
         )
     else:
-        window = window_body(text, open_match.group(1))
+        window = window_body(code, open_match.group(1))
         if window is None:
             problems.append(
                 f"the locked window heredoc {open_match.group(1)!r} has no terminator"
@@ -158,18 +195,18 @@ def check_concurrent_safety(text):
             trap_at = RESTORE_TRAP_RE.search(window).start()
             if make_in_window.start() < trap_at:
                 problems.append("the restore trap is armed only after make dmg")
-    elif MAKE_RE.search(text):
+    elif MAKE_RE.search(code):
         problems.append(
             "make dmg runs outside the exclusive lock, so a rewrite can land mid-archive"
         )
 
     # 3. The restore must remove only our keychain, under the lock — never restore a snapshot
     #    (that clobbers a concurrent holder's own change) and never write an empty list.
-    if not RESTORE_FN_RE.search(text):
+    if not RESTORE_FN_RE.search(code):
         problems.append("there is no restore_search_list helper")
     else:
-        fn_at = RESTORE_FN_RE.search(text).start()
-        body = text[fn_at:]
+        fn_at = RESTORE_FN_RE.search(code).start()
+        body = code[fn_at:]
         end = re.search(r"\n[ \t]*\}[ \t]*\n", body)
         body = body if end is None else body[: end.start()]
         if not RESTORE_REMOVES_OURS_RE.search(body):
