@@ -237,7 +237,15 @@ pub trait Session: Send + Sync {
         ))
     }
 
-    /// Preserve a conversation after a voluntary limit handoff (including a successful last turn).
+    /// Forget an unavailable conversation before a single fresh-session fallback. Called only
+    /// after resume failed before agent work started; never a retry for a failed tool/model turn.
+    fn reset_conversation(&self) -> Result<(), AgentError> {
+        Err(AgentError::Other(
+            "fresh-session fallback is not supported by this harness".into(),
+        ))
+    }
+
+    /// Preserve a conversation after a limit handoff or drain (including a successful last turn).
     fn retain_for_limit(&self) {}
 
     /// Records the store run-row id for this session, so the backend can expose it to the agent
@@ -379,6 +387,9 @@ pub enum AgentError {
     TurnFailed,
     #[error("turn_timeout")]
     TurnTimeout,
+    /// A retained conversation is absent/expired, before any new model/tool work started.
+    #[error("resume_unavailable")]
+    ResumeUnavailable,
     /// Returned when the billing guard fails: the first system/init event did not report
     /// `apiKeySource == "none"`, so the agent would bill the metered API.
     #[error("billing_guard_failed")]

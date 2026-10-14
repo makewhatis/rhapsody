@@ -21,12 +21,17 @@ use std::time::{Duration, Instant};
 use rhapsody_desktop::app::{App, CloseDecision, ShutdownWait};
 use rhapsody_desktop::supervisor::{Options, State, Supervisor};
 
+mod support;
+use support::SupervisorGuard;
+
 /// The wall-clock bound the tests give the quit — the production one.
 const BOUND: Duration = rhapsody_desktop::app::SHUTDOWN_WAIT_BOUND;
 
-/// How long the test waits for a quit before calling it hung. Well past [`BOUND`], so a failure here
-/// means the bound itself did not hold.
+/// How long the test waits AFTER setup reaches the Exit handler before calling a quit hung.
+/// Runtime creation, child startup, and pre-quit pumping have their own setup watchdog.
 const HUNG_AFTER: Duration = Duration::from_secs(30);
+
+const SETUP_LIMIT: Duration = Duration::from_secs(120);
 
 /// How long `fakedaemon` takes to finish shutting down after SIGTERM — like the real daemon, which
 /// spent five seconds draining in the incident. It must comfortably outlast one tray tick so the tray
@@ -144,8 +149,9 @@ fn quit_scenario(
 ) -> Option<Quit> {
     let _alone = alone();
     let (result_tx, result_rx) = mpsc::channel();
-    // The scenario owns its runtime: if the quit hangs, the thread (and the runtime it would block
-    // dropping) is simply leaked and the test fails on the watchdog below.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    // Setup and Exit have separate watchdogs; the caller owns the held setter and a stop guard so
+    // even a failing quit releases the worker and terminates the child.
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Runtime::new() {
             Ok(rt) => rt,
@@ -153,8 +159,11 @@ fn quit_scenario(
         };
         let (main_tx, main_rx) = mpsc::channel::<Job>();
         let main = MainThread { rx: main_rx };
-        spawn_tray_refresh(&runtime, main_tx);
         let app = before_exit(&runtime, &main);
+        let _guard = app.get_sup().map(|sup| SupervisorGuard::new(&sup));
+        // Startup uses block_on before the fake main loop pumps. A tray setter here would starve
+        // readiness instead of testing Exit (the false "quit hung" in STUDIO-1268).
+        spawn_tray_refresh(&runtime, main_tx);
         // Idle a few tray ticks so the loop is demonstrably healthy before the quit.
         main.pump_for(TRAY_TICK * 4);
 
@@ -164,20 +173,24 @@ fn quit_scenario(
         let held = main.rx.recv_timeout(TRAY_TICK * 20);
         std::thread::sleep(TRAY_TICK);
 
+        let _ = ready_tx.send((app.clone(), held));
         let started = Instant::now();
         let wait = app.on_shutdown_blocking(runtime.handle(), BOUND);
         let elapsed = started.elapsed();
         let _ = result_tx.send(Quit { wait, elapsed, app });
 
-        // Back in the event loop: the held setter runs, then teardown proceeds without waiting on the
-        // tray (its next setter fails fast once the main queue is gone).
-        if let Ok(job) = held {
-            job();
-        }
         drop(main);
         runtime.shutdown_background();
     });
-    result_rx.recv_timeout(HUNG_AFTER).ok()
+    let (app, held) = ready_rx
+        .recv_timeout(SETUP_LIMIT)
+        .expect("quit scenario setup failed to reach Exit; the shutdown bound was not exercised");
+    let _guard = app.get_sup().map(|sup| SupervisorGuard::new(&sup));
+    let result = result_rx.recv_timeout(HUNG_AFTER).ok();
+    if let Ok(job) = held {
+        job();
+    }
+    result
 }
 
 /// Asserts the quit finished in time, and its shutdown task really ran to completion.
@@ -292,8 +305,8 @@ fn quit_after_the_daemon_already_exited_finishes() {
     assert_completed(quit, "quit after the daemon exited");
 }
 
-// Quit when the daemon ignores SIGTERM: the supervisor's SIGKILL backstop still fires (it needs the
-// runtime's timer), and the quit finishes.
+// Quit when the daemon ignores SIGTERM: the supervisor's wall-clock SIGKILL backstop still fires,
+// and the quit finishes.
 #[test]
 fn quit_with_a_hung_daemon_finishes() {
     let quit = quit_scenario(|runtime, _main| {
@@ -356,4 +369,94 @@ fn the_shutdown_wait_is_bounded_even_when_the_runtime_is_wedged() {
 
     let _ = wedge_tx.send(());
     runtime.shutdown_background();
+}
+
+// Unlike the original scenarios, this holds the ONLY worker behind an acknowledged timer-woken
+// tray setter. It cannot be rescued by an idle worker or a SIGCHLD on another runtime. Neither the
+// quit deadline nor SIGKILL/reaping may require that worker to make progress (STUDIO-1268).
+#[test]
+fn quit_bound_holds_when_the_driver_worker_is_blocked() {
+    blocked_driver_quit(false);
+}
+
+#[test]
+fn second_quit_bound_holds_when_the_driver_worker_is_blocked() {
+    blocked_driver_quit(true);
+}
+
+fn blocked_driver_quit(drain_started: bool) {
+    let _alone = alone();
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("runtime");
+    let mut opts = daemon_options(&["FAKE_STOP_DELAY_MS=600000"]);
+    opts.stop_grace = Duration::from_secs(1);
+    let sup = Supervisor::new(opts);
+    let guard = SupervisorGuard::new(&sup);
+    runtime
+        .block_on(async { sup.start(tokio::time::sleep(Duration::from_secs(15))).await })
+        .expect("fakedaemon should start");
+    let pid = sup.status().pid;
+    assert!(pid > 0);
+    let app = App::new(None, PathBuf::new());
+    app.set_sup(sup.clone());
+    if drain_started {
+        assert_eq!(app.on_before_close(), CloseDecision::StartDrain);
+    }
+
+    let (main_tx, main_rx) = mpsc::channel::<Job>();
+    runtime.spawn(async move {
+        tokio::time::sleep(TRAY_TICK).await;
+        run_on_main_thread(&main_tx);
+    });
+    let setter = main_rx
+        .recv_timeout(Duration::from_secs(15))
+        .expect("timer-woken tray setter should reach the main thread");
+    if drain_started {
+        let drain = app.clone();
+        runtime.spawn(async move { drain.drain_daemon(Duration::from_secs(10)).await });
+    }
+
+    let (result_tx, result_rx) = mpsc::channel();
+    let handle = runtime.handle().clone();
+    let started = Instant::now();
+    std::thread::spawn(move || {
+        let wait = app.on_shutdown_blocking(&handle, BOUND);
+        let _ = result_tx.send((wait, started.elapsed()));
+    });
+
+    // Check the one-second SIGTERM grace independently of the twelve-second quit bound, without
+    // pumping the setter or polling a Tokio timer. Signal 0 still sees a zombie until it is reaped.
+    let kill_deadline = Instant::now() + Duration::from_secs(3);
+    while unsafe { libc::kill(pid, 0) == 0 } && Instant::now() < kill_deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let child_survived_grace = unsafe { libc::kill(pid, 0) == 0 };
+    let result =
+        result_rx.recv_timeout((BOUND + Duration::from_secs(2)).saturating_sub(started.elapsed()));
+    let child_survived_quit = unsafe { libc::kill(pid, 0) == 0 };
+
+    // Release and clean up BEFORE asserting: the failing-first run and runtime-timer mutation must
+    // not leak their own worker, child, or quit thread.
+    setter();
+    drop(main_rx);
+    drop(guard);
+    runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(10), sup.stop()).await })
+        .expect("cleanup should finish once the worker is released");
+    runtime.shutdown_background();
+
+    let (wait, elapsed) = result.expect("quit exceeded BOUND + 2s with the driver worker blocked");
+    assert_eq!(wait, ShutdownWait::TimedOut);
+    assert!(
+        elapsed <= BOUND + Duration::from_secs(2),
+        "quit took {elapsed:?}"
+    );
+    assert!(
+        !child_survived_grace,
+        "SIGKILL/reaping depended on the blocked driver: pid {pid}"
+    );
+    assert!(!child_survived_quit, "quit leaked fakedaemon pid {pid}");
 }

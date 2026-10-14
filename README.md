@@ -115,6 +115,35 @@ reason and a WARN, without fabricating zero usage or a quota wall. Live passive 
 repair probe failure staleness and take precedence over a probe completed during live work. These
 Rhapsody-only knobs round-trip through workflow saves; Go-owned API/config goldens are unchanged.
 
+### Retry admission before fresh work (STUDIO-1263)
+
+Due retries and retries waiting for capacity are served oldest-first before fresh candidates on
+each poll tick; retry timer events use the same ordering. The frozen Go scheduler lets fresh polls
+compete with independently backed-off retries, which can starve already-started work. A slot wait
+now preserves the attempt and original due time (including across restart), and re-arms a fixed
+five-second timer like drain parking instead of charging another failure or growing backoff.
+Waiting retries check local capacity before making any tracker read; a full pool consumes no retry
+polls. The ordinary board poll refreshes waiting snapshots without extra reads and reconsiders retries
+before fresh selection in the same tick. Admission still revalidates the ticket and all caps once
+capacity is free. That tick's older board snapshots cannot re-admit a retry rejected by the newer read.
+Selection still observes the full board's human holds; retry ownership excludes admission only.
+Future genuine-failure backoffs and account-limit waits retain their existing deadlines. Global
+implementation, per-project-group and shared per-state caps remain enforced, including preparation
+reservations. No configuration, schema, API shape or golden fixture changes.
+
+### Durable drain continuations (STUDIO-1259)
+
+Retry-backed ticket runs parked at a drain boundary retain their harness's resumable conversation,
+including OpenCode's private session state. The existing retry queue stores `drain continuation:`
+JSON containing the thread ID, harness, issue snapshot and pinned fallback engine; restart recovery
+restores it and does not suppress in-flight work for a PR it already opened. Admission delays keep
+the metadata until dispatch, and release/completion clears it. Non-resumable harnesses start fresh.
+Every drain continuation prompt identifies the drain and requires inspecting `git status`,
+`git log <base>..HEAD` and the ticket's progress file before new writes. A missing/expired session
+refused before model/tool work falls back once to a fresh conversation with one warning; unrelated
+turn, authentication and billing failures retain normal error handling. Ticketless review/manager
+exit policies, Go-owned schemas, payload shapes and parity fixtures are unchanged.
+
 ### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1252)
 
 Landing is **Rhapsody-only, with no Go counterpart**. Per-project `projects[].landing` in
@@ -151,6 +180,15 @@ The [operational guide](LANDING.md)
 documents availability, every config/contract field, worked examples and migration precautions.
 With landing absent or disabled, merge completion and auto-merge behavior are unchanged; the
 Go-owned tables, config/API golden shapes and fixture normalization are untouched.
+
+### Hindsight prefetch freshness (STUDIO-1270)
+
+Worker memory prefetch skips a cached `(identity, ticket)` entry younger than five minutes
+(half its ten-minute TTL), including successful empty answers. Personal and shared-team facts
+refresh together under that entry. Each minute's rotating pass spends at most ten actual bank
+calls, counting both banks; skipped fresh entries spend no calls. Carry-over keeps the original
+timestamp and expiry semantics, bank failures still warn, and dispatch reads only the cache
+without waiting. This Teams-only scheduling change has no frozen Go counterpart.
 
 ### Hindsight recall deadlines and failure diagnostics (STUDIO-1253)
 
@@ -436,6 +474,17 @@ Desktop sidecars are killed on child-handle drop if their supervisor task/runtim
 normal SIGTERM/graceful-stop behavior stays the same. Test guards request stop before signaling,
 preventing the restart loop from relaunching a daemon during failure cleanup. No configuration,
 API payload, schema or golden changes.
+
+### Desktop quit and child-stop deadlines (STUDIO-1116, STUDIO-1268)
+
+The Tauri main thread's final Quit waits on a standard channel for at most twelve seconds rather
+than blocking on a runtime timer. It requests stop before scheduling async teardown, so a blocked
+tray setter cannot prevent the sidecar from receiving SIGTERM. A per-launch standard-thread
+backstop observes child exit and escalates to process-group SIGKILL after `stop_grace` (five seconds
+by default), independently of Tokio's driver. Signaling and reaping share the owned child handle,
+preventing a delayed backstop from signaling a recycled PID. Go's goroutines and `time.After` need
+no UI/runtime driver; these explicit backstops preserve that lifecycle guarantee in the Tauri port.
+No configuration, API payload, schema or golden changes.
 
 ### Manager findings and tracker documents (STUDIO-1146)
 

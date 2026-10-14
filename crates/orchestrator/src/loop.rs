@@ -699,6 +699,7 @@ fn worker_deps_for(
         prepared_harness: None,
         engine: None,
         resume_session: String::new(),
+        resume_after_drain: false,
     };
     if let Some(rp) = rp {
         deps.workspace = Arc::clone(&rp.workspace);
@@ -869,7 +870,20 @@ impl Orchestrator {
             Event::TranscriptOpened { issue_id, path } => {
                 self.on_transcript_opened(&issue_id, &path)
             }
-            Event::Retry(e) => self.on_retry(e).await,
+            Event::Retry(e) => {
+                if e.issue_id.starts_with("limit:")
+                    || self.retry_attempts.get(&e.issue_id).is_some_and(|re| {
+                        re.err.starts_with(crate::limitpolicy::RETRY_LIMIT_PREFIX)
+                    })
+                {
+                    self.on_retry(e).await;
+                } else {
+                    // Timers may arrive in any order, or remain queued after a tick has served
+                    // their retry. Re-read the ready queue rather than bypassing its age order
+                    // (or pulling a newly re-armed failure backoff forward on a stale event).
+                    self.dispatch_ready_retries().await;
+                }
+            }
             Event::Reload => self.on_reload(),
             Event::DispatchPrepared {
                 id,
@@ -1241,6 +1255,7 @@ impl Orchestrator {
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
         async {
+            self.dispatch_ready_retries().await;
             self.dispatch_decisions().await;
             // DAG auto-promote (INF-318): AFTER the normal dispatch decisions, flip any enabled-mode
             // Backlog dependent whose blockers are cleared Backlog→Todo (O6 `promote.rs`). A no-op for
@@ -1307,6 +1322,15 @@ impl Orchestrator {
             // so a recall rendered during THIS tick's dispatch can attach a ticket's current state
             // without asking the tracker anything (§5.2). In-memory, and a no-op with Teams off.
             self.record_issue_states(tagged.iter().map(|t| &t.iss));
+            self.refresh_waiting_retry_issues(tagged.iter().map(|t| &t.iss));
+            let retry_identifiers: std::collections::HashSet<_> = self
+                .retry_attempts
+                .values()
+                .map(|re| re.identifier.clone())
+                .collect();
+            // A waiter parked against its old state may now have capacity. Reconsider it before
+            // fresh selection can spend that slot; saturated waiters still make no tracker read.
+            self.dispatch_ready_retries().await;
             // Rhapsody Teams review quorum (STUDIO-659, T7): the same snapshot, for the other
             // consumer — per-identity load and each ticket's open PR / marker label, so a handoff
             // arriving between ticks can choose reviewers without a tracker read. A hard no-op with
@@ -1337,16 +1361,24 @@ impl Orchestrator {
                     tagged.iter().map(|t| t.iss.id.clone()).collect();
                 self.cancel_dropped_preparations(&present);
             }
+            // Retry admission can reject a newer ticket and release its claim. Do not let this
+            // tick's older board copy override that verdict through fresh or wake admission.
             // STUDIO-1017 (§7.9): admit any pending manager wake obligation BEFORE ordinary
             // selection, so the author is dispatched once, with its seed, and selection never sees
             // the ticket as a fresh dispatch.
             let wake_candidates: Vec<crate::managerwake::WakeCandidate<'_>> = tagged
                 .iter()
+                .filter(|t| !retry_identifiers.contains(&t.iss.identifier))
                 .map(|t| (&t.iss, self.route_for(t.proj)))
                 .collect();
             self.pump_manager_wakes(&wake_candidates);
-            let (picked, reopen, held_for_capacity) =
-                self.select_dispatch_multi_after_fetch(tagged, read_the_board);
+            // Selection observes the full board's human labels; the exclusion gates admission only.
+            let (picked, reopen, held_for_capacity) = self
+                .select_dispatch_multi_after_fetch_excluding(
+                    tagged,
+                    read_the_board,
+                    &retry_identifiers,
+                );
             // What this pass withheld for want of a teammate's capacity (STUDIO-803), stored over
             // the reset at the top of the tick exactly as the single-project path below does — and
             // PUBLISHED through the same setter, because this is the only ladder a `projects:`
@@ -1435,6 +1467,14 @@ impl Orchestrator {
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
         self.record_issue_states(issues.iter());
+        self.refresh_waiting_retry_issues(issues.iter());
+        let retry_identifiers: std::collections::HashSet<_> = self
+            .retry_attempts
+            .values()
+            .map(|re| re.identifier.clone())
+            .collect();
+        // The legacy ladder must give refreshed waiters the same first claim as the project path.
+        self.dispatch_ready_retries().await;
         self.record_quorum_state(issues.iter());
         self.observe_lead_review_departures(issues.iter().map(|iss| (iss, None)), true);
         // The legacy ladder's half of the adoption sweep (STUDIO-838). Untagged, so each candidate
@@ -1449,12 +1489,17 @@ impl Orchestrator {
                 issues.iter().map(|i| i.id.clone()).collect();
             self.cancel_dropped_preparations(&present);
         }
+        // The same tick-local exclusion covers recovered identifier-keyed retries on both ladders.
         // STUDIO-1017 (§7.9): the legacy ladder's half of the wake admission — see the multi-project
         // ladder above for why it runs before selection.
-        let wake_candidates: Vec<crate::managerwake::WakeCandidate<'_>> =
-            issues.iter().map(|iss| (iss, None)).collect();
+        let wake_candidates: Vec<crate::managerwake::WakeCandidate<'_>> = issues
+            .iter()
+            .filter(|iss| !retry_identifiers.contains(&iss.identifier))
+            .map(|iss| (iss, None))
+            .collect();
         self.pump_manager_wakes(&wake_candidates);
-        let (active, reopen, held_for_capacity) = self.select_dispatch_with_reopens(issues);
+        let (active, reopen, held_for_capacity) =
+            self.select_dispatch_with_reopens_excluding(issues, &retry_identifiers);
         // What this pass withheld for want of a teammate's capacity (STUDIO-802). Stored wholesale
         // over the reset at the top of the tick, so a teammate who has since freed up cannot linger
         // in it.
@@ -2133,6 +2178,10 @@ impl Orchestrator {
             .get(&iss.id)
             .map(|r| r.resume_session.clone())
             .unwrap_or_default();
+        deps.resume_after_drain = self
+            .running
+            .get(&iss.id)
+            .is_some_and(|r| r.resume_after_drain);
         // ⚠️ The routed teammate's HARNESS (STUDIO-902): swap in that backend's already-built
         // runner. Empty — every profile that names none — leaves `deps.agent` exactly as
         // `worker_deps_for` set it, which is what keeps every existing dispatch byte-identical.

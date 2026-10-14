@@ -459,6 +459,14 @@ impl ClaudeSession {
 
 #[async_trait]
 impl Session for ClaudeSession {
+    fn reset_conversation(&self) -> Result<(), AgentError> {
+        self.thread_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        self.turn_n.store(0, Ordering::SeqCst);
+        Ok(())
+    }
     fn resume_from(&self, thread_id: &str) -> Result<(), AgentError> {
         if thread_id.is_empty() {
             return Err(AgentError::Other(
@@ -669,6 +677,8 @@ impl Session for ClaudeSession {
         let mut stderr_open = true;
         let mut mailbox_open = messages.is_some();
         let mut stderr_buf = CappedBuffer::new(MAX_STDERR_CAPTURE);
+        let mut stdout_seen = false;
+        let mut resume_refusal_only = !resume.is_empty();
         let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
         let mut out_chunk = vec![0u8; READ_CHUNK];
         let mut err_chunk = vec![0u8; READ_CHUNK];
@@ -699,6 +709,7 @@ impl Session for ClaudeSession {
                     match r {
                         Ok(0) => break 'outer, // EOF
                         Ok(n) => {
+                            stdout_seen = true;
                             acc.extend_from_slice(&out_chunk[..n]);
                             loop {
                                 let Some(pos) = acc.iter().position(|&b| b == b'\n') else {
@@ -718,6 +729,9 @@ impl Session for ClaudeSession {
                                 }
                                 // Tee the raw line, then classify.
                                 self.tee_stdout(&line);
+                                resume_refusal_only = resume_refusal_only
+                                    && !terminal_seen
+                                    && missing_resume_result(&line, &resume);
                                 let c = classify(&line);
                                 // Capture the session id for EVERY classified line, BEFORE the !ok
                                 // gate, so a session id arriving on a non-surfaced line still seeds
@@ -879,6 +893,24 @@ impl Session for ClaudeSession {
         if billing_failed {
             return (failed(usage), Some(AgentError::BillingGuard));
         }
+        // Missing --resume conversations are refused before work: older CLIs emit only stderr,
+        // while 2.1.296 also emits one explicit zero-turn/zero-usage error result without init.
+        // Recognize that closed shape before generic billing/result handling, never after other
+        // stdout, a partial scan, or a timeout. Match the requested ID on both output channels.
+        if !resume.is_empty()
+            && matches!(&wait_res, Ok(s) if !s.success())
+            && !timed_out
+            && scan_err.is_none()
+            && acc.is_empty()
+            && (!stdout_seen || (resume_refusal_only && result.is_some()))
+            && String::from_utf8_lossy(stderr_buf.bytes())
+                .lines()
+                .any(|line| {
+                    line.trim() == format!("No conversation found with session ID: {resume}")
+                })
+        {
+            return (failed(usage), Some(AgentError::ResumeUnavailable));
+        }
         // Fail-closed billing guard: a result but no system/init observed → apiKeySource could not
         // be verified, so we cannot prove the turn ran on the logged-in subscription. Refuse it
         // (this only fires when a result would otherwise be returned; the timeout/scan-error/wait
@@ -959,6 +991,35 @@ impl Session for ClaudeSession {
             )),
         )
     }
+}
+
+/// Unlike the lenient protocol parser, missing evidence is not proof that replay is safe.
+fn missing_resume_result(line: &[u8], resume: &str) -> bool {
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+        return false;
+    };
+    v["type"] == "result"
+        && v["subtype"] == "error_during_execution"
+        && v["is_error"] == true
+        && v["num_turns"].as_u64() == Some(0)
+        && v["duration_api_ms"].as_u64() == Some(0)
+        && v["total_cost_usd"].as_f64() == Some(0.0)
+        && [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ]
+        .iter()
+        .all(|key| v["usage"][key].as_u64() == Some(0))
+        && v.get("modelUsage")
+            .is_none_or(|models| models.as_object().is_some_and(|m| m.is_empty()))
+        && v.get("result").is_none_or(|text| text.as_str() == Some(""))
+        && v["errors"].as_array().is_some_and(|errors| {
+            errors.len() == 1
+                && errors[0].as_str()
+                    == Some(format!("No conversation found with session ID: {resume}").as_str())
+        })
 }
 
 /// Builds a `TURN_FAILED` result carrying the given usage.
@@ -1250,6 +1311,119 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn missing_resume_refusal_is_classified_only_before_work() {
+        let _env = ENV_GUARD.read().await;
+        // Claude Code 2.1.296 reports a missing --resume conversation with this zero-turn
+        // error result as well as stderr; it emits no system/init or model/tool events.
+        let refusal = serde_json::json!({
+            "type": "result", "subtype": "error_during_execution", "is_error": true,
+            "duration_ms": 12, "duration_api_ms": 0, "num_turns": 0,
+            "total_cost_usd": 0, "session_id": "missing-session",
+            "usage": {"input_tokens": 0, "output_tokens": 0,
+                "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+            "modelUsage": {}, "errors": ["No conversation found with session ID: missing-session"]
+        });
+        let result_line = format!("printf '%s\\n' '{refusal}'\n");
+        let mut cases = vec![
+            ("stream-json refusal".to_string(), result_line.clone(), true),
+            ("stderr-only refusal".to_string(), String::new(), true),
+        ];
+        for (field, value) in [
+            ("num_turns", serde_json::json!(1)),
+            ("duration_api_ms", serde_json::json!(1)),
+            ("total_cost_usd", serde_json::json!(0.001)),
+            ("is_error", serde_json::json!(false)),
+            ("subtype", serde_json::json!("error_max_turns")),
+            (
+                "modelUsage",
+                serde_json::json!({"model": {"inputTokens": 1}}),
+            ),
+            (
+                "errors",
+                serde_json::json!(["No conversation found with session ID: other-session"]),
+            ),
+            ("errors", serde_json::json!(["Authentication failed"])),
+            ("usage", serde_json::Value::Null),
+        ] {
+            let mut altered = refusal.clone();
+            altered[field] = value;
+            cases.push((
+                field.to_string(),
+                format!("printf '%s\\n' '{altered}'\n"),
+                false,
+            ));
+        }
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ] {
+            let mut altered = refusal.clone();
+            altered["usage"][field] = serde_json::json!(1);
+            cases.push((
+                field.to_string(),
+                format!("printf '%s\\n' '{altered}'\n"),
+                false,
+            ));
+        }
+        for (name, prefix) in [
+            (
+                "init",
+                r#"{"type":"system","subtype":"init","apiKeySource":"none"}"#,
+            ),
+            (
+                "billing init",
+                r#"{"type":"system","subtype":"init","apiKeySource":"api"}"#,
+            ),
+            (
+                "assistant tool",
+                r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","name":"Bash"}]}}"#,
+            ),
+            ("unknown stdout", "unclassified output"),
+        ] {
+            cases.push((
+                name.to_string(),
+                format!("printf '%s\\n' '{prefix}'\n{result_line}"),
+                false,
+            ));
+        }
+        cases.push(("duplicate result".into(), result_line.repeat(2), false));
+        cases.push((
+            "partial trailing stdout".into(),
+            format!("{result_line}printf '%s' 'partial'\n"),
+            false,
+        ));
+
+        for guard_on in [true, false] {
+            for (name, stdout, unavailable) in &cases {
+                let root = TempDir::new();
+                let ws = make_ws(&root, "RESUME-1");
+                let (_s, script) = write_fake_claude(&format!(
+                    "read -r prompt\nprintf '%s\\n' 'No conversation found with session ID: missing-session' >&2\n{stdout}exit 1\n"
+                ));
+                let sess = Runner::new(Config {
+                    billing_guard: Some(guard_on),
+                    ..new_runner(&script, &root.path()).cfg
+                })
+                .start_session(&ws, issue("1", "RESUME-1"), None)
+                .await
+                .unwrap();
+                sess.resume_from("missing-session").unwrap();
+                let (tr, err) = sess.run_turn("p", None, None, &|_| {}).await;
+                if *unavailable {
+                    assert_eq!(tr.status, TURN_FAILED);
+                }
+                assert_eq!(
+                    matches!(err, Some(AgentError::ResumeUnavailable)),
+                    *unavailable,
+                    "{name}, guard={guard_on}: {err:?}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

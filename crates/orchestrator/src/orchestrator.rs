@@ -152,6 +152,7 @@ pub struct RunningEntry {
     pub engine_index: usize,
     pub engine: Option<crate::dispatch::DispatchEngine>,
     pub resume_session: String,
+    pub(crate) resume_after_drain: bool,
     pub turn_count: i64,
     /// The last observed agent event type (one of `rhapsody_agent`'s `EVENT_*` values; Go's
     /// `agent.EventType`).
@@ -268,6 +269,7 @@ impl RunningEntry {
             engine_index: 0,
             engine: None,
             resume_session: String::new(),
+            resume_after_drain: false,
             turn_count: 0,
             last_event: String::new(),
             last_message: String::new(),
@@ -334,8 +336,8 @@ pub struct RetryEntry {
     ///
     /// The gap closes on a SUCCESSFUL re-dispatch, not on one retry fire: every requeue path in
     /// `on_retry` — continuation and backoff poll failure, in-flight state recheck failure, and
-    /// both "no available orchestrator slots" branches — re-schedules with the identity it just
-    /// took out, so an entry that keeps missing a slot or keeps hitting a flaky tracker carries the
+    /// slot parking — retains the identity it just took out, so an entry that keeps missing a slot
+    /// or keeps hitting a flaky tracker carries the
     /// empty string forward for as long as that lasts. Accepted: it is the pre-Teams behaviour, and
     /// the alternative is persisting a routing decision that re-dispatch is entitled to revisit.
     pub identity: String,
@@ -1092,6 +1094,8 @@ pub struct Orchestrator {
     /// when the previous tick found the drain armed, which is what makes the cancel transition
     /// observable. Mutated only by `on_tick` on the single control task, like [`Self::probe_cache`].
     pub(crate) drain_gate: Option<crate::drain::DrainGateLog>,
+    /// Retry-backed drain continuations, keyed by the store's human identifier.
+    pub(crate) drain_continuations: HashMap<String, crate::drain::DrainContinuation>,
 
     // --- STUDIO-988: asynchronous prepared-dispatch + zero-turn refusal (Rhapsody-only; `prepare.rs`). ---
     /// The loop-owned `preparing` reservations — the duplicate/concurrency gate that exists before a
@@ -1322,6 +1326,7 @@ impl Orchestrator {
             claude_probe_last_attempt_s: None,
             limit_policy: crate::limitpolicy::LimitPolicy::default(),
             drain_gate: None,
+            drain_continuations: HashMap::new(),
             // STUDIO-988: no resolver, no reservations, an empty gate → preparation is inert by
             // default and every dispatch path is byte-identical to a daemon built before the feature.
             preparing: crate::prepare::PreparingReservations::default(),
