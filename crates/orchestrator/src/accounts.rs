@@ -430,7 +430,7 @@ impl crate::Orchestrator {
     pub(crate) fn record_claude_probe(&mut self, result: Result<Vec<LimitObs>, &'static str>) {
         self.claude_probe_in_flight = false;
         // A run may have started after admission; its passive stream is the fresher signal.
-        if self.claude_run_live()
+        if (result.is_ok() && self.claude_run_live())
             || self.claude_probe_last_attempt_s.is_some_and(|started| {
                 self.accounts
                     .snapshot((self.now)().timestamp())
@@ -904,6 +904,22 @@ mod tests {
         assert_eq!(view.source, "stream");
         assert_eq!(view.windows[0].utilization, 0.2);
         assert!(!view.stale);
+    }
+
+    #[test]
+    fn probe_failure_during_live_claude_work_stays_visible_until_passive_usage() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        o.claude_probe_last_attempt_s = Some(1000);
+        let mut run = crate::RunningEntry::empty(rhapsody_core::Issue::default());
+        run.harness = "claude".into();
+        o.running.insert("live".into(), run);
+        o.record_claude_probe(Err("usage_timeout"));
+        let view = &o.accounts.snapshot(1001)[0];
+        assert!(view.stale);
+        assert_eq!(view.stale_reason.as_deref(), Some("usage_timeout"));
+        o.accounts
+            .observe("claude-subscription", obs(0.2, 5000, 1002));
+        assert!(!o.accounts.snapshot(1002)[0].stale);
     }
 
     #[test]
