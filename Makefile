@@ -13,6 +13,9 @@ test:
 # each `taiki-e/install-action` step — the wiring that stops the concurrent Mac jobs clobbering the
 # action's one shared `${HOME}/.install-action/tmp`; its own mutation test proves it reds when an
 # override is dropped. Like the other checks it is bash/python-only, so it rides this gate.
+# The keychain search-list lock check (STUDIO-1280) reads release.yml and pins the shared-lock +
+# prepend + surgical-restore fix that serializes this repo's signing against Tally's on the one Mac;
+# its mutation test proves it reds when the exclusive acquisition is removed.
 lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
@@ -22,6 +25,11 @@ lint:
 	python3 harness/ci/check-install-action-home.py
 	python3 harness/ci/check-install-action-home_test.py
 	python3 harness/ci/check-process-leaks_test.py
+	# STUDIO-1280: release.yml rewrites the host-global user keychain search list that Tally's
+	# release also rewrites; the check pins the shared-lock + prepend + surgical-restore fix, and
+	# its mutation test proves it reds when the exclusive acquisition is dropped.
+	python3 harness/ci/check-release-keychain-lock.py
+	python3 harness/ci/check-release-keychain-lock_test.py
 
 # Recapture golden fixtures from the reference Go daemon (operator machine only; see harness/capture/)
 fixtures:

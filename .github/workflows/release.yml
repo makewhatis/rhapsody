@@ -159,30 +159,99 @@ jobs:
           # notarytool's login-keychain default. Exported so `make dmg` -> notarize.sh inherits it.
           export NOTARY_KEYCHAIN="$SIGNING_KEYCHAIN"
 
-          # Prepare the keychain UP FRONT (unconditionally, before make dmg — not only on a codesign
-          # failure): unlock it, add it to the user search list so sign.sh (which pins no keychain)
-          # resolves the Developer ID cert from it, and partition-list the signing key for
-          # non-interactive codesign. -k passes the keychain password so the partition-list change is
-          # non-interactive (no GUI prompt on the headless runner); -s matches signing keys.
+          # Unlock the dedicated signing keychain UP FRONT (unconditionally, before make dmg — not
+          # only on a codesign failure), and partition-list the signing key for non-interactive
+          # codesign. -k passes the keychain password so the partition-list change is
+          # non-interactive (no GUI prompt on the headless runner); -s matches signing keys. This
+          # touches only OUR keychain, never the shared search list, so it needs no lock.
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
-          security list-keychains -d user -s "$SIGNING_KEYCHAIN" login.keychain-db
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
 
-          # Belt-and-suspenders: if codesign still hits errSecInternalComponent (signing key not
-          # reachable non-interactively under this launchd session), re-unlock + re-partition the
-          # dedicated keychain and retry once.
-          log="$(mktemp)"
-          if ! make dmg VERSION="$version" 2>&1 | tee "$log"; then
-            if grep -q errSecInternalComponent "$log"; then
-              echo "codesign hit errSecInternalComponent — re-unlocking + re-partitioning $SIGNING_KEYCHAIN"
-              security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
-              security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
-              make dmg VERSION="$version"
-            else
-              echo "::error::make dmg failed for a reason other than errSecInternalComponent (see log above)"
-              exit 1
+          # --- Shared keychain search-list lock (STUDIO-1280) ----------------------------------
+          # The user keychain search list is ONE host-global, per-user setting, and this same Mac
+          # signs Tally releases. codesign resolves the signing PRIVATE KEY by walking that list
+          # (first match wins) — --keychain / OTHER_CODE_SIGN_FLAGS only scope where the
+          # CERTIFICATE is found — so any process that rewrites the list while another is
+          # mid-archive can evict or reorder the signing keychain out from under it, and the
+          # victim fails with errSecInternalComponent. Tally's Fastfile (STUDIO-878) serializes
+          # its rewrite on ~/.rhapsody/keychain-search-list.lock; a lock only one writer honours is
+          # not a lock, so this takes the SAME lock, across the whole window the list order
+          # matters: the rewrite through `make dmg`.
+          #
+          # macOS ships no flock(1), and lockf(1) is fcntl(2) — a DIFFERENT lock namespace that
+          # does not exclude Tally's File#flock — so the exclusive flock(2) is taken via perl (a
+          # macOS system binary) and held by the perl parent for the whole guarded child below.
+          # Everything inside the heredoc runs while that lock is held; the EXIT trap restores the
+          # list under it.
+          LOCK_FILE="$HOME/.rhapsody/keychain-search-list.lock"
+          mkdir -p "$(dirname "$LOCK_FILE")"
+          export SIGNING_KEYCHAIN version
+
+          perl -MFcntl=:flock -e '
+            my $path = shift @ARGV;
+            open(my $fh, ">>", $path) or die "keychain-search-list lock: open $path: $!\n";
+            flock($fh, LOCK_EX) or die "keychain-search-list lock: flock $path: $!\n";
+            my $rc = system(@ARGV);
+            exit($rc == -1 ? 127 : ($rc & 127 ? 128 + ($rc & 127) : $rc >> 8));
+          ' "$LOCK_FILE" bash -c "$(cat <<'SIGNING_WINDOW'
+            set -euo pipefail
+
+            # Snapshot the shared list UNDER the lock, before we change it.
+            original_list=()
+            while IFS= read -r kc; do
+              if [ -n "$kc" ]; then original_list+=("$kc"); fi
+            done < <(security list-keychains -d user | sed -e 's/^[[:space:]]*//' -e 's/"//g')
+
+            # PREPEND our keychain, keeping every existing entry: building the certificate chain
+            # needs the Apple intermediate that lives in login, and replacing the list outright is
+            # exactly what evicts a concurrent job's keychain (STUDIO-878 review B1).
+            new_list=("$SIGNING_KEYCHAIN")
+            for kc in ${original_list[@]+"${original_list[@]}"}; do
+              dup=""
+              for seen in ${new_list[@]+"${new_list[@]}"}; do
+                if [ "$seen" = "$kc" ]; then dup=1; break; fi
+              done
+              if [ -z "$dup" ]; then new_list+=("$kc"); fi
+            done
+            security list-keychains -d user -s ${new_list[@]+"${new_list[@]}"}
+
+            # Restore on exit: remove ONLY our keychain from whatever the list is by then. Never
+            # restore the snapshot captured above — that clobbers a concurrent holder's own change
+            # — and never write an empty list (`-s` with no keychains would).
+            restore_search_list() {
+              current=()
+              while IFS= read -r kc; do
+                if [ -n "$kc" ]; then current+=("$kc"); fi
+              done < <(security list-keychains -d user | sed -e 's/^[[:space:]]*//' -e 's/"//g')
+              remaining=()
+              for kc in ${current[@]+"${current[@]}"}; do
+                if [ "$kc" != "$SIGNING_KEYCHAIN" ]; then remaining+=("$kc"); fi
+              done
+              if [ "${#remaining[@]}" -eq 0 ] || [ "${#remaining[@]}" -eq "${#current[@]}" ]; then
+                return 0
+              fi
+              security list-keychains -d user -s ${remaining[@]+"${remaining[@]}"}
+            }
+            trap restore_search_list EXIT
+
+            # Belt-and-suspenders (TRA-257): if codesign still hits errSecInternalComponent
+            # (signing key not reachable non-interactively under this launchd session), re-unlock +
+            # re-partition OUR keychain and retry once — inside the lock, because the retry re-runs
+            # the archive that depends on the list order.
+            log="$(mktemp)"
+            if ! make dmg VERSION="$version" 2>&1 | tee "$log"; then
+              if grep -q errSecInternalComponent "$log"; then
+                echo "codesign hit errSecInternalComponent — re-unlocking + re-partitioning $SIGNING_KEYCHAIN"
+                security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
+                security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$SIGNING_KEYCHAIN"
+                make dmg VERSION="$version"
+              else
+                echo "::error::make dmg failed for a reason other than errSecInternalComponent (see log above)"
+                exit 1
+              fi
             fi
-          fi
+          SIGNING_WINDOW
+          )"
 
       # RD2 acceptance gate (TRA-258): both the dmg AND the .app inside it are signed, notarized, and
       # OFFLINE-stapled. We assert on the "Notarized Developer ID" source line (the definitive signal

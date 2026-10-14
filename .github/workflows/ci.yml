@@ -77,6 +77,14 @@ jobs:
       # rides `lint` rather than adding a branch-protection context.
       - run: python3 harness/ci/check-install-action-home.py
       - run: python3 harness/ci/check-install-action-home_test.py
+      # STUDIO-1280: release.yml rewrites the host-global user keychain search list, which the same
+      # Mac's Tally release also rewrites; both must serialize on the shared
+      # ~/.rhapsody/keychain-search-list.lock and PREPEND (not replace) so neither evicts the
+      # other's signing keychain mid-archive. The check reads release.yml; its mutation test proves
+      # it reds when the exclusive acquisition (or the prepend, or the surgical restore) is dropped.
+      # Python-only, so it rides `lint` rather than adding a branch-protection context.
+      - run: python3 harness/ci/check-release-keychain-lock.py
+      - run: python3 harness/ci/check-release-keychain-lock_test.py
 
   test:
     timeout-minutes: 45
