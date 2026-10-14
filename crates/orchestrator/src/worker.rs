@@ -257,6 +257,8 @@ pub struct WorkerDeps {
     /// The existing Store connection is shared solely for next-turn prompt delivery. It never
     /// exposes scheduling state to the worker; pending rows outlive cancellation and run teardown.
     pub message_store: Option<Arc<dyn store::Store + Send + Sync>>,
+    /// Payload-free partial-output liveness; updates only the existing emission watermark.
+    pub activity_callback: Option<agent::ActivityCallback>,
     /// The review state a declared HANDOFF parks the ticket in (a review-state name; `None` ⇒ the
     /// feature is off, giving Go-identical behavior). Dispatched agents cannot move Linear state
     /// themselves — the runner injects the mcp_config with `--strict-mcp-config`, so only the
@@ -1461,6 +1463,9 @@ impl WorkerDeps {
         mut messages: Option<&mut mpsc::Receiver<String>>,
         on_event: &(dyn Fn(Event) + Send + Sync),
     ) -> (String, String, Option<WorkerError>) {
+        if let Some(callback) = &self.activity_callback {
+            sess.set_activity_callback(Arc::clone(callback));
+        }
         // The broker supervisor is carried on `self` (a per-dispatch field), so the turn loop reads
         // it here rather than taking an eighth argument.
         let broker = self.broker.clone();
@@ -2024,6 +2029,7 @@ fi
             manager_test_credential: Some("fake-manager-access".into()),
             run_id: 0,
             message_store: None,
+            activity_callback: None,
             drain: crate::drain::DrainSignal::new(),
             // STUDIO-978: a fully-capable fake, MCP injection on, no pre-decided refusal — the
             // honest default for the pre-978 tests, none of which exercises the refusal path.

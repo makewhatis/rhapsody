@@ -901,6 +901,129 @@ mod tests {
         std::sync::Arc::new(FakeSampler::new(ok, map))
     }
 
+    fn claude_liveness_case(body: &str) -> (Orchestrator, TempDir) {
+        let (mut o, dir) = liveness_orch(std::time::Duration::from_millis(750));
+        let script = dir.child("claude.sh");
+        std::fs::write(&script, body).unwrap();
+        let eff = o.eff.as_mut().unwrap();
+        eff.cfg.claude.stall_timeout_ms = 750;
+        eff.agent = Arc::new(agent::claude::Runner::new(agent::claude::Config {
+            command: format!("bash {script}"),
+            workspace_root: dir.path.clone(),
+            turn_timeout: std::time::Duration::from_secs(20),
+            ..Default::default()
+        }));
+        eff.max_turns = 1;
+        eff.cpu_sampler = sampler(false, &[]); // macOS fallback, regardless of the test host
+        eff.log_dir = dir.child("logs");
+        eff.transcripts = Arc::new(crate::obslog::Store::new(&eff.log_dir));
+        o.spawn = None;
+        o.dispatch_issue(issue("1", "MT-1", "In Progress"), None, None, String::new());
+        // A completely silent CLI has no init from which to learn its PID. Still exercise
+        // the same unavailable-sampler grace as the partial-message case.
+        o.running.get_mut("1").unwrap().pgid = 42;
+        (o, dir)
+    }
+
+    const COMPLETE_CLAUDE_MESSAGES: &str = r#"
+printf '%s\n' '{"type":"assistant","session_id":"s","message":{"content":[{"type":"text","text":"finished message"}],"usage":{"input_tokens":10,"output_tokens":20}}}'
+printf '%s\n' '{"type":"result","subtype":"success","session_id":"s","result":"finished message","usage":{"input_tokens":10,"output_tokens":20}}'
+"#;
+
+    async fn drive_claude_liveness(o: &mut Orchestrator) {
+        let mut rx = o.events_rx.lock().unwrap().take().unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        crate::control_loop::Event::AgentUpdate(update) => {
+                            o.on_agent_update(update)
+                        }
+                        crate::control_loop::Event::WorkerExit(exit) => {
+                            assert!(!exit.failed, "fake CLI failed: {}", exit.err_msg);
+                        }
+                        _ => {}
+                    }
+                }
+                o.reconcile_stalled();
+                if !o.running.contains_key("1") || o.running["1"].terminal_result_seen {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("fake Claude did not finish or wedge");
+        tokio::time::timeout(std::time::Duration::from_secs(5), o.wg.wait())
+            .await
+            .expect("worker did not exit after completion/cancellation");
+    }
+
+    #[tokio::test]
+    async fn long_generation_with_partial_events_is_not_wedged() {
+        let body = format!(
+            r#"
+read -r prompt
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none"}}'
+for i in {{1..40}}; do
+  case " $* " in *' --include-partial-messages '*)
+    printf '%s\n' '{{"type":"stream_event","session_id":"s","event":{{"type":"content_block_delta","delta":{{"type":"text_delta","text":"partial"}}}}}}'
+  esac
+  sleep 0.1
+done
+{COMPLETE_CLAUDE_MESSAGES}
+"#
+        );
+        let (mut o, _dir) = claude_liveness_case(&body);
+        let started = std::time::Instant::now();
+        drive_claude_liveness(&mut o).await;
+        assert!(o.running.contains_key("1"), "generation was wedge-killed");
+        assert!(o.running["1"].terminal_result_seen);
+        assert!(o.retry_attempts.is_empty());
+        assert!(started.elapsed() > std::time::Duration::from_secs(3));
+        assert_eq!(o.running["1"].total_tokens, 30);
+    }
+
+    #[tokio::test]
+    async fn silent_cli_is_still_wedged() {
+        let (mut o, _dir) = claude_liveness_case("read -r prompt\nexec sleep 30\n");
+        drive_claude_liveness(&mut o).await;
+        assert!(!o.running.contains_key("1"));
+        assert_eq!(o.retry_attempts["1"].err, "stalled");
+    }
+
+    #[tokio::test]
+    async fn partial_events_are_not_persisted() {
+        let body = format!(
+            r#"
+read -r prompt
+printf '%s\n' '{{"type":"system","subtype":"init","session_id":"s","apiKeySource":"none"}}'
+for i in {{1..1000}}; do
+  printf '%s\n' '{{"type":"stream_event","session_id":"s","event":{{"type":"message_delta","usage":{{"output_tokens":999}}}}}}'
+done
+{COMPLETE_CLAUDE_MESSAGES}
+"#
+        );
+        let (mut o, _dir) = claude_liveness_case(&body);
+        drive_claude_liveness(&mut o).await;
+        let re = &o.running["1"];
+        let types: Vec<_> = re.recent_events.iter().map(|e| e.event.as_str()).collect();
+        assert_eq!(types, ["session_started", "notification", "turn_completed"]);
+        assert_eq!(re.total_tokens, 30, "partials must not affect accounting");
+        let raw = std::fs::read_to_string(o.eff.as_ref().unwrap().transcripts.latest_path("MT-1"))
+            .unwrap();
+        let types: Vec<_> = raw
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(types, ["system", "assistant", "result"]);
+    }
+
     // Exercise the production worker callback while control deliberately leaves its channel
     // unapplied. MUTATION: read re.last_event_at in event_liveness_at and the first verdict reds.
     #[tokio::test]

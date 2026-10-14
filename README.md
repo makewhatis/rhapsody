@@ -98,6 +98,16 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Claude partial-message liveness (STUDIO-1285)
+
+Claude turns request `--include-partial-messages`. Parsed `stream_event` lines renew only the
+run-local worker emission watermark, so a long model message remains alive without Linux CPU
+sampling. Partial payloads never become agent events, recent history, logs, transcript lines,
+session metadata or usage estimates; complete messages retain their existing accounting and
+transcript semantics. The subscription usage probe opts out of the flag. Silent CLIs still
+follow the existing bounded stall/retry policy, including the doubled macOS fallback window.
+No configuration, schema, API payload or golden-fixture changes.
+
 ### Idle Claude subscription usage probe (STUDIO-1269)
 
 An off-loop, single-flight probe runs the configured `claude.command` in one stable, empty

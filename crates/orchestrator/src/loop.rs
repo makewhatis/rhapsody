@@ -661,6 +661,7 @@ fn worker_deps_for(
         // Per-dispatch, like `stack_context` above: `spawn_worker` stamps the dispatched run's id.
         run_id: 0,
         message_store: None,
+        activity_callback: None,
         // Per-dispatch and review-only (STUDIO-715): `spawn_worker` stamps it, and `None` keeps the
         // two existing provisioning paths exactly as they were.
         review: None,
@@ -2266,6 +2267,9 @@ impl Orchestrator {
             .running
             .get(&iss.id)
             .map(|re| re.worker_emit_time.clone());
+        if let Some(time) = worker_emit_time.clone() {
+            deps.activity_callback = Some(Arc::new(move || time.record(Utc::now())));
+        }
         let attempt32 = attempt.map(|a| a as i32);
         let guard = self.wg.add();
         tokio::spawn(async move {

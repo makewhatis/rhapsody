@@ -227,6 +227,8 @@ the `Orchestrator` struct itself. Concretely:
     The worker's forwarding callback stamps it before queuing real agent events; stall detection
     reads it directly so control-channel backlog cannot turn a live worker into a wedge. It shares
     no scheduling maps, is never persisted, and a new RunningEntry gets a fresh watermark.
+    Claude partial messages use a separate payload-free session activity callback (STUDIO-1285)
+    to stamp this same watermark without queuing, logging or persisting an agent event.
 
 - `worker.rs` runs as its own spawned task per attempt and touches NO orchestrator state directly —
   it only emits events outward via an `on_event` callback. Don't reach into `Orchestrator` from

@@ -37,6 +37,8 @@ pub struct Classified {
     pub ok: bool,
     /// The `apiKeySource` carried on the system/init line (empty for every other line).
     pub api_key_source: String,
+    /// Partial stream output renews liveness only, never a normalized event (`ok` stays false).
+    pub heartbeat: bool,
 }
 
 /// A lenient view of one claude stream-json event (Go `rawLine`). Every field is optional via the
@@ -112,6 +114,10 @@ pub fn classify(line: &[u8]) -> Classified {
     }
 
     match r.r#type.as_str() {
+        "stream_event" => Classified {
+            heartbeat: true,
+            ..Default::default()
+        },
         "system" => {
             if r.subtype != "init" {
                 // Not surfaced, but the session id is still carried (mirrors Go).
@@ -304,6 +310,35 @@ fn truncate_tail(s: &str, max: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn partial_stream_lines_are_payload_free_heartbeats_only() {
+        for kind in [
+            "message_start",
+            "content_block_delta",
+            "message_delta",
+            "message_stop",
+        ] {
+            let line = serde_json::json!({
+                "type": "stream_event", "session_id": "partial-session",
+                "event": {"type": kind, "delta": {"text": "partial"}, "usage": {"output_tokens": 999}}
+            });
+            let c = super::classify(line.to_string().as_bytes());
+            assert!(c.heartbeat);
+            assert!(!c.ok && !c.terminal);
+            assert_eq!(c.event, crate::Event::default());
+            assert_eq!(c.result, crate::TurnResult::default());
+            assert!(c.session_id.is_empty() && c.api_key_source.is_empty());
+        }
+        for line in [
+            b"not json".as_slice(),
+            br#"{"type":"stream_event""#,
+            br#"{"type":"unknown"}"#,
+            br#"{"type":"assistant"}"#,
+        ] {
+            assert!(!super::classify(line).heartbeat);
+        }
+    }
+
     #[test]
     fn captured_bash_and_mcp_results_close_the_actual_call_ids() {
         let lines: Vec<_> = include_str!("../../../../harness/harness-spike/claude/happy.jsonl")
