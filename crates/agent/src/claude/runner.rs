@@ -738,6 +738,11 @@ impl Session for ClaudeSession {
                                     scan_err = Some("token too long".to_string());
                                     break 'outer;
                                 }
+                                // Preserve the all-stdout replay guard: partial model output also
+                                // disproves a pre-work missing-session refusal.
+                                resume_refusal_only = resume_refusal_only
+                                    && !terminal_seen
+                                    && missing_resume_result(&line, &resume);
                                 let c = classify(&line);
                                 if c.heartbeat {
                                     let callback = self.activity_callback.lock().unwrap_or_else(|e| e.into_inner()).clone();
@@ -747,9 +752,6 @@ impl Session for ClaudeSession {
                                     continue; // no tee, session metadata, event, usage or logging
                                 }
                                 self.tee_stdout(&line);
-                                resume_refusal_only = resume_refusal_only
-                                    && !terminal_seen
-                                    && missing_resume_result(&line, &resume);
                                 // Capture the session id for EVERY classified line, BEFORE the !ok
                                 // gate, so a session id arriving on a non-surfaced line still seeds
                                 // the thread id (else --resume / billing-guard association is lost).
@@ -1454,6 +1456,10 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"complete-sessi
             (
                 "assistant tool",
                 r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"t","name":"Bash"}]}}"#,
+            ),
+            (
+                "partial model output",
+                r#"{"type":"stream_event","event":{"type":"content_block_delta","delta":{"type":"text_delta","text":"started work"}}}"#,
             ),
             ("unknown stdout", "unclassified output"),
         ] {
