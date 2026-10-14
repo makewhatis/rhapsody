@@ -2,24 +2,27 @@
 
 use crate::ratelimit::{LimitObs, parse_claude_rate_limit};
 use std::os::unix::fs::DirBuilderExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 struct ProbeDir(PathBuf);
 
 impl ProbeDir {
-    fn new() -> Result<Self, &'static str> {
-        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|_| "usage_scratch")?
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!(
-            "rhapsody-claude-probe-{}-{nonce}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-        ));
+    fn new(state_root: &Path) -> Result<Self, &'static str> {
+        // Claude names its home project directory after cwd, even without session persistence.
+        // One stable path bounds that footprint; recreate it to discard crash leftovers/permissions.
+        let path = state_root.join("claude-probe");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(state_root)
+            .map_err(|_| "usage_scratch")?;
+        match std::fs::remove_dir_all(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err("usage_scratch"),
+        }
         std::fs::DirBuilder::new()
             .mode(0o700)
             .create(&path)
@@ -37,18 +40,26 @@ impl Drop for ProbeDir {
 }
 
 /// The configured command owns authentication. Never open a credential store or quote CLI output.
-pub async fn probe(command: &str, timeout: Duration) -> Result<Vec<LimitObs>, &'static str> {
+pub async fn probe(
+    command: &str,
+    timeout: Duration,
+    state_root: &Path,
+) -> Result<Vec<LimitObs>, &'static str> {
     let deadline = tokio::time::Instant::now()
         .checked_add(timeout)
         .ok_or("usage_timeout")?;
     let (name, prefix) = super::split_command(command).map_err(|_| "usage_command")?;
-    let scratch = ProbeDir::new()?;
+    let scratch = ProbeDir::new(state_root)?;
     let cfg = super::Config {
         model: "haiku".into(),
         permission_mode: "default".into(),
         tools: Some(String::new()),
         mcp_config: r#"{"mcpServers":{}}"#.into(),
-        extra_args: vec!["--max-turns".into(), "1".into()],
+        extra_args: vec![
+            "--max-turns".into(),
+            "1".into(),
+            "--no-session-persistence".into(),
+        ],
         ..Default::default()
     };
     let mut cmd = tokio::process::Command::new(name);
@@ -148,7 +159,7 @@ mod tests {
         std::fs::write(&script, format!(r#"
 test -z "$(ls -A)" || exit 10
 args=" $* "
-for pair in '-p' '--output-format stream-json' '--input-format stream-json' '--verbose' '--model haiku' '--max-turns 1'; do
+for pair in '-p' '--output-format stream-json' '--input-format stream-json' '--verbose' '--model haiku' '--max-turns 1' '--no-session-persistence'; do
   case "$args" in *" $pair "*) ;; *) exit 11 ;; esac
 done
 read -r prompt
@@ -158,6 +169,7 @@ printf '%s\n' '{fixture}' '{fixture}'
         let observations = probe(
             &format!("bash {}", script.display()),
             Duration::from_secs(10),
+            dir.path(),
         )
         .await
         .unwrap();
@@ -184,6 +196,41 @@ printf '%s\n' '{fixture}' '{fixture}'
     }
 
     #[tokio::test]
+    async fn claude_probe_reuses_one_working_directory() {
+        use std::os::unix::fs::PermissionsExt;
+        let _env = crate::ENV_GUARD.read().await;
+        let dir = TempDir::new();
+        let state_root = dir.path().join(".rhapsody");
+        let scratch = state_root.join("claude-probe");
+        let cwd_file = dir.path().join("cwd");
+        let script = dir.path().join("probe.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "test -z \"$(ls -A)\" || exit 10\ntest \"$(stat -c %a . 2>/dev/null || stat -f %Lp .)\" = 700 || exit 11\npwd >> '{}'\nprintf '%s\\n' '{}'\nmkdir leftover\nprintf junk > leftover/file",
+                cwd_file.display(),
+                include_str!("../../testdata/limits/allowed.jsonl")
+            ),
+        )
+        .unwrap();
+        let command = format!("bash {}", script.display());
+        for _ in 0..2 {
+            // Include crash leftovers and loose permissions: every launch must start empty/private.
+            std::fs::create_dir_all(scratch.join("old/nested")).unwrap();
+            std::fs::write(scratch.join("old/nested/file"), "junk").unwrap();
+            std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o755)).unwrap();
+            probe(&command, Duration::from_secs(10), &state_root)
+                .await
+                .unwrap();
+        }
+        let recorded = std::fs::read_to_string(cwd_file).unwrap();
+        let paths: Vec<_> = recorded.lines().collect();
+        assert_eq!(paths.len(), 2);
+        assert_eq!(paths[0], paths[1], "every probe must reuse the same cwd");
+        assert!(std::path::Path::new(paths[0]).starts_with(state_root.canonicalize().unwrap()));
+    }
+
+    #[tokio::test]
     async fn claude_probe_failure_reasons_are_closed_and_timeout_kills_process() {
         let _env = crate::ENV_GUARD.read().await;
         let dir = TempDir::new();
@@ -199,7 +246,7 @@ printf '%s\n' '{fixture}' '{fixture}'
         ] {
             std::fs::write(&script, body).unwrap();
             assert_eq!(
-                probe(&format!("bash {}", script.display()), timeout).await,
+                probe(&format!("bash {}", script.display()), timeout, dir.path()).await,
                 Err(reason)
             );
         }
@@ -218,6 +265,7 @@ printf '%s\n' '{fixture}' '{fixture}'
         let observations = probe(
             &format!("bash {}", script.display()),
             Duration::from_secs(10),
+            dir.path(),
         )
         .await
         .unwrap();
@@ -250,6 +298,7 @@ printf '%s\n' '{fixture}' '{fixture}'
             )
             .unwrap();
             let command = format!("bash {}", script.display());
+            let state_root = dir.path().to_path_buf();
             let task = tokio::spawn(async move {
                 probe(
                     &command,
@@ -258,6 +307,7 @@ printf '%s\n' '{fixture}' '{fixture}'
                     } else {
                         Duration::from_secs(1)
                     },
+                    &state_root,
                 )
                 .await
             });

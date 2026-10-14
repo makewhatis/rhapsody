@@ -782,6 +782,7 @@ mod tests {
         let result = rhapsody_agent::claude::limits::probe(
             &format!("bash {}", script.display()),
             std::time::Duration::from_secs(10),
+            std::path::Path::new(&dir.child(".rhapsody")),
         )
         .await;
         o.record_claude_probe(result);
@@ -831,6 +832,7 @@ mod tests {
                 rhapsody_agent::claude::limits::probe(
                     &format!("bash {}", script.display()),
                     timeout,
+                    std::path::Path::new(&dir.child(".rhapsody")),
                 )
                 .await,
             );

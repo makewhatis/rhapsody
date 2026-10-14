@@ -950,6 +950,7 @@ where
     let claude_usage_probe_task = if install_probe || claude_usage_probe {
         let handle = handle.clone();
         let mut ctx = shutdown.wait();
+        let state_root = runtime_home.as_ref().map(|home| home.join(".rhapsody"));
         Some(tokio::spawn(async move {
             let work = async {
                 if !handle.wait_for_snapshot().await {
@@ -958,11 +959,17 @@ where
                 let mut boot = true;
                 loop {
                     if let Some(request) = handle.claude_probe_request(boot).await {
-                        let result = rhapsody_agent::claude::limits::probe(
-                            &request.command,
-                            request.timeout,
-                        )
-                        .await;
+                        let result = match state_root.as_deref() {
+                            Some(root) => {
+                                rhapsody_agent::claude::limits::probe(
+                                    &request.command,
+                                    request.timeout,
+                                    root,
+                                )
+                                .await
+                            }
+                            None => Err("usage_scratch"),
+                        };
                         handle.record_claude_probe(result);
                     }
                     boot = false;
@@ -3001,10 +3008,12 @@ mod tests {
     async fn boot_claude_probe_uses_configured_fake_command_and_gates_subscription() {
         let dir = TempDir::new();
         let script = dir.child("claude-probe.sh");
+        let cwd_file = dir.child("probe-cwd");
         std::fs::write(
             &script,
             format!(
-                "printf '%s\\n' '{}'",
+                "pwd > '{}'\nprintf '%s\\n' '{}'",
+                cwd_file.display(),
                 include_str!("../../agent/testdata/limits/allowed.jsonl")
             ),
         )
@@ -3054,6 +3063,15 @@ mod tests {
         assert_eq!(view["windows"][0]["utilization"], 0.05);
         assert_eq!(view["windows"][1]["window"], "seven_day");
         assert_eq!(view["windows"][1]["utilization"], 0.02);
+        let cwd = std::fs::read_to_string(cwd_file).unwrap();
+        assert_eq!(
+            std::path::Path::new(cwd.trim()),
+            dir.path
+                .canonicalize()
+                .unwrap()
+                .join(".rhapsody/claude-probe"),
+            "probe must share runtime.json's injected home"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

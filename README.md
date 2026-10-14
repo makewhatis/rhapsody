@@ -100,8 +100,11 @@ reference (the parity goldens stay byte-strict).
 
 ### Idle Claude subscription usage probe (STUDIO-1269)
 
-An off-loop, single-flight probe runs the configured `claude.command` in an empty temporary
-directory with Haiku, one turn and the runner's stream-json argv. The command owns authentication;
+An off-loop, single-flight probe runs the configured `claude.command` in one stable, empty
+0700 directory at `~/.rhapsody/claude-probe` (under the same home as `runtime.json`), with Haiku,
+one turn, `--no-session-persistence` and the runner's stream-json argv. The directory is cleared
+before every probe, so Claude leaves at most one empty project directory and no session transcripts
+in its own home. The command owns authentication;
 the daemon never reads an OAuth token or calls the OAuth usage endpoint. Boot, queued Claude work
 and limit-suspended Claude work admit a probe only while no Claude run is live and the subscription
 reading is older than `limits.claude_probe_interval_s` (default `600`, `0` disables). Failed attempts
