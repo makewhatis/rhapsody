@@ -98,6 +98,23 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Idle Claude subscription usage probe (STUDIO-1269)
+
+An off-loop, single-flight probe runs the configured `claude.command` in an empty temporary
+directory with Haiku, one turn and the runner's stream-json argv. The command owns authentication;
+the daemon never reads an OAuth token or calls the OAuth usage endpoint. Boot, queued Claude work
+and limit-suspended Claude work admit a probe only while no Claude run is live and the subscription
+reading is older than `limits.claude_probe_interval_s` (default `600`, `0` disables). Failed attempts
+also respect that cadence. `limits.claude_probe_timeout_s` (default `60`, positive) bounds the call;
+timeout or cancellation kills its process tree and cleans its scratch directory.
+
+Every parsed `rate_limit_event` supplies real windows, including unknown per-model keys, with
+`source: probe` to the existing subscription limit policy, Accounts view and window-named
+notifications. Non-zero exit, timeout or missing events marks the account stale with a closed
+reason and a WARN, without fabricating zero usage or a quota wall. Live passive Claude observations
+repair probe failure staleness and take precedence over a probe completed during live work. These
+Rhapsody-only knobs round-trip through workflow saves; Go-owned API/config goldens are unchanged.
+
 ### Landing — opt-in post-merge verification (STUDIO-1248 … STUDIO-1252)
 
 Landing is **Rhapsody-only, with no Go counterpart**. Per-project `projects[].landing` in

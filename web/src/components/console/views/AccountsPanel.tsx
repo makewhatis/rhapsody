@@ -29,6 +29,7 @@ export function AccountsPanel({ accounts, nowS }: { accounts: AccountView[]; now
           {account.using_credits ? <Pill variant="blocked">credits in use</Pill> : <span className="sub">credits off</span>}
           <span className="mono">{account.today_usd == null ? `${kind} today unknown` : `$${account.today_usd.toFixed(2)} ${kind} today`}</span>
         </div>
+        <p className="sub" title={account.last_seen_s > 0 ? new Date(account.last_seen_s * 1000).toLocaleString() : undefined}>source {account.source || "unknown"} · {account.last_seen_s > 0 ? `observed ${Math.max(0, nowS - account.last_seen_s)}s ago` : "not yet observed"}</p>
         {account.stale ? <p className="sub">last known {level} · last observed {new Date(account.last_seen_s * 1000).toLocaleString()}</p> : null}
         {account.stale_reason ? <p className="sub">Probe unavailable: {account.stale_reason.replaceAll("_", " ")}</p> : null}
         {account.windows.length === 0 ? <p className="sub">Utilization and reset not yet observed.</p> : account.windows.map((window) => {

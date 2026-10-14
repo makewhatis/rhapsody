@@ -13,6 +13,14 @@ const account = (level: string, extra = {}): AccountView => ({
 });
 
 describe("AccountsPanel", () => {
+  it("shows fresh probe source and age with per-model windows", () => {
+    render(<AccountsPanel nowS={1120} accounts={[account("ok", {
+      account: "claude-subscription", source: "probe", detection: "probe",
+      windows: [{ window: "seven_day_opus", utilization: 0.97, resets_at_s: 1600 }],
+    })]} />);
+    expect(screen.getByText("source probe · observed 120s ago")).toBeTruthy();
+    expect(screen.getByRole("progressbar", { name: "claude-subscription seven_day_opus" }).getAttribute("aria-valuenow")).toBe("97");
+  });
   it("distinguishes a Rhapsody budget wall from the real ChatGPT plan and shows probe failures", () => {
     render(<AccountsPanel nowS={1000} accounts={[
       account("wall", { account: "openai", source: "budget", detection: "budget" }),
