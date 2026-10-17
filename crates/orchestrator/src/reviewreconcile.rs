@@ -1257,13 +1257,18 @@ impl Orchestrator {
                     // closes. The durable manager row is the fact, so it is reported from there.
                     Some(crate::reviewadjudicate::Adjudication::InFlight { .. }) => {
                         match self.manager_unapplied_advice(&pr.to_string()) {
-                            Some(advice) if any_unapproved => Some(unapplied_advice_divergence(
-                                pr,
-                                facts,
-                                now,
-                                self.rounds_used(pr),
-                                &advice,
-                            )),
+                            Some(advice)
+                                if any_unapproved
+                                    && self.head_governs_observed(pr, &advice.head) =>
+                            {
+                                Some(unapplied_advice_divergence(
+                                    pr,
+                                    facts,
+                                    now,
+                                    self.rounds_used(pr),
+                                    &advice,
+                                ))
+                            }
                             _ => None,
                         }
                     }
@@ -1281,17 +1286,19 @@ impl Orchestrator {
                         rounds,
                         reason,
                         ..
-                    }) if any_unapproved => Some(unapplied_advice_divergence(
-                        pr,
-                        facts,
-                        now,
-                        rounds,
-                        &crate::managerintervention::UnappliedAdvice {
-                            kind,
-                            head,
-                            rationale: reason,
-                        },
-                    )),
+                    }) if any_unapproved && self.head_governs_observed(pr, &head) => {
+                        Some(unapplied_advice_divergence(
+                            pr,
+                            facts,
+                            now,
+                            rounds,
+                            &crate::managerintervention::UnappliedAdvice {
+                                kind,
+                                head,
+                                rationale: reason,
+                            },
+                        ))
+                    }
                     // The same for an advice whose rows have since ALL approved: the loop converged
                     // past it, so it is the merge gate's business exactly as a fully-approved ship
                     // is (STUDIO-1021's rule, one decision kind over).
@@ -1613,8 +1620,25 @@ impl Orchestrator {
         let Some(decision) = self.adjudication(pr) else {
             return true;
         };
+        // An in-flight marker governs by construction — a turn is out right now — which is exactly
+        // `Adjudication::governs`'s answer for it.
+        if !decision.settled() {
+            return true;
+        }
+        self.head_governs_observed(pr, decision.head())
+    }
+
+    /// Whether a decision bound to `head` still governs the head the branch carries, by the same
+    /// "no observation is `true`" rule [`Self::adjudication_governs_observed`] applies (STUDIO-1005).
+    ///
+    /// Split out for STUDIO-1330: an unapplied advice's head is not always the ledger's — the
+    /// unlanded-announcement arm reads it off the durable manager row — and both must be compared
+    /// the same way, or a superseded advice would keep being reported after the author pushed.
+    fn head_governs_observed(&self, pr: &PrCoord, head: &str) -> bool {
         match self.review_observed_head.get(pr) {
-            Some(observed) => decision.governs(&observed.head, &observed.unchanged_from),
+            Some(observed) => {
+                head == observed.head || observed.unchanged_from.iter().any(|old| old == head)
+            }
             None => true,
         }
     }
@@ -4372,6 +4396,44 @@ mod store_tests {
             found[0].reason.contains("ROUTE_TO_AUTHOR"),
             "the report names the recommendation: {}",
             found[0].reason
+        );
+    }
+
+    /// **The supersession guard (STUDIO-1330).** An advice whose head the branch has moved past with
+    /// new work no longer governs — the loop resumed — so the sweep must not keep reporting it as
+    /// needing a human.
+    ///
+    /// MUTATION: drop the `head_governs_observed` conjunct and this reds.
+    #[test]
+    fn a_superseded_advice_is_not_reported() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-10-17T19:00:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr,
+            Adjudication::Advice {
+                kind: "ROUTE_TO_AUTHOR".to_string(),
+                head: HEAD.to_string(),
+                rounds: 3,
+                findings: Vec::new(),
+                reason: "the demonstrated B1 ownership gap warrants an author fix".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+        // The watcher has OBSERVED a different head — a content-changing push, no proof.
+        observed_head(o, HEAD_PUSHED, &[]);
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert!(
+            found
+                .iter()
+                .all(|d| d.kind != DivergenceKind::AdviceUnapplied),
+            "an advice the branch moved past must not be reported: {found:?}"
         );
     }
 
