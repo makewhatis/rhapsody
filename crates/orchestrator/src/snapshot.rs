@@ -464,7 +464,26 @@ impl Orchestrator {
                     .push(crate::reviewreconcile::REVIEW_DIVERGENCE_UNREADABLE_WARNING.to_string());
             }
             if review_unexplained {
-                warnings.push(crate::reviewreconcile::REVIEW_DIVERGENCE_WARNING.to_string());
+                // STUDIO-1330: name the pull request(s), not just the condition. The fixed sentence
+                // alone was identical on every project, so it told an operator that something was
+                // diverged but not which — and on a nine-project install that is not actionable.
+                let names: Vec<String> = self
+                    .review_divergences()
+                    .iter()
+                    .filter(|d| {
+                        d.capacity_held.is_none()
+                            && d.capacity_unreadable.is_none()
+                            && d.kind != crate::reviewreconcile::DivergenceKind::HeldForHuman
+                    })
+                    .map(|d| {
+                        if d.ticket.is_empty() {
+                            d.pr.clone()
+                        } else {
+                            format!("{} ({})", d.pr, d.ticket)
+                        }
+                    })
+                    .collect();
+                warnings.push(crate::reviewreconcile::review_divergence_warning(&names));
             }
             out.push(ProjectStatus {
                 slug: group.clone(),

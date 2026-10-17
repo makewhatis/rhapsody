@@ -66,6 +66,10 @@ pub fn stall_kind_for(kind: DivergenceKind) -> Option<&'static str> {
         | DivergenceKind::ReviewRequestedNoRun
         | DivergenceKind::ReviewTokenCeilingStopped
         | DivergenceKind::MergedTicketNotTerminal
+        // STUDIO-1330: an UNAPPLIED advice is the manager's own recommendation already recorded, not
+        // a stall for the manager to adopt — routing it back would ask the manager to advise about
+        // its own advice. It is a human's to act on.
+        | DivergenceKind::AdviceUnapplied
         // STUDIO-964: a held pull request is not the manager's stall — a PERSON owes the next move,
         // and routing it to the manager would page a human a second time for work they reserved.
         | DivergenceKind::HeldForHuman
@@ -99,6 +103,18 @@ pub(crate) struct ManagerRouting {
     /// Pull-request keys the manager could NOT adopt this sweep, each with the §10.2 human-feed
     /// sentence. Their signals stay on the feed, annotated with the manager's own wording.
     pub surfaced: Vec<(String, String)>,
+}
+
+/// One UNAPPLIED `advise`-mode manager decision (STUDIO-1330), as the review loop's readers need it:
+/// what the manager recommended, about which head, and its own rationale.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnappliedAdvice {
+    /// The manager's decision variant (`ROUTE_TO_AUTHOR`, `RERUN_REVIEW`, `APPROVE`, `ESCALATE`).
+    pub kind: String,
+    /// The head the decision was bound to.
+    pub head: String,
+    /// The manager's own rationale.
+    pub rationale: String,
 }
 
 /// The pure routing rule (§7.2). Kept separate from the store writes so the deduplication across
@@ -1523,6 +1539,44 @@ impl Orchestrator {
                     "manager: recording the proposal outcome failed");
             }
         }
+    }
+
+    /// STUDIO-1330: the LATEST manager intervention for `pr`, when it is an `advise`-mode proposal
+    /// whose decision the daemon deliberately did not apply — or `None`.
+    ///
+    /// Read straight from the durable `rhapsody_manager_intervention` table (the authoritative
+    /// record of what the manager recommended), so the reconciliation sweep and the review watcher
+    /// can report and respect an advisory decision without a second copy of it. The `proposed`
+    /// state IS the unapplied marker (§9: an `advise` decision is recorded, never applied), so a row
+    /// in any other state is not this, and a NEWER intervention for the pull request supersedes it —
+    /// the same "latest row wins" rule [`Orchestrator::manager_console_state`] applies.
+    ///
+    /// Silent when the manager is not routing at all (`off`), so that mode stays byte-identical to a
+    /// daemon built before the manager existed. A stored block that no longer parses is likewise
+    /// silent: there is nothing a reader could do with half a decision.
+    pub(crate) fn manager_unapplied_advice(&self, pr: &str) -> Option<UnappliedAdvice> {
+        if !self.manager_routing_enabled() {
+            return None;
+        }
+        let rows = self.store().load_manager_interventions().ok()?;
+        let row = rows.iter().rev().find(|r| r.pr.eq_ignore_ascii_case(pr))?;
+        if row.mode != MANAGER_MODE_ADVISE
+            || row.state != MANAGER_INTERVENTION_PROPOSED
+            || row.decision_json.is_empty()
+        {
+            return None;
+        }
+        let wrapped = format!(
+            "```{}\n{}\n```",
+            managerdecision::MANAGER_DECISION_TAG,
+            row.decision_json
+        );
+        let decision = managerdecision::parse_stored_decision(&wrapped, &[]).ok()?;
+        Some(UnappliedAdvice {
+            kind: decision.variant().to_string(),
+            head: decision.head,
+            rationale: decision.rationale,
+        })
     }
 
     /// §6.2/§8.2: every `route.fix` revision the decision names is still an open finding.

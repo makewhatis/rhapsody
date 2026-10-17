@@ -796,6 +796,13 @@ pub struct SummonWatermark {
 pub const REVIEW_ADJUDICATION_SHIP: &str = "ship";
 /// The `decision` column of a SETTLED "escalate" adjudication (STUDIO-956).
 pub const REVIEW_ADJUDICATION_ESCALATE: &str = "escalate";
+/// The `decision` column of an UNAPPLIED `advise`-mode manager recommendation (STUDIO-1330).
+///
+/// A third settled token rather than reusing `ship`/`escalate`: an advisory decision is neither. It
+/// stops the legacy SHIP|ESCALATE turn the way the other two do — the pull request is not being
+/// reviewed or fixed while it stands — but it records what the manager RECOMMENDED and that the
+/// daemon did not act on it, so the reconciliation sweep reports a human's move rather than a ship.
+pub const REVIEW_ADJUDICATION_ADVICE: &str = "advice";
 
 /// What the manager DECIDED about one pull request's review loop, durably (STUDIO-956). No Go
 /// counterpart — the whole review feature is a Rhapsody addition.
@@ -807,8 +814,9 @@ pub const REVIEW_ADJUDICATION_ESCALATE: &str = "escalate";
 /// which costs one turn and cannot deadlock the loop.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ReviewAdjudication {
-    /// [`REVIEW_ADJUDICATION_SHIP`] or [`REVIEW_ADJUDICATION_ESCALATE`]. A row whose decision is
-    /// neither (including the empty string a counter-only row carries) records no decision at all.
+    /// [`REVIEW_ADJUDICATION_SHIP`], [`REVIEW_ADJUDICATION_ESCALATE`] or
+    /// [`REVIEW_ADJUDICATION_ADVICE`]. A row whose decision is none of them (including the empty
+    /// string a counter-only row carries) records no decision at all.
     pub decision: String,
     /// The head the loop stopped at.
     pub head: String,

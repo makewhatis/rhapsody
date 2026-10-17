@@ -3260,6 +3260,64 @@ impl Orchestrator {
                 }
             }
         }
+        // STUDIO-1330: an UNAPPLIED `advise`-mode recommendation governs this head, so the legacy
+        // SHIP|ESCALATE turn must neither run over it nor stand beside it. In the incident the
+        // manager's advice arrived seconds AFTER the legacy turn had already shipped, and nothing
+        // read it back: the loop stayed stopped at a `ship` the manager had explicitly
+        // contradicted, `review_shipped` named no actor who could move the pull request, and the
+        // only comment on the pull request was the one saying "ship it".
+        //
+        // A settled decision that is NOT the advice is SUPERSEDED — cleared here — so no surface can
+        // report the pull request as shipped, and the reconciliation sweep reports the advice
+        // instead. The advice is then ANNOUNCED through the ordinary adjudication sink (a comment
+        // that names the manager's decision kind and says advise mode did not apply it), which is
+        // recorded as `Adjudication::Advice`; the `is_none` guard is what keeps that a one-shot
+        // rather than one comment per sweep.
+        //
+        // Head-scoped exactly as `Adjudication::governs` is: an advice about a head the branch has
+        // moved past with new work no longer governs, and the loop resumes its ordinary rules.
+        //
+        // And CONVERGENCE wins, exactly as it does for a settled verdict (STUDIO-1021): a pull
+        // request every live reviewer approved at this head is finished, so an advisory decision
+        // about it is moot — the merge gate owns the next move, and announcing "a human must act"
+        // over an approved change would be the false page this subsystem is careful about.
+        if let Some(advice) = self.manager_unapplied_advice(&churn_key(pr))
+            && (advice.head == head || unchanged_from.iter().any(|old| old == &advice.head))
+            && crate::automerge::auto_merge_verdict_with_proof(&mine, head, &proven).is_err()
+        {
+            if let Some(ledger) = self.adjudication_ledger.as_ref() {
+                if self.adjudication(pr).is_some_and(|d| {
+                    d.settled()
+                        && !matches!(d, crate::reviewadjudicate::Adjudication::Advice { .. })
+                }) {
+                    // A SETTLED verdict that is not the advice is what is being superseded. An
+                    // in-flight announcement is left alone — clearing it would re-emit the plan
+                    // every sweep, and a `note_failure`-style window has nothing to add here.
+                    ledger.clear(pr);
+                }
+                if self.adjudication(pr).is_none() {
+                    ledger.mark_in_flight(pr, self.rounds_used(pr));
+                    report
+                        .adjudicate
+                        .push(crate::reviewadjudicate::ReviewAdjudicationPlan {
+                            pr: pr.clone(),
+                            head: head.to_string(),
+                            rounds: self.rounds_used(pr),
+                            findings: self.open_findings(&mine, head, &proven),
+                            // Unused on the advice lane: no turn runs and no ship is judged.
+                            ship_available: true,
+                            ship_unavailable_reason: String::new(),
+                            advice: Some(crate::reviewadjudicate::AdjudicationAdvice {
+                                kind: advice.kind,
+                                rationale: advice.rationale,
+                            }),
+                        });
+                }
+            }
+            report.deferred += 1;
+            self.propose_auto_merge(&mine, pr, head, merge_state, &[head], report);
+            return;
+        }
         if disputes.is_empty()
             && !mine.is_empty()
             && verdict_at_head
@@ -3391,6 +3449,7 @@ impl Orchestrator {
                     findings,
                     ship_available: ship.is_ok(),
                     ship_unavailable_reason,
+                    advice: None,
                 };
                 if let Some(ledger) = self.adjudication_ledger.as_ref() {
                     // A decision recorded at a head this one has moved past no longer governs: it
@@ -11643,6 +11702,193 @@ mod tests {
                 "nothing reached a worker either way"
             );
         }
+    }
+
+    /// Seeds the manager's UNAPPLIED `advise`-mode recommendation for PR #12, as
+    /// `advance_manager_decision` leaves it: a terminal `proposed` row carrying the decision block.
+    /// `head` is the head the decision is bound to; `kind`/`route` shape the block.
+    fn seed_manager_advice(o: &Orchestrator, kind: &str, head: &str) {
+        let block = format!(
+            r#"{{"decision":"{kind}","head":"{head}","evidence_rev":1,"route":{{"fix":[{{"finding":"alice:F1","revision":1}}],"instructions":"fix the lifetime gap"}},"rationale":"the demonstrated ownership gap warrants an author fix"}}"#
+        );
+        o.store()
+            .save_manager_intervention(rs::ManagerInterventionRow {
+                id: "iv-advice".to_string(),
+                pr: format!("{OWNER}/{REPO}#12"),
+                generation: 1,
+                stall_kinds: vec!["review_shipped".to_string()],
+                mode: rs::MANAGER_MODE_ADVISE.to_string(),
+                state: rs::MANAGER_INTERVENTION_PROPOSED.to_string(),
+                decision_json: block,
+                ..rs::ManagerInterventionRow::default()
+            })
+            .expect("seed the manager's proposal");
+    }
+
+    /// **Acceptance (STUDIO-1330).** The incident, replayed at the watcher. The legacy turn has
+    /// already SHIPPED (a settled `Ship` at the head) and the manager, in `advise` mode, has since
+    /// recorded a `ROUTE_TO_AUTHOR` recommendation the daemon did not apply. The watcher must stop
+    /// the loop, SUPERSEDE the settled ship, and emit exactly ONE advice plan — which the off-loop
+    /// sink turns into a comment naming the manager's decision. A second sweep emits nothing more.
+    ///
+    /// MUTATION: drop the `manager_unapplied_advice` branch in `service_review_pr` and this reds —
+    /// the settled ship governs, the pull request keeps the contradicting verdict, and no advice is
+    /// ever announced.
+    #[test]
+    fn an_unapplied_advice_supersedes_a_settled_ship_and_is_announced_once() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Advise;
+        let (mut o, dispatched) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+        seed_manager_advice(&o, "ROUTE_TO_AUTHOR", HEAD_A);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+
+        assert_eq!(
+            report.adjudicate.len(),
+            1,
+            "exactly one plan is handed to the off-loop sink"
+        );
+        let plan = &report.adjudicate[0];
+        let advice = plan
+            .advice
+            .as_ref()
+            .expect("the plan announces the advice, not a verdict");
+        assert_eq!(advice.kind, "ROUTE_TO_AUTHOR");
+        assert_eq!(plan.head, HEAD_A);
+        assert!(
+            dispatched.lock().expect("lock").is_empty(),
+            "nothing reached a worker"
+        );
+        assert_eq!(
+            l.peek(&coord(12)),
+            Some(Adjudication::InFlight { rounds: 3 }),
+            "the settled ship is SUPERSEDED: the ledger now holds the in-flight announcement"
+        );
+
+        let again = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert!(
+            again.adjudicate.is_empty(),
+            "the advice is announced once, not once per sweep"
+        );
+    }
+
+    /// A `PrCommentSink` recording every body the adjudication posts.
+    #[derive(Default)]
+    struct AdviceComments(Mutex<Vec<String>>);
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::PrCommentSink for AdviceComments {
+        async fn post_pr_comment(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _number: i64,
+            body: &str,
+        ) -> crate::ghsummons::PrCommentResult {
+            self.0.lock().expect("comments").push(body.to_string());
+            Ok(())
+        }
+    }
+
+    /// An adjudicator that PANICS if asked for a turn: an advice plan must never run a model.
+    struct NoTurnAdjudicator;
+
+    #[async_trait::async_trait]
+    impl crate::reviewadjudicate::ReviewAdjudicator for NoTurnAdjudicator {
+        async fn adjudicate(
+            &self,
+            _req: &crate::reviewadjudicate::AdjudicationRequest,
+        ) -> Result<crate::reviewadjudicate::Verdict, String> {
+            panic!("an advice plan must not run a model turn");
+        }
+    }
+
+    /// **Acceptance (STUDIO-1330), the whole chain — the regression guard.** A stored
+    /// `ROUTE_TO_AUTHOR` recommendation beside a legacy `ship` at the same head. After the watcher
+    /// supersedes the ship and the off-loop sink announces the advice, the reconciliation sweep
+    /// reports `advice_unapplied`, the comment names the manager's decision and says it was not
+    /// applied, and NO adjudication path produces `review_shipped`.
+    #[tokio::test]
+    async fn a_stored_route_to_author_never_produces_review_shipped() {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Advise;
+        let (mut o, _d) = orch(teams);
+        let l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        l.record(
+            &coord(12),
+            Adjudication::Ship {
+                head: HEAD_A.to_string(),
+                rounds: 3,
+            },
+        );
+        seed_manager_advice(&o, "ROUTE_TO_AUTHOR", HEAD_A);
+
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(report.adjudicate.len(), 1, "one advice plan");
+
+        let comments = Arc::new(AdviceComments::default());
+        let deps = crate::reviewadjudicate::AdjudicationDeps {
+            adjudicator: Arc::new(NoTurnAdjudicator),
+            room: None,
+            comments: Some(Arc::clone(&comments) as Arc<dyn crate::ghsummons::PrCommentSink>),
+            ledger: Arc::clone(&l),
+            turn: crate::reviewadjudicate::AdjudicationTurn {
+                command: String::new(),
+                billing_guard: false,
+                tracker_api_key: String::new(),
+                model: String::new(),
+                timeout: std::time::Duration::from_secs(60),
+            },
+        };
+        for plan in &report.adjudicate {
+            crate::reviewadjudicate::perform_adjudication(plan, &deps, (o.now)()).await;
+        }
+        assert!(
+            matches!(l.peek(&coord(12)), Some(Adjudication::Advice { .. })),
+            "the advice is the settled decision, not the ship"
+        );
+
+        o.reconcile_review_divergence();
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(
+            found[0].kind,
+            crate::reviewreconcile::DivergenceKind::AdviceUnapplied
+        );
+        assert!(
+            !found
+                .iter()
+                .any(|d| d.kind == crate::reviewreconcile::DivergenceKind::ReviewShipped),
+            "no adjudication path may produce review_shipped while the stored decision is \
+             ROUTE_TO_AUTHOR: {found:?}"
+        );
+
+        let posted = comments.0.lock().expect("comments").clone();
+        assert_eq!(posted.len(), 1, "one pull-request comment");
+        assert!(
+            posted[0].contains("ROUTE_TO_AUTHOR"),
+            "the comment states the manager's decision kind: {}",
+            posted[0]
+        );
+        assert!(
+            posted[0].contains("did NOT apply"),
+            "the comment says the advice was not applied: {}",
+            posted[0]
+        );
     }
 
     /// **Acceptance (STUDIO-1018, §9), review B1.** Under `act` the manager is authoritative at the
