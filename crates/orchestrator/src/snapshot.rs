@@ -415,14 +415,30 @@ impl Orchestrator {
             .review_divergences()
             .iter()
             .any(|d| d.capacity_unreadable.is_some());
-        let review_unexplained = self.review_divergences().iter().any(|d| {
-            d.capacity_held.is_none()
-                && d.capacity_unreadable.is_none()
-                // STUDIO-964: a held pull request is an EXPLAINED wait — the sweep's own row says a
-                // person holds it — so the generic "nothing has reported it blocked" string is false
-                // for it and must not light. Its own row on `/api/v1/state` is the report.
-                && d.kind != crate::reviewreconcile::DivergenceKind::HeldForHuman
-        });
+        // STUDIO-1330: the pull requests the generic divergence advisory is ABOUT, one
+        // `owner/repo#number (TICKET)` each. Collected once here and used BOTH as the predicate (a
+        // non-empty list is the warning) and as the text, so the advisory can never name a set the
+        // condition did not select. The fixed sentence alone was identical on every project, so it
+        // told an operator that something was diverged but not which.
+        let review_unexplained: Vec<String> = self
+            .review_divergences()
+            .iter()
+            .filter(|d| {
+                d.capacity_held.is_none()
+                    && d.capacity_unreadable.is_none()
+                    // STUDIO-964: a held pull request is an EXPLAINED wait — the sweep's own row says a
+                    // person holds it — so the generic "nothing has reported it blocked" string is false
+                    // for it and must not light. Its own row on `/api/v1/state` is the report.
+                    && d.kind != crate::reviewreconcile::DivergenceKind::HeldForHuman
+            })
+            .map(|d| {
+                if d.ticket.is_empty() {
+                    d.pr.clone()
+                } else {
+                    format!("{} ({})", d.pr, d.ticket)
+                }
+            })
+            .collect();
         let mut out = Vec::with_capacity(order.len());
         for group in &order {
             let Some(g) = by_group.get(group) else {
@@ -463,27 +479,10 @@ impl Orchestrator {
                 warnings
                     .push(crate::reviewreconcile::REVIEW_DIVERGENCE_UNREADABLE_WARNING.to_string());
             }
-            if review_unexplained {
-                // STUDIO-1330: name the pull request(s), not just the condition. The fixed sentence
-                // alone was identical on every project, so it told an operator that something was
-                // diverged but not which — and on a nine-project install that is not actionable.
-                let names: Vec<String> = self
-                    .review_divergences()
-                    .iter()
-                    .filter(|d| {
-                        d.capacity_held.is_none()
-                            && d.capacity_unreadable.is_none()
-                            && d.kind != crate::reviewreconcile::DivergenceKind::HeldForHuman
-                    })
-                    .map(|d| {
-                        if d.ticket.is_empty() {
-                            d.pr.clone()
-                        } else {
-                            format!("{} ({})", d.pr, d.ticket)
-                        }
-                    })
-                    .collect();
-                warnings.push(crate::reviewreconcile::review_divergence_warning(&names));
+            if !review_unexplained.is_empty() {
+                warnings.push(crate::reviewreconcile::review_divergence_warning(
+                    &review_unexplained,
+                ));
             }
             out.push(ProjectStatus {
                 slug: group.clone(),
