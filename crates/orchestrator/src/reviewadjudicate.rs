@@ -382,9 +382,9 @@ impl Adjudication {
             }),
             REVIEW_ADJUDICATION_ADVICE => {
                 // `to_stored` writes the manager's decision variant ahead of its rationale, joined
-                // by the first `": "`. Split only when the prefix really is one of the four
-                // variants, so a rationale that happens to contain the separator is never mistaken
-                // for one — the worst case is a blank kind, which only costs the sweep's wording.
+                // by the first `": "`. Split only when the prefix really reads as a variant, so a
+                // rationale that happens to contain the separator is never mistaken for one — the
+                // worst case is a blank kind, which only costs the sweep's wording.
                 let (kind, reason) = match stored.reason.split_once(": ") {
                     Some((kind, reason)) if is_decision_variant(kind) => {
                         (kind.to_string(), reason.to_string())
@@ -404,14 +404,16 @@ impl Adjudication {
     }
 }
 
-/// Whether `token` is one of the four manager decision variants ([`Adjudication::Advice::kind`]'s
-/// closed set). Used only to split a rehydrated advice's stored `reason` back into its kind and
-/// rationale without a second store column.
+/// Whether `token` looks like a manager decision variant — an all-uppercase, underscore-separated
+/// ASCII token.
+///
+/// Used only to split a rehydrated advice's stored `reason` back into its kind and rationale
+/// without a second store column. Deliberately NOT a re-enumeration of
+/// [`crate::managerdecision::ManagerDecision::variant`]'s closed set: a fifth variant added there
+/// must not need this predicate edited too. The worst case of a mis-match is a blank kind, which
+/// only costs the reconciliation sweep's wording.
 fn is_decision_variant(token: &str) -> bool {
-    matches!(
-        token,
-        "RERUN_REVIEW" | "ROUTE_TO_AUTHOR" | "APPROVE" | "ESCALATE"
-    )
+    !token.is_empty() && token.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
 }
 
 /// What each pull request's adjudication is, shared between the control task (which reads it to
@@ -882,13 +884,17 @@ async fn announce_decision(
 /// it — the defect was a pull request whose only comment said "ship it" while the stored decision
 /// was `ROUTE_TO_AUTHOR`. Names the head and the round count like the other two verdicts, and
 /// repeats the manager's rationale so the reader can act without opening the console.
+///
+/// No summon token can survive into the returned body ([`crate::managerapply::strip_summon_tokens`]):
+/// the rationale is model output, and a comment carrying `@symphony`/`@rhapsody` would re-dispatch
+/// the ticket's own author — §7.9's rule, and the reason every other manager comment strips too.
 pub fn advice_body(plan: &ReviewAdjudicationPlan, advice: &AdjudicationAdvice) -> String {
     let findings = if plan.findings.is_empty() {
         "none recorded".to_string()
     } else {
         plan.findings.join("; ")
     };
-    format!(
+    crate::managerapply::strip_summon_tokens(&format!(
         "@manager advised **{kind}** on {pr} after {rounds} review rounds, and the daemon did NOT \
          apply it — the manager is running in `advise` mode, so this is a recommendation only: no \
          review or author round was dispatched and no ticket move was made. A human must act. Head \
@@ -906,7 +912,7 @@ pub fn advice_body(plan: &ReviewAdjudicationPlan, advice: &AdjudicationAdvice) -
         } else {
             advice.rationale.trim()
         },
-    )
+    ))
 }
 
 /// The prompt the manager answers. Names the pull request, the head, the round count and every open
@@ -1805,6 +1811,27 @@ mod tests {
             room.0.lock().unwrap().len(),
             1,
             "and the same decision reaches the room"
+        );
+    }
+
+    /// **Acceptance (STUDIO-1330, §7.9).** The advisory comment is model output, so a summon token in
+    /// the manager's rationale must not survive into it — a comment carrying `@symphony`/`@rhapsody`
+    /// would re-dispatch the pull request's own author.
+    #[test]
+    fn an_advice_comment_carries_no_summon_token() {
+        let plan = ReviewAdjudicationPlan {
+            advice: Some(AdjudicationAdvice {
+                kind: "ROUTE_TO_AUTHOR".to_string(),
+                rationale: "ask @symphony to fix it, or @rhapsody".to_string(),
+            }),
+            ..plan()
+        };
+        let advice = plan.advice.as_ref().expect("advice");
+        let body = advice_body(&plan, advice);
+        assert!(
+            !body.contains(rhapsody_core::SUMMON_TOKEN_SYMPHONY)
+                && !body.contains(rhapsody_core::SUMMON_TOKEN_RHAPSODY),
+            "a summon token must not reach a manager comment: {body}"
         );
     }
 
