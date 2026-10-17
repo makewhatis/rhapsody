@@ -141,6 +141,21 @@ pub const RECONCILE_LOG_EVERY: usize = 60;
 pub const REVIEW_DIVERGENCE_WARNING: &str = "a pull request's board state and its activity disagree — nothing is progressing it and \
      nothing has reported it blocked; see `review_divergence` on /api/v1/state";
 
+/// [`REVIEW_DIVERGENCE_WARNING`] with the pull requests it is about NAMED after it (STUDIO-1330).
+///
+/// The fixed sentence alone appeared identically on all nine projects of the installation that filed
+/// this ticket, so it identified nothing: the operator had to pull `review_divergence` off
+/// `/api/v1/state` to learn WHICH pull request it meant. `names` is one `owner/repo#number (TICKET)`
+/// per diverged pull request, in the sweep's own deterministic order — the two fields
+/// `review_divergence` already holds. The sentence itself is unchanged, so an operator (and a test)
+/// still greps the same prefix; only the actionable part is appended.
+pub fn review_divergence_warning(names: &[String]) -> String {
+    if names.is_empty() {
+        return REVIEW_DIVERGENCE_WARNING.to_string();
+    }
+    format!("{}: {}", REVIEW_DIVERGENCE_WARNING, names.join(", "))
+}
+
 /// [`REVIEW_DIVERGENCE_WARNING`]'s sibling for a divergence the review watcher is HOLDING for want
 /// of a global slot (STUDIO-950). The plain string's "nothing has reported it blocked" is false
 /// there — the watcher reports the hold every tick — so the project advisory names the deliberate
@@ -249,6 +264,19 @@ pub enum DivergenceKind {
     /// rows are all approved is not reported here, since auto-merge either merges it or
     /// [`DivergenceKind::ApprovedStillOpen`] reports the stuck gate after the staleness threshold.
     ReviewShipped,
+    /// The manager RECOMMENDED a decision in `advise` mode and the daemon deliberately did not
+    /// apply it (STUDIO-1330). An advisory outcome must not be able to produce a strictly more
+    /// terminal result than the decision it was advising: tally#281 sat green and mergeable for
+    /// five hours because the legacy turn SHIPPED the loop while the manager, in the same mode,
+    /// recommended `ROUTE_TO_AUTHOR` — and `review_shipped` names no actor who can move it.
+    ///
+    /// Reported from the durable `rhapsody_manager_intervention` row (mode `advise`, terminal
+    /// `proposed`, a stored decision) exactly as [`DivergenceKind::MergedTicketNotTerminal`] is
+    /// reported from the durable owed-move row the merge wrote — the sweep invents nothing and asks
+    /// GitHub and the tracker nothing. It replaces whatever the adjudication ledger would have said
+    /// about this pull request, so a stored `ROUTE_TO_AUTHOR` advice can never render as
+    /// [`DivergenceKind::ReviewShipped`].
+    AdviceUnapplied,
     /// A pull request MERGED and its implementation ticket is still not in its terminal state
     /// (STUDIO-1007). The auto-Done move (`crate::reviewdone`) is still owed — it is being retried,
     /// or its bounded retry was exhausted — so the ticket sits in review and silently blocks every
@@ -288,6 +316,7 @@ impl DivergenceKind {
             DivergenceKind::RoundBudgetExhausted => "round_budget_exhausted",
             DivergenceKind::ReviewEscalated => "review_escalated",
             DivergenceKind::ReviewShipped => "review_shipped",
+            DivergenceKind::AdviceUnapplied => "advice_unapplied",
             DivergenceKind::MergedTicketNotTerminal => "merged_ticket_not_terminal",
             DivergenceKind::ManagerDeferred => "manager_deferred",
             DivergenceKind::ReviewInfrastructure => "review_infrastructure",
@@ -331,6 +360,10 @@ impl DivergenceKind {
             DivergenceKind::ReviewShipped => {
                 "the manager shipped the review loop and no further review or author round will be \
                  dispatched; the merge gate still holds the pull request"
+            }
+            DivergenceKind::AdviceUnapplied => {
+                "the manager's advisory decision was not applied (advise mode), so nothing will \
+                 progress this pull request without a human"
             }
             DivergenceKind::MergedTicketNotTerminal => {
                 "the pull request merged but the ticket is still not in its terminal state, so the \
@@ -841,6 +874,47 @@ fn newest_activity_secs(facts: &PrFacts, now: DateTime<Utc>) -> i64 {
     newest.map_or(0, |n| now.signed_duration_since(n).num_seconds().max(0))
 }
 
+/// The reported row for an UNAPPLIED `advise`-mode recommendation (STUDIO-1330).
+///
+/// Built from the manager's own recommendation — the decision kind and its rationale — and the
+/// head it was made at, so the human feed, the console and the project advisory all name WHAT was
+/// recommended rather than repeating the generic "needs a human". `rounds` is the loop's own count
+/// for the pull request, which is the only round figure this sweep can read locally.
+fn unapplied_advice_divergence(
+    pr: &PrCoord,
+    facts: &PrFacts,
+    now: DateTime<Utc>,
+    rounds: usize,
+    advice: &crate::managerintervention::UnappliedAdvice,
+) -> Divergence {
+    Divergence {
+        pr: pr.to_string(),
+        kind: DivergenceKind::AdviceUnapplied,
+        ticket: facts
+            .rows
+            .iter()
+            .find(|r| !r.ticket.is_empty())
+            .map(|r| r.ticket.clone())
+            .unwrap_or_default(),
+        reviewer: String::new(),
+        stale_secs: newest_activity_secs(facts, now),
+        auto_merge_reason: None,
+        // Neither a slot wait nor a merge-gate decline: the manager's advice is the report, and its
+        // own WARN arm names it.
+        capacity_held: None,
+        capacity_unreadable: None,
+        adjudicated_head: advice.head.clone(),
+        current_head: String::new(),
+        rounds,
+        findings: Vec::new(),
+        reason: format!(
+            "the manager recommended {} in `advise` mode and it was NOT applied — no review or \
+             author round was dispatched and no ticket move was made. Rationale: {}",
+            advice.kind, advice.rationale
+        ),
+    }
+}
+
 impl Orchestrator {
     /// Runs one reconciliation sweep: reads the live watch set, dates each row against the `runs`
     /// ledger, and records what diverged. **Reports only** — nothing here dispatches, arms, merges
@@ -1172,9 +1246,65 @@ impl Orchestrator {
                     Some(crate::reviewadjudicate::Adjudication::Ship { .. }) => {
                         reconcile_pr(facts, now, RECONCILE_STALE_AFTER)
                     }
+                    // The same for an advice whose rows have since ALL approved: the loop converged
+                    // past it, so it is the merge gate's business exactly as a fully-approved ship
+                    // is (STUDIO-1021's rule, one decision kind over).
                     // Still deciding: the loop is deliberately stopped while the manager's turn
-                    // runs, so the row and budget rules must not report it.
-                    Some(crate::reviewadjudicate::Adjudication::InFlight { .. }) => None,
+                    // runs, so the row and budget rules must not report it. A STUDIO-1330 advice
+                    // announcement that never LANDED is the exception: on an install with no
+                    // adjudication sink the plan is dropped and the marker would stay `InFlight`
+                    // forever, which would turn the advice into the very silent stall this ticket
+                    // closes. The durable manager row is the fact, so it is reported from there.
+                    Some(crate::reviewadjudicate::Adjudication::InFlight { .. }) => {
+                        match self.manager_unapplied_advice(&pr.to_string()) {
+                            Some(advice)
+                                if any_unapproved
+                                    && self.head_governs_observed(pr, &advice.head) =>
+                            {
+                                Some(unapplied_advice_divergence(
+                                    pr,
+                                    facts,
+                                    now,
+                                    self.rounds_used(pr),
+                                    &advice,
+                                ))
+                            }
+                            _ => None,
+                        }
+                    }
+                    // STUDIO-1330: the manager RECOMMENDED a decision in `advise` mode and the
+                    // daemon deliberately did not apply it. This arm is what stops the pull request
+                    // from rendering as a ship the manager explicitly contradicted — the defect.
+                    // Gated on `any_unapproved` for the settled `Escalate` arm's reason: a pull
+                    // request every live row APPROVED has converged, so the merge gate (not the
+                    // manager's moot advice) owns the next move, and `reconcile_pr` below reports
+                    // the gate's own holding instead. `reason` carries the manager's recommendation
+                    // so the human feed names it.
+                    Some(crate::reviewadjudicate::Adjudication::Advice {
+                        kind,
+                        head,
+                        rounds,
+                        reason,
+                        ..
+                    }) if any_unapproved && self.head_governs_observed(pr, &head) => {
+                        Some(unapplied_advice_divergence(
+                            pr,
+                            facts,
+                            now,
+                            rounds,
+                            &crate::managerintervention::UnappliedAdvice {
+                                kind,
+                                head,
+                                rationale: reason,
+                            },
+                        ))
+                    }
+                    // The same for an advice whose rows have since ALL approved: the loop converged
+                    // past it, so it is the merge gate's business exactly as a fully-approved ship
+                    // is (STUDIO-1021's rule, one decision kind over).
+                    Some(crate::reviewadjudicate::Adjudication::Advice { .. }) => {
+                        reconcile_pr(facts, now, RECONCILE_STALE_AFTER)
+                    }
                     None if self.round_budget_spent(pr) && round_budget_owed(facts) => {
                         Some(Divergence {
                             pr: pr.to_string(),
@@ -1490,8 +1620,25 @@ impl Orchestrator {
         let Some(decision) = self.adjudication(pr) else {
             return true;
         };
+        // An in-flight marker governs by construction — a turn is out right now — which is exactly
+        // `Adjudication::governs`'s answer for it.
+        if !decision.settled() {
+            return true;
+        }
+        self.head_governs_observed(pr, decision.head())
+    }
+
+    /// Whether a decision bound to `head` still governs the head the branch carries, by the same
+    /// "no observation is `true`" rule [`Self::adjudication_governs_observed`] applies (STUDIO-1005).
+    ///
+    /// Split out for STUDIO-1330: an unapplied advice's head is not always the ledger's — the
+    /// unlanded-announcement arm reads it off the durable manager row — and both must be compared
+    /// the same way, or a superseded advice would keep being reported after the author pushed.
+    fn head_governs_observed(&self, pr: &PrCoord, head: &str) -> bool {
         match self.review_observed_head.get(pr) {
-            Some(observed) => decision.governs(&observed.head, &observed.unchanged_from),
+            Some(observed) => {
+                head == observed.head || observed.unchanged_from.iter().any(|old| old == head)
+            }
             None => true,
         }
     }
@@ -1693,6 +1840,31 @@ impl Orchestrator {
                         d.kind.detail(),
                         d.adjudicated_head,
                         d.rounds
+                    );
+                    continue;
+                }
+                // STUDIO-1330: the manager RECOMMENDED a decision in `advise` mode and the daemon
+                // deliberately did not apply it, so the generic copy below would be false — the
+                // manager has reported it, and the wait is the mode's own. Name the recommendation,
+                // the head it was made at and the round count, exactly as the shipped arm does, so
+                // the operator can act without reading the manager row themselves.
+                if d.kind == DivergenceKind::AdviceUnapplied {
+                    tracing::warn!(
+                        pr = %d.pr,
+                        kind = d.kind.as_str(),
+                        ticket = %d.ticket,
+                        head = %d.adjudicated_head,
+                        rounds = d.rounds,
+                        reason = %d.reason,
+                        stale_secs = d.stale_secs,
+                        sweeps,
+                        "review reconciliation: {} — {}. Head {}, {} rounds. {}. A human must apply \
+                         it, or clear the advice from the console (`POST /api/v1/reviews/clear`).",
+                        d.pr,
+                        d.kind.detail(),
+                        d.adjudicated_head,
+                        d.rounds,
+                        d.reason.trim()
                     );
                     continue;
                 }
@@ -2915,9 +3087,10 @@ mod store_tests {
         // Surface one: the per-project advisory.
         let projects = o.project_statuses();
         assert!(
-            projects
+            projects.iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "the advisory must reach /api/v1/projects, got {projects:?}"
         );
         // Surface two: the detail on /api/v1/state.
@@ -3149,9 +3322,10 @@ mod store_tests {
             "the advisory must name the unreadable coordinate, got {projects:?}"
         );
         assert!(
-            !projects
+            !projects.iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "it must not also claim nothing has reported it blocked, got {projects:?}"
         );
 
@@ -3364,9 +3538,10 @@ mod store_tests {
             "the advisory must name the capacity hold, got {projects:?}"
         );
         assert!(
-            !projects
+            !projects.iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "it must not also claim nothing has reported it blocked, got {projects:?}"
         );
         // The state row carries the detail the fixed advisory string cannot.
@@ -3437,9 +3612,10 @@ mod store_tests {
             "the held round's advisory must reach /api/v1/projects, got {projects:?}"
         );
         assert!(
-            projects
+            projects.iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "the unexplained stall must keep its warning alongside the capacity one, got {projects:?}"
         );
     }
@@ -3481,11 +3657,11 @@ mod store_tests {
             o.review_divergences().is_empty(),
             "a held ticket is a deliberate hold, not a stalled obligation"
         );
-        assert!(
-            o.project_statuses()
+        assert!(o.project_statuses().iter().all(|p| {
+            !p.warnings
                 .iter()
-                .all(|p| !p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING))
-        );
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))
+        }));
     }
 
     /// STUDIO-964: a held ticket whose pull request cleared every gate — every live row approved and
@@ -3702,9 +3878,10 @@ mod store_tests {
         // Surface one: the per-project advisory.
         let projects = o.project_statuses();
         assert!(
-            projects
+            projects.iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "the advisory must reach /api/v1/projects, got {projects:?}"
         );
         // Surface two: the detail on /api/v1/state.
@@ -3811,9 +3988,10 @@ mod store_tests {
         // Surface one: the per-project advisory.
         let projects = o.project_statuses();
         assert!(
-            projects
+            projects.iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "the advisory must reach /api/v1/projects, got {projects:?}"
         );
         // Surface two: the detail on /api/v1/state.
@@ -3929,9 +4107,10 @@ mod store_tests {
         // Surface one: the per-project advisory.
         let projects = o.project_statuses();
         assert!(
-            projects
+            projects.iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "the advisory must reach /api/v1/projects, got {projects:?}"
         );
         // Surface two: the detail on /api/v1/state.
@@ -4012,14 +4191,250 @@ mod store_tests {
         // Surface one: the per-project advisory.
         let projects = o.project_statuses();
         assert!(
-            projects
+            projects.iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "the advisory must reach /api/v1/projects, got {projects:?}"
         );
         // Surface two: the detail on /api/v1/state.
         let rendered = crate::snapshot_json::render(&o.build_snapshot());
         assert_eq!(rendered["review_divergence"][0]["kind"], "review_escalated");
+    }
+
+    /// **Acceptance (STUDIO-1330).** An UNAPPLIED `advise`-mode recommendation is reported as its
+    /// own kind, naming the manager's recommendation and the pull request — NEVER as
+    /// `review_shipped`, even when a settled `Ship` was what the loop recorded first. This is the
+    /// incident: tally#281's manager recommended `ROUTE_TO_AUTHOR` after the legacy turn had already
+    /// shipped, and `review_shipped` named no actor who could move the pull request.
+    ///
+    /// MUTATION: drop the `Adjudication::Advice` arm and this reds (the pull request falls through to
+    /// `review_shipped` or to the staleness rules).
+    #[test]
+    fn an_unapplied_advice_is_reported_and_never_as_shipped() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-10-17T19:00:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr,
+            Adjudication::Advice {
+                kind: "ROUTE_TO_AUTHOR".to_string(),
+                head: HEAD.to_string(),
+                rounds: 3,
+                findings: Vec::new(),
+                reason: "the demonstrated B1 ownership gap warrants an author fix".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+
+        // Warm-up for the new WARN callsite, then capture.
+        o.reconcile_review_divergence();
+        o.review_divergent.clear();
+        let (_, events) = crate::testsupport::capture_events(|| o.reconcile_review_divergence());
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(
+            found[0].kind,
+            DivergenceKind::AdviceUnapplied,
+            "an unapplied advice must never be reported as a ship"
+        );
+        assert_ne!(found[0].kind, DivergenceKind::ReviewShipped);
+        assert_eq!(found[0].pr, "makewhatis/rhapsody#164");
+        assert_eq!(found[0].ticket, "STUDIO-170");
+        assert_eq!(found[0].adjudicated_head, HEAD);
+        assert_eq!(found[0].rounds, 3);
+        assert!(
+            found[0].reason.contains("ROUTE_TO_AUTHOR"),
+            "the report must name the manager's actual recommendation: {}",
+            found[0].reason
+        );
+        assert!(
+            found[0]
+                .reason
+                .contains("the demonstrated B1 ownership gap warrants an author fix"),
+            "the manager's own rationale must reach the report: {}",
+            found[0].reason
+        );
+
+        let warn = events
+            .iter()
+            .find(|e| e.level == "WARN")
+            .unwrap_or_else(|| panic!("no WARN fired: {events:?}"));
+        assert!(
+            warn.message.contains("ROUTE_TO_AUTHOR"),
+            "the WARN must name the recommendation, got: {}",
+            warn.message
+        );
+
+        // Surface one: the per-project advisory NAMES the pull request (criterion 3).
+        let projects = o.project_statuses();
+        let warning = projects
+            .iter()
+            .flat_map(|p| p.warnings.iter())
+            .find(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))
+            .unwrap_or_else(|| panic!("no divergence advisory, got {projects:?}"));
+        assert!(
+            warning.contains("makewhatis/rhapsody#164"),
+            "the advisory must name the pull request, got: {warning}"
+        );
+        assert!(
+            warning.contains("STUDIO-170"),
+            "the advisory must name the ticket, got: {warning}"
+        );
+
+        // Surface two: the detail on /api/v1/state.
+        let rendered = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(rendered["review_divergence"][0]["kind"], "advice_unapplied");
+        assert_eq!(
+            rendered["review_divergence"][0]["reason"], found[0].reason,
+            "the row carries the reason so the console can render it"
+        );
+    }
+
+    /// **The convergence guard (STUDIO-1330).** An advice whose rows have since ALL approved is
+    /// moot — the loop converged past it, so the merge gate owns the next move and the sweep must
+    /// not page a human over an approved change.
+    ///
+    /// MUTATION: drop the `if any_unapproved` guard on the `Adjudication::Advice` arm and this reds
+    /// (`advice_unapplied` for a pull request every reviewer approved).
+    #[test]
+    fn a_converged_advice_is_not_reported_as_unapplied() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-10-17T19:00:00Z");
+        let key = ReviewWatchKey {
+            owner: "makewhatis".to_string(),
+            repo: "rhapsody".to_string(),
+            number: 164,
+            reviewer: "alice".to_string(),
+        };
+        o.store()
+            .save_review_watch(ReviewWatchRow {
+                key: key.clone(),
+                author: "jimmy".to_string(),
+                introduced_by: "handoff:STUDIO-170".to_string(),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: String::new(),
+                open: true,
+            })
+            .expect("seed the row");
+        o.store()
+            .mark_review_requested(&key, HEAD)
+            .expect("requested");
+        o.store()
+            .mark_review_completed(&key, HEAD, REVIEW_STATUS_APPROVED)
+            .expect("approved");
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &PrCoord::new("makewhatis", "rhapsody", 164),
+            Adjudication::Advice {
+                kind: "ROUTE_TO_AUTHOR".to_string(),
+                head: HEAD.to_string(),
+                rounds: 3,
+                findings: Vec::new(),
+                reason: "the demonstrated B1 ownership gap warrants an author fix".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert!(
+            found
+                .iter()
+                .all(|d| d.kind != DivergenceKind::AdviceUnapplied),
+            "an advice the loop converged past must not be reported as needing a human: {found:?}"
+        );
+    }
+
+    /// **Acceptance (STUDIO-1330), the dropped-announcement shape.** On an install with no
+    /// adjudication sink the advice plan is dropped and the ledger's marker stays `InFlight`
+    /// forever. The advice must still be REPORTED from the durable manager row — otherwise the fix
+    /// would trade the incident's loud-but-wrong `review_shipped` for a silent stall.
+    ///
+    /// MUTATION: make the `InFlight` arm return `None` unconditionally and this reds.
+    #[test]
+    fn an_unlanded_advice_announcement_is_still_reported() {
+        use crate::reviewadjudicate::AdjudicationLedger;
+
+        let o = &mut orch(false, "2026-10-17T19:00:00Z");
+        o.teams.as_mut().expect("teams").manager.review_authority =
+            rhapsody_config::teams::ReviewAuthority::Advise;
+        reviewed_row(o, "alice", "STUDIO-170");
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.mark_in_flight(&pr, 3);
+        o.adjudication_ledger = Some(ledger);
+        // The durable row the announcement never consumed.
+        o.store()
+            .save_manager_intervention(rhapsody_store::ManagerInterventionRow {
+                id: "iv-advice".to_string(),
+                pr: "makewhatis/rhapsody#164".to_string(),
+                generation: 1,
+                stall_kinds: vec!["review_shipped".to_string()],
+                mode: rhapsody_store::MANAGER_MODE_ADVISE.to_string(),
+                state: rhapsody_store::MANAGER_INTERVENTION_PROPOSED.to_string(),
+                decision_json: format!(
+                    r#"{{"decision":"ROUTE_TO_AUTHOR","head":"{HEAD}","evidence_rev":1,"route":{{"fix":[{{"finding":"alice:F1","revision":1}}],"instructions":"fix it"}},"rationale":"the B1 ownership gap warrants an author fix"}}"#
+                ),
+                ..rhapsody_store::ManagerInterventionRow::default()
+            })
+            .expect("seed the manager's proposal");
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert_eq!(found.len(), 1, "one divergence, got {found:?}");
+        assert_eq!(found[0].kind, DivergenceKind::AdviceUnapplied);
+        assert!(
+            found[0].reason.contains("ROUTE_TO_AUTHOR"),
+            "the report names the recommendation: {}",
+            found[0].reason
+        );
+    }
+
+    /// **The supersession guard (STUDIO-1330).** An advice whose head the branch has moved past with
+    /// new work no longer governs — the loop resumed — so the sweep must not keep reporting it as
+    /// needing a human.
+    ///
+    /// MUTATION: drop the `head_governs_observed` conjunct and this reds.
+    #[test]
+    fn a_superseded_advice_is_not_reported() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-10-17T19:00:00Z");
+        reviewed_row(o, "alice", "STUDIO-170");
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr,
+            Adjudication::Advice {
+                kind: "ROUTE_TO_AUTHOR".to_string(),
+                head: HEAD.to_string(),
+                rounds: 3,
+                findings: Vec::new(),
+                reason: "the demonstrated B1 ownership gap warrants an author fix".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+        // The watcher has OBSERVED a different head — a content-changing push, no proof.
+        observed_head(o, HEAD_PUSHED, &[]);
+
+        o.reconcile_review_divergence();
+
+        let found = o.review_divergences();
+        assert!(
+            found
+                .iter()
+                .all(|d| d.kind != DivergenceKind::AdviceUnapplied),
+            "an advice the branch moved past must not be reported: {found:?}"
+        );
     }
 
     /// Records an ESCALATE at `head` for PR #164 with the incident's own reason text, so a test can
@@ -4876,11 +5291,11 @@ mod store_tests {
         o.reconcile_review_divergence();
 
         assert!(o.review_divergences().is_empty());
-        assert!(
-            o.project_statuses()
+        assert!(o.project_statuses().iter().all(|p| {
+            !p.warnings
                 .iter()
-                .all(|p| !p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING))
-        );
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))
+        }));
         let rendered = crate::snapshot_json::render(&o.build_snapshot());
         assert!(
             rendered.get("review_divergence").is_none(),
@@ -5124,9 +5539,10 @@ mod store_tests {
             "a conflict route-back in flight must not be reported as needing a human"
         );
         assert!(
-            o.project_statuses()
+            o.project_statuses().iter().all(|p| !p
+                .warnings
                 .iter()
-                .all(|p| !p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "and the advisory must not light"
         );
         let rendered = crate::snapshot_json::render(&o.build_snapshot());
@@ -5237,9 +5653,10 @@ mod store_tests {
         );
         assert_eq!(found[0].kind, DivergenceKind::ChangesRequestedNoRun);
         assert!(
-            o.project_statuses()
+            o.project_statuses().iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "and the advisory must still light"
         );
     }
@@ -5311,9 +5728,10 @@ mod store_tests {
             "the advisory must name the unreadable coordinate, got {projects:?}"
         );
         assert!(
-            !projects
+            !projects.iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "it must not also claim nothing has reported it blocked, got {projects:?}"
         );
 
@@ -5367,9 +5785,10 @@ mod store_tests {
         assert_eq!(ds[0].pr, "makewhatis/rhapsody#216");
 
         assert!(
-            o.project_statuses()
+            o.project_statuses().iter().any(|p| p
+                .warnings
                 .iter()
-                .any(|p| p.warnings.iter().any(|w| w == REVIEW_DIVERGENCE_WARNING)),
+                .any(|w| w.starts_with(REVIEW_DIVERGENCE_WARNING))),
             "the project advisory points at the divergence surface"
         );
 

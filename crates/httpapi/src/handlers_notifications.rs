@@ -227,6 +227,7 @@ async fn observe(
             | D::RoundBudgetExhausted
             | D::ReviewEscalated
             | D::ReviewShipped
+            | D::AdviceUnapplied
             | D::MergedTicketNotTerminal
             | D::ReviewInfrastructure => {
                 if d.capacity_held.is_some() {

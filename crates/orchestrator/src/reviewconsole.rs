@@ -501,6 +501,12 @@ impl Orchestrator {
             if let Some(ledger) = self.adjudication_ledger.as_ref() {
                 ledger.clear(pr);
             }
+            // STUDIO-1330 review B1: and it overrides the manager's UNAPPLIED `advise`-mode
+            // recommendation. A `rerun` does NOT bump the generation (only `/clear` does), so the
+            // ledger clear alone would leave the durable proposal standing and the watcher would
+            // re-install an advice plan on the next sweep, deferring before dispatch — the control
+            // would answer `Applied` while nothing progressed.
+            self.supersede_manager_advice(&churn_key(pr));
             tracing::info!(pr = %pr, rows = armed, "ticketless review: operator re-ran a review");
         }
         ReviewControlOutcome::Applied(armed)
@@ -598,6 +604,12 @@ impl Orchestrator {
             );
             return ReviewControlOutcome::Failed(e.to_string());
         }
+        // STUDIO-1330 review B1: the generation bump already stops a stale proposal governing (the
+        // watcher's `manager_unapplied_advice` rejects a prior generation), but the store's
+        // clear-time supersession deliberately skips the terminal `proposed` state. Retire it here
+        // too, so the durable row says the advice was overridden rather than leaving the console
+        // and the calibration record claiming a proposal that an operator has already dismissed.
+        self.supersede_manager_advice(&churn_key(pr));
         tracing::info!(
             pr = %pr,
             "ticketless review: operator cleared the pull request's review budget and any manager \

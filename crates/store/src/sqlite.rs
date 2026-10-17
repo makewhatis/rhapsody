@@ -3696,7 +3696,8 @@ impl Store for Sqlite {
                 // decision nobody can act on — the fail-closed direction, since the alternative is
                 // a pull request stopped forever by a token no code branch matches.
                 adjudication: (decision == REVIEW_ADJUDICATION_SHIP
-                    || decision == REVIEW_ADJUDICATION_ESCALATE)
+                    || decision == REVIEW_ADJUDICATION_ESCALATE
+                    || decision == REVIEW_ADJUDICATION_ADVICE)
                     .then(|| {
                         Ok::<_, rusqlite::Error>(ReviewAdjudication {
                             decision,
@@ -3816,7 +3817,8 @@ impl Store for Sqlite {
                 pr: row.get(0)?,
                 dispatches: row.get(1)?,
                 adjudication: (decision == REVIEW_ADJUDICATION_SHIP
-                    || decision == REVIEW_ADJUDICATION_ESCALATE)
+                    || decision == REVIEW_ADJUDICATION_ESCALATE
+                    || decision == REVIEW_ADJUDICATION_ADVICE)
                     .then(|| {
                         Ok::<_, rusqlite::Error>(ReviewAdjudication {
                             decision,
@@ -8687,6 +8689,41 @@ mod tests {
                 evidence_rev: 0,
             }],
             "the re-run's override drops the decision and keeps the budget"
+        );
+    }
+
+    /// **STUDIO-1330.** The `advice` token is a SETTLED decision like the other two: it round-trips
+    /// through the store, so a restart rehydrates the manager's unapplied recommendation instead of
+    /// refunding the loop. MUTATION: drop `REVIEW_ADJUDICATION_ADVICE` from `load_review_bounds` and
+    /// this reds (`adjudication` reads back as `None`).
+    #[test]
+    fn an_advice_adjudication_round_trips() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        let pr = "makewhat/rhapsody#281";
+        store
+            .record_review_adjudication(
+                pr,
+                &ReviewAdjudication {
+                    decision: REVIEW_ADJUDICATION_ADVICE.into(),
+                    head: "574d437".into(),
+                    rounds: 3,
+                    findings: Vec::new(),
+                    reason: "ROUTE_TO_AUTHOR: the B1 ownership gap warrants an author fix".into(),
+                },
+            )
+            .expect("record the advice");
+
+        let bounds = store.load_review_bounds().expect("load");
+        let adjudication = bounds[0]
+            .adjudication
+            .as_ref()
+            .expect("an advice is a settled decision, not an absent one");
+        assert_eq!(adjudication.decision, REVIEW_ADJUDICATION_ADVICE);
+        assert_eq!(adjudication.head, "574d437");
+        assert_eq!(adjudication.rounds, 3);
+        assert_eq!(
+            adjudication.reason,
+            "ROUTE_TO_AUTHOR: the B1 ownership gap warrants an author fix"
         );
     }
 

@@ -72,7 +72,8 @@ use chrono::{DateTime, Utc};
 use rhapsody_config::room::{Message, RoomLog};
 use rhapsody_config::teams::{ReviewModelChoice, Teams};
 use rhapsody_store::{
-    REVIEW_ADJUDICATION_ESCALATE, REVIEW_ADJUDICATION_SHIP, ReviewAdjudication, Store,
+    REVIEW_ADJUDICATION_ADVICE, REVIEW_ADJUDICATION_ESCALATE, REVIEW_ADJUDICATION_SHIP,
+    ReviewAdjudication, Store,
 };
 
 use crate::ghsummons::PrCommentSink;
@@ -140,6 +141,24 @@ pub struct ReviewAdjudicationPlan {
     /// true. Carried so the escalation names the real reason ("a review round is still owed at this
     /// head") rather than a false "nobody read it".
     pub ship_unavailable_reason: String,
+    /// STUDIO-1330: the manager's UNAPPLIED `advise`-mode recommendation, when this plan exists to
+    /// ANNOUNCE one rather than to ask a turn. `Some` ⇒ [`perform_adjudication`] runs no model turn:
+    /// it records [`Adjudication::Advice`] and posts a comment that states the manager's decision
+    /// kind and says plainly that advise mode did not apply it. `None` is every ordinary plan.
+    ///
+    /// The control task sets this when it finds an advisory decision that governs the observed head
+    /// ([`Orchestrator::manager_unapplied_advice`]) — the same durable fact the review watcher uses
+    /// to stop the legacy turn from shipping over it.
+    pub advice: Option<AdjudicationAdvice>,
+}
+
+/// One UNAPPLIED `advise`-mode recommendation a [`ReviewAdjudicationPlan`] announces (STUDIO-1330).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdjudicationAdvice {
+    /// The manager's decision variant (`ROUTE_TO_AUTHOR`, `RERUN_REVIEW`, `APPROVE`, `ESCALATE`).
+    pub kind: String,
+    /// The manager's own rationale.
+    pub rationale: String,
 }
 
 /// What the manager is asked, and the bounds it is asked under. The turn parameters mirror
@@ -212,6 +231,22 @@ pub enum Adjudication {
         findings: Vec<String>,
         reason: String,
     },
+    /// The manager RECOMMENDED a decision in `advise` mode and the daemon deliberately did not apply
+    /// it (STUDIO-1330). No further round arms — an advisory outcome must not be able to produce a
+    /// strictly more terminal result than the decision it was advising, and it must not silently
+    /// become a `ship` either. The reconciliation sweep reports this as needing a human.
+    ///
+    /// `kind` is the manager's decision variant (`ROUTE_TO_AUTHOR`, `RERUN_REVIEW`, `APPROVE`,
+    /// `ESCALATE`); `reason` is its own rationale. Both are carried so the comment posted to the
+    /// pull request and the human feed can state what the manager actually recommended rather than
+    /// the legacy turn's contradicting verdict.
+    Advice {
+        kind: String,
+        head: String,
+        rounds: usize,
+        findings: Vec<String>,
+        reason: String,
+    },
 }
 
 impl Adjudication {
@@ -224,7 +259,9 @@ impl Adjudication {
     pub fn head(&self) -> &str {
         match self {
             Adjudication::InFlight { .. } => "",
-            Adjudication::Ship { head, .. } | Adjudication::Escalate { head, .. } => head,
+            Adjudication::Ship { head, .. }
+            | Adjudication::Escalate { head, .. }
+            | Adjudication::Advice { head, .. } => head,
         }
     }
 
@@ -233,7 +270,8 @@ impl Adjudication {
         match self {
             Adjudication::InFlight { rounds }
             | Adjudication::Ship { rounds, .. }
-            | Adjudication::Escalate { rounds, .. } => *rounds,
+            | Adjudication::Escalate { rounds, .. }
+            | Adjudication::Advice { rounds, .. } => *rounds,
         }
     }
 
@@ -274,7 +312,9 @@ impl Adjudication {
             Adjudication::InFlight { .. } => true,
             // The decision's own head, or a no-op move that PROVES that head is what the branch now
             // carries. Any other non-empty list is a partial proof for some other row's history.
-            Adjudication::Ship { .. } | Adjudication::Escalate { .. } => {
+            Adjudication::Ship { .. }
+            | Adjudication::Escalate { .. }
+            | Adjudication::Advice { .. } => {
                 self.head() == head || unchanged_from.iter().any(|old| old == self.head())
             }
         }
@@ -304,6 +344,22 @@ impl Adjudication {
                 findings: findings.clone(),
                 reason: reason.clone(),
             }),
+            Adjudication::Advice {
+                kind,
+                head,
+                rounds,
+                findings,
+                reason,
+            } => Some(ReviewAdjudication {
+                decision: REVIEW_ADJUDICATION_ADVICE.to_string(),
+                head: head.clone(),
+                rounds: *rounds as i64,
+                findings: findings.clone(),
+                // The manager's RECOMMENDATION is the fact worth keeping across a restart: the
+                // stored `reason` column carries it as `KIND: rationale`, and `from_stored` splits
+                // it back apart. `kind` is the decision variant the comment must name.
+                reason: format!("{kind}: {reason}"),
+            }),
         }
     }
 
@@ -324,9 +380,40 @@ impl Adjudication {
                 findings: stored.findings.clone(),
                 reason: stored.reason.clone(),
             }),
+            REVIEW_ADJUDICATION_ADVICE => {
+                // `to_stored` writes the manager's decision variant ahead of its rationale, joined
+                // by the first `": "`. Split only when the prefix really reads as a variant, so a
+                // rationale that happens to contain the separator is never mistaken for one — the
+                // worst case is a blank kind, which only costs the sweep's wording.
+                let (kind, reason) = match stored.reason.split_once(": ") {
+                    Some((kind, reason)) if is_decision_variant(kind) => {
+                        (kind.to_string(), reason.to_string())
+                    }
+                    _ => (String::new(), stored.reason.clone()),
+                };
+                Some(Adjudication::Advice {
+                    kind,
+                    head: stored.head.clone(),
+                    rounds,
+                    findings: stored.findings.clone(),
+                    reason,
+                })
+            }
             _ => None,
         }
     }
+}
+
+/// Whether `token` looks like a manager decision variant — an all-uppercase, underscore-separated
+/// ASCII token.
+///
+/// Used only to split a rehydrated advice's stored `reason` back into its kind and rationale
+/// without a second store column. Deliberately NOT a re-enumeration of
+/// [`crate::managerdecision::ManagerDecision::variant`]'s closed set: a fifth variant added there
+/// must not need this predicate edited too. The worst case of a mis-match is a blank kind, which
+/// only costs the reconciliation sweep's wording.
+fn is_decision_variant(token: &str) -> bool {
+    !token.is_empty() && token.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
 }
 
 /// What each pull request's adjudication is, shared between the control task (which reads it to
@@ -568,6 +655,36 @@ pub async fn perform_adjudication(
     deps: &AdjudicationDeps,
     at: DateTime<Utc>,
 ) {
+    // STUDIO-1330: this plan exists to ANNOUNCE an UNAPPLIED `advise`-mode recommendation, not to
+    // ask a turn. There is nothing to decide — the manager already decided — so no model is run: the
+    // advice is recorded as a settled adjudication (which stops the loop the legacy verdict would
+    // otherwise have stopped as a `ship`) and a comment states the manager's actual decision kind
+    // and that advise mode did not apply it.
+    //
+    // Before the `rounds == 0` guard below: that guard protects a STALE findings loop from spending
+    // a manager turn, and an advisory decision is a complete fact about the head it was made at.
+    if let Some(advice) = plan.advice.as_ref() {
+        let adjudication = Adjudication::Advice {
+            kind: advice.kind.clone(),
+            head: plan.head.clone(),
+            rounds: plan.rounds,
+            findings: plan.findings.clone(),
+            reason: advice.rationale.clone(),
+        };
+        let body = advice_body(plan, advice);
+        deps.ledger.record(&plan.pr, adjudication);
+        let refs = vec![plan.pr.to_string()];
+        announce_decision(plan, &body, &refs, deps, at).await;
+        tracing::info!(
+            pr = %plan.pr,
+            head = %plan.head,
+            rounds = plan.rounds,
+            recommendation = %advice.kind,
+            findings = plan.findings.len(),
+            "review adjudication: recorded the manager's unapplied advisory decision"
+        );
+        return;
+    }
     // A stale zero-round plan is not a findings loop. Leave the reviewer obligation armed;
     // the next watcher sweep will retry it without spending a manager turn (STUDIO-1129).
     if plan.rounds == 0 {
@@ -706,9 +823,38 @@ pub async fn perform_adjudication(
     }
 
     let refs = vec![plan.pr.to_string()];
+    announce_decision(plan, &body, &refs, deps, at).await;
+
+    let outcome = match &adjudication {
+        Adjudication::Ship { .. } => "ship",
+        Adjudication::Escalate { .. } => "escalate",
+        Adjudication::Advice { .. } => "advise",
+        Adjudication::InFlight { .. } => "in flight",
+    };
+    tracing::info!(
+        pr = %plan.pr,
+        head = %plan.head,
+        rounds = plan.rounds,
+        verdict = outcome,
+        findings = plan.findings.len(),
+        "review adjudication: the manager decided"
+    );
+}
+
+/// Write a settled decision's two audit records — the room post and the pull-request comment — each
+/// best effort, so a failure on one surface warns and the other still lands. Extracted so the
+/// ordinary verdict and the STUDIO-1330 advisory announcement cannot drift apart in what they
+/// publish or in how a failure is reported.
+async fn announce_decision(
+    plan: &ReviewAdjudicationPlan,
+    body: &str,
+    refs: &[String],
+    deps: &AdjudicationDeps,
+    at: DateTime<Utc>,
+) {
     if let Some(room) = deps.room.as_ref() {
-        let mut msg = Message::room(MANAGER_IDENTITY, at, body.clone());
-        msg.refs = refs.clone();
+        let mut msg = Message::room(MANAGER_IDENTITY, at, body.to_string());
+        msg.refs = refs.to_vec();
         if let Err(e) = room.append(&msg) {
             tracing::warn!(
                 pr = %plan.pr,
@@ -720,7 +866,7 @@ pub async fn perform_adjudication(
     }
     if let Some(comments) = deps.comments.as_ref()
         && let Err(e) = comments
-            .post_pr_comment(&plan.pr.owner, &plan.pr.repo, plan.pr.number, &body)
+            .post_pr_comment(&plan.pr.owner, &plan.pr.repo, plan.pr.number, body)
             .await
     {
         tracing::warn!(
@@ -730,20 +876,43 @@ pub async fn perform_adjudication(
              room post and the ledger are unaffected"
         );
     }
+}
 
-    let outcome = match &adjudication {
-        Adjudication::Ship { .. } => "ship",
-        Adjudication::Escalate { .. } => "escalate",
-        Adjudication::InFlight { .. } => "in flight",
+/// The comment and room post for an UNAPPLIED `advise`-mode recommendation (STUDIO-1330).
+///
+/// Leads with the manager's ACTUAL decision kind and states plainly that advise mode did not apply
+/// it — the defect was a pull request whose only comment said "ship it" while the stored decision
+/// was `ROUTE_TO_AUTHOR`. Names the head and the round count like the other two verdicts, and
+/// repeats the manager's rationale so the reader can act without opening the console.
+///
+/// No summon token can survive into the returned body ([`crate::managerapply::strip_summon_tokens`]):
+/// the rationale is model output, and a comment carrying `@symphony`/`@rhapsody` would re-dispatch
+/// the ticket's own author — §7.9's rule, and the reason every other manager comment strips too.
+pub fn advice_body(plan: &ReviewAdjudicationPlan, advice: &AdjudicationAdvice) -> String {
+    let findings = if plan.findings.is_empty() {
+        "none recorded".to_string()
+    } else {
+        plan.findings.join("; ")
     };
-    tracing::info!(
-        pr = %plan.pr,
-        head = %plan.head,
+    crate::managerapply::strip_summon_tokens(&format!(
+        "@manager advised **{kind}** on {pr} after {rounds} review rounds, and the daemon did NOT \
+         apply it — the manager is running in `advise` mode, so this is a recommendation only: no \
+         review or author round was dispatched and no ticket move was made. A human must act. Head \
+         `{head}`.\n\nRationale: {reason}\nOpen findings: {findings}",
+        kind = if advice.kind.trim().is_empty() {
+            "a decision"
+        } else {
+            advice.kind.trim()
+        },
+        pr = plan.pr,
         rounds = plan.rounds,
-        verdict = outcome,
-        findings = plan.findings.len(),
-        "review adjudication: the manager decided"
-    );
+        head = plan.head,
+        reason = if advice.rationale.trim().is_empty() {
+            "not stated"
+        } else {
+            advice.rationale.trim()
+        },
+    ))
 }
 
 /// The prompt the manager answers. Names the pull request, the head, the round count and every open
@@ -1063,6 +1232,7 @@ mod tests {
             ],
             ship_available: true,
             ship_unavailable_reason: String::new(),
+            advice: None,
         }
     }
 
@@ -1569,6 +1739,119 @@ mod tests {
                 timeout: Duration::from_secs(60),
             },
         }
+    }
+
+    /// **Acceptance (STUDIO-1330).** An advice plan runs NO model turn: it records the manager's
+    /// recommendation as a settled [`Adjudication::Advice`] and posts a comment that names the
+    /// actual decision kind and says explicitly that advise mode did not apply it. This is the fix
+    /// for a pull request whose only comment said "ship it" while the stored decision was
+    /// `ROUTE_TO_AUTHOR`.
+    ///
+    /// MUTATION: drop the `plan.advice` branch and this reds — the injected `Ship` verdict is
+    /// recorded instead and the comment is the ship body.
+    #[tokio::test]
+    async fn an_advice_plan_records_the_recommendation_and_posts_it_without_a_turn() {
+        let room = Arc::new(RecordingRoom(Mutex::new(Vec::new())));
+        let comments = Arc::new(RecordingComments::default());
+        let ledger = Arc::new(AdjudicationLedger::default());
+        let plan = ReviewAdjudicationPlan {
+            advice: Some(AdjudicationAdvice {
+                kind: "ROUTE_TO_AUTHOR".to_string(),
+                rationale: "the B1 ownership gap warrants an author fix".to_string(),
+            }),
+            ..plan()
+        };
+        let deps = deps(
+            // If a turn ran, this verdict would be what landed — so the assertions below are the
+            // mutation check on the early return.
+            Arc::new(FixedVerdict(Verdict::Ship)),
+            Arc::clone(&room),
+            Arc::clone(&comments),
+            Arc::clone(&ledger),
+        );
+
+        perform_adjudication(&plan, &deps, Utc::now()).await;
+
+        match ledger.peek(&plan.pr) {
+            Some(Adjudication::Advice {
+                kind,
+                head,
+                rounds,
+                reason,
+                ..
+            }) => {
+                assert_eq!(kind, "ROUTE_TO_AUTHOR");
+                assert_eq!(head, plan.head);
+                assert_eq!(rounds, plan.rounds);
+                assert_eq!(reason, "the B1 ownership gap warrants an author fix");
+            }
+            other => panic!("expected a settled advice, got {other:?}"),
+        }
+
+        let posted = comments.0.lock().unwrap().clone();
+        assert_eq!(posted.len(), 1, "exactly one pull-request comment");
+        let body = &posted[0].3;
+        assert!(
+            body.contains("ROUTE_TO_AUTHOR"),
+            "the comment must state the manager's actual decision kind: {body}"
+        );
+        assert!(
+            !body.contains("ship it"),
+            "the comment must not read as a ship: {body}"
+        );
+        assert!(
+            body.contains("did NOT apply") && body.contains("advise"),
+            "the comment must say explicitly that the advice was not applied: {body}"
+        );
+        assert!(
+            body.contains("the B1 ownership gap warrants an author fix"),
+            "the manager's rationale must reach the comment: {body}"
+        );
+        assert_eq!(
+            room.0.lock().unwrap().len(),
+            1,
+            "and the same decision reaches the room"
+        );
+    }
+
+    /// **Acceptance (STUDIO-1330, §7.9).** The advisory comment is model output, so a summon token in
+    /// the manager's rationale must not survive into it — a comment carrying `@symphony`/`@rhapsody`
+    /// would re-dispatch the pull request's own author.
+    #[test]
+    fn an_advice_comment_carries_no_summon_token() {
+        let plan = ReviewAdjudicationPlan {
+            advice: Some(AdjudicationAdvice {
+                kind: "ROUTE_TO_AUTHOR".to_string(),
+                rationale: "ask @symphony to fix it, or @rhapsody".to_string(),
+            }),
+            ..plan()
+        };
+        let advice = plan.advice.as_ref().expect("advice");
+        let body = advice_body(&plan, advice);
+        assert!(
+            !body.contains(rhapsody_core::SUMMON_TOKEN_SYMPHONY)
+                && !body.contains(rhapsody_core::SUMMON_TOKEN_RHAPSODY),
+            "a summon token must not reach a manager comment: {body}"
+        );
+    }
+
+    /// A settled advice survives the store round trip (the restart shape): the kind is recovered from
+    /// the stored `reason` column, so the sweep can still name the recommendation after a boot.
+    #[test]
+    fn a_settled_advice_round_trips_through_the_store_form() {
+        let adjudication = Adjudication::Advice {
+            kind: "ROUTE_TO_AUTHOR".to_string(),
+            head: "h".to_string(),
+            rounds: 3,
+            findings: Vec::new(),
+            reason: "the demonstrated ownership gap warrants an author fix".to_string(),
+        };
+        let stored = adjudication
+            .to_stored()
+            .expect("a settled advice is durable");
+        assert_eq!(stored.decision, REVIEW_ADJUDICATION_ADVICE);
+        let back = Adjudication::from_stored(&stored).expect("the token is recognised");
+        assert_eq!(back, adjudication);
     }
 
     /// **Acceptance: the decision is recorded in the room AND on the pull request**, both naming the
