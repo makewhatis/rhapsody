@@ -1554,6 +1554,15 @@ impl Orchestrator {
     /// Silent when the manager is not routing at all (`off`), so that mode stays byte-identical to a
     /// daemon built before the manager existed. A stored block that no longer parses is likewise
     /// silent: there is nothing a reader could do with half a decision.
+    ///
+    /// STUDIO-1330 review B1: the advice governs only in the GENERATION it was made in (§5.1 — the
+    /// row's own doc says "a new generation supersedes it"). Nothing retires an `advise` proposal
+    /// when the generation moves — the store's clear-time supersession skips `proposed` because that
+    /// state is terminal by design — so without this an operator's `POST /api/v1/reviews/clear`
+    /// would bump the generation, report success, and the same stale recommendation would keep
+    /// re-stopping the loop on the next sweep. A store that holds no bound row falls back to the
+    /// row's own generation, the same `map_or` shape [`Self::revalidate_manager_decision`] uses, so
+    /// a store that cannot answer is not a generation change.
     pub(crate) fn manager_unapplied_advice(&self, pr: &str) -> Option<UnappliedAdvice> {
         if !self.manager_routing_enabled() {
             return None;
@@ -1564,6 +1573,15 @@ impl Orchestrator {
             || row.state != MANAGER_INTERVENTION_PROPOSED
             || row.decision_json.is_empty()
         {
+            return None;
+        }
+        let current_generation = self
+            .store()
+            .review_bound(pr)
+            .ok()
+            .flatten()
+            .map_or(row.generation, |b| b.generation);
+        if row.generation != current_generation {
             return None;
         }
         let wrapped = format!(
@@ -1577,6 +1595,32 @@ impl Orchestrator {
             head: decision.head,
             rationale: decision.rationale,
         })
+    }
+
+    /// STUDIO-1330 review B1: retire every pending `advise`-mode recommendation for `pr`, because an
+    /// operator has taken the loop back into their own hands.
+    ///
+    /// `POST /api/v1/reviews/clear` already bumps the generation, which
+    /// [`Self::manager_unapplied_advice`] rejects on its own; `POST /api/v1/reviews/rerun` does NOT
+    /// bump it, so without this the same `proposed` row would keep re-stopping the loop the operator
+    /// just re-armed, and the control would report `Applied` while nothing progressed. `superseded`
+    /// is the state the design already uses for a decision that is "not applied" (§7.2), and the row
+    /// is kept for audit — nothing is deleted.
+    ///
+    /// Best-effort, like every other manager state write: a store failure is a WARN, and the
+    /// generation guard still covers the clear path. A PR with no pending advice writes nothing.
+    pub(crate) fn supersede_manager_advice(&self, pr: &str) {
+        let Ok(rows) = self.store().load_manager_interventions() else {
+            return;
+        };
+        for row in rows {
+            if row.pr.eq_ignore_ascii_case(pr)
+                && row.mode == MANAGER_MODE_ADVISE
+                && row.state == MANAGER_INTERVENTION_PROPOSED
+            {
+                self.set_manager_state(&row, MANAGER_INTERVENTION_SUPERSEDED);
+            }
+        }
     }
 
     /// §6.2/§8.2: every `route.fix` revision the decision names is still an open finding.

@@ -11783,6 +11783,135 @@ mod tests {
         );
     }
 
+    /// Seeds the advice the incident left behind, with the generation bound the manager's
+    /// intervention creation always leaves (`ensure_review_generation`), so the advice is bound to
+    /// the generation the pull request is actually in.
+    fn seeded_advice_orchestrator() -> (Orchestrator, DispatchedEntries) {
+        let mut teams = adjudicating(&["alice", "bob"], 3);
+        teams.manager.review_authority = rhapsody_config::teams::ReviewAuthority::Advise;
+        let (mut o, dispatched) = orch(teams);
+        let _l = ledger(&mut o);
+        introduce(&o, reviewed_row(12, "bob", HEAD_A));
+        o.store()
+            .ensure_review_generation(&churn_key(&coord(12)))
+            .expect("generation");
+        o.review_rounds
+            .insert(churn_key(&coord(12)), 3 * o.reviewers_per_round());
+        seed_manager_advice(&o, "ROUTE_TO_AUTHOR", HEAD_A);
+        (o, dispatched)
+    }
+
+    /// **Acceptance (STUDIO-1330), review B1.** An operator's `clear` — which bumps the generation —
+    /// followed by a `rerun` must progress a pull request the manager advised `ROUTE_TO_AUTHOR` on,
+    /// instead of the stale proposal re-installing itself every sweep. Both controls report
+    /// `Applied`; the sweep after them must dispatch the review.
+    ///
+    /// MUTATION: remove every operator override this fix adds (the clear supersession, the
+    /// generation guard in `manager_unapplied_advice`, and the rerun supersession) and this reds —
+    /// the advice keeps deferring and `dispatched` stays 0.
+    #[test]
+    fn operator_clear_and_rerun_progress_past_an_unapplied_advice() {
+        let (mut o, dispatched) = seeded_advice_orchestrator();
+
+        let first = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(first.adjudicate.len(), 1, "the advice is announced once");
+
+        assert!(
+            matches!(
+                o.handle_review_clear(&coord(12)),
+                crate::reviewconsole::ReviewControlOutcome::Applied(_)
+            ),
+            "the operator's clear applies"
+        );
+        // The store's clear-time supersession deliberately skips the terminal `proposed` state, so
+        // this is the operator write's own effect — assert it before the re-run would do the same.
+        assert!(
+            o.store()
+                .load_manager_interventions()
+                .expect("interventions")
+                .iter()
+                .all(|r| r.state == rs::MANAGER_INTERVENTION_SUPERSEDED),
+            "the clear retires the durable proposal"
+        );
+        assert!(
+            matches!(
+                o.handle_review_rerun(&coord(12)),
+                crate::reviewconsole::ReviewControlOutcome::Applied(_)
+            ),
+            "the operator's re-run applies"
+        );
+
+        let after = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            after.dispatched, 1,
+            "operator clear + rerun must progress past the old advice: {after:?}"
+        );
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+    }
+
+    /// **Acceptance (STUDIO-1330), review B1.** A `rerun` alone — which does NOT bump the generation
+    /// — must also progress past an unapplied advice. The ledger clear it performs is not enough:
+    /// the durable proposal would otherwise re-arm the advice plan on the next sweep.
+    ///
+    /// MUTATION: drop the `supersede_manager_advice` call from `handle_review_rerun` and this reds —
+    /// the advice keeps deferring and `dispatched` stays 0.
+    #[test]
+    fn operator_rerun_progresses_past_an_unapplied_advice() {
+        let (mut o, dispatched) = seeded_advice_orchestrator();
+
+        let first = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(first.adjudicate.len(), 1, "the advice is announced once");
+
+        assert!(
+            matches!(
+                o.handle_review_rerun(&coord(12)),
+                crate::reviewconsole::ReviewControlOutcome::Applied(_)
+            ),
+            "the operator's re-run applies"
+        );
+        assert!(
+            o.store()
+                .load_manager_interventions()
+                .expect("interventions")
+                .iter()
+                .all(|r| r.state == rs::MANAGER_INTERVENTION_SUPERSEDED),
+            "the re-run retires the durable proposal"
+        );
+
+        let after = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            after.dispatched, 1,
+            "operator rerun alone must progress past the old advice: {after:?}"
+        );
+        assert_eq!(dispatched.lock().expect("lock").len(), 1);
+    }
+
+    /// **Acceptance (STUDIO-1330), review B1 — the generation rule.** A recommendation made in
+    /// generation N must not govern generation N+1 (§5.1 — the intervention row's own contract says
+    /// "a new generation supersedes it"), whatever moved the generation. This isolates the read-side
+    /// guard from the operator writes: the generation moves with no `Clear`/`Rerun` involved.
+    ///
+    /// MUTATION: drop the generation guard in `manager_unapplied_advice` and this reds — the stale
+    /// advice governs a generation it was never made in.
+    #[test]
+    fn an_advice_does_not_govern_a_later_generation() {
+        let (o, _dispatched) = seeded_advice_orchestrator();
+        let pr = churn_key(&coord(12));
+        assert!(
+            o.manager_unapplied_advice(&pr).is_some(),
+            "the advice governs the generation it was made in"
+        );
+
+        o.store()
+            .increment_review_generation(&pr)
+            .expect("bump the generation");
+
+        assert!(
+            o.manager_unapplied_advice(&pr).is_none(),
+            "the advice must not govern a later generation"
+        );
+    }
+
     /// A `PrCommentSink` recording every body the adjudication posts.
     #[derive(Default)]
     struct AdviceComments(Mutex<Vec<String>>);
