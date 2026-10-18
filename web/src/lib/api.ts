@@ -441,6 +441,19 @@ export interface IssueRun extends RunSummary {
   // row as you rendered it before the field existed", which is the same absence-is-the-fallback
   // shape `review_ticket` and `review_run` use above.
   review_of?: string;
+  // True when this row's own subject is a key NO tracker can resolve (STUDIO-1343) — a review run
+  // (`pr:…@reviewer`), a manager adjudication (`pr:…@manager`), a lead decision (`lead:…#n@manager`),
+  // an account-limit decision (`limit:…@manager`) or a landing (`land:…`). The daemon reads it off
+  // the run's own issue id with the one predicate the orchestrator already keys its boundaries on,
+  // so a new synthetic prefix is covered the moment that predicate learns it rather than needing a
+  // second list here.
+  //
+  // It is NOT a restatement of `review_run`: a review run is folded onto the ticket it reviews, and
+  // only some non-tracker rows are reviews. This is the fact that says "there is no ticket behind
+  // this row at all", which is what lets a completed `lead:`/`limit:` run read `done` instead of
+  // the "awaiting a reviewer" a completed ticket-backed row means. Positive-only, on the same terms
+  // as `review_ticket`/`review_run`.
+  non_tracker?: boolean;
 }
 
 // IssueRunsResponse is the GET /api/v1/history/issues payload (TRA-320): one entry per ISSUE —
@@ -475,6 +488,11 @@ export interface IssueStatusBucket {
   // cannot move any of the five figures — while resolving it would double this endpoint's tracker
   // cost. If the strip ever splits "reviewing" out, the daemon adds the lookup and the field.
   review_run?: boolean;
+  // True when these are synthetic subjects NO tracker can resolve (STUDIO-1343) — the same fact the
+  // listing serves per row, read off the id. It is what stops a finished `lead:`/`limit:` run's
+  // bucket being inferred into the strip's "In review" count, exactly as `review_run` does for a
+  // finished review. Read off the id, so it costs nothing; positive-only.
+  non_tracker?: boolean;
   count: number;
 }
 

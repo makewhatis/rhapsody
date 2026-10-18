@@ -27,6 +27,7 @@ import {
   mateStates,
   projectActiveStates,
   needsOperator,
+  nonTrackerIssues,
   providerByIssue,
   relativeSince,
   reviewOfTickets,
@@ -1387,6 +1388,170 @@ describe("a page of ticketless review jobs", () => {
   it("adds no run note to a row that has no ticket behind it", () => {
     expect(row("pr:makewhatis/rhapsody#135@jimmy")?.statusNote).toBeUndefined();
     expect(row("pr:makewhatis/rhapsody#138@jimmy")?.statusNote).toBeUndefined();
+  });
+});
+
+// STUDIO-1343 — a finished manager run with no ticket behind it. The Jobs worklist showed "Manager
+// limit decision for claude-subscription" (`limit:claude-subscription@manager`) as "In review"
+// forever: the run completed, the ticket it decided for (STUDIO-1328) went Done, and nothing was
+// waiting on anyone. Every finished `lead:…#n@manager` row read the same way. These rows have no
+// tracker ticket, so — exactly as for a ticketless REVIEW run (STUDIO-826) — the daemon serves
+// `non_tracker` and the console reads the run's own outcome: `completed → done`, `failed`/`waiting →
+// blocked`, live → `run`. The field set below is the one `GET /api/v1/history/issues` serves.
+describe("a page of ticketless manager/lead jobs", () => {
+  const rows = buildConsoleJobs(
+    [
+      job({ issue: "limit:claude-subscription@manager", status: "completed" }),
+      job({ issue: "lead:makewhatis/rhapsody#1:2@manager", status: "completed" }),
+      job({ issue: "limit:fireworks@manager", status: "failed" }),
+      job({ issue: "lead:makewhatis/rhapsody#1:3@manager", status: "failed" }),
+      job({ issue: "limit:opencode@manager", status: "running" }),
+      // The adjudication run the ticket names: `pr:…@manager` already carried `review_run`, and its
+      // behaviour must not change — it is still a ticketless row, still `done`.
+      job({ issue: "pr:makewhatis/rhapsody#9@manager", status: "completed" }),
+      job({ issue: "pr:makewhatis/rhapsody#9@alice", status: "completed" }),
+      // The ticket the limit decision was about: an ordinary completed run with no resolved
+      // lifecycle, which still means "awaiting a reviewer" and must be left alone.
+      job({ issue: "STUDIO-1328", status: "completed" }),
+      // One ticket the tracker DID answer for, so the "Needs you" gate is open and its number is a
+      // real one rather than the "—" a wholly unanswered page gets.
+      job({ issue: "STUDIO-1200", status: "completed" }),
+    ],
+    [
+      issueRow({ issue_identifier: "limit:claude-subscription@manager", non_tracker: true }),
+      issueRow({ issue_identifier: "lead:makewhatis/rhapsody#1:2@manager", non_tracker: true }),
+      issueRow({
+        issue_identifier: "limit:fireworks@manager",
+        non_tracker: true,
+        outcome: "failed",
+      }),
+      issueRow({
+        issue_identifier: "lead:makewhatis/rhapsody#1:3@manager",
+        non_tracker: true,
+        outcome: "failed",
+      }),
+      issueRow({ issue_identifier: "limit:opencode@manager", non_tracker: true, outcome: "running" }),
+      issueRow({
+        issue_identifier: "pr:makewhatis/rhapsody#9@manager",
+        non_tracker: true,
+        review_run: true,
+      }),
+      issueRow({
+        issue_identifier: "pr:makewhatis/rhapsody#9@alice",
+        non_tracker: true,
+        review_run: true,
+      }),
+      issueRow({ issue_identifier: "STUDIO-1328" }),
+      issueRow({ issue_identifier: "STUDIO-1200", lifecycle: "in_review" }),
+    ],
+    undefined,
+    NOW,
+  );
+  const row = (issue: string) => rows.find((r) => r.issue === issue);
+
+  it("reads a finished manager/lead run as done, not awaiting a reviewer", () => {
+    expect(row("limit:claude-subscription@manager")).toMatchObject({
+      status: "done",
+      statusLabel: "done",
+      needsYou: false,
+    });
+    expect(row("lead:makewhatis/rhapsody#1:2@manager")).toMatchObject({
+      status: "done",
+      needsYou: false,
+    });
+  });
+
+  it("keeps a failed manager/lead run the operator's move", () => {
+    expect(row("limit:fireworks@manager")).toMatchObject({ status: "blocked", needsYou: true });
+    expect(row("lead:makewhatis/rhapsody#1:3@manager")).toMatchObject({
+      status: "blocked",
+      needsYou: true,
+    });
+  });
+
+  // Live is `run`, never `reviewing`: `reviewing` claims an agent is doing a REVIEW, and a manager
+  // or lead run is not one. Only the terminal arm is widened to every ticketless subject.
+  it("reads a live manager run as running, never reviewing", () => {
+    expect(row("limit:opencode@manager")).toMatchObject({ status: "run", statusLabel: "running" });
+  });
+
+  it("leaves ticket-backed and review rows exactly as they were", () => {
+    expect(row("STUDIO-1328")).toMatchObject({ status: "review", needsYou: true });
+    expect(row("pr:makewhatis/rhapsody#9@manager")).toMatchObject({
+      status: "done",
+      needsYou: false,
+    });
+    expect(row("pr:makewhatis/rhapsody#9@alice")).toMatchObject({
+      status: "done",
+      needsYou: false,
+    });
+  });
+
+  // The half the pill-only test misses: the Seg's "In review" button and the strip's tally must
+  // both exclude these rows, or the operator still sees a queue of phantom reads.
+  it("keeps the finished manager/lead rows out of the In review filter and count", () => {
+    expect(filterConsoleJobs(rows, "review", "").map((r) => r.issue)).toEqual([
+      "STUDIO-1328",
+      "STUDIO-1200",
+    ]);
+    expect(consoleJobCounts(rows)).toEqual({
+      running: 1,
+      review: 2,
+      queued: 0,
+      blocked: 2,
+      needsYou: 4,
+    });
+  });
+
+  // The reader itself: positive-only, and it must not read the key or the title.
+  it("collects only the rows the daemon marked non_tracker", () => {
+    expect(
+      [
+        ...nonTrackerIssues([
+          issueRow({ issue_identifier: "limit:x@manager", non_tracker: true }),
+          issueRow({ issue_identifier: "lead:o/r#1:2@manager", non_tracker: true }),
+          issueRow({ issue_identifier: "STUDIO-1" }),
+          issueRow({ issue_identifier: "limit:y@manager", non_tracker: false }),
+          issueRow({ issue_identifier: "", non_tracker: true }),
+        ]),
+      ].sort(),
+    ).toEqual(["lead:o/r#1:2@manager", "limit:x@manager"]);
+  });
+});
+
+// The same widening, reached through the daemon's whole-store tally rather than the rows.
+describe("consoleStoreCounts with a ticketless manager bucket", () => {
+  it("does not bill a finished manager run to In review or Needs you", () => {
+    expect(
+      consoleStoreCounts({
+        issues: 7,
+        buckets: [
+          { outcome: "completed", non_tracker: true, count: 4 },
+          { outcome: "completed", lifecycle: "in_review", count: 3 },
+        ],
+      }),
+    ).toEqual({ running: 0, review: 3, queued: 0, blocked: 0, needsYou: 3 });
+  });
+
+  // The direct rule, so a mutation that drops the widened branch reds here rather than only in the
+  // builder: `completed` is the only arm the widening changes, and the live arm stays `run`.
+  it("maps a ticketless subject's own outcome in consoleJobStatus", () => {
+    expect(consoleJobStatus("completed", undefined, false, false, false, false, false, true)).toBe(
+      "done",
+    );
+    expect(consoleJobStatus("failed", undefined, false, false, false, false, false, true)).toBe(
+      "blocked",
+    );
+    expect(consoleJobStatus("waiting", undefined, false, false, false, false, false, true)).toBe(
+      "blocked",
+    );
+    expect(consoleJobStatus("running", undefined, false, false, false, false, false, true)).toBe(
+      "run",
+    );
+    // The two flags stay distinct: a live review is still `reviewing`.
+    expect(consoleJobStatus("running", undefined, false, true, false, false, false, true)).toBe(
+      "reviewing",
+    );
   });
 });
 

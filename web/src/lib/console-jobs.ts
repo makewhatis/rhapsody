@@ -178,6 +178,21 @@ function fromRunOutcome(status: string): ConsoleJobStatus {
  * the two flags mark different subjects, the daemon sets them on different rows, and only the live
  * arm is shared between them.
  *
+ * `nonTracker` (STUDIO-1343) is that same terminal reading, widened from a ticketless REVIEW run to
+ * every synthetic subject the daemon mints: a manager adjudication (`pr:…@manager`), a lead decision
+ * (`lead:…#n@manager`), an account-limit decision (`limit:…@manager`) and a landing (`land:…`).
+ * Each has no tracker ticket, so — exactly as for a review run — `lifecycle` is unresolvable and
+ * `completed → review` is a lie: it says somebody owes this row a read when the work is simply over.
+ * A finished `limit:`/`lead:` run therefore reads `done`, `failed`/`waiting` still read `blocked`
+ * (the operator's move), and a live one reads `run`.
+ *
+ * It is a SEPARATE argument from `reviewRun` rather than a replacement, because the two facts differ
+ * and the LIVE arm depends on the difference: `reviewRun` says "this run reviews a pull request" and
+ * is what makes a live row read `reviewing`, while `nonTracker` says only "no ticket is behind this
+ * row". Reading the live arm off `nonTracker` would paint a live manager/lead run `reviewing`, which
+ * the ticket explicitly does not want. Keeping both also means a console talking to a daemon that
+ * predates the field (it serves `review_run` but no `non_tracker`) is unchanged.
+ *
  * The fifth rule is `heldNeverRan` (STUDIO-949), and it names the word deliberately. A
  * `rhapsody:human` ticket that has NEVER RUN reaches this function as a synthetic `waiting` row,
  * whose outcome maps to `blocked` — the BLOCKER's word. Nothing is blocked and nothing is wrong:
@@ -240,6 +255,7 @@ export function consoleJobStatus(
   heldNeverRan = false,
   parked = false,
   budgetHeldNeverRan = false,
+  nonTracker = false,
 ): ConsoleJobStatus {
   const fromRun = fromRunOutcome(status);
   // A hold on a ticket that HAS run keeps the run's lane and wears the hold as its sub-label; only a
@@ -247,8 +263,12 @@ export function consoleJobStatus(
   if (heldNeverRan || budgetHeldNeverRan) return "queued";
   if (fromRun === "run") return reviewTicket || reviewRun ? "reviewing" : "run";
   // No ticket exists behind this row, so there is no lifecycle for one to outrank and the run's own
-  // outcome is the whole truth. `completed` here means the review finished, not that one is owed.
-  if (reviewRun) return fromRun === "review" ? "done" : fromRun;
+  // outcome is the whole truth. `completed` here means the work finished, not that a review is owed.
+  // `reviewRun` is the narrower fact (a review the console folds onto a ticket); `nonTracker` is the
+  // broader one that also covers `lead:`/`limit:`/`land:` subjects (STUDIO-1343). Both reach the
+  // same terminal reading. The LIVE arm above deliberately reads only `reviewRun`: a live manager or
+  // lead run is `run`, while a live review reads `reviewing`.
+  if (reviewRun || nonTracker) return fromRun === "review" ? "done" : fromRun;
   switch (lifecycle) {
     case "done":
     case "canceled":
@@ -612,6 +632,30 @@ export function reviewRunIssues(rows: readonly IssueRun[]): Set<string> {
 }
 
 /**
+ * The rows whose subject is a key NO tracker can resolve, from the issue-level listing's
+ * `non_tracker` field (STUDIO-1343) — a review run (`pr:…@reviewer`), a manager adjudication
+ * (`pr:…@manager`), a lead decision (`lead:…#n@manager`), an account-limit decision
+ * (`limit:…@manager`) or a landing (`land:…`).
+ *
+ * The WIDER sibling of [`reviewRunIssues`], and the one that closes the `lead:`/`limit:` case: those
+ * rows have no tracker ticket either, so their `lifecycle` is unresolvable and a completed run was
+ * being read as "awaiting a reviewer" forever — the same misreading STUDIO-826 fixed for reviews, on
+ * a kind of ticketless row it did not cover. See [`consoleJobStatus`].
+ *
+ * Positive-only, mirroring the daemon exactly, for the reason [`reviewTicketIssues`] is. Nothing
+ * here parses the key or reads the title: the daemon resolves this from the run's own issue id with
+ * the one predicate the orchestrator already keys its boundaries on, and a prefix list here would be
+ * a second source of truth that drifts the moment the daemon mints another synthetic subject.
+ */
+export function nonTrackerIssues(rows: readonly IssueRun[]): Set<string> {
+  const out = new Set<string>();
+  for (const r of rows) {
+    if (r.issue_identifier !== "" && r.non_tracker === true) out.add(r.issue_identifier);
+  }
+  return out;
+}
+
+/**
  * Review-run key → the TICKET that review is of, from the issue-level listing's `review_of` field
  * (STUDIO-834).
  *
@@ -793,6 +837,7 @@ export function buildConsoleJobs(
   const lifecycles = lifecycleByIssue(issueRows);
   const reviewTickets = reviewTicketIssues(issueRows);
   const reviewRuns = reviewRunIssues(issueRows);
+  const nonTrackers = nonTrackerIssues(issueRows);
   const reviewOf = reviewOfTickets(issueRows);
   const providers = providerByIssue(issueRows);
   const costs = ticketCostsByIssue(costRows);
@@ -801,6 +846,10 @@ export function buildConsoleJobs(
     const ticket = lifecycles.get(job.issue);
     const reviewTicket = reviewTickets.has(job.issue);
     const reviewRun = reviewRuns.has(job.issue);
+    // No ticket is behind this row at all (STUDIO-1343): a `lead:`/`limit:`/`land:` subject as well
+    // as a review's `pr:` key. A superset of `reviewRun`, kept apart because only `reviewRun` turns a
+    // LIVE row into `reviewing` — see [`consoleJobStatus`].
+    const nonTracker = nonTrackers.has(job.issue);
     // "Held for a human" speaks for the LANE only when there is no run to name it (STUDIO-949):
     // `mergeJobs` sets `runId` to the newest REAL segment's id and 0 for a synthetic hold row, so
     // 0 is the honest "nothing ran" — never "the daemon could not resolve a lifecycle", which a cold
@@ -823,6 +872,7 @@ export function buildConsoleJobs(
       heldNeverRan,
       parked,
       budgetHeldNeverRan,
+      nonTracker,
     );
     const updatedAtMs = activity.get(job.issue) ?? job.startedAtMs;
     // The PR the row has always carried in its issue key, surfaced (STUDIO-925). Only a review row
@@ -1104,7 +1154,16 @@ export function consoleStoreCounts(
       // `reviewTicket` is always false here: the daemon does not resolve that marker for the tally
       // because it cannot move any of these five numbers — a live review TICKET reads `reviewing`
       // and an ordinary live run reads `run`, and `running` counts both. See `IssueStatusBucket`.
-      const status = consoleJobStatus(b.outcome, b.lifecycle, false, b.review_run ?? false);
+      const status = consoleJobStatus(
+        b.outcome,
+        b.lifecycle,
+        false,
+        b.review_run ?? false,
+        false,
+        false,
+        false,
+        b.non_tracker ?? false,
+      );
       return [
         {
           status,

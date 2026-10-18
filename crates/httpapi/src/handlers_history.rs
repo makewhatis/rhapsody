@@ -709,6 +709,10 @@ fn status_key(
             .get(issue_id)
             .map(|life| life.lifecycle.as_str().to_string()),
         review_run: review::is_review_key(issue_id),
+        // Every synthetic subject, not only a review's `pr:` key (STUDIO-1343) — read off the id,
+        // the same predicate the listing serves as the row's `non_tracker` flag, so a finished
+        // `lead:`/`limit:` run's bucket reaches the client's `done` arm instead of its `review` one.
+        non_tracker: review::is_non_tracker_key(issue_id),
     }
 }
 
@@ -2200,6 +2204,53 @@ mod tests {
         );
     }
 
+    // STUDIO-1343 — a finished manager run with no ticket behind it read "In review" forever: the
+    // run completed, the ticket it was deciding for went Done, and nothing waited on anyone. The
+    // listing therefore states the broader fact the console needs — this row's subject is a key NO
+    // tracker can resolve — for EVERY synthetic subject, not only a review's `pr:` key. It is
+    // [`review::is_non_tracker_key`], the same predicate the orchestrator keys its own dispatch,
+    // retry and lookup boundaries on, so a new synthetic prefix is covered here the moment that
+    // function learns it rather than needing a second list in the client.
+    //
+    // The three `lead:`/`limit:`/`land:` shapes are the ones STUDIO-826 did NOT cover, and the
+    // tracker-backed row is the control: it must carry no flag, or the console would read an
+    // ordinary completed ticket's "awaiting a reviewer" as "done".
+    #[tokio::test]
+    async fn issue_runs_mark_every_synthetic_subject_non_tracker() {
+        let store = mem_store();
+        let synthetic = [
+            "lead:makewhatis/rhapsody#0:2@manager",
+            "limit:claude-subscription@manager",
+            "land:makewhatis/rhapsody#12",
+            "pr:makewhatis/rhapsody#136@alice",
+        ];
+        for (n, key) in synthetic.iter().enumerate() {
+            seed_run_for(key, key, &format!("2026-08-01T00:0{n}:00Z"), &store);
+        }
+        seed_run_for("iss_impl", "MT-2", "2026-08-01T00:09:00Z", &store);
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues")).await;
+        assert_eq!(status, 200);
+        let rows = by_identifier(&body);
+        for key in synthetic {
+            assert_eq!(
+                rows[key]["non_tracker"], true,
+                "a synthetic subject carries the flag: {}",
+                rows[key],
+            );
+        }
+        // The review key carries BOTH facts, and they stay distinct: `review_run` is what folds it
+        // onto the ticket it reviews; `non_tracker` is what says no ticket is behind it at all.
+        assert_eq!(rows["pr:makewhatis/rhapsody#136@alice"]["review_run"], true);
+        assert!(
+            rows["MT-2"].get("non_tracker").is_none(),
+            "a tracker-backed row carries no flag, never a false: {}",
+            rows["MT-2"],
+        );
+    }
+
     // STUDIO-831 — a ticketless review run's id is a synthetic `pr:owner/repo#n@reviewer` key, not
     // a tracker issue id, and Linear validates `id: { in: … }` before it serves it: ONE such
     // element fails the whole request, so no id in the batch resolves. STUDIO-826 put those rows
@@ -2778,7 +2829,7 @@ mod tests {
 
     /// Collapse the counts payload into `bucket-key -> count`, so a test asserts on the tally
     /// rather than on the array's order. The key is spelled the way the wire spells it: an absent
-    /// lifecycle is `-`, and `review_run` only appears when true.
+    /// lifecycle is `-`, and `review_run`/`non_tracker` each appear only when true.
     fn tally(body: &Value) -> std::collections::HashMap<String, i64> {
         body["buckets"]
             .as_array()
@@ -2792,6 +2843,9 @@ mod tests {
                 );
                 if b.get("review_run").is_some() {
                     key.push_str("/review_run");
+                }
+                if b.get("non_tracker").is_some() {
+                    key.push_str("/non_tracker");
                 }
                 (key, b["count"].as_i64().unwrap_or_default())
             })
@@ -2964,6 +3018,38 @@ mod tests {
         assert_eq!(provider.issue_lifecycles_asked(), ["ticket-id"]);
     }
 
+    // STUDIO-1343 — the tally's half of the same fact: a finished `limit:` subject must reach the
+    // client's `done` arm rather than its `review` arm, so its bucket carries `non_tracker` exactly
+    // as the listing row does. `lead:` rows are already dropped from this endpoint (STUDIO-1145), so
+    // the ticketless bucket below is the `limit:` one — the shape that was inflating "In review" on
+    // the operator's own store while the ticket behind it sat Done. MUTATION: drop the `non_tracker`
+    // field from `IssueStatusKey` and the `limit:` bucket reads `completed/-`, which the console
+    // paints In Review.
+    #[tokio::test]
+    async fn issue_counts_mark_a_ticketless_subject_non_tracker() {
+        let store = mem_store();
+        seed_run_for(
+            "limit:account@manager",
+            "limit:account@manager",
+            "2026-08-01T00:00:00Z",
+            &store,
+        );
+        seed_run_for("ticket-id", "STUDIO-123", "2026-08-01T00:01:00Z", &store);
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store)));
+        let base = spawn_arc(Arc::clone(&provider) as Arc<dyn StateProvider>).await;
+
+        let (status, body) = get_json(&format!("{base}/api/v1/history/issues/counts")).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            tally(&body),
+            std::collections::HashMap::from([
+                ("completed/-".to_string(), 1),
+                ("completed/-/non_tracker".to_string(), 1),
+            ]),
+            "the ticketless subject carries the flag; the ticket does not: {body}",
+        );
+    }
+
     // STUDIO-965 — an UNATTRIBUTED run (`issue_identifier == ""`) is not a card: the console groups
     // by identifier and `buildConsoleBoard` skips a row it cannot name, so the tally must skip it
     // too. This is the same "count what the board draws" rule as the review fold; before the fold
@@ -3090,7 +3176,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             tally(&body),
-            std::collections::HashMap::from([("completed/-/review_run".to_string(), 1)]),
+            std::collections::HashMap::from([(
+                "completed/-/review_run/non_tracker".to_string(),
+                1
+            )]),
             "the orphan review counts once, keeping its review_run bit: {body}",
         );
         assert_eq!(body["issues"], 1, "{body}");
@@ -3136,7 +3225,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             tally(&body),
-            std::collections::HashMap::from([("completed/-/review_run".to_string(), 1)]),
+            std::collections::HashMap::from([(
+                "completed/-/review_run/non_tracker".to_string(),
+                1
+            )]),
             "three rounds of one orphan ticket are one card, the newest row deciding it: {body}",
         );
         assert_eq!(body["issues"], 1, "{body}");
@@ -3168,7 +3260,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             tally(&body),
-            std::collections::HashMap::from([("running/-/review_run".to_string(), 1)]),
+            std::collections::HashMap::from([("running/-/review_run/non_tracker".to_string(), 1)]),
             "the live orphan review is one card, not also a run of its own: {body}",
         );
         assert_eq!(body["issues"], 1, "{body}");
@@ -3225,7 +3317,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             tally(&body),
-            std::collections::HashMap::from([("running/-/review_run".to_string(), 1)]),
+            std::collections::HashMap::from([("running/-/review_run/non_tracker".to_string(), 1)]),
             "the live round is the one the board draws; the finished one is a chip it drops: {body}",
         );
         assert_eq!(body["issues"], 1, "{body}");
@@ -3277,7 +3369,7 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(
             tally(&body),
-            std::collections::HashMap::from([("running/-/review_run".to_string(), 2)]),
+            std::collections::HashMap::from([("running/-/review_run/non_tracker".to_string(), 2)]),
             "one Running row per live review run, as the lane body draws them: {body}",
         );
         assert_eq!(body["issues"], 2, "{body}");

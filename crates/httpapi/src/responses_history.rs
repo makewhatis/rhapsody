@@ -253,6 +253,22 @@ pub(crate) fn history_response(runs: &[RunSummary], next_offset: Option<i64>) ->
 /// the title: `Review owner/repo#n at <sha>` is a string the daemon happens to mint, not a fact
 /// about the run. Positive-only for the same reason `review_ticket` is.
 ///
+/// It carries `non_tracker: true` when the row's own subject is a key NO tracker can resolve
+/// (STUDIO-1343) — every synthetic subject the daemon mints, not only a review's `pr:` key: a
+/// review (`pr:…@reviewer`), a manager adjudication (`pr:…@manager`), a lead decision
+/// (`lead:…#n@manager`), an account limit decision (`limit:…@manager`) and a landing (`land:…`).
+/// It is [`review::is_non_tracker_key`], the ONE predicate the orchestrator already keys its own
+/// dispatch, retry and lookup boundaries on, so a new synthetic prefix is covered here the moment
+/// that function learns it rather than needing a second list in the client.
+///
+/// WHY IT IS A SEPARATE FIELD FROM `review_run`, which is true for some of the same rows: a
+/// `review_run` row is a review the console folds onto the ticket it reviews (`review_of`), and
+/// broadening that flag would make every `lead:`/`limit:` row look like a foldable review. The two
+/// facts are independent — "this run reviews a pull request" versus "this subject has no ticket" —
+/// and the console needs the second to stop reading a finished `lead:`/`limit:` run as awaiting a
+/// reviewer, exactly the mistake STUDIO-826 fixed for reviews. `review_run` rows keep it unchanged;
+/// positive-only, on the same terms as every other flag here.
+///
 /// It carries `review_of` beside that flag when `review_origins` names the ticket the review is OF
 /// (STUDIO-834) — the fact that makes a review row readable at a glance, because a `pr:` key names
 /// the repository, the number and the reviewer and no ticket at all. The daemon resolves it from
@@ -308,6 +324,14 @@ pub(crate) fn issue_runs_response(
             if review::is_review_key(&r.issue_id) {
                 obj.insert("review_run".to_string(), json!(true));
             }
+            // Every synthetic subject, not only a review's `pr:` key (STUDIO-1343): the console
+            // reads this to let a ticketless row's own outcome be terminal (`completed → done`)
+            // instead of inferring "awaiting a reviewer" from a ticket that does not exist. Same
+            // predicate the orchestrator keys its own boundaries on, so a new synthetic prefix is
+            // covered the moment that function learns it.
+            if review::is_non_tracker_key(&r.issue_id) {
+                obj.insert("non_tracker".to_string(), json!(true));
+            }
             // WHICH ticket that review is of (STUDIO-834). Only ever present beside `review_run`,
             // because the map is keyed by review-run key and no other row can match one. Absent —
             // never an empty string — when the origin names no ticket (`console:`, an operator) or
@@ -350,6 +374,13 @@ pub(crate) struct IssueStatusKey {
     /// so it cannot move any of the five figures — while resolving it would double this endpoint's
     /// tracker cost. See [`crate::handlers_history`]'s counts handler.
     pub review_run: bool,
+    /// Whether this is a synthetic subject NO tracker can resolve (STUDIO-1343) — a review, a
+    /// manager adjudication, a lead or account-limit decision, a landing. The sibling of `review_run`
+    /// and the fact that stops a finished `lead:`/`limit:` run reading as "awaiting a reviewer",
+    /// which is the same misreading STUDIO-826 fixed for reviews. Read off the id, so it costs
+    /// nothing, and it is [`review::is_non_tracker_key`] — the orchestrator's own predicate — rather
+    /// than a second prefix list the client would have to keep in step.
+    pub non_tracker: bool,
 }
 
 /// `{issues, buckets:[…], held_for_human?}` — the `GET /api/v1/history/issues/counts` payload
@@ -360,9 +391,9 @@ pub(crate) struct IssueStatusKey {
 /// exists to make, and a client that wants to check the claim should not have to reconstruct it.
 ///
 /// Each bucket serializes its key exactly as the per-row listing serializes the same facts —
-/// `lifecycle` present only when resolved, `review_run` positive-only — so the two endpoints speak
-/// one vocabulary and a client reads a bucket with the code it already has for a row. The array is
-/// ordered by the key, so the payload is stable for a given store.
+/// `lifecycle` present only when resolved, `review_run` and `non_tracker` positive-only — so the two
+/// endpoints speak one vocabulary and a client reads a bucket with the code it already has for a
+/// row. The array is ordered by the key, so the payload is stable for a given store.
 ///
 /// `held_for_human` (STUDIO-949) is emitted only while the dispatcher holds at least one non-live
 /// `rhapsody:human` ticket for which the run store has NO stored row — the never-ran hold, for
@@ -397,6 +428,9 @@ pub(crate) fn issue_counts_response(
         }
         if key.review_run {
             obj.insert("review_run".to_string(), json!(true));
+        }
+        if key.non_tracker {
+            obj.insert("non_tracker".to_string(), json!(true));
         }
         obj.insert("count".to_string(), json!(count));
         out.push(Value::Object(obj));
