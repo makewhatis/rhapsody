@@ -610,9 +610,14 @@ pub(crate) fn run_provenance_response(
     Value::Object(obj)
 }
 
-/// `{issue_identifier, runs:[…], reviews:[…]}` — the `GET /api/v1/issues/{id}/history` payload.
-/// `runs` mirrors Go `issueHistoryResponse` and is unchanged; `reviews` is ADDITIVE and
-/// Rhapsody-only (STUDIO-976).
+/// `{issue_identifier, runs:[…], reviews:[…], total}` — the `GET /api/v1/issues/{id}/history`
+/// payload. `runs` mirrors Go `issueHistoryResponse` and is unchanged; `reviews` is ADDITIVE and
+/// Rhapsody-only (STUDIO-976), as is `total` (STUDIO-1376).
+///
+/// `total` is the ticket's TRUE run count, the same predicate `runs` is drawn from but ignoring the
+/// page limit — so a console handed a capped page still states the real attempt total. Without it,
+/// a ticket with more runs than the default page read "attempt 50 of 50" (STUDIO-1376). Go reports
+/// no total at all; a client older than the field simply falls back to `runs.len()`.
 ///
 /// `reviews` is the ticket's review runs, joined to it by the same watch-set fold the listing's
 /// `review_of` uses, and rendered with the SAME `run_summary_json` as `runs`: a review is a real run
@@ -634,9 +639,11 @@ pub(crate) fn issue_history_response(
     runs: &[RunSummary],
     reviews: &[RunSummary],
     verdicts: &HashMap<i64, String>,
+    total: i64,
 ) -> Value {
     json!({
         "issue_identifier": identifier,
+        "total": total,
         "runs": Value::Array(runs.iter().map(run_summary_json).collect()),
         "reviews": Value::Array(
             reviews

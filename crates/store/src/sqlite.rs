@@ -2565,6 +2565,29 @@ impl Store for Sqlite {
         }
     }
 
+    fn issue_history_count(&self, identifier: &str, project: &str) -> Result<i64, StoreError> {
+        // The SAME predicate as `issue_history`, without the LIMIT — the ticket's true run count,
+        // which the history page reports beside its capped page (STUDIO-1376).
+        let (q, args) = if project.is_empty() {
+            (
+                "SELECT COUNT(*) FROM runs WHERE issue_identifier = ?".to_string(),
+                vec![Value::Text(identifier.to_string())],
+            )
+        } else {
+            (
+                "SELECT COUNT(*) FROM runs WHERE issue_identifier = ? AND project_slug = ?"
+                    .to_string(),
+                vec![
+                    Value::Text(identifier.to_string()),
+                    Value::Text(project.to_string()),
+                ],
+            )
+        };
+        let conn = self.lock();
+        let count = conn.query_row(&q, params_from_iter(args), |row| row.get::<_, i64>(0))?;
+        Ok(count)
+    }
+
     fn runs_for_issues(
         &self,
         identifiers: &[String],
@@ -7257,6 +7280,63 @@ mod tests {
         let alpha = st.issue_history("MT-9", "alpha", 0).expect("history alpha");
         assert_eq!(alpha.len(), 1);
         assert_eq!(alpha[0].project_slug, "alpha");
+        // The count shares the predicate: all of MT-9, and only the alpha one when scoped.
+        assert_eq!(st.issue_history_count("MT-9", "").expect("count all"), 2);
+        assert_eq!(
+            st.issue_history_count("MT-9", "alpha")
+                .expect("count alpha"),
+            1
+        );
+        assert_eq!(st.issue_history_count("MT-404", "").expect("count none"), 0);
+    }
+
+    // STUDIO-1376 — `issue_history_count` reports the ticket's TRUE run count even when the page
+    // is capped at the default limit, which is what stops the console reading "attempt 50 of 50" on
+    // a ticket with more runs than that.
+    #[test]
+    fn issue_history_count_counts_past_the_page_limit() {
+        let st = open_mem();
+        for i in 0..55 {
+            let id = st
+                .start_run(RunStart {
+                    issue_identifier: "MT-9".into(),
+                    started_at: format!("2026-01-01T00:{:02}:00Z", i % 60),
+                    ..Default::default()
+                })
+                .expect("start");
+            st.end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end");
+        }
+        // A different ticket's runs must not leak into the count.
+        let other = st
+            .start_run(RunStart {
+                issue_identifier: "MT-10".into(),
+                started_at: "2026-01-02T00:00:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start other");
+        st.end_run(
+            other,
+            RunEnd {
+                outcome: OUTCOME_COMPLETED.into(),
+                ..Default::default()
+            },
+        )
+        .expect("end other");
+
+        let page = st.issue_history("MT-9", "", 0).expect("history");
+        assert_eq!(page.len(), DEFAULT_RUN_LIMIT as usize, "the page is capped");
+        assert_eq!(
+            st.issue_history_count("MT-9", "").expect("count"),
+            55,
+            "the total is not the page size"
+        );
     }
 
     // STUDIO-976 — the review half of a ticket's run detail: one query for a whole set of keys,

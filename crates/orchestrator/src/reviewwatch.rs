@@ -5234,6 +5234,13 @@ mod tests {
         ) -> Result<Vec<rs::RunSummary>, rs::StoreError> {
             self.0.issue_history(identifier, project, limit)
         }
+        fn issue_history_count(
+            &self,
+            identifier: &str,
+            project: &str,
+        ) -> Result<i64, rs::StoreError> {
+            self.0.issue_history_count(identifier, project)
+        }
         fn runs_for_issues(
             &self,
             identifiers: &[String],

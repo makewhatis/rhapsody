@@ -854,11 +854,18 @@ pub(crate) async fn handle_issue_history(
         Ok(n) => n,
         Err(resp) => return *resp,
     };
-    let runs = match provider
-        .history()
-        .issue_history(&id, qget(&q, "project"), limit)
-    {
+    let project = qget(&q, "project");
+    let runs = match provider.history().issue_history(&id, project, limit) {
         Ok(runs) => runs,
+        Err(_) => return store_error("issue history query failed"),
+    };
+    // The ticket's TRUE run count beside the page above (STUDIO-1376). The page is capped at the
+    // store's default when the caller sends no `limit`, so a console that took the page's length as
+    // the total read "attempt 50 of 50" on a ticket with more runs than that. Same predicate,
+    // ignoring the limit — and a store error here is the same failure as the page read, so it fails
+    // the request rather than serving a total that would understate the ticket.
+    let total = match provider.history().issue_history_count(&id, project) {
+        Ok(total) => total,
         Err(_) => return store_error("issue history query failed"),
     };
     // The review runs credited to this ticket (STUDIO-976), so the console's attempt strip can show
@@ -875,7 +882,7 @@ pub(crate) async fn handle_issue_history(
         .unwrap_or_default();
     write_json(
         StatusCode::OK,
-        &issue_history_response(&id, &runs, &reviews, &verdicts),
+        &issue_history_response(&id, &runs, &reviews, &verdicts, total),
     )
 }
 
@@ -1707,6 +1714,9 @@ mod tests {
             limit: i64,
         ) -> Result<Vec<RunSummary>, StoreError> {
             Store::issue_history(&self.inner, identifier, project, limit)
+        }
+        fn issue_history_count(&self, identifier: &str, project: &str) -> Result<i64, StoreError> {
+            Store::issue_history_count(&self.inner, identifier, project)
         }
         fn runs_for_issues(
             &self,
@@ -4142,6 +4152,29 @@ mod tests {
         let (_s, body) = get_json(&format!("{base}/api/v1/issues/MT-1/history")).await;
         assert_eq!(body["issue_identifier"], "MT-1");
         assert_eq!(body["runs"].as_array().expect("runs").len(), 1);
+        assert_eq!(body["total"], 1, "one run, one total");
+    }
+
+    // STUDIO-1376 — the history page is capped at the store's default, but the response states the
+    // ticket's TRUE run count beside it. Without this a console read the page's length as the total
+    // and labelled a 114-run ticket's newest page "attempt 50 of 50".
+    #[tokio::test]
+    async fn issue_history_reports_the_true_total_beyond_the_page() {
+        let store = mem_store();
+        for i in 0..60 {
+            seed_run_at(&store, "MT-1", &format!("2026-01-01T00:{:02}:00Z", i));
+        }
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(Arc::new(store))).await;
+        let (_s, body) = get_json(&format!("{base}/api/v1/issues/MT-1/history")).await;
+        assert_eq!(
+            body["runs"].as_array().expect("runs").len(),
+            50,
+            "the page is capped at the default limit"
+        );
+        assert_eq!(
+            body["total"], 60,
+            "the total is the ticket's real run count, not the page size"
+        );
     }
 
     // Mirrors Go `TestRunEventsRoundTrip`.

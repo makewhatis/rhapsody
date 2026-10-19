@@ -2848,6 +2848,13 @@ mod tests {
         ) -> Result<Vec<rhapsody_store::RunSummary>, rhapsody_store::StoreError> {
             self.0.issue_history(a0, a1, a2)
         }
+        fn issue_history_count(
+            &self,
+            a0: &str,
+            a1: &str,
+        ) -> Result<i64, rhapsody_store::StoreError> {
+            self.0.issue_history_count(a0, a1)
+        }
         fn runs_for_issues(
             &self,
             a0: &[String],

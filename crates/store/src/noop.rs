@@ -228,6 +228,9 @@ impl Store for Noop {
     ) -> Result<Vec<RunSummary>, StoreError> {
         Ok(Vec::new())
     }
+    fn issue_history_count(&self, _identifier: &str, _project: &str) -> Result<i64, StoreError> {
+        Ok(0)
+    }
     fn runs_for_issues(
         &self,
         _identifiers: &[String],
@@ -802,6 +805,11 @@ mod tests {
             st.issue_history("MT-1", "", 0)
                 .expect("issue_history")
                 .is_empty()
+        );
+        assert_eq!(
+            st.issue_history_count("MT-1", "").expect("count"),
+            0,
+            "a disabled store reports no runs"
         );
         assert!(st.get_run(1).expect("get_run").is_none());
         assert!(st.run_events(1).expect("run_events").is_empty());

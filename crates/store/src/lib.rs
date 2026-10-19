@@ -348,6 +348,16 @@ pub trait Store {
         project: &str,
         limit: i64,
     ) -> Result<Vec<RunSummary>, StoreError>;
+    /// How many runs a ticket has, matching the SAME predicate as [`Store::issue_history`] (exact
+    /// `issue_identifier`, plus `project_slug` when `project` is non-empty) and IGNORING any page
+    /// limit. Rhapsody-only; Go reports no total.
+    ///
+    /// It exists so `GET /api/v1/issues/{id}/history` can state the ticket's TRUE attempt count
+    /// beside the page it serves: the page defaults to [`DEFAULT_RUN_LIMIT`](crate::DEFAULT_RUN_LIMIT)
+    /// rows, and a console that labelled the page's length as the total read "attempt 50 of 50" on a
+    /// ticket with 114 runs (STUDIO-1376). A `COUNT(*)` rather than `list_runs(.., i64::MAX).len()`
+    /// so the polled endpoint never materializes a whole retry loop just to count it.
+    fn issue_history_count(&self, identifier: &str, project: &str) -> Result<i64, StoreError>;
     /// Every run whose `issue_identifier` is one of `identifiers`, most-recent first, capped at
     /// `limit` (<= 0 ⇒ the default page). One query for a WHOLE set rather than a probe per key.
     ///
