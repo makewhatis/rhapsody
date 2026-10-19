@@ -1562,6 +1562,11 @@ impl OpencodeSession {
         let mut session_announced = false;
         // Whether opencode reported on the session at all — any session line beyond the host's own
         // pre-prompt marker — which is the evidence the prompt was stored in it (STUDIO-1374).
+        // Whatever the turn's outcome, the session then holds this prompt, so it becomes the held
+        // digest AT ONCE: a turn cancelled after this point (an operator Stop, a shutdown, a stall
+        // kill) never reaches the end of `run_turn`, but `Drop` still retains the session and
+        // writes the digest into its record. Without that evidence the held digest is left alone:
+        // eliding a prompt that never landed would leave the agent without one.
         let mut prompt_landed = false;
         let mut stderr_buf = CappedBuffer::new(MAX_STDERR_CAPTURE);
         let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
@@ -1603,8 +1608,11 @@ impl OpencodeSession {
                             *sid = c.session_id.clone();
                         }
                     }
-                    if !c.session_id.is_empty() && !c.host_marker {
+                    if !prompt_landed && !c.session_id.is_empty() && !c.host_marker {
                         prompt_landed = true;
+                        if sends_prompt {
+                            *self.locked_held_prompt() = digest.clone();
+                        }
                     }
                     // Synthesize the session event opencode never emits (design §6.1's
                     // `SessionEstablished`, once per process).
@@ -1807,13 +1815,6 @@ impl OpencodeSession {
             child.wait().await
         };
         teardown.disarm_tree();
-
-        // Whatever the outcome, a full prompt opencode reported on is now in the session, so the
-        // next resume of it need not send it again (STUDIO-1374). Without that evidence the held
-        // digest is left alone: eliding a prompt that never landed would leave the agent without one.
-        if sends_prompt && prompt_landed {
-            *self.locked_held_prompt() = digest;
-        }
 
         // A stop part is not a successful drain: observer loss or a deadline before
         // root idle / prompt success must still fail the observation-dependent turn.
@@ -3716,6 +3717,16 @@ printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
     /// before any model output with a retryable provider error, as STUDIO-1363's dead login did, and
     /// every later one succeeds.
     fn growth_fake(scripts: &TempDir, fails: u32) -> (String, std::path::PathBuf) {
+        growth_fake_pausing(scripts, fails, "")
+    }
+
+    /// [`growth_fake`], running `pause` (a shell command) after a failing invocation reports its
+    /// error and before it exits, so a test can cancel the turn while the process is still alive.
+    fn growth_fake_pausing(
+        scripts: &TempDir,
+        fails: u32,
+        pause: &str,
+    ) -> (String, std::path::PathBuf) {
         let prompts = scripts.path().join("prompts");
         std::fs::create_dir_all(&prompts).expect("mkdir prompts");
         let body = format!(
@@ -3726,6 +3737,7 @@ for last; do :; done
 printf '%s' "$last" > '{prompts}'/"$n".txt
 if [ "$n" -le {fails} ]; then
   printf '%s\n' '{{"type":"error","sessionID":"ses_loop","error":{{"name":"APIError","data":{{"message":"upstream unavailable","statusCode":503,"isRetryable":true}}}}}}'
+  {pause}
   exit 1
 fi
 printf '%s\n' '{{"type":"step_finish","sessionID":"ses_loop","part":{{"reason":"stop"}}}}'
@@ -3733,6 +3745,7 @@ printf '%s\n' '{{"type":"step_finish","sessionID":"ses_loop","part":{{"reason":"
             count = scripts.path().join("count").display(),
             prompts = prompts.display(),
             fails = fails,
+            pause = pause,
         );
         (write_script(scripts, "growth.sh", &body), prompts)
     }
@@ -3868,6 +3881,73 @@ printf '%s\n' '{{"type":"step_finish","sessionID":"ses_loop","part":{{"reason":"
             !repeat.contains("REVIEW FEEDBACK") && repeat.len() <= RESUME_BYTES_MAX,
             "once the session holds the edited prompt, repeating it is elided: {repeat:?}"
         );
+    }
+
+    /// STUDIO-1374 review B1: a cancelled turn (an operator Stop, a shutdown, a stall kill) is
+    /// dropped mid-flight and never reaches the end of `run_turn`, yet `Drop` still retains the
+    /// session. Once opencode has reported on the session the prompt is in it, so that receipt must
+    /// survive the drop: the next identical resume sends only the note, not another full copy.
+    #[tokio::test]
+    async fn a_cancelled_turn_after_the_prompt_landed_keeps_resumes_within_the_byte_bound() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let (fake, prompts) = growth_fake_pausing(&scripts, 6, "sleep 60");
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+        let runner = runner_with(&fake, &root, &auth, &sr, "m", 30);
+        let prompt = big_prompt("STUDIO-1374");
+
+        for n in 1..=6 {
+            let sess = runner
+                .start_session(&ws, issue("STUDIO-1374"), None)
+                .await
+                .expect("session");
+            let failed = tokio::sync::Notify::new();
+            let on = |e: Event| {
+                if e.event_type == EVENT_TURN_FAILED {
+                    failed.notify_one();
+                }
+            };
+            {
+                let turn = sess.run_turn(&prompt, None, None, &on);
+                tokio::pin!(turn);
+                tokio::select! {
+                    result = &mut turn => panic!("attempt {n} ended before cancellation: {result:?}"),
+                    seen = tokio::time::timeout(Duration::from_secs(10), failed.notified()) => {
+                        seen.expect("the fake's in-band error must be reported before cancellation");
+                    }
+                }
+            }
+            // Cancelled without `stop()`, the operator-Stop shape.
+            drop(sess);
+            assert!(
+                record_file(&sr, "STUDIO-1374").is_file(),
+                "cancelled attempt {n} must retain the session"
+            );
+        }
+        let (tr, err) = one_attempt(&runner, &ws, "STUDIO-1374", &prompt).await;
+        assert_eq!(
+            tr.status, TURN_SUCCEEDED,
+            "the last resume succeeds: {err:?}"
+        );
+
+        assert_eq!(
+            sent_prompt(&prompts, 1),
+            prompt,
+            "the cold attempt sends it"
+        );
+        for n in 2..=7 {
+            let sent = sent_prompt(&prompts, n);
+            assert!(
+                sent.len() <= RESUME_BYTES_MAX,
+                "resume {n} added {} bytes after a cancelled attempt whose prompt landed; at most \
+                 {RESUME_BYTES_MAX} allowed",
+                sent.len()
+            );
+        }
     }
 
     /// A full prompt the session never received — the turn ended with nothing but the host's own
