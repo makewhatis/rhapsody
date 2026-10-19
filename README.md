@@ -98,6 +98,20 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Empty keepalive events are not history (STUDIO-1375)
+
+An agent event that carries no message and synthesizes no text — an OpenCode streaming delta
+(`message.part.delta` → `{"type":"progress"}`), an OpenCode `step_finish`/`tool_use` part, or a
+tool-only Claude assistant message — is folded into the running entry (liveness clock, tool/session
+state, usage) but is NOT written to the `events` table, and the worker does not emit its per-event
+`agent event` debug line for it. The frozen Go reference persists every event, which since
+STUDIO-1208's OpenCode executor wrote one `kind='text'`, `text=''` row per delta (3.65M in a week,
+99.8% of all `text` rows) and, because the log record's message IS the event's own message, a blank
+line in the console's live log. Liveness is unaffected: `last_event_at` and the run-local worker
+emission watermark still advance, so STUDIO-1208's silent-tool-wait protection is unchanged. The
+per-run `event_seq` advances only for a row actually written, keeping the persisted sequence dense.
+No configuration, schema, API payload or golden-fixture changes.
+
 ### Claude partial-message liveness (STUDIO-1285)
 
 Claude turns request `--include-partial-messages`. Parsed `stream_event` lines renew only the

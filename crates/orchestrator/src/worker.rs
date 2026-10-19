@@ -1584,12 +1584,19 @@ impl WorkerDeps {
                     if e.event_type == agent::EVENT_ACCOUNT_AUTH {
                         return;
                     }
-                    tracing::debug!(
-                        issue_identifier = %ident,
-                        event = %e.event_type,
-                        message = %e.message,
-                        "agent event"
-                    );
+                    // STUDIO-1375: the log record's message IS the event's own message (the
+                    // `message` field wins over the format string in the log ring's field visitor), so
+                    // an empty-message keepalive/progress delta renders as a blank line in the
+                    // console's live log. Skip the line for those — the event itself is still
+                    // forwarded below, so liveness and state folding are unaffected.
+                    if !e.message.is_empty() {
+                        tracing::debug!(
+                            issue_identifier = %ident,
+                            event = %e.event_type,
+                            message = %e.message,
+                            "agent event"
+                        );
+                    }
                     on_event(e);
                 };
                 sess.run_turn_brokered(
@@ -4875,6 +4882,81 @@ exit 1
             agent_ev.fields.get("issue_identifier").map(String::as_str),
             Some("MT-1"),
             "agent-event log must carry the standardized issue_identifier key: {agent_ev:?}"
+        );
+    }
+
+    /// Like [`notify_then_succeed`], but the notification carries NO message — the shape an opencode
+    /// streaming delta (`{"type":"progress"}`) or a tool-only claude assistant message produces.
+    fn empty_notify_then_succeed() -> Arc<agentfake::Fake> {
+        fake_agent(vec![agentfake::TurnScript {
+            events: vec![Event {
+                event_type: EVENT_NOTIFICATION.to_string(),
+                ..Default::default()
+            }],
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                ..Default::default()
+            },
+            err: None,
+        }])
+    }
+
+    // STUDIO-1375: an empty-message keepalive notification must not produce a blank line in the
+    // console's live log. The log ring's field visitor takes the event's `message` field as the
+    // record message (it wins over the `"agent event"` format string), so before this guard every
+    // streaming delta logged a `time DBG` line with no message at all. The event is still forwarded —
+    // liveness folds on the control task — it is simply not logged.
+    //
+    // ⚠️ MUTATION: dropping the `!e.message.is_empty()` guard around the `tracing::debug!` in
+    // `run_turns`' forwarding closure turns this red — the agent-event record reappears.
+    #[tokio::test]
+    async fn empty_keepalive_events_do_not_log_a_blank_line() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
+        let (events, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        // Warm the shared agent-event callsite, exactly as `worker_logs_carry_issue_identifier` does,
+        // so a parallel no-subscriber test cannot cache it `Interest::never`.
+        {
+            let ag = empty_notify_then_succeed();
+            let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let mut warm = make_deps(ws, ag, tr, "do it", 20);
+            let _ = run_agent_attempt(
+                &mut warm,
+                issue("1", "MT-1", "In Progress"),
+                None,
+                None,
+                &noop_event(),
+                None,
+            )
+            .await;
+        }
+        tracing::callsite::rebuild_interest_cache();
+        events.lock().expect("event buffer lock").clear();
+
+        let ag = empty_notify_then_succeed();
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]); // leaves the active set after turn 1
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag, tr, "do it", 20);
+        let (_last, _declared, err) = run_agent_attempt(
+            &mut d,
+            issue("1", "MT-1", "In Progress"),
+            None,
+            None,
+            &noop_event(),
+            None,
+        )
+        .await;
+        drop(guard);
+        assert!(err.is_none(), "expected a normal run, got {err:?}");
+
+        let captured = events.lock().expect("event buffer lock");
+        assert!(
+            !captured
+                .iter()
+                .any(|e| e.fields.get("event").map(String::as_str) == Some(EVENT_NOTIFICATION)),
+            "an empty keepalive event must not log an agent-event line: {captured:?}"
         );
     }
 
