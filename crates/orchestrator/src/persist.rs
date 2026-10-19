@@ -149,6 +149,20 @@ pub(crate) fn map_text(ev: &agent::Event) -> String {
     }
 }
 
+/// Whether an agent event would persist as an EMPTY history row — no message and no synthesized
+/// text — i.e. a keepalive/progress delta rather than a recordable step (STUDIO-1375).
+///
+/// Both harnesses emit these: opencode forwards one empty notification per streaming
+/// `message.part.delta` (`{"type":"progress"}`) and one per `step_finish`/`tool_use` part, and a
+/// claude assistant message whose content is tool calls with no prose is an empty notification too.
+/// Persisting each one wrote a `kind='text'` row with `text=''` — 3.65M of them in a week, 99.8% of
+/// every `text` row. The predicate is on the ROW's text, not the event type, so a real `text` line,
+/// a `turn_failed` and a `session_started` (each synthesizing their own text) stay history. No Go
+/// counterpart: this is the STUDIO-1375 divergence.
+pub(crate) fn is_empty_event(ev: &agent::Event) -> bool {
+    map_text(ev).is_empty()
+}
+
 impl Orchestrator {
     // --- async history-event writer -----------------------------------------------------------
 
