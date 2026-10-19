@@ -97,7 +97,7 @@ function summary(over: Partial<RunSummary> = {}): RunSummary {
 beforeEach(() => {
   h.runDetail.mockResolvedValue(detail());
   h.transcript.mockResolvedValue(transcript([]));
-  h.issueHistory.mockResolvedValue({ issue_identifier: "INF-231", runs: [], reviews: [] });
+  h.issueHistory.mockResolvedValue({ issue_identifier: "INF-231", total: 0, runs: [], reviews: [] });
   h.stopRun.mockResolvedValue({ identifier: "INF-231", moved_to: "Backlog" });
   h.resumeRun.mockResolvedValue({ identifier: "INF-231", moved_to: "Todo" });
   h.runMessages.mockResolvedValue([]);
@@ -155,6 +155,7 @@ describe("RunDetail header + meta", () => {
   it("shows the branch (from the run's history row) in the Branch meta cell", async () => {
     h.issueHistory.mockResolvedValue({
       issue_identifier: "INF-231",
+      total: 1,
       runs: [summary({ id: 1, branch: "inf/231-sign" })],
       reviews: [],
     });
@@ -479,6 +480,7 @@ describe("RunDetail run history", () => {
     const onSelectRun = vi.fn();
     h.issueHistory.mockResolvedValue({
       issue_identifier: "INF-231",
+      total: 2,
       runs: [
         summary({ id: 1, attempt: 1, outcome: "completed", total_tokens: 1_040_000 }),
         summary({ id: 2, attempt: 0, outcome: "failed", started_at: "2026-06-05T10:00:00Z", ended_at: "2026-06-05T10:05:00Z", total_tokens: 1000, error: "boom" }),
@@ -500,6 +502,7 @@ describe("RunDetail run history", () => {
   it("hides the attempt badge for a clean attempt-0 run but shows it for a retried one", async () => {
     h.issueHistory.mockResolvedValue({
       issue_identifier: "INF-231",
+      total: 2,
       runs: [
         summary({ id: 1, attempt: 0, outcome: "completed", total_tokens: 1_040_000 }),
         summary({ id: 2, attempt: 2, outcome: "failed", started_at: "2026-06-05T10:00:00Z", ended_at: "2026-06-05T10:05:00Z", total_tokens: 1000, error: "boom" }),
@@ -519,7 +522,7 @@ describe("RunDetail run history", () => {
   });
 
   it("shows 'No prior runs' once issue history resolves empty", async () => {
-    h.issueHistory.mockResolvedValue({ issue_identifier: "INF-231", runs: [], reviews: [] });
+  h.issueHistory.mockResolvedValue({ issue_identifier: "INF-231", total: 0, runs: [], reviews: [] });
     renderDetail();
     expect(await screen.findByText("No prior runs.")).toBeTruthy();
   });

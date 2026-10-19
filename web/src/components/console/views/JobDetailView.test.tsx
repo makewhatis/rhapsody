@@ -223,8 +223,11 @@ function mountDetail(
   onNavigate = vi.fn(),
   reviews: RunSummary[] = [],
   issue = "STUDIO-654",
+  // The ticket's true run count (STUDIO-1376); defaults to the page's length, which is the shape
+  // every pre-STUDIO-1376 test was written against. A test about a CAPPED page passes a larger one.
+  total: number = runs.length,
 ) {
-  h.fetchIssueHistory.mockResolvedValue({ issue_identifier: issue, runs, reviews });
+  h.fetchIssueHistory.mockResolvedValue({ issue_identifier: issue, total, runs, reviews });
   // STUDIO-1023: a review route resolves its origin ticket through `/history/issues`, so that read
   // is defaulted here (empty, the honest "no origin credited" answer) and overridden per test.
   if (h.fetchIssueRuns.getMockImplementation() === undefined) {
@@ -642,6 +645,28 @@ describe("zone A — the sticky header (§3A)", () => {
     );
     // No segments: the dropdown REPLACES them, it does not sit beside them.
     expect(document.querySelectorAll(".trattempts button")).toHaveLength(0);
+  });
+
+  // STUDIO-1376 — a ticket with MORE runs than the history page holds. The page carries its newest
+  // 50 rows plus the ticket's real `total` (114 here), and the picker must label the selected run
+  // against that total, not the page size: the newest of 114 runs is attempt 114, not "attempt 50
+  // of 50". The label also says the list is a window, because it no longer holds the whole history.
+  // MUTATION GUARD: number the ordinals by `runs.length` and this reads "attempt 50 of 50".
+  it("labels the selected attempt against the ticket's real total, not the page size", async () => {
+    const rows = Array.from({ length: 50 }, (_, i) =>
+      run({ id: 600 - i, started_at: `2026-09-01T19:${String(i % 60).padStart(2, "0")}:00Z` }),
+    );
+    mountDetail(rows, vi.fn(), [], "STUDIO-654", 114);
+    const select = (await screen.findByRole("combobox", { name: "Attempt" })) as HTMLSelectElement;
+    // The page is 50 rows; the total is not.
+    expect(select.options).toHaveLength(50);
+    await waitFor(() =>
+      expect(select.options[select.selectedIndex].textContent).toBe(
+        "attempt 114 of 114 · alice (showing latest 50)",
+      ),
+    );
+    // The OLDEST row on the page is the ticket's 65th attempt — not its 50th — and says so too.
+    expect(select.options[49].textContent).toBe("attempt 65 of 114 · alice (showing latest 50)");
   });
 
   // The STUDIO-988 shape the ticket measured: 11 attempts AND 25 reviews. Both strips must stay
