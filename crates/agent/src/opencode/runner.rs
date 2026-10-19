@@ -3879,6 +3879,21 @@ printf '{{"type":"step_finish","sessionID":"ses_auth","part":{{"type":"step-fini
         write_script(dir, "auth-fake.sh", &body)
     }
 
+    /// A fake `opencode` for the STUDIO-1373 shape: a dead login reported as an `UnknownError`
+    /// whose message carries the refresh's 401 but no `statusCode`. It emits exactly the one error
+    /// line and exits 1, never a clean turn — the credential hold must stop the run, not retry it.
+    fn auth_fake_unknown_error(dir: &TempDir, auth: &str) -> String {
+        let d = dir.path().display();
+        let body = format!(
+            r#"n=$(( $(cat '{d}/count' 2>/dev/null || echo 0) + 1 )); echo "$n" > '{d}/count'
+if cmp -s "$XDG_DATA_HOME/opencode/auth.json" '{auth}'; then echo same > '{d}/match.'"$n"; else echo differ > '{d}/match.'"$n"; fi
+printf '{{"type":"error","sessionID":"ses_auth","error":{{"name":"UnknownError","data":{{"message":"Token refresh failed: 401"}}}}}}\n'
+exit 1
+"#
+        );
+        write_script(dir, "auth-fake-unknown.sh", &body)
+    }
+
     fn invocations(dir: &TempDir) -> u32 {
         std::fs::read_to_string(dir.path().join("count"))
             .ok()
@@ -3944,6 +3959,56 @@ printf '{{"type":"step_finish","sessionID":"ses_auth","part":{{"type":"step-fini
         // The failed session is retained, so the human-resumed dispatch adopts it and re-seeds.
         sess.stop().await.expect("stop");
         assert!(record_file(&sr, "STUDIO-1118").is_file());
+    }
+
+    // ⚠️⚠️ STUDIO-1373 acceptance. The 2026-10-19 shape — `UnknownError: Token refresh failed:
+    // 401` with NO statusCode — is the same dead-credential event as the STUDIO-1118 capture, so it
+    // must take the same hold. Before the classifier fix it fell through to `AgentError::Other` and
+    // the ordinary failure backoff retried 113 times over 9h on an unchanged login.
+    #[tokio::test]
+    async fn an_unknown_error_token_refresh_401_on_an_unchanged_login_stops_with_auth_needed() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let script = auth_fake_unknown_error(&scripts, &auth);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        let sess = runner_for(&script, &root, &auth, &sr)
+            .start_session(&ws, issue("STUDIO-1373"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        assert_eq!(
+            invocations(&scripts),
+            1,
+            "an unchanged login is never retried"
+        );
+        assert_eq!(tr.status, TURN_FAILED);
+        let err = err.expect("an auth rejection is an error");
+        assert!(
+            matches!(err, AgentError::AuthNeeded(_)),
+            "the no-statusCode refresh 401 must be AuthNeeded, not Other: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.starts_with("opencode_auth_needed:"), "{msg}");
+        assert!(msg.contains("byte-identical"), "names why: {msg}");
+        assert!(
+            msg.contains("turn_failed: UnknownError: Token refresh failed: 401"),
+            "the provider's own reason is kept verbatim: {msg}"
+        );
+        let evs = events_of(&seen);
+        assert!(
+            evs.iter().any(|e| e.event_type == EVENT_NOTIFICATION
+                && e.message.starts_with("opencode_auth_needed:")),
+            "the run's own event stream says a human is needed: {evs:#?}"
+        );
+
+        sess.stop().await.expect("stop");
     }
 
     /// The `level` and fields of every event a test subscriber saw — just enough to assert the
