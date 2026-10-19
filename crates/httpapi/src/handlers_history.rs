@@ -862,11 +862,15 @@ pub(crate) async fn handle_issue_history(
     // The ticket's TRUE run count beside the page above (STUDIO-1376). The page is capped at the
     // store's default when the caller sends no `limit`, so a console that took the page's length as
     // the total read "attempt 50 of 50" on a ticket with more runs than that. Same predicate,
-    // ignoring the limit — and a store error here is the same failure as the page read, so it fails
-    // the request rather than serving a total that would understate the ticket.
+    // ignoring the limit. Best-effort like the reviews beside it: a store error here logs and falls
+    // back to the page's own length — the numbering that shipped before — rather than failing a page
+    // the read above already served.
     let total = match provider.history().issue_history_count(&id, project) {
         Ok(total) => total,
-        Err(_) => return store_error("issue history query failed"),
+        Err(_) => {
+            tracing::warn!("issue history: counting the ticket's runs failed");
+            runs.len() as i64
+        }
     };
     // The review runs credited to this ticket (STUDIO-976), so the console's attempt strip can show
     // the reviews in time order with the attempts they answered. The join is the server's existing
