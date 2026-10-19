@@ -1354,6 +1354,22 @@ shown. They are kept OUT of `runs` deliberately: the console derives an attempt'
 position in that list, so folding reviews in would renumber every attempt label quoted in tickets,
 PR comments and the room.
 
+### A ticket's true run total on its run detail — `GET /api/v1/issues/{id}/history` (STUDIO-1376)
+
+`GET /api/v1/issues/{id}/history` gains an **additive**, Rhapsody-only `total`: the ticket's TRUE run
+count, over the same predicate as `runs` (exact `issue_identifier`, plus `project_slug` when scoped)
+but IGNORING the page limit. Go reports no total at all, and the endpoint caps its page at the store's
+default (`defaultRunLimit = 50`) whenever the caller sends no `limit` — the same silent-truncation
+shape `GET /api/v1/history`'s `next_offset` fix addressed for the run-paged listing (TRA-320). A
+console that took the page's length as the total read "attempt 50 of 50" on a ticket with 114 runs,
+understating a retry loop exactly when the number matters.
+
+`total` is the ticket's real count regardless of the page, so the console's attempt selector numbers
+its ordinals against it and says when the page is a window ("attempt 65 of 114 · sam (showing latest
+50)"). The `runs` array is unchanged and its Go golden is untouched; `total` is `runs.len()` whenever
+the ticket has no more runs than the page, so a client that ignores it — or a daemon older than the
+field — renders exactly as it did before it existed.
+
 ### Daemon-mediated review handoff — `POST /api/v1/runs/{id}/handoff` (TRA-242)
 
 Go has no analogue: an agent that finished its work moved its own ticket to the review state through
