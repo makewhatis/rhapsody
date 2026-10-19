@@ -71,7 +71,7 @@ function review(endedAt: string): RunSummary {
 }
 
 function history(reviews: RunSummary[]): IssueHistoryResponse {
-  return { issue_identifier: "STUDIO-1020", runs: [], reviews };
+  return { issue_identifier: "STUDIO-1020", total: 0, runs: [], reviews };
 }
 
 describe("historyPollInterval", () => {

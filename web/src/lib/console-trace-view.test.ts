@@ -652,9 +652,8 @@ describe("attemptOptions — the header selector's \"attempt N · teammate\" lab
     ]);
   });
 
-  // The run id is the daemon's own unambiguous handle on an attempt, and the ordinal is not: the
-  // history endpoint serves at most its newest 50 rows, so on a ticket that ran more the numbering
-  // is relative to that window. The handle stays reachable in the tooltip either way.
+  // The run id is the daemon's own unambiguous handle on an attempt, and the ordinal is derived
+  // rather than recorded. The handle stays reachable in the tooltip either way.
   it("keeps the daemon's run id and start time on every option, whatever the label says", () => {
     const identities = new Map([[547, "alice"]]);
     expect(attemptOptions(newestFirst, identities, "")).toEqual([
@@ -666,6 +665,45 @@ describe("attemptOptions — the header selector's \"attempt N · teammate\" lab
 
   it("survives a ticket with no runs at all", () => {
     expect(attemptOptions([], NONE, "")).toEqual([]);
+  });
+
+  // STUDIO-1376 — the history page is capped at 50 rows, but the ticket's REAL run count rides on
+  // the response as `total`. The ordinals count from it, so the newest run of a 114-run ticket is
+  // attempt 114 (not 50) and the oldest shown is attempt 65; and because the page is short of the
+  // whole history, the label says so. This is the ticket's exact shape: "attempt 113 of 113" on a
+  // page that only held 50 rows understated the retry loop.
+  it("numbers against the ticket's real total, not the page, and says the page is capped", () => {
+    const rows = Array.from({ length: 50 }, (_, i) =>
+      run({ id: 1140 - i, started_at: `2026-09-03T10:00:00Z` }),
+    );
+    const identities = new Map(rows.map((r) => [r.id, "sam"]));
+    const opts = attemptOptions(rows, identities, "", 114);
+    // The newest shown run is the ticket's 114th attempt, the oldest shown its 65th.
+    expect(opts[0].ordinal).toBe(114);
+    expect(opts[0].dropdownLabel).toBe("attempt 114 of 114 · sam (showing latest 50)");
+    expect(opts[49].ordinal).toBe(65);
+    expect(opts[49].dropdownLabel).toBe("attempt 65 of 114 · sam (showing latest 50)");
+    // The plain label (the ≤3-attempt segment form) carries the real ordinal too.
+    expect(opts[0].label).toBe("attempt 114 · sam");
+  });
+
+  // A caller with no better total — and an older daemon that omits the field — passes nothing, and
+  // the page's length is then the total: exactly the numbering that shipped before STUDIO-1376,
+  // with no "(showing latest …)" note, because the page IS the whole history as far as it knows.
+  it("falls back to the page's own length when no total is given", () => {
+    const identities = new Map([[547, "alice"]]);
+    const [only] = attemptOptions([c], identities, "");
+    expect(only.ordinal).toBe(1);
+    expect(only.dropdownLabel).toBe("attempt 1 of 1 · alice");
+  });
+
+  // A total below the rows in hand cannot happen against an honest daemon, but a stale or malformed
+  // one must not number a shown run past the end of the list (or report a total it can see through).
+  it("never numbers a shown run past the end of the list", () => {
+    const identities = new Map(newestFirst.map((r) => [r.id, "alice"]));
+    const opts = attemptOptions(newestFirst, identities, "", 1);
+    expect(opts.map((o) => o.ordinal)).toEqual([3, 2, 1]);
+    expect(opts[0].dropdownLabel).toBe("attempt 3 of 3 · alice");
   });
 });
 

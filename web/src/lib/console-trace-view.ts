@@ -663,8 +663,10 @@ export interface AttemptOption {
   /**
    * What the COMPACT DROPDOWN option reads (STUDIO-1023): "attempt 2 of 5 · jimmy". It carries the
    * ticket's total because a single collapsed control has no siblings to count, and the ordinal
-   * alone ("attempt 5") leaves the operator guessing how many there are. The unnamed fallbacks
-   * keep the run-id shape, since there is no ordinal that names anything.
+   * alone ("attempt 5") leaves the operator guessing how many there are. The total is the ticket's
+   * REAL run count (`IssueHistoryResponse.total`), not the page's length, and when the page is
+   * capped the label says so — "attempt 65 of 114 · jimmy (showing latest 50)" (STUDIO-1376). The
+   * unnamed fallbacks keep the run-id shape, since there is no ordinal that names anything.
    */
   dropdownLabel: string;
   /**
@@ -685,11 +687,15 @@ export interface AttemptOption {
  * the oldest run the ticket has is attempt 1. It is deliberately not `runs.attempt`, which the
  * daemon increments on the retry path alone — every re-summoned or re-dispatched run records
  * attempt 0, which is 432 of the 441 rows the store has ever written, and a selector reading
- * "attempt 0" five times names none of its five choices. It is also not a claim the daemon makes:
- * `GET /issues/{id}/history` serves at most its newest 50 rows, so on a ticket that ran more than
- * that the numbering is relative to the window the console was given. The run id — which IS the
- * daemon's unambiguous handle — therefore stays on every option, for the view to put in the
- * tooltip.
+ * "attempt 0" five times names none of its five choices.
+ *
+ * The ordinals are counted against `total`, the ticket's TRUE run count (STUDIO-1376), not against
+ * `runs.length`: `GET /issues/{id}/history` serves at most its newest 50 rows, so on a ticket that
+ * ran more than that the page's length is not the total, and numbering from it read "attempt 50 of
+ * 50" on a ticket with 114 runs — understating a retry loop exactly when the number matters. `total`
+ * defaults to `runs.length`, which is the honest answer when a caller has no better one (and the
+ * only one an older daemon can give). The run id — which IS the daemon's unambiguous handle —
+ * therefore stays on every option, for the view to put in the tooltip.
  *
  * The teammate resolves through [`runTeammate`], so an option can never disagree with the header
  * assignee or the spine's baton about whose attempt it was. Its tri-state is what the two
@@ -707,9 +713,17 @@ export function attemptOptions(
   runs: readonly RunSummary[],
   identities: ReadonlyMap<number, string>,
   assignee: string,
+  total: number = runs.length,
 ): AttemptOption[] {
+  // A caller that knows only the page passes nothing, and the page's length is then the total; a
+  // caller holding the daemon's own count passes it. Never fewer than the rows in hand, so a stale
+  // or missing total cannot number a shown run past the end of the list.
+  const count = Math.max(total, runs.length);
+  // The page is short of the ticket's whole history, so the ordinals start ABOVE the page's length
+  // and every label must say the list is a window rather than the whole story (STUDIO-1376).
+  const capped = count > runs.length;
   return runs.map((run, index) => {
-    const ordinal = runs.length - index;
+    const ordinal = count - index;
     const who = runTeammate(run, identities, assignee);
     // "" from the map is the run's OWN answer that it routed to nobody; an absent key is no
     // answer at all. Only the first earns an ordinal-and-dash label.
@@ -721,7 +735,10 @@ export function attemptOptions(
         : recordedNobody
           ? `attempt ${ordinal} · —`
           : `run ${run.id}`;
-    const dropdownLabel = named ? `attempt ${ordinal} of ${runs.length} · ${who === "" ? "—" : who}` : `run ${run.id}`;
+    const dropdownLabel = named
+      ? `attempt ${ordinal} of ${count} · ${who === "" ? "—" : who}` +
+        (capped ? ` (showing latest ${runs.length})` : "")
+      : `run ${run.id}`;
     return { id: run.id, ordinal, label, dropdownLabel, named, startedAt: run.started_at };
   });
 }

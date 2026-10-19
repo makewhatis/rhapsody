@@ -572,6 +572,13 @@ export interface DaySummary {
 // trace, cost and outcome, so an entry opens like any other; a ticket with no reviews gets `[]`.
 export interface IssueHistoryResponse {
   issue_identifier: string;
+  /**
+   * The ticket's TRUE run count, ignoring the page cap `runs` was served under (STUDIO-1376). The
+   * attempt selector labels its ordinals against this, so a capped page still reads "attempt 65 of
+   * 114" rather than "attempt 50 of 50". A daemon older than the field omits it; `fetchIssueHistory`
+   * falls back to `runs.length`, which is exactly the old (capped) behaviour.
+   */
+  total: number;
   runs: RunSummary[];
   reviews: RunSummary[];
 }
@@ -1242,6 +1249,9 @@ export async function fetchIssueHistory(identifier: string): Promise<IssueHistor
   h.runs ??= [];
   // A daemon older than STUDIO-976 omits the field; the strip then renders as it did before it.
   h.reviews ??= [];
+  // A daemon older than STUDIO-1376 omits `total`; the page's own length is then the only total the
+  // console has, which is exactly what it used before the field existed.
+  h.total ??= h.runs.length;
   return h;
 }
 

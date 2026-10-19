@@ -15,9 +15,9 @@
 use std::collections::HashMap;
 
 use rhapsody_store::{
-    DayProviderRollup, DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens,
-    ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, RunUsage,
-    StoreError,
+    DayProviderRollup, DayRollup, DayTotals, EventHit, EventQuery, EventRow, IssueHistoryPage,
+    ProviderTokens, ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance,
+    RunSummary, RunUsage, StoreError,
 };
 
 /// The read-only subset of [`rhapsody_store::Store`] the history endpoints query. Never writes; the
@@ -42,6 +42,15 @@ pub trait HistoryStore: Send + Sync {
         project: &str,
         limit: i64,
     ) -> Result<Vec<RunSummary>, StoreError>;
+    /// A ticket's run history AND its true run count, from ONE read — the true total beside a
+    /// capped page (STUDIO-1376). Mirrors [`rhapsody_store::Store::issue_history_page`];
+    /// Rhapsody-only, Go reports no total.
+    fn issue_history_page(
+        &self,
+        identifier: &str,
+        project: &str,
+        limit: i64,
+    ) -> Result<IssueHistoryPage, StoreError>;
     /// Every run under one of `identifiers`, most-recent first (`GET /api/v1/issues/{id}/history`'s
     /// review half, STUDIO-976). The caller resolves those identifiers from the watch set with
     /// `reviewdone::origin_ticket`; this is only the run lookup. Rhapsody-only; Go has no reviews.
@@ -132,6 +141,14 @@ impl<S: rhapsody_store::Store + Send + Sync + ?Sized> HistoryStore for S {
         limit: i64,
     ) -> Result<Vec<RunSummary>, StoreError> {
         rhapsody_store::Store::issue_history(self, identifier, project, limit)
+    }
+    fn issue_history_page(
+        &self,
+        identifier: &str,
+        project: &str,
+        limit: i64,
+    ) -> Result<IssueHistoryPage, StoreError> {
+        rhapsody_store::Store::issue_history_page(self, identifier, project, limit)
     }
     fn runs_for_issues(
         &self,

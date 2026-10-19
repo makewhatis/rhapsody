@@ -1012,6 +1012,14 @@ mod tests {
         fn issue_history(&self, _: &str, _: &str, _: i64) -> Result<Vec<RunSummary>, StoreError> {
             Err(StoreError::Disabled)
         }
+        fn issue_history_page(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+        ) -> Result<rhapsody_store::IssueHistoryPage, StoreError> {
+            Err(StoreError::Disabled)
+        }
         fn runs_for_issues(&self, _: &[String], _: i64) -> Result<Vec<RunSummary>, StoreError> {
             Err(StoreError::Disabled)
         }

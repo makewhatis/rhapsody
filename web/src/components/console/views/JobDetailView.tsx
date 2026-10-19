@@ -273,6 +273,9 @@ export function JobDetailView({
           run={run}
           issue={issue}
           runs={runs}
+          // The daemon's own count of the ticket's runs (STUDIO-1376), which is `runs.length`
+          // unless the history page was capped; an older daemon omits it and the page is all we have.
+          attemptTotal={history.data?.total ?? runs.length}
           reviews={reviews}
           identities={identities}
           identityRead={identityRead}
@@ -295,6 +298,7 @@ function RunTrace({
   run,
   issue,
   runs,
+  attemptTotal,
   reviews,
   identities,
   identityRead,
@@ -313,6 +317,12 @@ function RunTrace({
    * link resolves from HERE, not from the selected run. */
   issue: string;
   runs: readonly RunSummary[];
+  /**
+   * The ticket's TRUE run count (STUDIO-1376), which is `runs.length` unless the history page was
+   * capped — the selector numbers its attempts against this so a 50-row window of a 114-run ticket
+   * reads "attempt 65 of 114" rather than "attempt 50 of 50".
+   */
+  attemptTotal: number;
   /** The ticket's review runs (STUDIO-976), credited by the daemon's origin-ticket join. */
   reviews: readonly RunSummary[];
   /** Run id → the teammate that run was dispatched as; see `lib/run-identity` for the tri-state. */
@@ -357,9 +367,12 @@ function RunTrace({
   );
   // The selector's labels, resolved from the same three inputs the batons are — so an option, the
   // baton beside it and the header assignee can never name different teammates for one attempt.
+  // The ticket's REAL run count, which is not `runs.length` when the history page was capped
+  // (STUDIO-1376): the selector's ordinals are counted against it so a 50-row window of a 114-run
+  // ticket reads "attempt 65 of 114" rather than "attempt 50 of 50".
   const attempts = useMemo(
-    () => attemptOptions(runs, identities, assignee),
-    [runs, identities, assignee],
+    () => attemptOptions(runs, identities, assignee, attemptTotal),
+    [runs, identities, assignee, attemptTotal],
   );
   // The review strip (STUDIO-976), grouped into ROUNDS (STUDIO-1023): one round per pull request at
   // one head, the newest round expanded and older rounds collapsed. A round boundary is
