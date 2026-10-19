@@ -86,6 +86,23 @@ from a previous interrupted run of this ticket. Your earlier work and the sessio
 intact — continue from where you left off rather than starting over. If you had completed an \
 investigation and recorded findings, act on them now.]";
 
+/// Appended to [`RESUME_NOTE`] when the resumed turn's prompt is byte-identical to the last one the
+/// session received in full, which is then NOT sent again (STUDIO-1374). Re-sending it on every
+/// resumed attempt appended one whole copy per failed retry: STUDIO-1363's 113 retries left 113
+/// copies in its session and the first working model call re-read ~921K tokens of them.
+const RESUME_PROMPT_UNCHANGED: &str = "[Your task prompt is unchanged: it is the one already \
+earlier in this session history, so it is not repeated here. Follow it.]";
+
+/// The hex SHA-256 of a prompt as sent (after the tool-name rewrite), the identity a retained
+/// session's last full prompt is compared by.
+fn prompt_digest(prompt: &str) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(prompt.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
 /// Builds opencode sessions.
 pub struct Runner {
     cfg: Config,
@@ -129,15 +146,18 @@ impl Runner {
     /// of the key: the override changes the `-m` of the resumed turn, but opencode continues the
     /// session regardless, and folding an override in would make a teammate's own retry unable to
     /// resume itself.
+    ///
+    /// Returns the state, the session id to continue (empty for a cold start), the digest of the
+    /// last prompt that session received in full (empty when unknown), and whether it was adopted.
     fn resolve_state(
         &self,
         workspace_path: &str,
         issue: &Issue,
         provision: impl FnOnce() -> Result<RunState, AgentError>,
-    ) -> Result<(RunState, String, bool), AgentError> {
+    ) -> Result<(RunState, String, String, bool), AgentError> {
         if self.force_fresh {
             resume::discard(&self.cfg.state_root, &issue.identifier);
-            return provision().map(|state| (state, String::new(), false));
+            return provision().map(|state| (state, String::new(), String::new(), false));
         }
         let now = Utc::now().timestamp_millis();
         match resume::select(
@@ -154,7 +174,7 @@ impl Runner {
                     issue = %issue.identifier, session = %rec.session_id, dir = %rec.dir,
                     "opencode: resuming the retained session of a cut-off attempt"
                 );
-                Ok((state, rec.session_id, true))
+                Ok((state, rec.session_id, rec.prompt_sha256, true))
             }
             ResumeDecision::Cold(reason) => {
                 if !reason.is_empty() {
@@ -163,7 +183,7 @@ impl Runner {
                         "opencode: not resuming a previous attempt; starting a cold session"
                     );
                 }
-                provision().map(|state| (state, String::new(), false))
+                provision().map(|state| (state, String::new(), String::new(), false))
             }
         }
     }
@@ -213,7 +233,7 @@ impl Runner {
         // A credential-FREE private state directory: no auth.json is created or copied. A retained
         // brokered session is resumed from its kept directory (STUDIO-1043), which likewise holds
         // no reusable credential — only what the per-turn capabilities left behind.
-        let (state, resume_session, adopted) =
+        let (state, resume_session, held_prompt, adopted) =
             self.resolve_state(workspace_path, &issue, || {
                 RunState::provision_brokered(
                     &self.cfg.state_root,
@@ -239,6 +259,7 @@ impl Runner {
                 command: self.cfg.command.clone(),
             }),
             session_id: Mutex::new(resume_session),
+            held_prompt: Mutex::new(held_prompt),
             turn_n: AtomicI64::new(0),
             transcript: Mutex::new(transcript),
             transcript_warned: AtomicBool::new(false),
@@ -457,6 +478,7 @@ impl Runner {
             config_path: String::new(),
             brokered: None,
             session_id: Mutex::new(String::new()),
+            held_prompt: Mutex::new(String::new()),
             turn_n: AtomicI64::new(0),
             transcript: Mutex::new(transcript),
             transcript_warned: AtomicBool::new(false),
@@ -546,7 +568,7 @@ impl crate::Runner for Runner {
         let (name, base_args) = split_command(&self.cfg.command)?;
         // A retained session is resumed from its kept directory; otherwise a fresh one is
         // provisioned, refusing a missing credential before anything is spawned.
-        let (state, resume_session, adopted) =
+        let (state, resume_session, held_prompt, adopted) =
             self.resolve_state(workspace_path, &issue, || {
                 RunState::provision_legacy(
                     &self.cfg.state_root,
@@ -616,6 +638,7 @@ impl crate::Runner for Runner {
             config_path,
             brokered: None,
             session_id: Mutex::new(resume_session),
+            held_prompt: Mutex::new(held_prompt),
             turn_n: AtomicI64::new(0),
             transcript: Mutex::new(transcript),
             transcript_warned: AtomicBool::new(false),
@@ -649,6 +672,11 @@ struct OpencodeSession {
     brokered: Option<BrokeredParams>,
     /// opencode's `ses_…` id, captured from the first line that carries one.
     session_id: Mutex<String>,
+    /// [`prompt_digest`] of the last prompt this session is known to have received IN FULL, empty
+    /// when none is (STUDIO-1374). Seeded from an adopted record, updated by every turn that sent a
+    /// full prompt opencode then reported on, and written back into the resume record, so a resumed
+    /// turn whose prompt is unchanged sends only the resume note.
+    held_prompt: Mutex<String>,
     turn_n: AtomicI64,
     transcript: Mutex<Option<Transcript>>,
     transcript_warned: AtomicBool,
@@ -689,6 +717,12 @@ impl OpencodeSession {
     /// turn into a panic here, on a production path. Mirrors the claude session's handling.
     fn locked_session_id(&self) -> std::sync::MutexGuard<'_, String> {
         self.session_id
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn locked_held_prompt(&self) -> std::sync::MutexGuard<'_, String> {
+        self.held_prompt
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
@@ -819,6 +853,7 @@ impl OpencodeSession {
             session_id,
             dir: dir.to_string_lossy().into_owned(),
             saved_at_ms: Utc::now().timestamp_millis(),
+            prompt_sha256: self.locked_held_prompt().clone(),
         };
         match resume::save(&self.cfg.state_root, &self.issue.identifier, &rec) {
             Ok(()) => self.state.keep(),
@@ -845,6 +880,8 @@ impl Drop for OpencodeSession {
 impl Session for OpencodeSession {
     fn reset_conversation(&self) -> Result<(), AgentError> {
         self.locked_session_id().clear();
+        // A new conversation holds no prompt yet.
+        self.locked_held_prompt().clear();
         self.turn_n.store(0, Ordering::SeqCst);
         Ok(())
     }
@@ -1129,7 +1166,25 @@ impl OpencodeSession {
         // ⚠️ The prompt is rewritten into opencode's tool-name spelling before it is sent. Rhapsody's
         // prompts name tools literally, including the one that ends the run.
         let prompt = rewrite_tool_names(prompt);
-        let prompt = if resumed_first_turn {
+        let digest = prompt_digest(&prompt);
+        // The resumed session already holds this exact prompt from an earlier attempt: send only
+        // the note, so N failed attempts do not leave N copies in the session (STUDIO-1374). A
+        // prompt that changed since — a route-back's REVIEW FEEDBACK — is sent in full, below.
+        let prompt_held = resumed_first_turn && *self.locked_held_prompt() == digest;
+        // Whether this turn sends the prompt itself, and so may become the session's held prompt.
+        let sends_prompt = !prompt_held;
+        let prompt = if prompt_held {
+            on_event(Event {
+                event_type: EVENT_NOTIFICATION.to_string(),
+                timestamp: Some(Utc::now()),
+                message: format!(
+                    "resumed the cut-off opencode session {resume}; its prompt is unchanged and was \
+                     not re-sent"
+                ),
+                ..Default::default()
+            });
+            format!("{RESUME_NOTE}\n\n{RESUME_PROMPT_UNCHANGED}")
+        } else if resumed_first_turn {
             // A daemon-authored notice on the run's own event stream, so the attempt records that it
             // continued the previous one (the console's run detail reads these events).
             on_event(Event {
@@ -1505,6 +1560,14 @@ impl OpencodeSession {
         // the session is new) would emit it once per RUN, and every multi-turn opencode run would
         // report as a single turn for its whole life.
         let mut session_announced = false;
+        // Whether opencode reported on the session at all — any session line beyond the host's own
+        // pre-prompt marker — which is the evidence the prompt was stored in it (STUDIO-1374).
+        // Whatever the turn's outcome, the session then holds this prompt, so it becomes the held
+        // digest AT ONCE: a turn cancelled after this point (an operator Stop, a shutdown, a stall
+        // kill) never reaches the end of `run_turn`, but `Drop` still retains the session and
+        // writes the digest into its record. Without that evidence the held digest is left alone:
+        // eliding a prompt that never landed would leave the agent without one.
+        let mut prompt_landed = false;
         let mut stderr_buf = CappedBuffer::new(MAX_STDERR_CAPTURE);
         let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
         let mut out_chunk = vec![0u8; READ_CHUNK];
@@ -1543,6 +1606,12 @@ impl OpencodeSession {
                         let mut sid = self.locked_session_id();
                         if sid.is_empty() {
                             *sid = c.session_id.clone();
+                        }
+                    }
+                    if !prompt_landed && !c.session_id.is_empty() && !c.host_marker {
+                        prompt_landed = true;
+                        if sends_prompt {
+                            *self.locked_held_prompt() = digest.clone();
                         }
                     }
                     // Synthesize the session event opencode never emits (design §6.1's
@@ -3643,6 +3712,288 @@ printf '{"type":"step_finish","sessionID":"ses_cut","part":{"reason":"stop"}}\n'
         assert!(!rec.exists(), "a completed run must clear the record");
     }
 
+    /// A fake `opencode` for the resume-growth tests (STUDIO-1374). Every invocation saves the
+    /// prompt it was sent (the final positional) to `PROMPTS/<n>.txt`; invocations `1..=FAILS` fail
+    /// before any model output with a retryable provider error, as STUDIO-1363's dead login did, and
+    /// every later one succeeds.
+    fn growth_fake(scripts: &TempDir, fails: u32) -> (String, std::path::PathBuf) {
+        growth_fake_pausing(scripts, fails, "")
+    }
+
+    /// [`growth_fake`], running `pause` (a shell command) after a failing invocation reports its
+    /// error and before it exits, so a test can cancel the turn while the process is still alive.
+    fn growth_fake_pausing(
+        scripts: &TempDir,
+        fails: u32,
+        pause: &str,
+    ) -> (String, std::path::PathBuf) {
+        let prompts = scripts.path().join("prompts");
+        std::fs::create_dir_all(&prompts).expect("mkdir prompts");
+        let body = format!(
+            r#"count='{count}'
+n=$(( $(cat "$count" 2>/dev/null || echo 0) + 1 ))
+printf '%s' "$n" > "$count"
+for last; do :; done
+printf '%s' "$last" > '{prompts}'/"$n".txt
+if [ "$n" -le {fails} ]; then
+  printf '%s\n' '{{"type":"error","sessionID":"ses_loop","error":{{"name":"APIError","data":{{"message":"upstream unavailable","statusCode":503,"isRetryable":true}}}}}}'
+  {pause}
+  exit 1
+fi
+printf '%s\n' '{{"type":"step_finish","sessionID":"ses_loop","part":{{"reason":"stop"}}}}'
+"#,
+            count = scripts.path().join("count").display(),
+            prompts = prompts.display(),
+            fails = fails,
+            pause = pause,
+        );
+        (write_script(scripts, "growth.sh", &body), prompts)
+    }
+
+    /// One dispatch of `id`: a fresh session (adopting any retained one), one turn, then `stop` —
+    /// the shape every retry of a failed attempt takes.
+    async fn one_attempt(
+        runner: &Runner,
+        ws: &str,
+        id: &str,
+        prompt: &str,
+    ) -> (TurnResult, Option<AgentError>) {
+        let sess = runner
+            .start_session(ws, issue(id), None)
+            .await
+            .expect("session");
+        let out = sess.run_turn(prompt, None, None, &|_| {}).await;
+        sess.stop().await.expect("stop");
+        out
+    }
+
+    fn sent_prompt(prompts: &std::path::Path, n: u32) -> String {
+        std::fs::read_to_string(prompts.join(format!("{n}.txt"))).expect("sent prompt")
+    }
+
+    /// A prompt the size of a real rendered one (~24 KB), distinctive enough to count copies of.
+    fn big_prompt(tag: &str) -> String {
+        let mut p = format!("You are working ticket {tag}.\n");
+        while p.len() < 24 * 1024 {
+            p.push_str("Read the ticket, write the failing test, make it pass, open the PR.\n");
+        }
+        p
+    }
+
+    /// The per-resume byte budget acceptance item 1 fixes.
+    const RESUME_BYTES_MAX: usize = 2 * 1024;
+
+    /// ⚠️ THE ACCEPTANCE TEST for STUDIO-1374. A cold attempt and then five resumed attempts all fail
+    /// before any model output, and a sixth resume succeeds. The full prompt must reach the retained
+    /// session ONCE; every resume adds only the short resume note. Restore "always send the full
+    /// prompt" and this goes red: every resume carries another 24 KB copy.
+    #[tokio::test]
+    async fn resumes_of_failed_attempts_do_not_resend_an_unchanged_prompt() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let (fake, prompts) = growth_fake(&scripts, 6);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+        let runner = runner_with(&fake, &root, &auth, &sr, "m", 30);
+        let prompt = big_prompt("STUDIO-1374");
+
+        for n in 1..=6 {
+            let (tr, err) = one_attempt(&runner, &ws, "STUDIO-1374", &prompt).await;
+            assert_eq!(tr.status, TURN_FAILED, "attempt {n} must fail: {err:?}");
+            assert!(
+                record_file(&sr, "STUDIO-1374").is_file(),
+                "attempt {n} must retain the session"
+            );
+        }
+        let (tr, err) = one_attempt(&runner, &ws, "STUDIO-1374", &prompt).await;
+        assert_eq!(
+            tr.status, TURN_SUCCEEDED,
+            "the last resume succeeds: {err:?}"
+        );
+
+        assert_eq!(
+            sent_prompt(&prompts, 1),
+            prompt,
+            "the cold attempt sends it"
+        );
+        let mut copies = 1;
+        for n in 2..=7 {
+            let sent = sent_prompt(&prompts, n);
+            copies += sent.matches(prompt.as_str()).count();
+            assert!(
+                sent.contains("Resuming a cut-off attempt"),
+                "resume {n} must still carry the resume note: {sent:?}"
+            );
+            assert!(
+                sent.len() <= RESUME_BYTES_MAX,
+                "resume {n} added {} bytes to the session; at most {RESUME_BYTES_MAX} allowed",
+                sent.len()
+            );
+        }
+        assert_eq!(
+            copies, 1,
+            "the full prompt must reach the session exactly once"
+        );
+        assert!(
+            session_dirs(state_root.path()).is_empty(),
+            "the successful resume still releases the session"
+        );
+    }
+
+    /// The other half of STUDIO-1374: a prompt that CHANGED since the session last received one (a
+    /// route-back writing REVIEW FEEDBACK into the description) is sent in full on the next resume,
+    /// and only an unchanged repeat of THAT prompt is elided afterwards.
+    #[tokio::test]
+    async fn a_resume_whose_prompt_changed_sends_the_new_prompt_in_full() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let (fake, prompts) = growth_fake(&scripts, 4);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+        let runner = runner_with(&fake, &root, &auth, &sr, "m", 30);
+        let before = big_prompt("STUDIO-1374");
+        let after = format!("{before}\nREVIEW FEEDBACK: the byte bound is not asserted.\n");
+
+        for p in [&before, &before, &after, &after] {
+            let (tr, _) = one_attempt(&runner, &ws, "STUDIO-1374", p).await;
+            assert_eq!(tr.status, TURN_FAILED);
+        }
+
+        assert_eq!(sent_prompt(&prompts, 1), before);
+        assert!(
+            !sent_prompt(&prompts, 2).contains(before.as_str()),
+            "an unchanged prompt is not re-sent"
+        );
+        let changed = sent_prompt(&prompts, 3);
+        assert!(
+            changed.contains("Resuming a cut-off attempt") && changed.ends_with(after.as_str()),
+            "the edited prompt must be sent in full on the next resume: {} bytes",
+            changed.len()
+        );
+        let repeat = sent_prompt(&prompts, 4);
+        assert!(
+            !repeat.contains("REVIEW FEEDBACK") && repeat.len() <= RESUME_BYTES_MAX,
+            "once the session holds the edited prompt, repeating it is elided: {repeat:?}"
+        );
+    }
+
+    /// STUDIO-1374 review B1: a cancelled turn (an operator Stop, a shutdown, a stall kill) is
+    /// dropped mid-flight and never reaches the end of `run_turn`, yet `Drop` still retains the
+    /// session. Once opencode has reported on the session the prompt is in it, so that receipt must
+    /// survive the drop: the next identical resume sends only the note, not another full copy.
+    #[tokio::test]
+    async fn a_cancelled_turn_after_the_prompt_landed_keeps_resumes_within_the_byte_bound() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let (fake, prompts) = growth_fake_pausing(&scripts, 6, "sleep 60");
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+        let runner = runner_with(&fake, &root, &auth, &sr, "m", 30);
+        let prompt = big_prompt("STUDIO-1374");
+
+        for n in 1..=6 {
+            let sess = runner
+                .start_session(&ws, issue("STUDIO-1374"), None)
+                .await
+                .expect("session");
+            let failed = tokio::sync::Notify::new();
+            let on = |e: Event| {
+                if e.event_type == EVENT_TURN_FAILED {
+                    failed.notify_one();
+                }
+            };
+            {
+                let turn = sess.run_turn(&prompt, None, None, &on);
+                tokio::pin!(turn);
+                tokio::select! {
+                    result = &mut turn => panic!("attempt {n} ended before cancellation: {result:?}"),
+                    seen = tokio::time::timeout(Duration::from_secs(10), failed.notified()) => {
+                        seen.expect("the fake's in-band error must be reported before cancellation");
+                    }
+                }
+            }
+            // Cancelled without `stop()`, the operator-Stop shape.
+            drop(sess);
+            assert!(
+                record_file(&sr, "STUDIO-1374").is_file(),
+                "cancelled attempt {n} must retain the session"
+            );
+        }
+        let (tr, err) = one_attempt(&runner, &ws, "STUDIO-1374", &prompt).await;
+        assert_eq!(
+            tr.status, TURN_SUCCEEDED,
+            "the last resume succeeds: {err:?}"
+        );
+
+        assert_eq!(
+            sent_prompt(&prompts, 1),
+            prompt,
+            "the cold attempt sends it"
+        );
+        for n in 2..=7 {
+            let sent = sent_prompt(&prompts, n);
+            assert!(
+                sent.len() <= RESUME_BYTES_MAX,
+                "resume {n} added {} bytes after a cancelled attempt whose prompt landed; at most \
+                 {RESUME_BYTES_MAX} allowed",
+                sent.len()
+            );
+        }
+    }
+
+    /// A full prompt the session never received — the turn ended with nothing but the host's own
+    /// pre-prompt marker, so there is no evidence opencode stored the message — must not be elided
+    /// on the next resume. Eliding it would leave the agent with no prompt at all.
+    #[tokio::test]
+    async fn a_prompt_with_no_evidence_it_landed_is_resent_on_the_next_resume() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let prompts = scripts.path().join("prompts");
+        std::fs::create_dir_all(&prompts).expect("mkdir prompts");
+        let silent = write_script(
+            &scripts,
+            "silent.sh",
+            &format!(
+                "for last; do :; done\nprintf '%s' \"$last\" > '{}'/\"$$\".txt\n# \"sessionID\":\"ses_quiet\"\nexit 1\n",
+                prompts.display()
+            ),
+        );
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+        let runner = runner_with(&silent, &root, &auth, &sr, "m", 30);
+        let prompt = big_prompt("STUDIO-1374");
+
+        for _ in 0..2 {
+            let (tr, _) = one_attempt(&runner, &ws, "STUDIO-1374", &prompt).await;
+            assert_ne!(tr.status, TURN_SUCCEEDED);
+        }
+        assert!(
+            record_file(&sr, "STUDIO-1374").is_file(),
+            "the session is retained"
+        );
+        let sent: Vec<String> = std::fs::read_dir(&prompts)
+            .expect("read prompts")
+            .map(|e| std::fs::read_to_string(e.expect("entry").path()).expect("prompt"))
+            .collect();
+        assert_eq!(sent.len(), 2, "both attempts reached the CLI");
+        assert!(
+            sent.iter().all(|s| s.ends_with(prompt.as_str())),
+            "with no evidence the first copy landed, the resume must send the prompt again"
+        );
+    }
+
     /// A cancelled run — an operator Stop, or a daemon shutdown dropping the worker future — never
     /// reaches `stop`, so `Drop` must make the same retention decision. Dropping the session future
     /// mid-turn must leave the directory and the record behind (STUDIO-1043 review F1).
@@ -3879,6 +4230,21 @@ printf '{{"type":"step_finish","sessionID":"ses_auth","part":{{"type":"step-fini
         write_script(dir, "auth-fake.sh", &body)
     }
 
+    /// A fake `opencode` for the STUDIO-1373 shape: a dead login reported as an `UnknownError`
+    /// whose message carries the refresh's 401 but no `statusCode`. It emits exactly the one error
+    /// line and exits 1, never a clean turn — the credential hold must stop the run, not retry it.
+    fn auth_fake_unknown_error(dir: &TempDir, auth: &str) -> String {
+        let d = dir.path().display();
+        let body = format!(
+            r#"n=$(( $(cat '{d}/count' 2>/dev/null || echo 0) + 1 )); echo "$n" > '{d}/count'
+if cmp -s "$XDG_DATA_HOME/opencode/auth.json" '{auth}'; then echo same > '{d}/match.'"$n"; else echo differ > '{d}/match.'"$n"; fi
+printf '{{"type":"error","sessionID":"ses_auth","error":{{"name":"UnknownError","data":{{"message":"Token refresh failed: 401"}}}}}}\n'
+exit 1
+"#
+        );
+        write_script(dir, "auth-fake-unknown.sh", &body)
+    }
+
     fn invocations(dir: &TempDir) -> u32 {
         std::fs::read_to_string(dir.path().join("count"))
             .ok()
@@ -3944,6 +4310,56 @@ printf '{{"type":"step_finish","sessionID":"ses_auth","part":{{"type":"step-fini
         // The failed session is retained, so the human-resumed dispatch adopts it and re-seeds.
         sess.stop().await.expect("stop");
         assert!(record_file(&sr, "STUDIO-1118").is_file());
+    }
+
+    // ⚠️⚠️ STUDIO-1373 acceptance. The 2026-10-19 shape — `UnknownError: Token refresh failed:
+    // 401` with NO statusCode — is the same dead-credential event as the STUDIO-1118 capture, so it
+    // must take the same hold. Before the classifier fix it fell through to `AgentError::Other` and
+    // the ordinary failure backoff retried 113 times over 9h on an unchanged login.
+    #[tokio::test]
+    async fn an_unknown_error_token_refresh_401_on_an_unchanged_login_stops_with_auth_needed() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let script = auth_fake_unknown_error(&scripts, &auth);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+
+        let sess = runner_for(&script, &root, &auth, &sr)
+            .start_session(&ws, issue("STUDIO-1373"), None)
+            .await
+            .expect("session");
+        let (seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+
+        assert_eq!(
+            invocations(&scripts),
+            1,
+            "an unchanged login is never retried"
+        );
+        assert_eq!(tr.status, TURN_FAILED);
+        let err = err.expect("an auth rejection is an error");
+        assert!(
+            matches!(err, AgentError::AuthNeeded(_)),
+            "the no-statusCode refresh 401 must be AuthNeeded, not Other: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.starts_with("opencode_auth_needed:"), "{msg}");
+        assert!(msg.contains("byte-identical"), "names why: {msg}");
+        assert!(
+            msg.contains("turn_failed: UnknownError: Token refresh failed: 401"),
+            "the provider's own reason is kept verbatim: {msg}"
+        );
+        let evs = events_of(&seen);
+        assert!(
+            evs.iter().any(|e| e.event_type == EVENT_NOTIFICATION
+                && e.message.starts_with("opencode_auth_needed:")),
+            "the run's own event stream says a human is needed: {evs:#?}"
+        );
+
+        sess.stop().await.expect("stop");
     }
 
     /// The `level` and fields of every event a test subscriber saw — just enough to assert the

@@ -626,6 +626,7 @@ pub(crate) fn seed_opencode_session(
         session_id: "ses_kept".to_string(),
         dir: dir.to_string_lossy().into_owned(),
         saved_at_ms,
+        prompt_sha256: String::new(),
     };
     agent::opencode::resume::save(&root_s, issue, &rec).expect("save resume record");
     let record = agent::opencode::resume::record_path(&root_s, issue).expect("record path");

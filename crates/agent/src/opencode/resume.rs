@@ -58,6 +58,13 @@ pub struct ResumeRecord {
     pub dir: String,
     /// When the record was written, in Unix milliseconds — the retention clock.
     pub saved_at_ms: i64,
+    /// The SHA-256 (hex) of the last prompt this session received IN FULL, or empty when no full
+    /// prompt is known to have reached it (STUDIO-1374). A resume whose prompt hashes the same sends
+    /// only the resume note, so a run of failed attempts no longer appends one copy of the whole
+    /// prompt per retry. Defaulted, so a record written before this field existed still parses — and
+    /// its empty digest simply means the next resume sends the prompt in full, as it always did.
+    #[serde(default)]
+    pub prompt_sha256: String,
 }
 
 /// The outcome of looking for a resumable session.
@@ -380,6 +387,7 @@ mod tests {
             session_id: "ses_keep".to_string(),
             dir: dir.to_string_lossy().into_owned(),
             saved_at_ms: 1_000_000,
+            prompt_sha256: String::new(),
         }
     }
 
@@ -604,6 +612,26 @@ mod tests {
             victim.is_dir(),
             "a record naming an unmanaged path must never let cleanup delete it"
         );
+    }
+
+    /// A record written before STUDIO-1374 has no `prompt_sha256`; it must still resume, with an
+    /// empty digest so the next turn sends its prompt in full.
+    #[test]
+    fn a_record_without_a_prompt_digest_still_resumes() {
+        let tmp = TempDir::new();
+        let r = root(&tmp);
+        let dir = session_dir(&r, "rhapsody-opencode-STUDIO-1043-1-2-0");
+        let path = record_path(&r, "STUDIO-1043").expect("path");
+        std::fs::create_dir_all(path.parent().expect("parent")).expect("mkdir");
+        let old = serde_json::json!({
+            "harness": HARNESS, "model": "m", "workspace": "/ws", "session_id": "ses_keep",
+            "dir": dir.to_string_lossy(), "saved_at_ms": 1_000_000,
+        });
+        std::fs::write(&path, old.to_string()).expect("write");
+        match select(&r, "STUDIO-1043", HARNESS, "m", "/ws", 1_000_100) {
+            ResumeDecision::Resume(rec) => assert_eq!(rec.prompt_sha256, ""),
+            other => panic!("expected resume, got {other:?}"),
+        }
     }
 
     #[test]

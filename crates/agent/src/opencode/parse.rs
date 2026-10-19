@@ -57,6 +57,10 @@ pub struct Classified {
     pub failure: Option<Failure>,
     /// Scoped live delta, not part of the historical CLI transcript vocabulary.
     pub progress: bool,
+    /// The bare `step_start` the owned-server bridge writes itself, carrying only the session id,
+    /// BEFORE it posts the prompt (`super::server`). Every other line carrying a session id is
+    /// opencode reporting on that session, i.e. evidence it received the prompt (STUDIO-1374).
+    pub host_marker: bool,
 }
 
 /// An in-band `error` event. opencode is the only measured harness that hands the daemon an HTTP
@@ -86,15 +90,22 @@ impl Failure {
         s
     }
 
-    /// Whether the provider rejected the run's CREDENTIAL (STUDIO-1118): an HTTP 401, or one of the
+    /// Whether the provider rejected the run's CREDENTIAL (STUDIO-1118): an HTTP 401, one of the
     /// two OAuth shapes the provider reports in the message ("invalidated oauth token", "expired
-    /// token"). A retry with the same credential cannot succeed, so the runner treats this as its
-    /// own outcome rather than an ordinary failed turn.
+    /// token"), or a refresh that failed with a 401 (STUDIO-1373). A retry with the same credential
+    /// cannot succeed, so the runner treats this as its own outcome rather than an ordinary failed
+    /// turn.
     pub fn is_auth(&self) -> bool {
         let msg = self.message.to_ascii_lowercase();
         self.status_code == 401
             || msg.contains("invalidated oauth token")
             || msg.contains("expired token")
+            // STUDIO-1373: opencode reports a dead login as `name = "UnknownError"` with the
+            // message `Token refresh failed: 401` and NO `statusCode`, so `status_code == 0` and the
+            // bare-401 arm above misses it. Match ONLY the 401: a refresh that failed with a 5xx or
+            // a 429 is an ordinary retryable provider failure, and holding the credential for it
+            // would park the ticket until a human acts over a transient outage.
+            || msg.contains("token refresh failed: 401")
     }
 }
 
@@ -180,6 +191,7 @@ pub fn classify(line: &[u8]) -> Classified {
         Err(_) => return Classified::default(),
     };
     let now = Some(Utc::now());
+    let host_marker = r.r#type == "step_start" && r.part.is_none();
     let part = r.part.unwrap_or_default();
 
     match r.r#type.as_str() {
@@ -297,6 +309,7 @@ pub fn classify(line: &[u8]) -> Classified {
         // stream, so dropping it here would delay the resume id by a whole step.
         _ => Classified {
             session_id: r.session_id,
+            host_marker,
             ..Default::default()
         },
     }
@@ -391,6 +404,29 @@ mod tests {
         assert!(!f(429, "rate limited").is_auth());
         assert!(!f(500, "internal error").is_auth());
         assert!(!f(0, "").is_auth());
+    }
+
+    // STUDIO-1373: the 2026-10-19 shape. opencode reports the dead login as an `UnknownError`
+    // whose message carries the refresh's 401 but NO `statusCode` — so neither the bare-401 arm nor
+    // the OAuth-message arms fire and the credential hold silently never triggers. Only the 401
+    // refresh is a credential rejection: a provider 5xx or a 429 refresh failure must stay an
+    // ordinary retryable failure (holding the credential on a 503 would park a ticket until a human
+    // acts for a transient provider outage).
+    #[test]
+    fn is_auth_recognizes_a_token_refresh_401_without_a_status_code() {
+        let f = |name: &str, msg: &str, code: i64| Failure {
+            name: name.to_string(),
+            message: msg.to_string(),
+            status_code: code,
+            retryable: false,
+        };
+        assert!(
+            f("UnknownError", "Token refresh failed: 401", 0).is_auth(),
+            "the no-statusCode refresh 401 is a credential rejection"
+        );
+        assert!(!f("UnknownError", "Token refresh failed: 500", 0).is_auth());
+        assert!(!f("UnknownError", "Token refresh failed: 503", 0).is_auth());
+        assert!(!f("UnknownError", "Token refresh failed: 429", 0).is_auth());
     }
 
     /// The committed spike captures (`harness/harness-spike/opencode/`) are this parser's
