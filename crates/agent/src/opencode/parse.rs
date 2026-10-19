@@ -57,6 +57,10 @@ pub struct Classified {
     pub failure: Option<Failure>,
     /// Scoped live delta, not part of the historical CLI transcript vocabulary.
     pub progress: bool,
+    /// The bare `step_start` the owned-server bridge writes itself, carrying only the session id,
+    /// BEFORE it posts the prompt (`super::server`). Every other line carrying a session id is
+    /// opencode reporting on that session, i.e. evidence it received the prompt (STUDIO-1374).
+    pub host_marker: bool,
 }
 
 /// An in-band `error` event. opencode is the only measured harness that hands the daemon an HTTP
@@ -180,6 +184,7 @@ pub fn classify(line: &[u8]) -> Classified {
         Err(_) => return Classified::default(),
     };
     let now = Some(Utc::now());
+    let host_marker = r.r#type == "step_start" && r.part.is_none();
     let part = r.part.unwrap_or_default();
 
     match r.r#type.as_str() {
@@ -297,6 +302,7 @@ pub fn classify(line: &[u8]) -> Classified {
         // stream, so dropping it here would delay the resume id by a whole step.
         _ => Classified {
             session_id: r.session_id,
+            host_marker,
             ..Default::default()
         },
     }
