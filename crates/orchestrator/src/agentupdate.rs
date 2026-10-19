@@ -217,13 +217,27 @@ impl Orchestrator {
         // task, so `enqueue_event` never blocks) and, on turn boundaries, write per-turn progress
         // synchronously. Both no-op when `re.run_id == 0` (store disabled). O3 advanced the monotonic
         // per-run `event_seq` and left these two store writes for O4 (`persist.rs`); they land here.
-        re.event_seq += 1;
-        let event_row = store::EventRow {
-            seq: re.event_seq,
-            at: crate::persist::rfc3339(re.last_event_at),
-            kind: crate::persist::map_kind(&e.ev),
-            tool: crate::persist::map_tool(&e.ev),
-            text: crate::persist::map_text(&e.ev),
+        //
+        // STUDIO-1375: a keepalive/progress delta carries no text, so persisting it wrote a
+        // `kind='text'` row with `text=''` — 3.65M of them in a week, 99.8% of every `text` row — and,
+        // because the console's live-log line renders the event's own message, a blank line in the
+        // log. Suppress the ROW, never the EVENT: the folding above has already advanced
+        // `last_event_at` and tracked the run's tool/session/usage state, so the liveness signal
+        // STUDIO-1208 depends on is untouched and a silent long tool wait is still not wedge-killed.
+        // `event_seq` is bumped only for a row that is actually written, so the persisted sequence
+        // stays dense.
+        let keepalive = crate::persist::is_empty_event(&e.ev);
+        let event_row = if keepalive {
+            None
+        } else {
+            re.event_seq += 1;
+            Some(store::EventRow {
+                seq: re.event_seq,
+                at: crate::persist::rfc3339(re.last_event_at),
+                kind: crate::persist::map_kind(&e.ev),
+                tool: crate::persist::map_tool(&e.ev),
+                text: crate::persist::map_text(&e.ev),
+            })
         };
         let run_id = re.run_id;
         let turn_boundary = e.ev.event_type == agent::EVENT_TURN_COMPLETED
@@ -243,7 +257,9 @@ impl Orchestrator {
             re.cur_total_tokens = 0;
         }
         // The `&mut re` borrow ends here; the `&self` store writes follow (a re-borrow for progress).
-        self.enqueue_event(run_id, event_row);
+        if let Some(event_row) = event_row {
+            self.enqueue_event(run_id, event_row);
+        }
         if turn_boundary && let Some(re) = self.running.get(&e.issue_id) {
             self.persist_progress(re);
         }
@@ -430,6 +446,85 @@ mod tests {
             );
         }
         assert_eq!(o.running["1"].recent_events.len(), MAX_RECENT_EVENTS);
+    }
+
+    // STUDIO-1375: opencode forwards one EMPTY-message notification per streaming delta
+    // (`message.part.delta` → `{"type":"progress"}`, plus its `step_finish`/`tool_use` siblings) purely
+    // as a liveness keepalive. Persisting each one wrote a `kind='text'` row with `text=''` — 3.65M of
+    // them in a week, 99.8% of every `text` row, and a blank line in the console's live log (whose
+    // record message IS the event's own message). The deltas must keep advancing the run's liveness
+    // clock — a silent long tool wait must still not be wedge-killed (STUDIO-1208) — but must leave no
+    // empty row.
+    //
+    // ⚠️ MUTATION: restoring the old persist-everything behaviour (dropping the `is_empty_event`
+    // guard in `on_agent_update`) turns this red — every delta reappears as a `text=''` row. The
+    // events are built through the REAL opencode classifier, so the test pins the source shape the
+    // harness actually emits rather than a hand-made notification that could drift from it.
+    #[test]
+    fn keepalive_deltas_advance_liveness_without_persisting_empty_rows() {
+        let (mut o, st) = orch_with_store();
+        o.start_event_writer();
+        let mut re = running_entry(issue("ID-1", "MT-1", "In Progress"), "", "");
+        o.persist_start_run(&mut re, 0);
+        let run_id = re.run_id;
+        o.running.insert("ID-1".to_string(), re);
+
+        // A pinned, strictly-advancing clock so `last_event_at` is observable across the turn.
+        let base = Utc.with_ymd_and_hms(2026, 5, 29, 12, 0, 0).unwrap();
+        let tick = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        o.now = Box::new({
+            let tick = Arc::clone(&tick);
+            move || {
+                base + chrono::Duration::seconds(
+                    tick.fetch_add(1, std::sync::atomic::Ordering::SeqCst),
+                )
+            }
+        });
+
+        // The measured opencode line shapes: `progress` (a streaming delta), `step_finish` and
+        // `tool_use` all surface as EMPTY notifications; only a completed `text` part carries prose.
+        let progress = br#"{"type":"progress","sessionID":"ses_x"}"#;
+        let step = br#"{"type":"step_finish","sessionID":"ses_x","part":{"reason":"tool-calls","tokens":{"input":10,"output":2}}}"#;
+        let tool = br#"{"type":"tool_use","sessionID":"ses_x","part":{"id":"p1","state":{"status":"running"}}}"#;
+        let text_a = br#"{"type":"text","sessionID":"ses_x","part":{"text":"first real line"}}"#;
+        let text_b = br#"{"type":"text","sessionID":"ses_x","part":{"text":"second real line"}}"#;
+
+        for _ in 0..20 {
+            update(&mut o, "ID-1", agent::opencode::classify(progress).event);
+            update(&mut o, "ID-1", agent::opencode::classify(step).event);
+        }
+        let after_first_deltas = o.running["ID-1"].last_event_at;
+        update(&mut o, "ID-1", agent::opencode::classify(text_a).event);
+        for _ in 0..20 {
+            update(&mut o, "ID-1", agent::opencode::classify(progress).event);
+            update(&mut o, "ID-1", agent::opencode::classify(tool).event);
+        }
+        update(&mut o, "ID-1", agent::opencode::classify(text_b).event);
+        o.stop_event_writer(); // closes the feed + final flush
+
+        // 1. Exactly the two real text lines were persisted, and no empty `text` row exists.
+        let events = st.run_events(run_id).expect("run events");
+        let texts: Vec<&str> = events.iter().map(|e| e.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["first real line", "second real line"],
+            "only the real text lines are history: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.kind == "text" && e.text.is_empty()),
+            "an empty `text` row was persisted: {events:?}"
+        );
+
+        // 2. The deltas still advanced the run's liveness clock (STUDIO-1208's signal), and the later
+        //    real text line advanced it further.
+        assert!(
+            after_first_deltas > base,
+            "keepalive deltas must advance last_event_at, got {after_first_deltas}"
+        );
+        assert!(
+            o.running["ID-1"].last_event_at > after_first_deltas,
+            "the real text line must still advance last_event_at"
+        );
     }
 
     // Mirrors Go `TestOnAgentUpdateTracksSessionAndTurns`.
