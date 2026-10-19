@@ -1320,14 +1320,26 @@ impl Sqlite {
     /// [`Store::get_run`] — the port of Go `queryRuns`.
     fn query_runs(&self, query: &str, args: Vec<Value>) -> Result<Vec<RunSummary>, StoreError> {
         let conn = self.lock();
-        let mut stmt = conn.prepare(query)?;
-        let rows = stmt.query_map(params_from_iter(args), map_run_summary)?;
-        let mut out = Vec::new();
-        for r in rows {
-            out.push(r?);
-        }
-        Ok(out)
+        collect_runs(&conn, query, args)
     }
+}
+
+/// Run a `RUN_COLS` projection over an already-locked connection. Split out of [`Sqlite::query_runs`]
+/// so a method that must hold the store lock across MORE than one statement —
+/// [`Store::issue_history_page`] — can run its page without re-acquiring (and re-releasing) the lock
+/// between statements.
+fn collect_runs(
+    conn: &Connection,
+    query: &str,
+    args: Vec<Value>,
+) -> Result<Vec<RunSummary>, StoreError> {
+    let mut stmt = conn.prepare(query)?;
+    let rows = stmt.query_map(params_from_iter(args), map_run_summary)?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r?);
+    }
+    Ok(out)
 }
 
 fn canonical_subject(conn: &Connection, subject: &str) -> Result<String, StoreError> {
@@ -2565,16 +2577,39 @@ impl Store for Sqlite {
         }
     }
 
-    fn issue_history_count(&self, identifier: &str, project: &str) -> Result<i64, StoreError> {
-        // The SAME predicate as `issue_history`, without the LIMIT — the ticket's true run count,
-        // which the history page reports beside its capped page (STUDIO-1376).
-        let (q, args) = if project.is_empty() {
+    fn issue_history_page(
+        &self,
+        identifier: &str,
+        project: &str,
+        limit: i64,
+    ) -> Result<IssueHistoryPage, StoreError> {
+        // The page and the ticket's TRUE run count, from ONE lock (STUDIO-1376). Read as two
+        // separate store calls, a concurrent `start_run` could land between them: the page was then
+        // the newest 50 of 60 while the count said 61, and the console's `total - index` ordinal
+        // labelled the newest shown run "attempt 61 of 61" instead of "attempt 60 of 61". Holding
+        // the single connection across both statements makes them one consistent read.
+        let limit = effective_run_limit(limit);
+        let (page_q, page_args, count_q, count_args) = if project.is_empty() {
             (
+                format!(
+                    "SELECT {RUN_COLS} FROM runs WHERE issue_identifier = ? \
+                     ORDER BY started_at DESC, id DESC LIMIT ?"
+                ),
+                vec![Value::Text(identifier.to_string()), Value::Integer(limit)],
                 "SELECT COUNT(*) FROM runs WHERE issue_identifier = ?".to_string(),
                 vec![Value::Text(identifier.to_string())],
             )
         } else {
             (
+                format!(
+                    "SELECT {RUN_COLS} FROM runs WHERE issue_identifier = ? AND project_slug = ? \
+                     ORDER BY started_at DESC, id DESC LIMIT ?"
+                ),
+                vec![
+                    Value::Text(identifier.to_string()),
+                    Value::Text(project.to_string()),
+                    Value::Integer(limit),
+                ],
                 "SELECT COUNT(*) FROM runs WHERE issue_identifier = ? AND project_slug = ?"
                     .to_string(),
                 vec![
@@ -2584,8 +2619,11 @@ impl Store for Sqlite {
             )
         };
         let conn = self.lock();
-        let count = conn.query_row(&q, params_from_iter(args), |row| row.get::<_, i64>(0))?;
-        Ok(count)
+        let runs = collect_runs(&conn, &page_q, page_args)?;
+        let total = conn.query_row(&count_q, params_from_iter(count_args), |row| {
+            row.get::<_, i64>(0)
+        })?;
+        Ok(IssueHistoryPage { runs, total })
     }
 
     fn runs_for_issues(
@@ -7280,21 +7318,33 @@ mod tests {
         let alpha = st.issue_history("MT-9", "alpha", 0).expect("history alpha");
         assert_eq!(alpha.len(), 1);
         assert_eq!(alpha[0].project_slug, "alpha");
-        // The count shares the predicate: all of MT-9, and only the alpha one when scoped.
-        assert_eq!(st.issue_history_count("MT-9", "").expect("count all"), 2);
+        // The page's total shares the predicate: all of MT-9, and only the alpha one when scoped.
         assert_eq!(
-            st.issue_history_count("MT-9", "alpha")
-                .expect("count alpha"),
+            st.issue_history_page("MT-9", "", 0)
+                .expect("page all")
+                .total,
+            2
+        );
+        assert_eq!(
+            st.issue_history_page("MT-9", "alpha", 0)
+                .expect("page alpha")
+                .total,
             1
         );
-        assert_eq!(st.issue_history_count("MT-404", "").expect("count none"), 0);
+        assert_eq!(
+            st.issue_history_page("MT-404", "", 0)
+                .expect("page none")
+                .total,
+            0
+        );
     }
 
-    // STUDIO-1376 — `issue_history_count` reports the ticket's TRUE run count even when the page
-    // is capped at the default limit, which is what stops the console reading "attempt 50 of 50" on
-    // a ticket with more runs than that.
+    // STUDIO-1376 — `issue_history_page` reports the ticket's TRUE run count beside a page capped at
+    // the default limit, which is what stops the console reading "attempt 50 of 50" on a ticket with
+    // more runs than that. The page and the total come from ONE read, so the page is always the
+    // newest window of the history the total describes.
     #[test]
-    fn issue_history_count_counts_past_the_page_limit() {
+    fn issue_history_page_reports_the_true_total_beyond_the_page_limit() {
         let st = open_mem();
         for i in 0..55 {
             let id = st
@@ -7330,12 +7380,19 @@ mod tests {
         )
         .expect("end other");
 
-        let page = st.issue_history("MT-9", "", 0).expect("history");
-        assert_eq!(page.len(), DEFAULT_RUN_LIMIT as usize, "the page is capped");
+        let page = st.issue_history_page("MT-9", "", 0).expect("page");
         assert_eq!(
-            st.issue_history_count("MT-9", "").expect("count"),
-            55,
-            "the total is not the page size"
+            page.runs.len(),
+            DEFAULT_RUN_LIMIT as usize,
+            "the page is capped"
+        );
+        assert_eq!(page.total, 55, "the total is not the page size");
+        // The page IS the newest window of the history the total describes: its first row is the
+        // ticket's newest run, so the console's `total - index` ordinal for it is the true attempt.
+        let newest = st.issue_history("MT-9", "", 1).expect("newest");
+        assert_eq!(
+            page.runs[0].id, newest[0].id,
+            "the page starts at the newest"
         );
     }
 

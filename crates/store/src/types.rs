@@ -449,6 +449,25 @@ pub struct RunSummary {
     pub team_id: String,
 }
 
+/// One ticket's run history as a single consistent read: the most-recent page of runs and the
+/// ticket's TRUE run count, taken TOGETHER (STUDIO-1376). Rhapsody-only: Go's `IssueHistory` returns
+/// the page alone and reports no total.
+///
+/// It exists as one value because the two numbers must describe the same run set. The console
+/// derives each row's attempt ordinal from `total - index`, which is only correct when `runs` is the
+/// newest window of a history of size `total`. Read as two separate store calls, a dispatch landing
+/// between them made the page the newest 50 of 60 while the total said 61, so the newest shown run
+/// was labelled "attempt 61 of 61" instead of "attempt 60 of 61". [`Store::issue_history_page`]
+/// therefore reads both under one lock.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct IssueHistoryPage {
+    /// The newest `limit` runs of the ticket, most-recent first — the same page
+    /// [`Store::issue_history`] returns.
+    pub runs: Vec<RunSummary>,
+    /// How many runs the ticket has, matching the SAME predicate and ignoring the page limit.
+    pub total: i64,
+}
+
 /// RunProvenance is what a run ACTUALLY ran on — the harness, the model and the provider — plus the
 /// origin of each configurable value, recorded at dispatch (STUDIO-909). Rhapsody-only: the frozen
 /// Go reference records none of it.

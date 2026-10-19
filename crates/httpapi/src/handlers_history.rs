@@ -12,7 +12,9 @@ use axum::http::{Method, StatusCode};
 use axum::response::Response;
 use chrono::{SecondsFormat, Utc};
 use rhapsody_orchestrator::{IssueKey, IssueLifecycleRow, review};
-use rhapsody_store::{EventQuery, OUTCOME_RUNNING, RunFilter, RunSummary, effective_run_limit};
+use rhapsody_store::{
+    EventQuery, IssueHistoryPage, OUTCOME_RUNNING, RunFilter, RunSummary, effective_run_limit,
+};
 
 use crate::handlers::{SNAPSHOT_TIMEOUT, require_get};
 use crate::responses::{write_error, write_json};
@@ -855,23 +857,17 @@ pub(crate) async fn handle_issue_history(
         Err(resp) => return *resp,
     };
     let project = qget(&q, "project");
-    let runs = match provider.history().issue_history(&id, project, limit) {
-        Ok(runs) => runs,
-        Err(_) => return store_error("issue history query failed"),
-    };
-    // The ticket's TRUE run count beside the page above (STUDIO-1376). The page is capped at the
-    // store's default when the caller sends no `limit`, so a console that took the page's length as
-    // the total read "attempt 50 of 50" on a ticket with more runs than that. Same predicate,
-    // ignoring the limit. Best-effort like the reviews beside it: a store error here logs and falls
-    // back to the page's own length — the numbering that shipped before — rather than failing a page
-    // the read above already served.
-    let total = match provider.history().issue_history_count(&id, project) {
-        Ok(total) => total,
-        Err(_) => {
-            tracing::warn!("issue history: counting the ticket's runs failed");
-            runs.len() as i64
-        }
-    };
+    // The page AND the ticket's TRUE run count, from ONE store read (STUDIO-1376). The page is
+    // capped at the store's default when the caller sends no `limit`, so a console that took the
+    // page's length as the total read "attempt 50 of 50" on a ticket with more runs than that. The
+    // two numbers must come from the same read: the console's ordinal is `total - index`, so a
+    // dispatch landing between a separate page read and count read would shift every ordinal by one
+    // — see `Store::issue_history_page`.
+    let IssueHistoryPage { runs, total } =
+        match provider.history().issue_history_page(&id, project, limit) {
+            Ok(page) => page,
+            Err(_) => return store_error("issue history query failed"),
+        };
     // The review runs credited to this ticket (STUDIO-976), so the console's attempt strip can show
     // the reviews in time order with the attempts they answered. The join is the server's existing
     // one — see `review_runs_for_ticket` — never a second client-side rule.
@@ -1475,9 +1471,10 @@ mod tests {
         EventRecord, IssueKey, IssueLifecycle, IssueLifecycleRow, Snapshot, TokenCounts, Totals,
     };
     use rhapsody_store::{
-        DEFAULT_RUN_LIMIT, EventRow, OUTCOME_COMPLETED, OUTCOME_FAILED, OUTCOME_STOPPED,
-        REVIEW_VERDICT_APPROVED, REVIEW_VERDICT_CHANGES_REQUESTED, ReviewWatchKey, ReviewWatchRow,
-        RunEnd, RunProgress, RunStart, RunSummary, Sqlite, Store, StoreError, StorePath,
+        DEFAULT_RUN_LIMIT, EventRow, IssueHistoryPage, OUTCOME_COMPLETED, OUTCOME_FAILED,
+        OUTCOME_STOPPED, REVIEW_VERDICT_APPROVED, REVIEW_VERDICT_CHANGES_REQUESTED, ReviewWatchKey,
+        ReviewWatchRow, RunEnd, RunProgress, RunStart, RunSummary, Sqlite, Store, StoreError,
+        StorePath,
     };
     use serde_json::{Value, json};
 
@@ -1719,8 +1716,13 @@ mod tests {
         ) -> Result<Vec<RunSummary>, StoreError> {
             Store::issue_history(&self.inner, identifier, project, limit)
         }
-        fn issue_history_count(&self, identifier: &str, project: &str) -> Result<i64, StoreError> {
-            Store::issue_history_count(&self.inner, identifier, project)
+        fn issue_history_page(
+            &self,
+            identifier: &str,
+            project: &str,
+            limit: i64,
+        ) -> Result<IssueHistoryPage, StoreError> {
+            Store::issue_history_page(&self.inner, identifier, project, limit)
         }
         fn runs_for_issues(
             &self,
@@ -1764,6 +1766,149 @@ mod tests {
         fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
             self.watch_reads
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Store::load_review_watch(&self.inner)
+        }
+        fn run_provenance(
+            &self,
+            run_id: i64,
+        ) -> Result<Option<rhapsody_store::RunProvenance>, StoreError> {
+            Store::run_provenance(&self.inner, run_id)
+        }
+        fn run_usage(&self, run_id: i64) -> Result<Option<rhapsody_store::RunUsage>, StoreError> {
+            Store::run_usage(&self.inner, run_id)
+        }
+        fn load_run_provenances(
+            &self,
+            run_ids: &[i64],
+        ) -> Result<std::collections::HashMap<i64, rhapsody_store::RunProvenance>, StoreError>
+        {
+            Store::load_run_provenances(&self.inner, run_ids)
+        }
+        fn load_review_verdicts(
+            &self,
+            run_ids: &[i64],
+        ) -> Result<std::collections::HashMap<i64, String>, StoreError> {
+            Store::load_review_verdicts(&self.inner, run_ids)
+        }
+        fn tokens_by_provider(
+            &self,
+            since: &str,
+        ) -> Result<Vec<rhapsody_store::ProviderTokens>, StoreError> {
+            Store::tokens_by_provider(&self.inner, since)
+        }
+        fn run_costs(&self) -> Result<Vec<rhapsody_store::RunCostBucket>, StoreError> {
+            Store::run_costs(&self.inner)
+        }
+    }
+
+    /// A [`crate::HistoryStore`] that lands ONE new run in its inner store on every history read,
+    /// standing in for the daemon's dispatcher writing a run while a request is in flight. It exists
+    /// so a test can prove the response's page and total describe the SAME run set: with the page
+    /// and the total taken as two separate reads, the injected write between them makes the page the
+    /// newest window of a SMALLER history than the total reports, and the console's `total - index`
+    /// ordinal is wrong for every row (STUDIO-1376, review finding B1). Under one read, the page
+    /// always starts at the newest run the total counts.
+    struct DispatchDuringHistory {
+        inner: Sqlite,
+        injected: std::sync::atomic::AtomicUsize,
+    }
+
+    impl DispatchDuringHistory {
+        fn new(inner: Sqlite) -> Self {
+            Self {
+                inner,
+                injected: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        /// One more completed run, timestamped AFTER every seeded one so it is the newest row.
+        fn dispatch_one(&self) {
+            let n = self
+                .injected
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            seed_run_at(
+                &self.inner,
+                "MT-1376-RACE",
+                &format!("2027-01-01T00:{:02}:00Z", n),
+            );
+        }
+    }
+
+    impl crate::HistoryStore for DispatchDuringHistory {
+        fn list_runs(&self, f: rhapsody_store::RunFilter) -> Result<Vec<RunSummary>, StoreError> {
+            Store::list_runs(&self.inner, f)
+        }
+        fn list_issue_runs(
+            &self,
+            f: rhapsody_store::RunFilter,
+        ) -> Result<Vec<RunSummary>, StoreError> {
+            Store::list_issue_runs(&self.inner, f)
+        }
+        fn day_totals(
+            &self,
+            since: &str,
+            now: &str,
+        ) -> Result<rhapsody_store::DayTotals, StoreError> {
+            Store::day_totals(&self.inner, since, now)
+        }
+        fn issue_history(
+            &self,
+            identifier: &str,
+            project: &str,
+            limit: i64,
+        ) -> Result<Vec<RunSummary>, StoreError> {
+            self.dispatch_one();
+            Store::issue_history(&self.inner, identifier, project, limit)
+        }
+        fn issue_history_page(
+            &self,
+            identifier: &str,
+            project: &str,
+            limit: i64,
+        ) -> Result<IssueHistoryPage, StoreError> {
+            self.dispatch_one();
+            Store::issue_history_page(&self.inner, identifier, project, limit)
+        }
+        fn runs_for_issues(
+            &self,
+            identifiers: &[String],
+            limit: i64,
+        ) -> Result<Vec<RunSummary>, StoreError> {
+            Store::runs_for_issues(&self.inner, identifiers, limit)
+        }
+        fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError> {
+            Store::get_run(&self.inner, run_id)
+        }
+        fn run_events(&self, run_id: i64) -> Result<Vec<EventRow>, StoreError> {
+            Store::run_events(&self.inner, run_id)
+        }
+        fn search_events(
+            &self,
+            q: rhapsody_store::EventQuery,
+        ) -> Result<Vec<rhapsody_store::EventHit>, StoreError> {
+            Store::search_events(&self.inner, q)
+        }
+        fn metrics(
+            &self,
+            since_days: i64,
+            project: &str,
+        ) -> Result<Vec<rhapsody_store::DayRollup>, StoreError> {
+            Store::metrics(&self.inner, since_days, project)
+        }
+        fn metrics_by_provider(
+            &self,
+            since_days: i64,
+            project: &str,
+        ) -> Result<Vec<rhapsody_store::DayProviderRollup>, StoreError> {
+            Store::metrics_by_provider(&self.inner, since_days, project)
+        }
+        fn list_run_messages(
+            &self,
+            run_id: i64,
+        ) -> Result<Vec<rhapsody_store::RunMessage>, StoreError> {
+            Store::list_run_messages(&self.inner, run_id)
+        }
+        fn load_review_watch(&self) -> Result<Vec<ReviewWatchRow>, StoreError> {
             Store::load_review_watch(&self.inner)
         }
         fn run_provenance(
@@ -4178,6 +4323,48 @@ mod tests {
         assert_eq!(
             body["total"], 60,
             "the total is the ticket's real run count, not the page size"
+        );
+    }
+
+    // STUDIO-1376 (review finding B1) — the page and the total must come from ONE read. Read
+    // separately, a dispatch landing between them left the page the newest 50 of 60 while the total
+    // said 61, so the console's `total - index` ordinal labelled the newest shown run "attempt 61 of
+    // 61" instead of "attempt 60 of 61". This drives a store that writes a run on every history
+    // read, standing in for that dispatch, and asserts the invariant the console relies on: the
+    // response's page starts at the newest run its total counts, so `total - index` is the true
+    // attempt number for every row.
+    #[tokio::test]
+    async fn issue_history_page_and_total_come_from_one_read() {
+        let store = mem_store();
+        for i in 0..60 {
+            seed_run_at(
+                &store,
+                "MT-1376-RACE",
+                &format!("2026-01-01T00:{:02}:00Z", i),
+            );
+        }
+        let history = Arc::new(DispatchDuringHistory::new(store));
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_history(history.clone())).await;
+
+        let (_s, body) = get_json(&format!("{base}/api/v1/issues/MT-1376-RACE/history")).await;
+
+        // The store as it stands once the response has been built: every write the request's reads
+        // triggered is in it.
+        let all = Store::issue_history(&history.inner, "MT-1376-RACE", "", 1000).expect("full");
+        assert_eq!(
+            body["runs"].as_array().expect("runs").len(),
+            50,
+            "the page is still capped at the default limit"
+        );
+        assert_eq!(
+            body["runs"][0]["id"].as_i64().expect("newest id"),
+            all[0].id,
+            "the page starts at the newest run — the ordinal `total - 0` is the true attempt"
+        );
+        assert_eq!(
+            body["total"].as_i64().expect("total"),
+            all.len() as i64,
+            "the total is the true run count of the set the page was read from"
         );
     }
 

@@ -35,9 +35,9 @@ use rhapsody_orchestrator::{
     RunMessageResult, Snapshot, StopResult,
 };
 use rhapsody_store::{
-    DayProviderRollup, DayRollup, DayTotals, EventHit, EventQuery, EventRow, ProviderTokens,
-    ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance, RunSummary, RunUsage,
-    Store, StoreError,
+    DayProviderRollup, DayRollup, DayTotals, EventHit, EventQuery, EventRow, IssueHistoryPage,
+    ProviderTokens, ReviewWatchRow, RunCostBucket, RunFilter, RunMessage, RunProvenance,
+    RunSummary, RunUsage, Store, StoreError,
 };
 
 /// Narrows the orchestrator's full [`Store`] handle to the httpapi read-only [`HistoryStore`]. The
@@ -65,8 +65,13 @@ impl HistoryStore for HistoryView {
     ) -> Result<Vec<RunSummary>, StoreError> {
         self.0.issue_history(identifier, project, limit)
     }
-    fn issue_history_count(&self, identifier: &str, project: &str) -> Result<i64, StoreError> {
-        self.0.issue_history_count(identifier, project)
+    fn issue_history_page(
+        &self,
+        identifier: &str,
+        project: &str,
+        limit: i64,
+    ) -> Result<IssueHistoryPage, StoreError> {
+        self.0.issue_history_page(identifier, project, limit)
     }
     fn runs_for_issues(
         &self,
