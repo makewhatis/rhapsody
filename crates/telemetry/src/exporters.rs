@@ -7,10 +7,19 @@
 //! exporters fill the per-signal `/v1/*` path (gRPC has no URL path), because the Rust OTLP/HTTP
 //! exporter POSTs a programmatic `with_endpoint` value verbatim — the same path-less-URL gap Go's
 //! `endpointURLForSignal` closes (a POST to `/` is a 404). Mirrors `$REF/internal/telemetry/telemetry.go`.
+//!
+//! Trust store: a secure endpoint verifies the collector against the **platform** trust store —
+//! Go's default, which uses `x509.SystemCertPool`. For gRPC that means an explicit
+//! [`ClientTlsConfig::with_native_roots`] (tonic's own default is a `ClientTlsConfig::new()` with an
+//! *empty* store, so an `https://` endpoint fails closed until it is supplied); for OTLP/HTTP it is
+//! reqwest's `native-tls` backend, enabled in `Cargo.toml`. Both read the OS roots — Security.framework
+//! on macOS, OpenSSL + system ca-certificates on Linux — so a distrust update reaches the daemon
+//! without a release (the 2026-10-17 eMudhra intermediates, STUDIO-1395/1397).
 
 use std::collections::HashMap;
 
 use opentelemetry_otlp::tonic_types::metadata::MetadataMap;
+use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
 use opentelemetry_otlp::{
     ExporterBuildError, LogExporter, MetricExporter, SpanExporter, WithExportConfig,
     WithHttpConfig, WithTonicConfig,
@@ -45,6 +54,36 @@ fn grpc_endpoint(cfg: &Config) -> String {
     }
 }
 
+/// Whether the configured endpoint speaks TLS: an explicit `https://` URL, or a bare `host:port`
+/// with `insecure` off (the scheme [`grpc_endpoint`] then prepends). An **empty** endpoint is left
+/// to the SDK (which reads `OTEL_*` env) and reported as not-secure: we cannot see that scheme, and
+/// eagerly loading a trust store for a possibly-plaintext endpoint would change `http://` behavior.
+/// Mirrors Go, where TLS is the default unless `WithInsecure` was applied.
+fn endpoint_is_secure(cfg: &Config) -> bool {
+    if endpoint_is_url(&cfg.endpoint) {
+        cfg.endpoint.starts_with("https://")
+    } else if cfg.endpoint.is_empty() {
+        false
+    } else {
+        !cfg.insecure
+    }
+}
+
+/// The tonic TLS config for a secure endpoint, or `None` for a plaintext one.
+///
+/// tonic's OTLP exporter defaults to a bare `ClientTlsConfig::new()`, whose trust store is **empty**
+/// — an `https://` endpoint then fails the handshake with an unknown-CA error and the bundled roots
+/// are never consulted. Supplying [`ClientTlsConfig::with_native_roots`] loads the platform store
+/// instead (Go's `x509.SystemCertPool` default). Applying it is also what makes the roots load, so
+/// removing this call is exactly the mutation that reds the gRPC TLS test.
+///
+/// It is applied only for a secure endpoint: `ClientTlsConfig` loads the roots eagerly when the
+/// connector is built, so passing it for a plaintext endpoint would make an `http://` exporter fail
+/// to build on a host with no cert store — and `http://`/`otel.insecure` must keep working unchanged.
+fn tonic_tls_config(cfg: &Config) -> Option<ClientTlsConfig> {
+    endpoint_is_secure(cfg).then(|| ClientTlsConfig::new().with_native_roots())
+}
+
 /// Best-effort gRPC metadata from the header map (invalid keys/values are skipped, never panic).
 /// Mirrors Go's OTLP `WithHeaders` on the gRPC exporters.
 fn to_metadata(headers: &HashMap<String, String>) -> MetadataMap {
@@ -77,6 +116,9 @@ pub fn new_trace_exporter(cfg: &Config) -> Result<SpanExporter, ExporterBuildErr
         if !cfg.endpoint.is_empty() {
             b = b.with_endpoint(grpc_endpoint(cfg));
         }
+        if let Some(tls) = tonic_tls_config(cfg) {
+            b = b.with_tls_config(tls);
+        }
         if !cfg.headers.is_empty() {
             b = b.with_metadata(to_metadata(&cfg.headers));
         }
@@ -100,6 +142,9 @@ pub fn new_metric_exporter(cfg: &Config) -> Result<MetricExporter, ExporterBuild
         if !cfg.endpoint.is_empty() {
             b = b.with_endpoint(grpc_endpoint(cfg));
         }
+        if let Some(tls) = tonic_tls_config(cfg) {
+            b = b.with_tls_config(tls);
+        }
         if !cfg.headers.is_empty() {
             b = b.with_metadata(to_metadata(&cfg.headers));
         }
@@ -122,6 +167,9 @@ pub fn new_log_exporter(cfg: &Config) -> Result<LogExporter, ExporterBuildError>
         let mut b = LogExporter::builder().with_tonic();
         if !cfg.endpoint.is_empty() {
             b = b.with_endpoint(grpc_endpoint(cfg));
+        }
+        if let Some(tls) = tonic_tls_config(cfg) {
+            b = b.with_tls_config(tls);
         }
         if !cfg.headers.is_empty() {
             b = b.with_metadata(to_metadata(&cfg.headers));

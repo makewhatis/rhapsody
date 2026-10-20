@@ -10,10 +10,19 @@ repository.workspace = true
 # OTLP exporters (traces/metrics/logs). `init` wires providers from the `otel:` config block.
 opentelemetry = { version = "0.32", features = ["trace", "metrics", "logs"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace", "metrics", "logs"] }
-# tls-ring + tls-webpki-roots give the gRPC (tonic) exporter a rustls provider + bundled cert roots
-# so a secure (`https://`) gRPC endpoint verifies TLS — Go's default (non-`WithInsecure`) transport.
-# Bundled roots (no system cert dep) keep the daemon portable across hosts.
-opentelemetry-otlp = { version = "0.32", features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client", "tls-ring", "tls-webpki-roots"] }
+# tls-ring + tls-roots give the gRPC (tonic) exporter a rustls provider and the *platform* trust
+# store (rustls-native-certs: Security.framework on macOS, OpenSSL + system ca-certificates on
+# Linux) — Go's default (non-`WithInsecure`) transport, which uses the OS cert pool. Native roots
+# rather than the bundled `tls-webpki-roots`: the OS store receives distrust updates (as it did for
+# the 2026-10-17 eMudhra intermediates) without a daemon release. See `exporters.rs`'s
+# `tonic_tls_config`, which is what actually turns the roots on — tonic's own default is an *empty*
+# trust store, so a secure endpoint fails closed without it.
+opentelemetry-otlp = { version = "0.32", features = ["trace", "metrics", "logs", "grpc-tonic", "http-proto", "reqwest-blocking-client", "tls-ring", "tls-roots"] }
+# reqwest (0.13 — the version opentelemetry-otlp's blocking HTTP client is built from): enabling its
+# `native-tls` backend is what lets an `https://` OTLP/HTTP endpoint verify against the platform
+# trust store, the same roots every other daemon HTTPS client uses. Feature-unified onto
+# opentelemetry-otlp's own reqwest dependency, so no second copy of the crate enters the build.
+reqwest = { version = "0.13", default-features = false, features = ["native-tls"] }
 # tracing bridge: the daemon records spans/logs via `tracing`; `tracing-opentelemetry` fans spans to
 # the OTLP trace provider (Go's `otelslog` + `otel.SetTracerProvider`).
 tracing = "0.1"
@@ -49,6 +58,21 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", 
 # testing: the `InMemoryMetricExporter` the metrics tests collect through (Go's ManualReader
 # analogue). A dev-only feature so it never enters the production lib.
 opentelemetry_sdk = { version = "0.32", features = ["testing"] }
+# The `tests/tls_native_roots.rs` harness stands up real local TLS servers (gRPC + HTTP) with a
+# throwaway CA so it can prove the exporters actually verify against the platform trust store:
+#   - rcgen mints the test CA + server certificate (dev-only; never linked into the daemon).
+#   - tonic (server + tls-ring) is the gRPC server, mirroring opentelemetry-otlp's own smoke test.
+#   - opentelemetry-proto's generated `TraceService` is the mock gRPC service the exporter calls.
+#   - native-tls is the HTTP server's TLS acceptor (the same OpenSSL the OTLP/HTTP client uses on
+#     Linux, so the test exercises one TLS stack end to end).
+# Every crate here is already in the workspace lock except rcgen (a small cert-minting crate).
+rcgen = "0.13"
+tonic = { version = "0.14", features = ["server", "transport", "tls-ring"] }
+opentelemetry-proto = { version = "0.32", default-features = false, features = ["gen-tonic", "trace"] }
+native-tls = "0.2"
+# tokio-stream: `TcpListenerStream` feeds the tonic test server's `serve_with_incoming`, so the test
+# can bind port 0 and learn the assigned port (already in the workspace lock).
+tokio-stream = { version = "0.1", features = ["net"] }
 
 [lints]
 workspace = true
