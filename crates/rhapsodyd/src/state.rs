@@ -354,6 +354,10 @@ impl StateProvider for DaemonState {
         self.handle.send_run_message(run_id, text).await
     }
 
+    async fn send_agent_run_message(&self, run_id: i64, text: &str) -> RunMessageResult {
+        self.handle.send_agent_run_message(run_id, text).await
+    }
+
     async fn resume_hold(
         &self,
         run_id: i64,
@@ -799,6 +803,113 @@ mod tests {
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.set_store(store);
         DaemonState::new(o.control())
+    }
+
+    // Real HTTP -> DaemonState -> control event -> durable queue -> harness prompt. In particular,
+    // a wiring mistake that delegates agent messages to send_run_message must turn this red.
+    #[tokio::test]
+    async fn http_message_origin_survives_into_the_harness_prompt() {
+        use rhapsody_agent::{Steering, fake};
+        use rhapsody_orchestrator::{CancelSignal, effective::build_effective_with_runner};
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        for agent_origin in [true, false] {
+            let dir = crate::testutil::TempDir::new();
+            let release = dir.child("release-worker");
+            let definition = rhapsody_config::workflow::parse(&format!(
+                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: synthetic\n  project_slug: test\nworkspace:\n  root: {}\nlogging:\n  dir: {}\nstorage:\n  path: ':memory:'\nagent:\n  max_turns: 1\nhooks:\n  timeout_ms: 5000\n  before_run: 'while [ ! -f \"{}\" ]; do sleep 0.01; done'\n---\nWork the ticket.\n",
+                dir.child("ws").display(), dir.child("logs").display(), release.display()
+            )).unwrap();
+            let cfg = rhapsody_config::decode(&definition).unwrap();
+            let mut runner = fake::Fake::new();
+            runner.capabilities.steering = Steering::BetweenTurns;
+            let runner = Arc::new(runner);
+            let mut effective = build_effective_with_runner(&cfg, &|_| runner.clone()).unwrap();
+            let issue = rhapsody_core::Issue {
+                id: "id".into(),
+                identifier: "TEST-1".into(),
+                state: "In Progress".into(),
+                ..Default::default()
+            };
+            let mut tracker = rhapsody_tracker::fake::Fake::new();
+            tracker.candidates = vec![issue.clone()];
+            tracker.by_id.insert(issue.id.clone(), issue.clone());
+            effective.tracker = Arc::new(tracker);
+            effective.projects.clear();
+            let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+            let mut o = Orchestrator::new(dir.child("WORKFLOW.md").to_string_lossy());
+            o.set_store(store.clone());
+            o.eff = Some(effective);
+            assert!(
+                o.dispatch_issue_with_engine(
+                    issue,
+                    None,
+                    None,
+                    String::new(),
+                    rhapsody_orchestrator::dispatch::DispatchEngine {
+                        index: 0,
+                        spec: rhapsody_config::profiles::EngineSpec {
+                            harness: "claude".into(),
+                            ..Default::default()
+                        },
+                        handoff_note: None,
+                    }
+                )
+                .unwrap()
+            );
+            let run = o.running.get_mut("id").unwrap();
+            run.identity = "sam".into();
+            let run_id = run.run_id;
+            // The worker owns its snapshotted dependencies; disable unrelated polling in this test.
+            o.eff = None;
+            let server = rhapsody_httpapi::Server::bind(
+                Arc::new(DaemonState::new(o.control())),
+                None,
+                "127.0.0.1:0",
+            )
+            .await
+            .unwrap();
+            let address = server.local_addr().unwrap();
+            let http = tokio::spawn(server.serve());
+            let cancel = CancelSignal::new();
+            o.set_ctx(cancel.wait());
+            let (_, result) = tokio::join!(o.run_loaded(cancel.wait()), async {
+                let result = tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+                    let marker = if agent_origin { format!("X-Rhapsody-Agent-Run-Id: {run_id}\r\n") } else { String::new() };
+                    let body = r#"{"text":"status update"}"#;
+                    socket.write_all(format!(
+                        "POST /api/v1/runs/{run_id}/message HTTP/1.1\r\nHost: {address}\r\nX-Rhapsody-Operator: 1\r\n{marker}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                    ).as_bytes()).await.unwrap();
+                    let mut response = String::new();
+                    socket.read_to_string(&mut response).await.unwrap();
+                    std::fs::write(&release, "ready").unwrap();
+                    while runner.last_prompt().is_empty() {
+                        tokio::time::sleep(Duration::from_millis(5)).await;
+                    }
+                    (response, runner.last_prompt())
+                }).await;
+                cancel.cancel();
+                result
+            });
+            http.abort();
+            let _ = http.await;
+            let (response, prompt) = result.expect("message/prompt deadline");
+            assert!(response.starts_with("HTTP/1.1 202"), "{response}");
+            assert!(prompt.contains("status update"), "{prompt}");
+            if agent_origin {
+                assert!(
+                    prompt.starts_with(&format!("AGENT MESSAGE from sam (run {run_id})")),
+                    "{prompt}"
+                );
+                assert!(prompt.contains("not operator instructions"));
+                assert!(!prompt.contains("OPERATOR MESSAGE"));
+            } else {
+                assert!(prompt.starts_with("OPERATOR MESSAGE (from a human operator monitoring this run — treat as updated instructions from the ticket owner, superseding conflicting earlier guidance): status update"), "{prompt}");
+                assert!(!prompt.contains("AGENT MESSAGE"));
+            }
+        }
     }
 
     // workflow_path threads through the handle.

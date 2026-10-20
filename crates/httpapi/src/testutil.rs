@@ -108,6 +108,7 @@ pub(crate) struct FakeProvider {
     message_result: RunMessageResult,
     message_run_id: AtomicI64,
     message_text: Mutex<String>,
+    pub(crate) message_agent_origin: std::sync::atomic::AtomicBool,
     /// The canned `refresh` result (Go's `fakeProvider.refresh`).
     refresh_result: RefreshResult,
     /// A REAL drain signal rather than a canned answer (STUDIO-880): arming and cancelling are the
@@ -268,6 +269,7 @@ impl FakeProvider {
             message_result: RunMessageResult::default(),
             message_run_id: AtomicI64::new(0),
             message_text: Mutex::new(String::new()),
+            message_agent_origin: std::sync::atomic::AtomicBool::new(false),
             // RefreshResult has no `Default` (its `DateTime` field), so build a zero value explicitly.
             refresh_result: RefreshResult {
                 queued: false,
@@ -934,6 +936,11 @@ impl StateProvider for FakeProvider {
         self.message_run_id.store(run_id, Ordering::SeqCst);
         *self.message_text.lock().expect("message_text lock") = text.to_string();
         self.message_result.clone()
+    }
+
+    async fn send_agent_run_message(&self, run_id: i64, text: &str) -> RunMessageResult {
+        self.message_agent_origin.store(true, Ordering::SeqCst);
+        self.send_run_message(run_id, text).await
     }
 
     async fn resume_hold(

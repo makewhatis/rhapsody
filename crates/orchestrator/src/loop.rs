@@ -353,6 +353,7 @@ pub enum Event {
     RunMessage {
         run_id: i64,
         text: String,
+        agent_origin: bool,
         reply: oneshot::Sender<RunMessageResult>,
     },
     /// Resolve a live run's issue/team + configured review state on the loop, replying with the handoff
@@ -953,9 +954,15 @@ impl Orchestrator {
             Event::RunMessage {
                 run_id,
                 text,
+                agent_origin,
                 reply,
             } => {
-                let _ = reply.send(self.handle_run_message(run_id, &text));
+                let result = if agent_origin {
+                    self.handle_agent_run_message(run_id, &text)
+                } else {
+                    self.handle_run_message(run_id, &text)
+                };
+                let _ = reply.send(result);
             }
             Event::HandoffRun { run_id, reply } => {
                 let _ = reply.send(self.handle_handoff_run(run_id));
@@ -2464,10 +2471,25 @@ impl ControlHandle {
     /// so admission stays loop-confined (Go `SendRunMessage`). Backs the P6 `POST /api/v1/runs/:id/message`
     /// surface. Returns `not_running` if the loop is gone or the reply is dropped.
     pub async fn send_run_message(&self, run_id: i64, text: &str) -> RunMessageResult {
+        self.send_run_message_origin(run_id, text, false).await
+    }
+
+    /// Queue an agent-attributed self-message, never an operator answer (STUDIO-1414).
+    pub async fn send_agent_run_message(&self, run_id: i64, text: &str) -> RunMessageResult {
+        self.send_run_message_origin(run_id, text, true).await
+    }
+
+    async fn send_run_message_origin(
+        &self,
+        run_id: i64,
+        text: &str,
+        agent_origin: bool,
+    ) -> RunMessageResult {
         let (tx, rx) = oneshot::channel();
         let ev = Event::RunMessage {
             run_id,
             text: text.to_string(),
+            agent_origin,
             reply: tx,
         };
         if self.events.send(ev).is_err() {

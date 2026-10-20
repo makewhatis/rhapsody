@@ -136,7 +136,7 @@ impl Client {
         path: &str,
         body: Option<Vec<u8>>,
     ) -> Result<Vec<u8>, FacadeError> {
-        self.do_request_timeout(method, path, body, HTTP_TIMEOUT, false)
+        self.do_request_timeout(method, path, body, HTTP_TIMEOUT, false, None)
             .await
     }
 
@@ -147,6 +147,7 @@ impl Client {
         body: Option<Vec<u8>>,
         timeout: Duration,
         operator_read: bool,
+        agent_run_id: Option<&str>,
     ) -> Result<Vec<u8>, FacadeError> {
         let base = self.base.as_deref().ok_or_else(|| {
             unreachable(
@@ -164,6 +165,10 @@ impl Client {
         let mut req = http.request(method.clone(), &url).timeout(timeout);
         if method != reqwest::Method::GET || operator_read {
             req = req.header(OPERATOR_HEADER, OPERATOR_HEADER_VALUE);
+        }
+        // Attribution only, not authentication: same-user local processes can forge this marker.
+        if let Some(run_id) = agent_run_id {
+            req = req.header("X-Rhapsody-Agent-Run-Id", run_id);
         }
         let body = if method == reqwest::Method::GET {
             body
@@ -214,7 +219,7 @@ impl Client {
     /// Sensitive manager evidence GETs prove browser-origin safety using the operator header.
     /// No body or mutation is sent. Ordinary GETs retain the Go facade's header contract.
     pub(crate) async fn get_operator(&self, path: &str) -> Result<Vec<u8>, FacadeError> {
-        self.do_request_timeout(reqwest::Method::GET, path, None, HTTP_TIMEOUT, true)
+        self.do_request_timeout(reqwest::Method::GET, path, None, HTTP_TIMEOUT, true, None)
             .await
     }
 
@@ -243,6 +248,7 @@ impl Client {
             Some(payload),
             Duration::from_secs(1320),
             false,
+            None,
         )
         .await
     }
@@ -290,15 +296,37 @@ impl Client {
         run_id: &str,
         text: &str,
     ) -> Result<Vec<u8>, FacadeError> {
+        self.post_message_origin(run_id, text, None).await
+    }
+
+    /// Worker self-message, marked so it can never take the human-operator delivery path.
+    /// The daemon resolves the identity from this live run rather than trusting model input.
+    pub(crate) async fn post_agent_message(
+        &self,
+        run_id: &str,
+        text: &str,
+    ) -> Result<Vec<u8>, FacadeError> {
+        self.post_message_origin(run_id, text, Some(run_id)).await
+    }
+
+    async fn post_message_origin(
+        &self,
+        run_id: &str,
+        text: &str,
+        agent_run_id: Option<&str>,
+    ) -> Result<Vec<u8>, FacadeError> {
         let payload = serde_json::to_vec(&MessageBody { text })
             .map_err(|e| FacadeError::new("encode_error", e.to_string()))?;
-        self.do_request(
+        self.do_request_timeout(
             reqwest::Method::POST,
             &format!(
                 "/api/v1/runs/{}/message",
                 crate::server::path_escape(run_id)
             ),
             Some(payload),
+            HTTP_TIMEOUT,
+            false,
+            agent_run_id,
         )
         .await
     }

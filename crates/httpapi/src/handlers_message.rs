@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use axum::body::Bytes;
 use axum::extract::{Path, State};
-use axum::http::{Method, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::Response;
 use rhapsody_store::{RUN_MESSAGE_QUEUED_NEXT_TURN, RUN_MESSAGE_SENT, RunMessage};
 use serde::Deserialize;
@@ -38,6 +38,7 @@ pub(crate) async fn handle_run_message(
     method: Method,
     Path(id): Path<String>,
     State(provider): State<Arc<dyn StateProvider>>,
+    headers: HeaderMap,
     body: Bytes,
 ) -> Response {
     if let Some(resp) = require_post(&method, "use POST to message a run") {
@@ -72,7 +73,27 @@ pub(crate) async fn handle_run_message(
             None,
         );
     }
-    let res = provider.send_run_message(run_id, text).await;
+    // A malformed or foreign agent marker must fail closed, never become a human message.
+    // This is attribution, not authentication against same-user local processes.
+    let marker = "x-rhapsody-agent-run-id";
+    let res = if headers.contains_key(marker) {
+        let mut values = headers.get_all(marker).iter();
+        let caller = values
+            .next()
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<i64>().ok());
+        if caller != Some(run_id) || values.next().is_some() {
+            return write_error(
+                StatusCode::FORBIDDEN,
+                "message_run_forbidden",
+                "agent messages must name only their own run",
+                None,
+            );
+        }
+        provider.send_agent_run_message(run_id, text).await
+    } else {
+        provider.send_run_message(run_id, text).await
+    };
     if res.not_running {
         return write_error(
             StatusCode::CONFLICT,
@@ -189,6 +210,55 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn message_origin_marker_routes_agents_and_refuses_invalid_markers_before_admission() {
+        use std::sync::atomic::Ordering;
+        for marker in [
+            None,
+            Some("7"),
+            Some("8"),
+            Some(""),
+            Some("invalid"),
+            Some("0"),
+        ] {
+            let provider = Arc::new(FakeProvider::ok(empty_snapshot()));
+            let base = spawn(provider.clone()).await;
+            let mut request = crate::testutil::operator_client()
+                .post(format!("{base}/api/v1/runs/7/message"))
+                .header("content-type", "application/json")
+                .body(r#"{"text":"status update"}"#);
+            if let Some(marker) = marker {
+                request = request.header("X-Rhapsody-Agent-Run-Id", marker);
+            }
+            let response = request.send().await.unwrap();
+            if marker.is_none() || marker == Some("7") {
+                assert_eq!(response.status(), 202);
+                assert_eq!(provider.message_run_id(), 7);
+                assert_eq!(
+                    provider.message_agent_origin.load(Ordering::SeqCst),
+                    marker.is_some()
+                );
+            } else {
+                assert_eq!(response.status(), 403);
+                assert_eq!(err_code(response).await, "message_run_forbidden");
+                assert_eq!(provider.message_run_id(), 0, "must not admit any message");
+            }
+        }
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()));
+        let base = spawn(provider.clone()).await;
+        let response = crate::testutil::operator_client()
+            .post(format!("{base}/api/v1/runs/7/message"))
+            .header("content-type", "application/json")
+            .header("X-Rhapsody-Agent-Run-Id", "7")
+            .header("X-Rhapsody-Agent-Run-Id", "7")
+            .body(r#"{"text":"duplicate marker"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 403);
+        assert_eq!(provider.message_run_id(), 0);
     }
 
     // Mirrors Go `TestHandleRunMessage_PostAccepted`: 202, the body echoes id/identifier/status:sent,

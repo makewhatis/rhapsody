@@ -262,6 +262,10 @@ pub trait StateProvider: Send + Sync {
     /// O6 `ControlHandle::send_run_message` surface this forwards to.
     async fn send_run_message(&self, run_id: i64, text: &str) -> RunMessageResult;
 
+    /// Agent-attributed self-message (STUDIO-1414). Resolve identity from the live run and never
+    /// use the operator banner or operator-only subject-release behavior.
+    async fn send_agent_run_message(&self, run_id: i64, text: &str) -> RunMessageResult;
+
     /// The operator's "Human step done → resume" action (STUDIO-1053; Rhapsody-only, no Go v0.4.0
     /// counterpart): remove `rhapsody:human` through the tracker, record the operator's note where
     /// the next run is guaranteed to read it, and requeue the ticket.
