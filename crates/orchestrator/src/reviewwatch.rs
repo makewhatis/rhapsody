@@ -2653,6 +2653,11 @@ impl Orchestrator {
         }
         // And what was announced about its auto-merge plan, for the first two of those reasons.
         self.auto_merge_announced.remove(&churn_key(pr));
+        // And its once-per-head park refusal (STUDIO-1441), for the same two reasons: a
+        // re-introduced pull request must be able to say why it is parked afresh, and an entry for a
+        // gone one would be a set that only ever grows.
+        self.parked_merge_refusals
+            .retain(|(parked, _)| parked != pr);
         // And its conflict route-back record (STUDIO-961): a retired pull request has no ticket to
         // route back, and leaving the entry would keep the reconciliation sweep silent about a
         // coordinate that is watched again later.
@@ -3071,6 +3076,9 @@ impl Orchestrator {
             draft,
         } = observed;
         if self.subject_parked(&pr.to_string(), "review") {
+            // STUDIO-1441: this is the one gate that can refuse a pull request every reviewer
+            // approved without saying so. Say so — once per head — before returning.
+            self.note_parked_merge_refusal(rows, pr, head);
             report.deferred += 1;
             return;
         }
@@ -4249,6 +4257,51 @@ impl Orchestrator {
                 tracing::debug!(pr = %pr, head, reason = why.why(), "auto-merge: not merging")
             }
         }
+    }
+
+    /// Logs, once per head, that an APPROVED pull request is not being offered to auto-merge because
+    /// its origin subject is PARKED for a human (STUDIO-1441).
+    ///
+    /// The park gate is `service_review_pr`'s first early return, and it is the only one that can
+    /// refuse a pull request every reviewer approved without emitting any auto-merge line at all:
+    /// it returns before the watch rows are even gathered, so `propose_auto_merge` — whose every
+    /// refusal logs — never runs. In booch#641 a lead escalation hold landed at 09:39:22 and the
+    /// pull request was approved three minutes later; for the next 1.5h the daemon re-evaluated it
+    /// every 22s and said nothing, at any level, about why the merge never happened. The park is
+    /// correct — an escalation is a deliberate human hold, and the daemon must not merge past it —
+    /// so the fix is to SAY so rather than to relax the gate.
+    ///
+    /// Quiet unless there is something to explain: only a pull request whose live rows all approve
+    /// `head` (`auto_merge_verdict_with_proof` is `Ok`) on a repo whose auto-merge is on reaches the
+    /// line. A parked pull request still under review says nothing here — its own round is what is
+    /// owed, and that is not this gate's doing. The once-per-head guard is
+    /// [`parked_merge_refusals`](Orchestrator::parked_merge_refusals), dropped with the pull request
+    /// when it leaves the watch set.
+    ///
+    /// MUTATION: drop the call from the park branch in `service_review_pr` and
+    /// `a_parked_approved_pull_request_logs_why_auto_merge_did_not_run` reds (no line is emitted).
+    fn note_parked_merge_refusal(&mut self, rows: &[ReviewWatchRow], pr: &PrCoord, head: &str) {
+        if head.is_empty() {
+            return; // an answer with no head is not an answer about a head
+        }
+        if !self.review_auto_merge_for_repo(&pr.owner, &pr.repo) {
+            return; // opt-in, and off by default — nothing would have merged anyway
+        }
+        let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
+        if crate::automerge::auto_merge_verdict_with_proof(&mine, head, &[head]).is_err() {
+            return; // not an approved head, so auto-merge owes this pull request no answer
+        }
+        if !self
+            .parked_merge_refusals
+            .insert((pr.clone(), head.to_string()))
+        {
+            return; // the same sentence about the same commit has already been said
+        }
+        tracing::info!(
+            pr = %pr, head,
+            "auto-merge: every reviewer approved this head, but the pull request's origin subject \
+             is parked for a human; not merging"
+        );
     }
 
     /// Whether announcing this auto-merge plan says anything that has not been said, remembering
@@ -8435,6 +8488,125 @@ mod tests {
         assert!(refusals.iter().all(|event| event.level == "INFO"));
         assert_eq!(refusals[0].fields["head"], HEAD_A);
         assert_eq!(refusals[1].fields["head"], HEAD_B);
+    }
+
+    /// STUDIO-1441: the PARK gate is the one early return in `service_review_pr` that can refuse a
+    /// pull request every reviewer approved without emitting any auto-merge line at all — it
+    /// returns before the watch rows are gathered, so `propose_auto_merge`, whose every refusal
+    /// logs, never runs. In booch#641 a lead escalation hold landed at 09:39:22 and alice's approval
+    /// three minutes later; the daemon re-evaluated the head every 22s for 1.5h and said nothing, at
+    /// any level. The park is CORRECT (an escalation is a deliberate human hold), so the fix is to
+    /// say why the approved head is not offered for merge.
+    ///
+    /// The row's origin is `handoff:STUDIO-721`, so parking `STUDIO-721` is the state booch#641 was
+    /// in. The watcher re-evaluates the same head every tick and the line is deduped per head — see
+    /// [`parked_refusal_logs_info_once_per_pr_head`] for the head half.
+    ///
+    /// MUTATION: drop the `note_parked_merge_refusal` call from `service_review_pr`'s park branch
+    /// and no line is emitted, so this reds.
+    #[test]
+    fn a_parked_approved_pull_request_logs_why_auto_merge_did_not_run() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, approved_row(64, "bob", HEAD_A)); // origin: `handoff:STUDIO-721`
+        o.store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "STUDIO-721".into(),
+                kind: "escalation".into(),
+                need: "fresh subject could not be confirmed; operator must inspect".into(),
+                ..Default::default()
+            })
+            .expect("park the subject");
+
+        let (reports, events) = capture_events(|| {
+            [
+                o.handle_review_sweep(&[open_at(64, HEAD_A)]),
+                o.handle_review_sweep(&[open_at(64, HEAD_A)]),
+                o.handle_review_sweep(&[open_at(64, HEAD_A)]),
+            ]
+        });
+
+        assert!(
+            reports.iter().all(|r| r.merge.is_empty()),
+            "a parked subject must not merge: {reports:?}"
+        );
+        assert!(
+            reports.iter().all(|r| r.deferred == 1),
+            "the park defers the pull request, as it always did: {reports:?}"
+        );
+        let lines: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("origin subject is parked for a human"))
+            .collect();
+        assert_eq!(
+            lines.len(),
+            1,
+            "three ticks at one head are one line, not three: {lines:?}"
+        );
+        assert!(
+            lines.iter().all(|event| event.level == "INFO"),
+            "the refusal must be visible in the default log: {lines:?}"
+        );
+        assert_eq!(lines[0].fields["head"], HEAD_A);
+    }
+
+    /// STUDIO-1441, the head half of the guard: a refusal is news once per HEAD, so a second head
+    /// the reviewers approve afresh is logged again. Driven through the decision itself rather than
+    /// the sweep because a head MOVE releases the park
+    /// ([`Orchestrator::observe_parked_head`]) before the park gate is ever reached — which is why
+    /// the same line cannot be re-emitted for one park episode by ticking.
+    ///
+    /// MUTATION: key `parked_merge_refusals` by the coordinate alone and the second head's lines
+    /// never appear, so this reds.
+    #[test]
+    fn parked_refusal_logs_info_once_per_pr_head() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        let rows_at_a = vec![approved_row(64, "bob", HEAD_A)];
+        let rows_at_b = vec![approved_row(64, "bob", HEAD_B)];
+        let (_, events) = capture_events(|| {
+            for (rows, head) in [
+                (&rows_at_a, HEAD_A),
+                (&rows_at_a, HEAD_A),
+                (&rows_at_b, HEAD_B),
+                (&rows_at_b, HEAD_B),
+            ] {
+                o.note_parked_merge_refusal(rows, &coord(64), head);
+            }
+        });
+        let lines: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.contains("origin subject is parked for a human"))
+            .collect();
+        assert_eq!(lines.len(), 2, "once per head: {lines:?}");
+        assert!(lines.iter().all(|event| event.level == "INFO"));
+        assert_eq!(lines[0].fields["head"], HEAD_A);
+        assert_eq!(lines[1].fields["head"], HEAD_B);
+    }
+
+    /// The other half of STUDIO-1441's guard: a PARKED pull request that is NOT approved says
+    /// nothing about auto-merge. Its round is what is owed, and that is the review loop's business,
+    /// not the park gate's — the line would be a false claim that auto-merge was held back by the
+    /// park rather than by the missing verdict.
+    #[test]
+    fn a_parked_pull_request_still_under_review_says_nothing_about_auto_merge() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        introduce(&o, row(64, "bob")); // requested, not approved
+        o.store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "STUDIO-721".into(),
+                kind: "escalation".into(),
+                ..Default::default()
+            })
+            .expect("park the subject");
+
+        let (report, events) = capture_events(|| o.handle_review_sweep(&[open_at(64, HEAD_A)]));
+
+        assert!(report.merge.is_empty());
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.message.contains("origin subject is parked for a human")),
+            "an unapproved pull request is not held back by the park: {events:?}"
+        );
     }
 
     #[test]
