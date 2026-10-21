@@ -1598,8 +1598,8 @@ mod tests {
     /// but the pull request converged, so no `rhapsody:human` label is written (STUDIO-1440).
     ///
     /// Mutation: drop the `!approved_at_head` guard and the crossing applies the hold.
-    #[test]
-    fn an_approval_at_head_suppresses_the_rounds_hold() {
+    #[tokio::test]
+    async fn an_approval_at_head_suppresses_the_rounds_hold() {
         let store = store();
         seed_watch_status(&store, "STUDIO-988", REVIEW_STATUS_APPROVED);
         for r in ["alice", "bob", "carol", "dan", "erin"] {
@@ -1623,6 +1623,24 @@ mod tests {
         assert!(
             rx.try_recv().is_err(),
             "a converged pull request must not be held"
+        );
+        // And no actual label write, the way the acceptance states it: drive anything the pass
+        // queued through the real hold sink.
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let hold_tracker = tracker.clone();
+        let deps = BreakerDeps {
+            hold: Some(Arc::new(TrackerHoldSink::new(move || {
+                Some(hold_tracker.clone() as Arc<dyn Tracker>)
+            }))),
+            room: None,
+            channels: Vec::new(),
+        };
+        while let Ok(plan) = rx.try_recv() {
+            perform_crossing(&plan, &deps, Utc::now()).await;
+        }
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "an approval at the current head must write no rhapsody:human label"
         );
         assert!(
             store
