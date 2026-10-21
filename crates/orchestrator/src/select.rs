@@ -2626,7 +2626,8 @@ mod tests {
     /// ticket sat for fourteen minutes while the global pool had a free slot.
     ///
     /// MUTATION: delete the `log_project_budget_hold` call from the multi active ladder and the
-    /// `.find(..)` below has nothing to return — the test reds.
+    /// `.find(..)` below has nothing to return — the test reds; so does downgrading it to `debug!`,
+    /// because the `.find` requires the INFO level the ticket asked for.
     #[test]
     fn a_project_at_its_cap_logs_the_refusal_with_its_review_split() {
         let running = HashMap::from([("rev-1".to_string(), review_run_in_group("rev-1", "a"))]);
@@ -2638,8 +2639,8 @@ mod tests {
         assert!(picked.is_empty(), "project cap 1, one review running");
         let ev = events
             .iter()
-            .find(|e| e.message == PROJECT_CAP_SKIP)
-            .expect("a project-budget line");
+            .find(|e| e.level == "INFO" && e.message == PROJECT_CAP_SKIP)
+            .expect("an INFO project-budget line");
         assert_eq!(
             ev.fields.get("project_group").map(String::as_str),
             Some("a")
@@ -2666,8 +2667,13 @@ mod tests {
 
     /// The same refusal on the REOPEN ladder (`select.rs`'s `ensure_project_budget` call in the
     /// review-state branch) — two ladders, two call sites, or the line is silently absent for one.
+    /// The full payload is asserted here too (running/cap/review split), so a wrong argument at this
+    /// call site — e.g. a cap that is not the project's — reds rather than passing on the message
+    /// alone.
     ///
-    /// MUTATION: delete the `note_project_hold` from the multi reopen branch and this reds.
+    /// MUTATION: delete the `note_project_hold` from the multi reopen branch and this reds; so does
+    /// downgrading `log_project_budget_hold` to `debug!` (the level filter), or logging a cap other
+    /// than `p.max_concurrent` (the `max_concurrent` assertion).
     #[test]
     fn the_reopen_ladder_logs_a_project_at_its_cap() {
         let mut projects = vec![proj("a", 1, HashMap::new())];
@@ -2694,11 +2700,21 @@ mod tests {
         assert!(reopen.is_empty(), "the project cap held the reopen");
         let ev = events
             .iter()
-            .find(|e| e.message == PROJECT_CAP_SKIP)
-            .expect("a project-budget line on the reopen ladder");
+            .find(|e| e.level == "INFO" && e.message == PROJECT_CAP_SKIP)
+            .expect("an INFO project-budget line on the reopen ladder");
         assert_eq!(
             ev.fields.get("project_group").map(String::as_str),
             Some("a")
+        );
+        assert_eq!(ev.fields.get("running").map(String::as_str), Some("1"));
+        assert_eq!(
+            ev.fields.get("reviews").map(String::as_str),
+            Some("1"),
+            "the reopen is held by a review run, and the line says so"
+        );
+        assert_eq!(
+            ev.fields.get("max_concurrent").map(String::as_str),
+            Some("1")
         );
         assert_eq!(
             ev.fields.get("not_considered").map(String::as_str),
@@ -2711,7 +2727,8 @@ mod tests {
     /// run holds the slot here, so the line's review split must read `0`.
     ///
     /// MUTATION: log inside the refusal branch instead of after the walk and this reds with three
-    /// lines (the `.filter(..).count()` becomes 3).
+    /// lines (the `.filter(..).count()` becomes 3); downgrading the log to `debug!` empties the
+    /// level-filtered `lines` and reds on the count.
     #[test]
     fn a_project_holding_several_candidates_logs_one_line_with_a_sample() {
         let running = HashMap::from([(
@@ -2734,9 +2751,13 @@ mod tests {
         assert!(picked.is_empty(), "project cap 1 already spent by the run");
         let lines: Vec<_> = events
             .iter()
-            .filter(|e| e.message == PROJECT_CAP_SKIP)
+            .filter(|e| e.level == "INFO" && e.message == PROJECT_CAP_SKIP)
             .collect();
-        assert_eq!(lines.len(), 1, "one line per project per tick: {events:?}");
+        assert_eq!(
+            lines.len(),
+            1,
+            "one INFO line per project per tick: {events:?}"
+        );
         assert_eq!(
             lines[0].fields.get("reviews").map(String::as_str),
             Some("0"),
@@ -2759,7 +2780,7 @@ mod tests {
     /// the limit, the limit, and the held ticket.
     ///
     /// MUTATION: delete the `log_state_limit_hold` call from the multi active ladder and the
-    /// `.find(..)` below has nothing to return.
+    /// `.find(..)` below has nothing to return; downgrading it to `debug!` reds the same way.
     #[test]
     fn a_state_at_its_limit_logs_the_refusal() {
         let cap = || HashMap::from([("in progress".to_string(), 1i64)]);
@@ -2778,8 +2799,8 @@ mod tests {
         assert_eq!(picked.len(), 1, "the per-state limit admits exactly one");
         let ev = events
             .iter()
-            .find(|e| e.message == STATE_LIMIT_SKIP)
-            .expect("a per-state-limit line");
+            .find(|e| e.level == "INFO" && e.message == STATE_LIMIT_SKIP)
+            .expect("an INFO per-state-limit line");
         assert_eq!(
             ev.fields.get("state").map(String::as_str),
             Some("in progress")
@@ -2798,7 +2819,7 @@ mod tests {
     /// reopen is refused and named.
     ///
     /// MUTATION: delete the `note_state_hold` from the multi reopen branch and this reds while the
-    /// active-ladder state test stays green.
+    /// active-ladder state test stays green; downgrading the log to `debug!` reds it too.
     #[test]
     fn the_reopen_ladder_logs_a_state_at_its_limit() {
         let mut projects = vec![proj("a", 10, HashMap::from([("todo".to_string(), 1i64)]))];
@@ -2830,8 +2851,8 @@ mod tests {
         assert!(reopen.is_empty(), "the promote-state limit held the reopen");
         let ev = events
             .iter()
-            .find(|e| e.message == STATE_LIMIT_SKIP)
-            .expect("a per-state-limit line on the reopen ladder");
+            .find(|e| e.level == "INFO" && e.message == STATE_LIMIT_SKIP)
+            .expect("an INFO per-state-limit line on the reopen ladder");
         assert_eq!(ev.fields.get("state").map(String::as_str), Some("todo"));
         assert_eq!(ev.fields.get("running").map(String::as_str), Some("1"));
         assert_eq!(ev.fields.get("limit").map(String::as_str), Some("1"));
