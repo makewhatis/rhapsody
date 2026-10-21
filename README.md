@@ -3858,12 +3858,15 @@ resume-granting release (STUDIO-1156), so an operator's edit is still not swallo
 suppression.
 
 The operator's **explicit** "Human step done → resume" (STUDIO-1053) is a different thing and says
-so: it seeds its note into `pending_reopen_summons` *before* it removes the label, and that seed is
-the authorization the observer looks for — so the same label removal does grant the admission on
-that path. A ticket coming off a human hold is otherwise re-engaged only by a summons strictly newer
-than the last run's end. `pr_suppressed` keeps its released-park exemption because the landing
-auto-revert reopen sets the landing's own resume and has no summons to offer; the human-hold release
-no longer reaches it.
+so: it records a **durable** authorization on the open episode (`set_subject_resume_authorization`)
+*and* seeds its note into `pending_reopen_summons` *before* it removes the label, and the observer
+reads that authorization — so the same label removal does grant the admission on that path. The
+durable mark is what makes a successful resume survive a restart between the label removal and the
+next pass: the in-memory seed alone did not, so losing it silently reverted an authorized resume to a
+bare label removal and suppressed the requested author run (STUDIO-1443 review B2). A ticket coming
+off a human hold is otherwise re-engaged only by a summons strictly newer than the last run's end.
+`pr_suppressed` keeps its released-park exemption because the landing auto-revert reopen sets the
+landing's own resume and has no summons to offer; the human-hold release no longer reaches it.
 
 ### A second agent backend — `opencode` (STUDIO-902)
 

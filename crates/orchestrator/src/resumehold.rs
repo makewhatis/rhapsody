@@ -16,10 +16,13 @@
 //!    mechanism a reopening summons uses (`pending_reopen_summons` → [`crate::message::Orchestrator::seed_reopen_summons`],
 //!    which wraps it as an OPERATOR MESSAGE, not a teammate one). The room and comments are
 //!    deliberately NOT used: neither is guaranteed to reach the next prompt. Done FIRST so a tick
-//!    racing the label removal already finds the note waiting;
+//!    racing the label removal already finds the note waiting. Beside it the action records a
+//!    DURABLE authorization on the open episode (`rhapsody_store::Store::set_subject_resume_authorization`,
+//!    STUDIO-1443 B2): the material-change observer reads it to tell this authorized resume from a
+//!    bare label removal, and it survives a restart that would lose the in-memory note;
 //! 2. **removes** `rhapsody:human` through the tracker (the wrinkle that actually unblocks
-//!    dispatch). If the tracker refuses, the seed is undone (restoring any seed it replaced) so a
-//!    refused action leaves no side effect behind;
+//!    dispatch). If the tracker refuses, the seed is undone (restoring any seed it replaced) and the
+//!    durable authorization is cleared, so a refused action leaves no side effect behind;
 //! 3. **requeues** the ticket — clears the in-memory suppression so the next tick can dispatch it,
 //!    keeping its state when it is already active and otherwise moving it to Todo.
 //!
@@ -228,8 +231,9 @@ impl ControlHandle {
     /// record the operator's note for the next run, and requeue the ticket.
     ///
     /// The note is seeded before label removal so a racing tick finds it. A refused removal undoes
-    /// that seed. Without a label, the loop admits only a non-live rejected-login claim and clears
-    /// it atomically with the seed; an ordinary suppression is still `not_held` (STUDIO-1200).
+    /// that seed and clears the durable authorization the observer reads (STUDIO-1443 B2). Without a
+    /// label, the loop admits only a non-live rejected-login claim and clears it atomically with the
+    /// seed; an ordinary suppression is still `not_held` (STUDIO-1200).
     /// A refused requeue move is a reported partial failure, never a silent success.
     pub async fn resume_hold(
         &self,
@@ -303,14 +307,34 @@ impl ControlHandle {
             }
             None => return Err(ResumeHoldError::Canceled),
         };
-        // 2. Remove the label. A refusal here undoes the seed (restoring any seed it replaced), so
-        //    nothing is left committed and the response reports a failure rather than a partial
-        //    success.
+        // 1b. Authorize the resume DURABLY, still before the label comes off (STUDIO-1443 B2). The
+        //     material-change observer reads this to tell an authorized resume from a bare label
+        //     removal; unlike the in-memory seed above, it survives a restart between the removal and
+        //     the next selection pass, so a successful action's requested author run is not lost. It
+        //     is written here — not after the removal — for the same reason the note is: the instant
+        //     the label is gone the observer may run and would otherwise classify this as a bare
+        //     removal. Only a held ticket (a label present) is authorized; the auth-claim path has no
+        //     label to remove and never reaches the observer's label-change branch. A store error
+        //     undoes the seed so nothing is left committed and the caller sees a failure.
+        if label_present
+            && let Err(e) = self
+                .store
+                .set_subject_resume_authorization(&run.issue_identifier, true)
+        {
+            let _ = self.clear_resume_note(&run.issue_id, prior).await;
+            return Err(ResumeHoldError::Store(e));
+        }
+        // 2. Remove the label. A refusal here undoes the seed (restoring any seed it replaced) and
+        //    clears the durable authorization, so nothing is left committed and the response reports
+        //    a failure rather than a partial success.
         if label_present
             && let Err(e) = tracker
                 .remove_issue_label(&run.issue_id, &run.team_id, HUMAN_LABEL)
                 .await
         {
+            let _ = self
+                .store
+                .set_subject_resume_authorization(&run.issue_identifier, false);
             let _ = self.clear_resume_note(&run.issue_id, prior).await;
             tracing::error!(
                 issue_identifier = %run.issue_identifier,
@@ -477,7 +501,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use rhapsody_core::Issue;
     use rhapsody_store::{OUTCOME_STOPPED, RunEnd, RunStart, Sqlite, StorePath};
     use rhapsody_tracker::TrackerError;
@@ -691,6 +715,99 @@ mod tests {
         );
     }
 
+    // STUDIO-1443 B2: a successful explicit resume must keep its author admission even if the
+    // daemon restarts before the next selection pass observes the removed label. The in-memory
+    // reopen seed does not survive a restart, so the action writes the authorization DURABLY before
+    // the label comes off; the fresh orchestrator below carries none of the old loop's maps. Without
+    // the durable mark the observer would classify the completed action as a bare label removal,
+    // release without a resume, and `pr_suppressed` would suppress the linked-PR ticket — so the
+    // action's `queued=true` run never starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_successful_resume_survives_a_restart_before_the_label_is_observed() {
+        let iss = held_issue("iss-1", "A-1", "In Progress");
+        let (h, run_id) = start(fake_for(&iss), &iss).await;
+        // The breaker's park: the open episode the explicit resume must authorize and the observer
+        // must release. Its snapshot records that the ticket wore `rhapsody:human`.
+        let id = h
+            .store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "A-1".into(),
+                kind: "breaker".into(),
+                snapshot: "{\"state\":\"In Progress\",\"human\":true,\"heads\":{}}".into(),
+                ..Default::default()
+            })
+            .expect("park the breaker hold");
+        assert!(id > 0, "the breaker hold must be open");
+        // A controlled author-run window. The harness's own seeded run has no `started_at`, so this
+        // run is the one the summons must beat (`seed_run`-style: `[ended - 1m, ended]`).
+        let ended = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        let run = h
+            .store
+            .start_run(RunStart {
+                issue_id: "iss-1".into(),
+                issue_identifier: "A-1".into(),
+                title: "t".into(),
+                started_at: (ended - chrono::Duration::minutes(1)).to_rfc3339(),
+                ..Default::default()
+            })
+            .expect("start_run");
+        h.store
+            .end_run(
+                run,
+                RunEnd {
+                    outcome: OUTCOME_STOPPED.into(),
+                    ended_at: ended.to_rfc3339(),
+                    ..Default::default()
+                },
+            )
+            .expect("end_run");
+
+        let res = h
+            .handle
+            .resume_hold(CancelWait::default(), run_id, "added the secrets")
+            .await
+            .expect("resume_hold");
+        assert!(
+            res.note_recorded && res.label_removed && res.queued,
+            "the action must have succeeded: {res:?}"
+        );
+
+        // Restart: keep only the store and tracker; the loop's in-memory maps go away.
+        let store = Arc::clone(&h.store);
+        let tracker = Arc::clone(&h.tracker);
+        let old = finish(h).await;
+        assert!(
+            old.pending_reopen_summons.contains_key("iss-1"),
+            "the in-process seed was present, so the restart is what loses it"
+        );
+        drop(old);
+
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let mut eff = empty_effective(Arc::clone(&tracker) as Arc<dyn Tracker>);
+        eff.active_states = HashSet::from(["todo".to_string(), "in progress".to_string()]);
+        eff.terminal_states = HashSet::from(["done".to_string()]);
+        eff.max_concurrent = 10;
+        o.eff = Some(eff);
+        o.set_store(store);
+        assert!(
+            o.pending_reopen_summons.is_empty(),
+            "a restart starts with no in-memory seed"
+        );
+
+        // The label is gone (the action removed it); the only summons is the SPENT one.
+        let mut opened = plain_issue("iss-1", "A-1", "In Progress");
+        opened.team_id = "team-1".into();
+        opened.linked_pr = true;
+        opened.latest_summon_at = Some(ended - chrono::Duration::seconds(30));
+
+        let (active, _reopen, _held) = o.select_dispatch_with_reopens(vec![opened]);
+        assert_eq!(
+            active.len(),
+            1,
+            "the successful resume's admission must survive the restart"
+        );
+    }
+
     /// STUDIO-1200: resume a legacy auth claim after an operator removes the label.
     /// The fake's candidates/by-id inputs describe the post-removal board (label mutations
     /// intentionally do not rewrite those programmed inputs). Mutating resume to retain the
@@ -844,13 +961,25 @@ mod tests {
     }
 
     // STUDIO-1053 acceptance: a partial failure (the tracker rejects the label removal) is
-    // reported, and nothing claims success — no note is seeded and the ticket is not requeued.
+    // reported, and nothing claims success — no note is seeded, the durable authorization is
+    // cleared (STUDIO-1443 B2), and the ticket is not requeued.
     #[tokio::test(flavor = "multi_thread")]
     async fn resume_hold_reports_a_label_removal_failure_and_claims_nothing() {
         let iss = held_issue("iss-1", "STUDIO-1052", "In Progress");
         let mut fake = fake_for(&iss);
         fake.remove_label_err = Some(TrackerError::Other("linear_move_rejected".into()));
         let (h, run_id) = start(fake, &iss).await;
+        // A breaker park, so the action's durable authorization has an open episode to land on.
+        let id = h
+            .store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "STUDIO-1052".into(),
+                kind: "breaker".into(),
+                snapshot: "{\"state\":\"In Progress\",\"human\":true,\"heads\":{}}".into(),
+                ..Default::default()
+            })
+            .expect("park the breaker hold");
+        assert!(id > 0);
 
         let err = h
             .handle
@@ -861,6 +990,14 @@ mod tests {
         assert!(
             matches!(err, ResumeHoldError::LabelRemovalFailed(_)),
             "want LabelRemovalFailed, got {err:?}"
+        );
+        // The durable authorization is cleared before the park is observed, so the refused action
+        // cannot later authorize a resume through a bare label removal.
+        assert!(
+            !h.store
+                .subject_resume_authorized("STUDIO-1052")
+                .expect("read authorization"),
+            "a failed label removal must clear the durable authorization"
         );
         let o = finish(h).await;
         // The seed is undone, so a failed action leaves nothing committed. (The suppressed set is

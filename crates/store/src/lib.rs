@@ -182,6 +182,28 @@ pub trait Store {
     ) -> Result<bool, StoreError> {
         Ok(false)
     }
+    /// Record or clear a DURABLE explicit-resume authorization on an OPEN episode (STUDIO-1443 B2).
+    ///
+    /// The operator's "Human step done → resume" action writes this BEFORE it removes
+    /// `rhapsody:human`, so the material-change observer still recognizes the release as an
+    /// authorized resume after a restart — the in-memory reopen seed does not survive one, and
+    /// without this marker the observer mistakes the completed action for a bare label removal and
+    /// suppresses the requested author run. It lives on the open episode's `resume_pending` column,
+    /// which [`Store::subject_resume_pending`] deliberately ignores while the episode is still open;
+    /// the release consumes it either way. A refused label removal clears it, so a failed action
+    /// leaves nothing committed.
+    fn set_subject_resume_authorization(
+        &self,
+        _subject: &str,
+        _authorized: bool,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Whether an OPEN episode carries the durable explicit-resume authorization
+    /// ([`Store::set_subject_resume_authorization`]).
+    fn subject_resume_authorized(&self, _subject: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Idempotent operator resolution, bound to that decision's episode, never a newer park.
     fn resolve_lead_escalation(&self, _decision: i64, _reason: &str) -> Result<bool, StoreError> {
         Ok(false)

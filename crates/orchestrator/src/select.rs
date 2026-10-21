@@ -1881,7 +1881,8 @@ mod tests {
     // is re-engaged only by a summons newer than the last run's end.
     //
     // MUTATION: let the observer grant the resume again (`release_subject_episode` instead of
-    // `release_subject_episode_without_resume`) and this reds with `reopen = ["A-1"]`.
+    // `release_subject_episode_without_resume`) and this reds — not on `reopen`, which the earlier
+    // predicate fix already refuses, but on the no-resume assertion below.
     #[test]
     fn a_released_breaker_hold_is_not_reopened_on_a_spent_summons() {
         let mut o = orch_for_select(10, HashMap::new(), None);
@@ -2011,6 +2012,46 @@ mod tests {
             active.len(),
             1,
             "an explicit resume is an authorization, not a spent summons"
+        );
+    }
+
+    // STUDIO-1443 B2: the authorization the observer reads is DURABLE. With NO in-memory seed at all
+    // — the state after a restart between the successful action and the next pass — a durable
+    // explicit-resume authorization still admits the author on the same label removal. Reading only
+    // `pending_reopen_summons` (the round-2 defect) reds this: the release would withhold the resume
+    // and `pr_suppressed` would suppress the linked-PR ticket.
+    //
+    // MUTATION: drop the `subject_resume_authorized` half of the observer's `authorized` and this
+    // reds with `active = []`.
+    #[test]
+    fn a_durable_resume_authorization_admits_the_author_after_a_restart() {
+        let mut o = orch_for_select(10, HashMap::new(), None);
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let ended = spent_summons_end();
+        seed_run(o.store(), "1", "A-1", ended);
+        park_breaker_hold_wearing_the_human_label(&o, "In Progress");
+        // Exactly what `resume_hold` writes before it removes the label. Nothing is in memory: the
+        // restart dropped the loop's maps.
+        o.store()
+            .set_subject_resume_authorization("A-1", true)
+            .expect("authorize the resume");
+        assert!(
+            o.pending_reopen_summons.is_empty(),
+            "the restart must have lost the in-memory seed, or this test proves nothing"
+        );
+
+        let mut opened = issue("1", "A-1", "In Progress");
+        opened.team_id = "team-1".into();
+        opened.linked_pr = true;
+        opened.latest_summon_at = Some(ended - ChronoDuration::seconds(30));
+
+        let (active, _reopen, _held) = o.select_dispatch_with_reopens(vec![opened]);
+        assert_eq!(
+            active.len(),
+            1,
+            "a durable explicit-resume authorization must survive losing the in-memory seed"
         );
     }
 

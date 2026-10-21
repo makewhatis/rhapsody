@@ -516,11 +516,19 @@ impl Orchestrator {
                 // ticket is a candidate again and the merge lock lifts — but the author is
                 // re-engaged only by a summons newer than the last run's end, never by the release
                 // itself. The operator's EXPLICIT "Human step done → resume" (STUDIO-1053) is a
-                // different thing and says so: it seeds the note into `pending_reopen_summons`
-                // BEFORE removing the label, so that path keeps its admission. Every other material
-                // change (a description or state edit) keeps it too, so an operator's change is not
+                // different thing and says so: it records a durable authorization on the open
+                // episode AND seeds the note into `pending_reopen_summons` BEFORE removing the
+                // label, so that path keeps its admission. The DURABLE mark is what makes a
+                // successful resume survive a restart between the label removal and this pass — the
+                // in-memory seed alone did not (STUDIO-1443 B2), and losing it silently reverted the
+                // authorized resume to a bare label removal. Every other material change (a
+                // description or state edit) keeps the admission too, so an operator's change is not
                 // swallowed by linked-PR suppression (STUDIO-1156).
-                let authorized = self.pending_reopen_summons.contains_key(&issue.id);
+                let authorized = self.pending_reopen_summons.contains_key(&issue.id)
+                    || self
+                        .store()
+                        .subject_resume_authorized(&issue.identifier)
+                        .map_err(|e| e.to_string())?;
                 let release = if human_hold_removed && !authorized {
                     self.store().release_subject_episode_without_resume(
                         hold.id,

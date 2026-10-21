@@ -1645,6 +1645,28 @@ impl Store for Sqlite {
         tx.commit()?;
         Ok(true)
     }
+    fn set_subject_resume_authorization(
+        &self,
+        subject: &str,
+        authorized: bool,
+    ) -> Result<(), StoreError> {
+        let conn = self.lock();
+        let subject = canonical_subject(&conn, subject)?;
+        conn.execute(
+            "UPDATE rhapsody_subject_holds SET resume_pending = ?2 WHERE subject = ?1 AND released_reason IS NULL",
+            params![subject, i64::from(authorized)],
+        )?;
+        Ok(())
+    }
+    fn subject_resume_authorized(&self, subject: &str) -> Result<bool, StoreError> {
+        let conn = self.lock();
+        let subject = canonical_subject(&conn, subject)?;
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM rhapsody_subject_holds WHERE subject = ?1 AND released_reason IS NULL AND resume_pending = 1)",
+            [subject],
+            |r| r.get(0),
+        )?)
+    }
     fn resolve_lead_escalation(&self, decision: i64, reason: &str) -> Result<bool, StoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
@@ -5994,6 +6016,57 @@ mod tests {
             )
             .unwrap();
         assert_eq!(reason, "ticket description/state/hold label changed");
+    }
+
+    // STUDIO-1443 B2: the durable explicit-resume authorization lives on the OPEN episode's
+    // `resume_pending` column. While the episode is open it is invisible to `subject_resume_pending`
+    // (which only reads RELEASED rows), so it authorizes nothing on its own; the release consumes it.
+    // Clearing it (the refused-action undo) grants nothing.
+    #[test]
+    fn an_open_episode_carries_a_durable_resume_authorization() {
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        let id = store
+            .park_subject(&SubjectHold {
+                subject: "TEST-1".into(),
+                kind: "breaker".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(id > 0);
+        assert!(!store.subject_resume_authorized("TEST-1").unwrap());
+        store
+            .set_subject_resume_authorization("TEST-1", true)
+            .unwrap();
+        assert!(store.subject_resume_authorized("TEST-1").unwrap());
+        assert!(
+            !store.subject_resume_pending("TEST-1").unwrap(),
+            "an open authorization is not yet a released resume"
+        );
+        // The release consumes the marker and grants the admission.
+        store
+            .release_subject_episode(id, "breaker", "operator resumed the hold")
+            .unwrap();
+        assert!(store.subject_resume_pending("TEST-1").unwrap());
+
+        // A refused action's undo clears the marker before any release, so nothing is granted.
+        let id = store
+            .park_subject(&SubjectHold {
+                subject: "TEST-2".into(),
+                kind: "breaker".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .set_subject_resume_authorization("TEST-2", true)
+            .unwrap();
+        store
+            .set_subject_resume_authorization("TEST-2", false)
+            .unwrap();
+        assert!(!store.subject_resume_authorized("TEST-2").unwrap());
+        store
+            .release_subject_episode_without_resume(id, "breaker", "label removed")
+            .unwrap();
+        assert!(!store.subject_resume_pending("TEST-2").unwrap());
     }
 
     #[test]
