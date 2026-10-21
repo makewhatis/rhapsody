@@ -449,6 +449,7 @@ impl Orchestrator {
         {
             self.claimed.remove(&iss.id);
             self.persist_release(&iss.identifier);
+            self.log_subject_parked_dispatch(&iss.identifier);
             return;
         }
         if prepared.is_none()
@@ -2503,7 +2504,79 @@ mod tests {
         );
     }
 
-    // Mirrors Go `TestOnWorkerExitNormalSchedulesContinuation`.
+    /// STUDIO-1436: the 03:04:09 sequence of the reported incident. A subject parked between
+    /// preparation and dispatch is dropped at the backstop, and the log's last word about it used
+    /// to be `preparation accepted; dispatching` — no run row, no retry row, no claim, no line.
+    /// The refusal must SAY so, name the hold that caused it, and release the claim it took.
+    ///
+    /// MUTATION: delete the `log_subject_parked_dispatch` call and the single-line assertion reds
+    /// (the captured event list carries no `subject parked` line at all).
+    #[test]
+    fn a_parked_subject_reaching_dispatch_names_its_hold_and_releases_the_claim() {
+        let spec = || rhapsody_agent::PreparedHarnessSpec {
+            harness: rhapsody_agent::HarnessId::Opencode,
+            model: Some("accounts/fireworks/models/x".to_string()),
+            provider: None,
+            knobs: rhapsody_agent::HarnessKnobs::Opencode(Default::default()),
+        };
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(store::Sqlite::open(store::StorePath::InMemory).expect("open"));
+        o.set_store(Arc::clone(&store));
+        let hold_id = store
+            .park_subject(&store::SubjectHold {
+                subject: "MT-1".into(),
+                kind: "escalation".into(),
+                ..Default::default()
+            })
+            .expect("park");
+        o.claimed.insert("1".into());
+
+        let (_, events) = crate::testsupport::capture_events(|| {
+            o.dispatch_issue_prepared(
+                issue("1", "MT-1", "Todo"),
+                None,
+                None,
+                String::new(),
+                Some(spec()),
+            );
+        });
+
+        assert!(
+            !o.running.contains_key("1"),
+            "a parked subject is not dispatched"
+        );
+        assert!(
+            !o.claimed.contains("1"),
+            "and the claim the backstop took is released"
+        );
+        let parked: Vec<_> = events
+            .iter()
+            .filter(|e| e.message.starts_with("skipping dispatch: subject parked"))
+            .collect();
+        assert_eq!(
+            parked.len(),
+            1,
+            "exactly one line: {:?}",
+            events.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            parked[0].fields.get("issue_identifier").map(String::as_str),
+            Some("MT-1")
+        );
+        let want_id = hold_id.to_string();
+        assert_eq!(
+            parked[0].fields.get("hold_id").map(String::as_str),
+            Some(want_id.as_str()),
+            "the line must name the hold, not just the ticket"
+        );
+        assert_eq!(
+            parked[0].fields.get("hold_kind").map(String::as_str),
+            Some("escalation")
+        );
+    }
+
+    /// Mirrors Go `TestOnWorkerExitNormalSchedulesContinuation`.
     #[test]
     fn on_worker_exit_normal_schedules_continuation() {
         let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
