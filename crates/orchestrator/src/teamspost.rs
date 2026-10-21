@@ -35,9 +35,8 @@
 //! attributed, weighable information that explicitly does not supersede the ticket, naming who
 //! wrote it and from which run.
 //!
-//! **The named dependency, restated (§0.11.4).** The pre-existing `agent_send_message` surface lets
-//! ANY run message ANY `run_id` as operator text. That is out of Teams' scope, is not touched here,
-//! and `teams_post` deliberately does not route through it — closing it is separate work.
+//! `agent_send_message` is now worker-self-only and agent-attributed (STUDIO-1414). `teams_post`
+//! remains the cross-agent channel and deliberately does not route through that tool.
 //!
 //! # The room has NO dispatch power, ever (§0.2)
 //!

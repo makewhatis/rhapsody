@@ -15,7 +15,7 @@
 //!     like stop/resume.
 
 use crate::client::FacadeError;
-use crate::server::{Facade, RunArgs, err_result, or_default, text_result};
+use crate::server::{Facade, Role, RunArgs, err_result, or_default, text_result};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::{tool, tool_router};
@@ -28,7 +28,7 @@ use serde::Deserialize;
 /// text is still caught at runtime as `empty_text`, exactly as Go's handler does.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct SendMessageArgs {
-    /// the target run id (numeric). Defaults to SYMPHONY_RUN_ID (the worker's own run) when omitted.
+    /// the target run id (numeric). Workers may only use their own SYMPHONY_RUN_ID; defaults to it.
     #[serde(default)]
     run_id: String,
     /// the message text to deliver to the running agent (required, max 4000 chars).
@@ -39,7 +39,7 @@ pub(crate) struct SendMessageArgs {
 impl Facade {
     #[tool(
         name = "symphony_send_message",
-        description = "Deliver a mid-run message (a \"btw\") to a live run's agent (INF-250 mailbox). Proxies POST /api/v1/runs/{id}/message. Defaults run_id to SYMPHONY_RUN_ID. 202 on accept; a not-running or backlog-full run returns an error result."
+        description = "Deliver a message to your own live run (INF-250 mailbox), attributed as agent information, not operator instructions. Workers can only target SYMPHONY_RUN_ID (the default). Use teams_post to talk to teammates. Proxies POST /api/v1/runs/{id}/message. A not-running or backlog-full run returns an error result."
     )]
     async fn symphony_send_message(
         &self,
@@ -52,10 +52,30 @@ impl Facade {
                 "no run_id given and SYMPHONY_RUN_ID is not set",
             ));
         }
+        if self.opts.role != Role::Manager
+            && (self
+                .opts
+                .default_run_id
+                .parse::<i64>()
+                .ok()
+                .filter(|id| *id > 0)
+                .is_none()
+                || id != self.opts.default_run_id)
+        {
+            return err_result(&FacadeError::new(
+                "message_run_forbidden",
+                "workers can only message their own SYMPHONY_RUN_ID; use teams_post for teammates",
+            ));
+        }
         if args.text.is_empty() {
             return err_result(&FacadeError::new("empty_text", "message text is required"));
         }
-        match self.client.post_message(&id, &args.text).await {
+        let result = if self.opts.role == Role::Manager {
+            self.client.post_message(&id, &args.text).await
+        } else {
+            self.client.post_agent_message(&id, &args.text).await
+        };
+        match result {
             Ok(body) => text_result(&body),
             Err(e) => err_result(&e),
         }
@@ -323,6 +343,100 @@ mod tests {
             assert!(
                 client.call_tool(call(name)).await.is_err(),
                 "{name} must be rejected when the stop gate is off"
+            );
+        }
+        let _ = client.cancel().await;
+    }
+
+    // STUDIO-1414: both spellings must refuse a foreign run before even contacting the daemon.
+    #[tokio::test]
+    async fn worker_message_cannot_target_another_run_or_run_without_a_binding() {
+        let requests = Arc::new(Mutex::new(0));
+        let sink = requests.clone();
+        let port = spawn_router(Router::new().fallback(any(move || {
+            let sink = sink.clone();
+            async move {
+                *sink.lock().unwrap() += 1;
+                "{}"
+            }
+        })))
+        .await;
+        for binding in ["7", "", "not-a-run", "0"] {
+            let client = connect(Facade::new(
+                &cfg_with(true, false, false, false),
+                Client::for_port(port as i64),
+                Options {
+                    default_run_id: binding.into(),
+                    ..Default::default()
+                },
+            ))
+            .await;
+            for name in ["symphony_send_message", "agent_send_message"] {
+                for target in ["8", binding] {
+                    if target == "7" {
+                        continue;
+                    }
+                    let res = client
+                        .call_tool(call(name).with_arguments(args(serde_json::json!({
+                            "run_id": target, "text": "status from another run"
+                        }))))
+                        .await
+                        .expect("tool result");
+                    assert_eq!(res.is_error, Some(true), "{name}: {}", result_text(&res));
+                    assert_eq!(*requests.lock().unwrap(), 0, "no HTTP call permitted");
+                }
+            }
+            let _ = client.cancel().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn worker_self_message_carries_agent_origin_for_both_spellings() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port = spawn_router(Router::new().fallback(any(
+            move |headers: axum::http::HeaderMap| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(headers);
+                    "{}"
+                }
+            },
+        )))
+        .await;
+        let client = connect(Facade::new(
+            &cfg_with(true, false, false, false),
+            Client::for_port(port as i64),
+            Options {
+                default_run_id: "7".into(),
+                ..Default::default()
+            },
+        ))
+        .await;
+        for (name, input) in [
+            (
+                "symphony_send_message",
+                serde_json::json!({"text": "implicit self"}),
+            ),
+            (
+                "agent_send_message",
+                serde_json::json!({"run_id": "7", "text": "explicit self"}),
+            ),
+        ] {
+            let res = client
+                .call_tool(call(name).with_arguments(args(input)))
+                .await
+                .unwrap();
+            assert_ne!(res.is_error, Some(true), "{}", result_text(&res));
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.len(), 2);
+        for headers in seen.iter() {
+            assert_eq!(
+                headers
+                    .get("x-rhapsody-agent-run-id")
+                    .and_then(|v| v.to_str().ok()),
+                Some("7")
             );
         }
         let _ = client.cancel().await;

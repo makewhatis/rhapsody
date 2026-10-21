@@ -98,6 +98,20 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Worker self-messages carry agent attribution (STUDIO-1414)
+
+The worker MCP `symphony_send_message` / `agent_send_message` tools only accept their own
+`SYMPHONY_RUN_ID`; a foreign target or missing/invalid caller binding returns an error before
+any HTTP call. Worker requests carry `X-Rhapsody-Agent-Run-Id`. The daemon requires that marker
+to match the destination and derives the identity from the live run, then delivers an **AGENT
+MESSAGE** explicitly marked as information, not operator instructions. This banner survives both
+live mailbox delivery and the durable next-turn queue/history. Self-messages remain useful for
+run-local notes but cannot release operator holds or resume ended runs. Use `teams_post` for peers.
+
+Go's `operatorWrap` and unmarked human console/API messages retain their existing operator banner;
+the manager posture is unchanged. The marker and the existing `X-Rhapsody-Operator: 1` header are
+not authentication against local processes. No schema, fixture or normalization changes.
+
 ### Empty keepalive events are not history (STUDIO-1375)
 
 An agent event that carries no message and synthesizes no text — an OpenCode streaming delta
