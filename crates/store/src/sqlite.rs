@@ -2814,6 +2814,45 @@ impl Store for Sqlite {
         Ok(n)
     }
 
+    fn newest_completed_review_verdict_among(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        reviewers: &[String],
+    ) -> Result<Option<String>, StoreError> {
+        if reviewers.is_empty() {
+            return Ok(None);
+        }
+        // One EXACT `pr:<owner>/<repo>#<n>@<reviewer>` pattern per reviewer, each escaped so a repo
+        // or reviewer name carrying a LIKE wildcard (`_`, `%`) cannot match a different coordinate.
+        // `ended_at` is the moment the verdict was DECLARED; `id` breaks a same-second tie
+        // deterministically, which is the order the breaker's "most recent completed verdict" names.
+        // `outcome = completed` and the `%@manager` exclusion are the same two the counting query
+        // uses (a manager run is a `pr:` key but never a review round, and only a completed run has a
+        // verdict to weigh).
+        let clause = vec!["r.issue_identifier LIKE ? ESCAPE '\\'"; reviewers.len()].join(" OR ");
+        let mut args: Vec<Value> = Vec::with_capacity(reviewers.len() + 1);
+        args.push(Value::Text(OUTCOME_COMPLETED.to_string()));
+        for reviewer in reviewers {
+            args.push(Value::Text(escape_like(&format!(
+                "pr:{owner}/{repo}#{number}@{reviewer}"
+            ))));
+        }
+        let conn = self.lock();
+        let q = format!(
+            "SELECT v.verdict FROM runs r \
+               JOIN rhapsody_review_verdicts v ON v.run_id = r.id \
+              WHERE r.outcome = ? AND r.issue_identifier NOT LIKE '%@manager' \
+                AND ({clause}) \
+              ORDER BY r.ended_at DESC, r.id DESC LIMIT 1"
+        );
+        let verdict: Option<String> = conn
+            .query_row(&q, params_from_iter(args), |row| row.get(0))
+            .optional()?;
+        Ok(verdict)
+    }
+
     fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError> {
         let conn = self.lock();
         let n: i64 = conn.query_row(
@@ -10511,6 +10550,126 @@ mod tests {
                 .expect("count"),
             0,
             "a coordinate with no runs is zero, not an error"
+        );
+    }
+
+    /// The breaker's "most recent completed verdict at the current head" ORDER (STUDIO-1440): among
+    /// a reviewer SET, the verdict whose round FINISHED last wins — ordered by `ended_at`, then `id`
+    /// — while a manager run, a non-completed run, another coordinate and a reviewer outside the set
+    /// are all invisible. This is the ordering the live watch rows cannot supply (one terminal
+    /// verdict per reviewer, no completion time).
+    ///
+    /// Mutation: order by `started_at` (or `id`) instead of `ended_at` and the quick findings round
+    /// that STARTED later beats the slow approval that FINISHED last.
+    #[test]
+    fn breaker_newest_completed_verdict_among_orders_by_completion() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        // A slow approving round that started first but finished LAST, and a quick findings round
+        // that started later but finished earlier: the approval is the newest completed verdict.
+        let slow = start_run_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            "2026-09-20T00:00:00Z",
+        );
+        let quick = start_run_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@carol",
+            "2026-09-20T00:05:00Z",
+        );
+        end_run_with(&store, slow, OUTCOME_COMPLETED, 10, "2026-09-20T00:10:00Z");
+        end_run_with(&store, quick, OUTCOME_COMPLETED, 10, "2026-09-20T00:06:00Z");
+        store
+            .set_review_verdict(slow, REVIEW_VERDICT_APPROVED)
+            .expect("verdict");
+        store
+            .set_review_verdict(quick, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("verdict");
+
+        let both = vec!["alice".to_string(), "carol".to_string()];
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among("makewhatis", "rhapsody", 12, &both)
+                .expect("newest")
+                .as_deref(),
+            Some(REVIEW_VERDICT_APPROVED),
+            "the round that FINISHED last is the newest completed verdict"
+        );
+        // A reviewer OUTSIDE the set is invisible: only carol's findings remains.
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among(
+                    "makewhatis",
+                    "rhapsody",
+                    12,
+                    &["carol".to_string()],
+                )
+                .expect("newest")
+                .as_deref(),
+            Some(REVIEW_VERDICT_CHANGES_REQUESTED)
+        );
+        // A manager/intervention run is a `pr:` key but never a review round: even named explicitly
+        // it does not answer.
+        let manager = start_run_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@manager",
+            "2026-09-20T00:20:00Z",
+        );
+        end_run_with(
+            &store,
+            manager,
+            OUTCOME_COMPLETED,
+            10,
+            "2026-09-20T00:21:00Z",
+        );
+        store
+            .set_review_verdict(manager, REVIEW_VERDICT_APPROVED)
+            .expect("verdict");
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among(
+                    "makewhatis",
+                    "rhapsody",
+                    12,
+                    &["manager".to_string()],
+                )
+                .expect("manager"),
+            None,
+            "a manager run is not a review round"
+        );
+        // Only a COMPLETED run counts.
+        let failed = start_run_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@bob",
+            "2026-09-20T00:30:00Z",
+        );
+        end_run_with(&store, failed, OUTCOME_FAILED, 10, "2026-09-20T00:31:00Z");
+        store
+            .set_review_verdict(failed, REVIEW_VERDICT_APPROVED)
+            .expect("verdict");
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among(
+                    "makewhatis",
+                    "rhapsody",
+                    12,
+                    &["bob".to_string()],
+                )
+                .expect("failed"),
+            None,
+            "only a completed round counts"
+        );
+        // An empty reviewer set and a coordinate with no rounds both answer None.
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among("makewhatis", "rhapsody", 12, &[])
+                .expect("empty"),
+            None
+        );
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among("makewhatis", "rhapsody", 99, &both)
+                .expect("none"),
+            None
         );
     }
 

@@ -928,6 +928,25 @@ pub trait Store {
         number: i64,
     ) -> Result<i64, StoreError>;
 
+    /// The verdict of the reviewer whose newest COMPLETED review round on one pull request FINISHED
+    /// most recently, restricted to `reviewers` — the reviewers the watcher holds a terminal verdict
+    /// for at the pull request's current head (STUDIO-1440).
+    ///
+    /// Ordered by `ended_at DESC, id DESC`: the moment a verdict was DECLARED, not the dispatch, so
+    /// two reviewers who completed different verdicts at the SAME head are ranked by who finished
+    /// last — "the most recent completed verdict at the current head". A manager/intervention run
+    /// (`@manager`) is a `pr:` key but never a review round, so it is excluded exactly as in
+    /// [`Store::count_changes_requested_review_runs`]. `None` when none of `reviewers` has a
+    /// completed review round, which the breaker reads as "no approval stands at the head" (fail
+    /// closed). An empty `reviewers` is `None`.
+    fn newest_completed_review_verdict_among(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        reviewers: &[String],
+    ) -> Result<Option<String>, StoreError>;
+
     /// How many runs this daemon has recorded for one exact `issue_identifier` — a ticket's
     /// "attempts" for the breaker's notification, counting every author run whatever its outcome.
     /// `0` for an identifier with no runs.

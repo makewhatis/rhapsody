@@ -1157,6 +1157,16 @@ mod tests {
             self.0
                 .count_changes_requested_review_runs(owner, repo, number)
         }
+        fn newest_completed_review_verdict_among(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+            reviewers: &[String],
+        ) -> Result<Option<String>, StoreError> {
+            self.0
+                .newest_completed_review_verdict_among(owner, repo, number, reviewers)
+        }
         fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError> {
             self.0.count_runs_for(identifier)
         }
