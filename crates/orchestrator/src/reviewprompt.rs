@@ -321,8 +321,23 @@ fn origin_ticket_window(description: &str) -> (String, usize) {
     (out, dropped)
 }
 
-/// The heading an operator route-back block carries, lowercased.
+/// The heading PREFIX an operator route-back block carries, lowercased.
+///
+/// Recognised by prefix, never by exact text: the operator's own route-back headings carry a suffix
+/// naming the gate and the commit they apply to — `## REVIEW FEEDBACK (operator gate, 2026-10-21
+/// ~07:00Z, on https://github.com/makewhatis/rhapsody/pull/363 at afcf29a)` — so an exact match
+/// misses every real one, and the pasted review's own `### Acceptance` checklist becomes the window.
 const ROUTE_BACK_HEADING: &str = "review feedback";
+
+/// Whether a heading (lowercased) names an operator route-back block.
+fn is_route_back(text: &str) -> bool {
+    text.starts_with(ROUTE_BACK_HEADING)
+}
+
+/// Whether a heading (lowercased) names the acceptance section, at any level.
+fn is_acceptance(text: &str) -> bool {
+    text == "acceptance" || text == "acceptance criteria"
+}
 
 /// The byte range of the ticket's acceptance section — its heading line to the next ATX heading of
 /// the same or higher level — or `None` when the description has no acceptance heading
@@ -336,27 +351,34 @@ const ROUTE_BACK_HEADING: &str = "review feedback";
 /// `## Acceptance` example must not have that example taken for the real section, which would drop
 /// the real acceptance while the marker claimed it was quoted in full.
 ///
-/// Leading route-back blocks are skipped too. The operator route-back PREPENDS its feedback, and a
-/// review carries an `### Acceptance` checklist of its own — so on a re-review the FIRST matching
-/// heading is the REVIEWER's, and anchoring there quotes the feedback as the ticket's acceptance
-/// while the real section falls outside the window. The ticket's own text begins after the
-/// prepended blocks, so the first acceptance heading there is the one that counts.
+/// A prepended route-back block is skipped too. The operator route-back PREPENDS its feedback (and
+/// sometimes an `## OPERATOR NOTE` section in front of that), and a pasted review carries an
+/// `### Acceptance` checklist of its own — so the FIRST acceptance heading in the description can be
+/// the REVIEWER's, and anchoring there quotes the feedback as the ticket's acceptance while the real
+/// section falls outside the window. A route-back heading that sits BEFORE that candidate marks the
+/// block in front of the ticket: everything through its own section is prepended, and the ticket's
+/// acceptance is the first one after it. A route-back heading that comes AFTER the candidate is not
+/// a prepend at all and changes nothing, which is what keeps a description that merely mentions one,
+/// past its acceptance, windowing on the real section.
 fn acceptance_section(description: &str) -> Option<std::ops::Range<usize>> {
     let headings = headings(description);
-    let mut skip = 0;
-    for (i, (line_start, level, text)) in headings.iter().enumerate() {
-        if *line_start < skip || text != ROUTE_BACK_HEADING {
-            break;
-        }
-        skip = section_end(&headings, i + 1, *level, description.len());
-    }
+    let skip = headings
+        .iter()
+        .position(|(_, _, text)| is_acceptance(text))
+        .and_then(|candidate| {
+            headings[..candidate]
+                .iter()
+                .enumerate()
+                .find(|(_, (_, _, text))| is_route_back(text))
+                .map(|(i, (_, level, _))| section_end(&headings, i + 1, *level, description.len()))
+        })
+        .unwrap_or(0);
     let (index, start, level) =
         headings
             .iter()
             .enumerate()
             .find_map(|(i, (line_start, level, text))| {
-                (*line_start >= skip && (text == "acceptance" || text == "acceptance criteria"))
-                    .then_some((i, *line_start, *level))
+                (*line_start >= skip && is_acceptance(text)).then_some((i, *line_start, *level))
             })?;
     Some(start..section_end(&headings, index + 1, level, description.len()))
 }
@@ -1638,6 +1660,77 @@ mod tests {
         assert!(
             !text.contains("bytes were elided here"),
             "the reviewer's checklist must not open an acceptance window:\n{text}"
+        );
+    }
+
+    /// B1 (STUDIO-1438 review, round 2): the operator's REAL route-back heading carries a suffix —
+    /// `## REVIEW FEEDBACK (operator gate, 2026-10-21 ~07:00Z, on …/pull/363 at afcf29a)` — so an
+    /// exact-text match misses it and the pasted review's own `### Acceptance` checklist captures
+    /// the window again. The heading is recognised by PREFIX.
+    ///
+    /// Mutation: restoring an exact-text match (`text == ROUTE_BACK_HEADING`) reds here — the window
+    /// anchors on the reviewer's checklist and the ticket's acceptance is dropped.
+    #[test]
+    fn a_route_back_heading_with_a_suffix_does_not_capture_the_window() {
+        let mut body = String::from(
+            "## REVIEW FEEDBACK (operator gate, 2026-10-21 ~07:00Z, on \
+             https://github.com/makewhatis/rhapsody/pull/363 at afcf29a)\n\n\
+             Here is what I found.\n\n### Acceptance\n\n",
+        );
+        body.push_str("- reviewer checklist item one\n- reviewer checklist item two\n\n");
+        body.push_str(&"the operator asked for this change. ".repeat(300));
+        body.push_str("\n\n## The defects\n\n1. one\n2. two\n3. three\n\n## Acceptance\n\n");
+        body.push_str("- THE REAL CRITERION\n- A SECOND REAL CRITERION\n");
+        assert!(body.len() > ORIGIN_TICKET_MAX_BYTES);
+
+        let text = rendered_with(&body);
+        let acceptance_region = text
+            .split_once("The acceptance criteria below are quoted in full.")
+            .map(|(_, after)| after)
+            .expect("the ticket's acceptance must be quoted");
+        assert!(
+            acceptance_region.contains("- THE REAL CRITERION")
+                && acceptance_region.contains("- A SECOND REAL CRITERION"),
+            "every real acceptance bullet must be the quoted section:\n{text}"
+        );
+        assert!(
+            !acceptance_region.contains("- reviewer checklist item one"),
+            "the reviewer's own checklist must not be quoted as the ticket's acceptance:\n{text}"
+        );
+    }
+
+    /// B1 (STUDIO-1438 review, round 2): STUDIO-1436's real layout puts an `## OPERATOR NOTE (…)`
+    /// section in FRONT of the route-back block. Everything through the route-back is prepended, so
+    /// the ticket's own acceptance — not a checklist inside either block — is what is windowed.
+    ///
+    /// Mutation: skipping only a route-back heading that is itself the FIRST heading reds here — the
+    /// window anchors on the pasted checklist and the ticket's acceptance is dropped.
+    #[test]
+    fn a_prepended_operator_note_before_a_route_back_does_not_capture_the_window() {
+        let mut body = String::from(
+            "## OPERATOR NOTE (2026-10-21 ~07:00Z)\n\nRead the review before the ticket body.\n\n\
+             ## REVIEW FEEDBACK (operator gate, 2026-10-21 ~07:00Z, on \
+             https://github.com/makewhatis/rhapsody/pull/363 at afcf29a)\n\n\
+             Here is what I found.\n\n### Acceptance\n\n",
+        );
+        body.push_str("- reviewer checklist item one\n- reviewer checklist item two\n\n");
+        body.push_str(&"the operator asked for this change. ".repeat(300));
+        body.push_str("\n\n## The defects\n\n1. one\n2. two\n3. three\n\n## Acceptance\n\n");
+        body.push_str("- THE REAL CRITERION\n- A SECOND REAL CRITERION\n");
+        assert!(body.len() > ORIGIN_TICKET_MAX_BYTES);
+
+        let text = rendered_with(&body);
+        let acceptance_region = text
+            .split_once("The acceptance criteria below are quoted in full.")
+            .map(|(_, after)| after)
+            .expect("the ticket's acceptance must be quoted");
+        assert!(
+            acceptance_region.contains("- THE REAL CRITERION"),
+            "the ticket's own acceptance must be the quoted section:\n{text}"
+        );
+        assert!(
+            !acceptance_region.contains("- reviewer checklist item one"),
+            "neither prepended block's checklist may be quoted as the ticket's acceptance:\n{text}"
         );
     }
 }
