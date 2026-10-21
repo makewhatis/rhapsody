@@ -25,9 +25,10 @@
 //! survive a restart.
 //!
 //! A round crossing also does NOT apply the hold while the most recent completed verdict at the
-//! pull request's CURRENT HEAD is an approval (every live watch row settled `approved` at the head
-//! it read): an approved-and-open pull request has converged, and holding it would be the exact
-//! false action the limit exists to avoid.
+//! pull request's CURRENT HEAD is an approval (the ledger's newest verdict, with a live row
+//! `approved` at the head it read): an approved-and-open pull request has converged, and holding it
+//! would be the exact false action the limit exists to avoid. A sibling still owing a round is not
+//! a completed verdict and does not defeat the approval.
 //!
 //! Spend crossings sum the ticket's author runs PLUS the review runs on its pull request, split by
 //! provider through `rhapsody_run_provenance` — exactly the join STUDIO-957 introduced, because the
@@ -927,23 +928,34 @@ impl Orchestrator {
             .count_changes_requested_review_runs(owner, repo, number)
             .unwrap_or(0);
         let attempts = self.store().count_runs_for(ticket).unwrap_or(0);
-        // This coordinate's live watch rows, read once: their statuses give the latest review
-        // OUTCOME, and together they say whether every reviewer's most recent completed verdict AT
-        // THE CURRENT HEAD is an approval.
+        // This coordinate's live watch rows, read once: their statuses give each reviewer's LATEST
+        // review OUTCOME and the head it was made at.
         let live = self.store().load_live_review_watch().unwrap_or_default();
         let mine: Vec<&rhapsody_store::ReviewWatchRow> = live
             .iter()
             .filter(|r| r.key.owner == owner && r.key.repo == repo && r.key.number == number)
             .collect();
         let latest_review = mine.first().map(|r| r.status.clone()).unwrap_or_default();
-        // "The most recent completed verdict at the PR's current head is an approval" (STUDIO-1440):
-        // every live reviewer settled on an approval at the head they read. `last_reviewed_sha` is
-        // non-empty only after a review ACTUALLY completed, so an `approved` row with no recorded
-        // SHA is not a verdict and does not suppress — the watcher's own `settled_at_current_head`
-        // rule. A row still owing a round (`requested`/`in_flight`/`truncated`), or one whose newest
-        // verdict asked for changes, keeps the round counting.
-        let approved_at_head = !mine.is_empty()
-            && mine.iter().all(|r| {
+        // "The most recent completed verdict at the PR's current head is an approval" (STUDIO-1440).
+        // Two halves, because neither source answers alone:
+        //
+        // * WHICH verdict is most recent comes from the per-run ledger — the watch set holds only
+        //   the LATEST status per (PR, reviewer), so it cannot order two reviewers' verdicts, and a
+        //   pending sibling (no verdict row at all) must not shadow the approval that is genuinely
+        //   the newest completed one.
+        // * WHETHER it is at the CURRENT HEAD comes from the live rows: a patch-changing head
+        //   advance re-arms EVERY row to `requested`, so an `approved` row with a recorded SHA is an
+        //   approval at the head the pull request still stands at (the watcher's own
+        //   `settled_at_current_head` rule; a patch-preserving move advances `last_reviewed_sha` and
+        //   keeps `approved`). A row still owing a round (`requested`/`in_flight`/`truncated`) is not
+        //   a completed verdict and does not defeat the approval — only a completed one would.
+        let latest_verdict = self
+            .store()
+            .latest_review_verdict(owner, repo, number)
+            .unwrap_or(None);
+        let approved_at_head = latest_verdict.as_deref()
+            == Some(rhapsody_store::REVIEW_VERDICT_APPROVED)
+            && mine.iter().any(|r| {
                 r.status == rhapsody_store::REVIEW_STATUS_APPROVED
                     && !r.last_reviewed_sha.is_empty()
             });
@@ -1197,7 +1209,14 @@ mod tests {
     /// approving one) is not a round the limit counts. The run carries the `anthropic` provider, so
     /// the per-ticket spend join sees it as the original incident's reviews did.
     fn seed_review_round(store: &SharedStore, key: &str, verdict: &str) {
-        let at = "2026-09-20T00:00:00Z";
+        seed_review_round_at(store, key, verdict, "2026-09-20T00:00:00Z");
+    }
+
+    /// [`seed_review_round`] with an explicit completion time — the order
+    /// [`rhapsody_store::Store::latest_review_verdict`] reads to name the MOST RECENT completed
+    /// verdict, so a test that needs one round to be newer than another gives it a later `at`
+    /// (STUDIO-1440).
+    fn seed_review_round_at(store: &SharedStore, key: &str, verdict: &str, at: &str) {
         let id = store
             .start_run(RunStart {
                 issue_id: format!("iss-{key}"),
@@ -1235,13 +1254,19 @@ mod tests {
     /// A live watch row already settled at `status` on the head it read — the shape that makes
     /// `plan_crossing` read "the most recent completed verdict at the current head".
     fn seed_watch_status(store: &SharedStore, ticket: &str, status: &str) {
+        seed_watch_row(store, ticket, "alice", status);
+    }
+
+    /// [`seed_watch_status`] for a named reviewer — so a test can put a pending SIBLING beside the
+    /// approving reviewer (STUDIO-1440).
+    fn seed_watch_row(store: &SharedStore, ticket: &str, reviewer: &str, status: &str) {
         store
             .save_review_watch(ReviewWatchRow {
                 key: ReviewWatchKey {
                     owner: "makewhatis".into(),
                     repo: "rhapsody".into(),
                     number: 12,
-                    reviewer: "alice".into(),
+                    reviewer: reviewer.into(),
                 },
                 author: "bob".into(),
                 introduced_by: format!("handoff:{ticket}"),
@@ -1344,6 +1369,56 @@ mod tests {
             plan.spend.iter().any(|s| s.provider == "anthropic"),
             "the plan reports the spend by provider"
         );
+    }
+
+    /// The "at the current head" half of the suppression (STUDIO-1440): an approving verdict that
+    /// was read at an OLD head — the author pushed since, so the watcher re-armed every row to
+    /// `requested` — is not a verdict at the head the pull request stands at, so the hold still
+    /// applies.
+    ///
+    /// Mutation: suppress on the newest verdict alone (drop the live-row half) and a stale approval
+    /// holds a pull request nobody has approved at its current head.
+    #[test]
+    fn a_stale_approval_does_not_suppress_the_rounds_hold() {
+        let store = store();
+        // The rows were re-armed by a head advance: no row stands `approved`.
+        seed_watch_status(&store, "STUDIO-988", REVIEW_STATUS_REQUESTED);
+        for at in [
+            "2026-09-20T00:00:00Z",
+            "2026-09-20T00:01:00Z",
+            "2026-09-20T00:02:00Z",
+            "2026-09-20T00:03:00Z",
+            "2026-09-20T00:04:00Z",
+        ] {
+            seed_review_round_at(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+                at,
+            );
+        }
+        // The newest completed verdict approved, but at the head the author has since moved off.
+        seed_review_round_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            REVIEW_VERDICT_APPROVED,
+            "2026-09-20T00:05:00Z",
+        );
+        assert_eq!(
+            store
+                .latest_review_verdict("makewhatis", "rhapsody", 12)
+                .expect("latest")
+                .as_deref(),
+            Some(REVIEW_VERDICT_APPROVED)
+        );
+        let mut o = orch(store.clone(), 5, &[]);
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        let plan = rx
+            .try_recv()
+            .expect("a stale approval must not suppress the hold");
+        assert_eq!(plan.kinds, vec![CrossingKind::Rounds]);
+        assert_eq!(plan.rounds, 5);
     }
 
     /// The boundary of the suppression: a head whose newest verdict ASKED FOR CHANGES is not
@@ -1485,12 +1560,97 @@ mod tests {
                 REVIEW_VERDICT_CHANGES_REQUESTED,
             );
         }
+        // The most recent COMPLETED verdict is the approving round at the head the row stands at.
+        seed_review_round_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            REVIEW_VERDICT_APPROVED,
+            "2026-09-20T00:05:00Z",
+        );
         let mut o = orch(store.clone(), 5, &[]);
         let mut rx = o.open_breaker_channel();
         o.reconcile_breaker();
         assert!(
             rx.try_recv().is_err(),
             "a converged pull request must not be held"
+        );
+        assert!(
+            store
+                .load_breaker_crossings()
+                .expect("crossings")
+                .is_empty(),
+            "no crossing is persisted for an approved head"
+        );
+    }
+
+    /// A pending SIBLING must not defeat an approval at head (PR #368 round 1, B1). Five findings
+    /// rounds, then a LATER approving round for alice, with alice's live row `approved` at the head
+    /// she read — while carol's row still owes a round (`requested`) and has no completed verdict.
+    /// The most recent COMPLETED verdict at the current head is alice's approval, so nothing crosses
+    /// and no `rhapsody:human` label is written.
+    ///
+    /// Mutation: require every live row to approve (`mine.iter().all(..)`) and carol's pending row
+    /// arms the hold again, writing the label.
+    #[tokio::test]
+    async fn a_pending_sibling_does_not_defeat_an_approval_at_head() {
+        let store = store();
+        for at in [
+            "2026-09-20T00:00:00Z",
+            "2026-09-20T00:01:00Z",
+            "2026-09-20T00:02:00Z",
+            "2026-09-20T00:03:00Z",
+            "2026-09-20T00:04:00Z",
+        ] {
+            seed_review_round_at(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+                at,
+            );
+        }
+        seed_review_round_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            REVIEW_VERDICT_APPROVED,
+            "2026-09-20T00:05:00Z",
+        );
+        seed_watch_row(&store, "STUDIO-988", "alice", REVIEW_STATUS_APPROVED);
+        seed_watch_row(&store, "STUDIO-988", "carol", REVIEW_STATUS_REQUESTED);
+        assert_eq!(
+            store
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            5,
+            "five findings rounds are counted"
+        );
+        assert_eq!(
+            store
+                .latest_review_verdict("makewhatis", "rhapsody", 12)
+                .expect("latest")
+                .as_deref(),
+            Some(REVIEW_VERDICT_APPROVED),
+            "the newest completed verdict is the approval"
+        );
+        let mut o = orch(store.clone(), 5, &[]);
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        // Perform anything the pass queued, against a real tracker sink: the assertion is that NO
+        // label write happens, which is exactly what B1 reported.
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let hold_tracker = tracker.clone();
+        let deps = BreakerDeps {
+            hold: Some(Arc::new(TrackerHoldSink::new(move || {
+                Some(hold_tracker.clone() as Arc<dyn Tracker>)
+            }))),
+            room: None,
+            channels: Vec::new(),
+        };
+        while let Ok(plan) = rx.try_recv() {
+            perform_crossing(&plan, &deps, Utc::now()).await;
+        }
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "a pending sibling must not defeat the approval at head and write rhapsody:human"
         );
         assert!(
             store

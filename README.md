@@ -2011,7 +2011,8 @@ changes** from the `runs` ledger joined to the per-run `rhapsody_review_verdicts
 that approved, a re-review armed only by merging `main`, and the manager's own intervention run
 (`@manager`) are all evidence of convergence, not of a runaway (STUDIO-1440). A round crossing also
 does not apply the hold while the most recent completed verdict at the pull request's current head is
-an approval (every live watch row settled `approved` at the head it read). An operator
+an approval (the ledger's newest verdict, with a live row `approved` at the head it read — a sibling
+still owing a round is not a completed verdict and does not defeat the approval). An operator
 `clear` resets both round counts (STUDIO-1134); only post-clear completed reviews count for the
 breaker. Spend sums the ticket's author runs plus its pull request's review runs, split by
 `rhapsody_run_provenance.provider`. The

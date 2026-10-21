@@ -5391,6 +5391,14 @@ mod tests {
         fn count_runs_for(&self, identifier: &str) -> Result<i64, rs::StoreError> {
             self.0.count_runs_for(identifier)
         }
+        fn latest_review_verdict(
+            &self,
+            owner: &str,
+            repo: &str,
+            number: i64,
+        ) -> Result<Option<String>, rs::StoreError> {
+            self.0.latest_review_verdict(owner, repo, number)
+        }
         fn ticket_spend_by_provider(
             &self,
             ticket: &str,
