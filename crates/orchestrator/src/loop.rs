@@ -594,6 +594,27 @@ pub enum Event {
 /// failing a post that already landed in the room log.
 const TEAMS_POST_MIRROR_WAIT: Duration = Duration::from_secs(5);
 
+/// How long the off-loop lead executor waits for the control task to answer a lead admission
+/// round-trip before giving up (STUDIO-1436).
+///
+/// Deliberately separate from [`TEAMS_POST_MIRROR_WAIT`]: that 5s bound is right for an agent on
+/// the far side of an MCP client, but the lead admission round-trip is made BY a tick.
+/// `pump_lead_items` runs inside `on_tick` and spawns the preparation whose first act is this
+/// round-trip, so the loop cannot answer until the tick returns to its `select!` — and a tick's
+/// own network work routinely exceeds 5s. A 5s bound therefore expired on the overlap and was
+/// read as a refusal, which is the flapping admission in the reported incident. The wait now
+/// outlasts a whole tick; a real answer still decides it, and only the cap expiring is logged.
+const LEAD_ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+/// The control task did not answer a lead admission round-trip within [`LEAD_ADMISSION_WAIT`]
+/// (STUDIO-1436).
+///
+/// This is NOT a refusal: a `false` answer from the control task is a genuine revocation, while
+/// this is the loop being wedged for a full minute. Callers must keep the two apart — conflating
+/// them is what made admission flap in the reported incident.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeadAdmissionExpired;
+
 /// The default `storage.retention_days` until a reload stores the effective value (Go `New`).
 pub(crate) const DEFAULT_RETENTION_DAYS: i64 = 30;
 
@@ -2659,22 +2680,24 @@ impl ControlHandle {
         let _ = self.events.send(Event::ManagerEffect(Box::new(result)));
     }
 
-    /// Asks the control task whether the lead may act on `repo`/`ticket` (STUDIO-1136). Every
-    /// caller reads a `false` as "authority or subject admission revoked", so the ONE case that is
-    /// not a verdict must not be silently folded into it (STUDIO-1436): the bounded wait expiring.
+    /// Asks the control task whether the lead may act on `repo`/`ticket` (STUDIO-1136). A `false`
+    /// answer is "authority or subject admission revoked"; an `Err` is the ONE case that is not a
+    /// verdict — the bounded wait expiring (STUDIO-1436).
     ///
-    /// The wait is bounded by [`TEAMS_POST_MIRROR_WAIT`] for the sibling surfaces' reason (an agent
-    /// on the far side of an MCP client cannot block on a tick busy with the network), but here the
-    /// caller is an off-loop lead executor and a timeout is NOT benign — it is read as a refusal and
-    /// used to be converted into a durable `escalation` hold. The wait can expire by construction:
-    /// `pump_lead_items` runs ON the control task inside `on_tick`, so the lead preparation it spawns
-    /// round-trips to a loop that cannot answer until `on_tick` returns to its `select!`. In the
-    /// reported incident (STUDIO-1407, item 2556) that produced a lead admission that flapped
-    /// refused/admitted/refused across three consecutive ticks with no author run live and no hold
-    /// in existence. The timeout is therefore logged, at `warn!`, naming the ticket — so the next
-    /// occurrence is distinguishable from a real revocation instead of only being diagnosable by
-    /// reading this function.
-    pub async fn lead_allowed(&self, repo: &str, ticket: &str) -> bool {
+    /// The wait is bounded by [`LEAD_ADMISSION_WAIT`], not [`TEAMS_POST_MIRROR_WAIT`], for the
+    /// reason that constant records: the caller is an off-loop lead executor, and the round-trip
+    /// is answered by the tick that spawned it, so a 5s bound expired on ordinary tick latency and
+    /// every caller read that expiry as a refusal — a durable `escalation` hold, or a re-queue that
+    /// cost a fresh model turn. In the reported incident (STUDIO-1407, item 2556) that produced a
+    /// lead admission that flapped refused/admitted/refused across three consecutive ticks with no
+    /// author run live and no hold in existence. A real answer still decides; only the generous cap
+    /// expiring is logged, at `warn!`, naming the ticket, and reported as `Err` so no caller can
+    /// mistake a wedged loop for a revocation.
+    pub async fn lead_allowed(
+        &self,
+        repo: &str,
+        ticket: &str,
+    ) -> Result<bool, LeadAdmissionExpired> {
         let (tx, rx) = oneshot::channel();
         if self
             .events
@@ -2685,18 +2708,20 @@ impl ControlHandle {
             })
             .is_err()
         {
-            return false;
+            // The loop is gone; there is nothing left to admit against. That is a real refusal.
+            return Ok(false);
         }
-        match tokio::time::timeout(TEAMS_POST_MIRROR_WAIT, rx).await {
-            Ok(reply) => reply.unwrap_or(false),
+        match tokio::time::timeout(LEAD_ADMISSION_WAIT, rx).await {
+            // Only the control task's own answer is a verdict: `true` admits, `false` refuses.
+            Ok(reply) => Ok(reply.unwrap_or(false)),
             Err(_) => {
                 tracing::warn!(
                     repo,
                     ticket,
-                    "lead admission: the control task did not answer within the bounded wait; \
-                     treating it as refused (it is busy in the tick that asked)"
+                    "lead admission: the control task did not answer within the admission wait; \
+                     not a refusal, the loop is wedged"
                 );
-                false
+                Err(LeadAdmissionExpired)
             }
         }
     }
@@ -4354,15 +4379,16 @@ mod tests {
         );
     }
 
-    /// STUDIO-1436: `lead_allowed` reads a bounded-wait EXPIRY as "refused", and every caller turns
-    /// that into `ADMISSION_REVOKED` — a durable refusal. The two are not the same thing, and in the
-    /// reported incident the conflation produced a lead admission that flapped
+    /// STUDIO-1436: `lead_allowed` used to read a bounded-wait EXPIRY as "refused", and every
+    /// caller turned that into `ADMISSION_REVOKED` — a durable refusal. The two are not the same
+    /// thing, and in the reported incident the conflation produced a lead admission that flapped
     /// refused/admitted/refused across three consecutive ticks with no author run live and no hold
     /// in existence, because the control task cannot answer a request that the tick it is inside
-    /// just spawned. The expiry must therefore say so, at WARN, naming the ticket.
+    /// just spawned. The expiry must therefore say so, at WARN, naming the ticket, and be reported
+    /// as an `Err` — not as the `false` a revocation is.
     ///
-    /// MUTATION: restore `.ok().and_then(Result::ok).unwrap_or(false)` and the assertion reds
-    /// (nothing is logged at all).
+    /// MUTATION: return `Ok(false)` on the expiry (folding it back into a refusal) and the
+    /// assertion reds.
     #[tokio::test(start_paused = true)]
     async fn a_lead_admission_whose_bounded_wait_expires_says_so() {
         let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
@@ -4386,13 +4412,18 @@ mod tests {
         drop(guard);
         held.abort();
 
-        assert!(!allowed, "an expiry is reported as a refusal to the caller");
+        assert_eq!(
+            allowed,
+            Err(LeadAdmissionExpired),
+            "an expiry is a distinct error, never the `false` a revocation is"
+        );
         let events = logs
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         assert!(
             events.iter().any(|e| {
-                e.message.contains("did not answer within the bounded wait")
+                e.message
+                    .contains("did not answer within the admission wait")
                     && e.fields.get("ticket").map(String::as_str) == Some("TEST-100")
             }),
             "the expiry must be logged, not silently read as a revocation: {:?}",
@@ -4400,6 +4431,37 @@ mod tests {
                 .iter()
                 .map(|e| (&e.level, &e.message))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// STUDIO-1436: the lead admission round-trip must outlast a tick's own network work. It used
+    /// to share `TEAMS_POST_MIRROR_WAIT`'s 5s bound, which a tick routinely exceeds because
+    /// `pump_lead_items` runs inside `on_tick` and the answer can only come once the tick returns
+    /// to its `select!`. A 6s answer must therefore still be admitted, not read as a revocation.
+    ///
+    /// MUTATION: restore `TEAMS_POST_MIRROR_WAIT` as the bound and this reds (the 6s answer
+    /// arrives after the wait expired).
+    #[tokio::test(start_paused = true)]
+    async fn a_lead_admission_answered_after_the_old_wait_is_still_granted() {
+        let o = crate::Orchestrator::new("WORKFLOW.md");
+        let mut control = o.control();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        control.events = tx;
+        let answerer = tokio::spawn(async move {
+            let event = rx.recv().await.expect("a lead admission request");
+            if let Event::LeadAllowed { reply, .. } = event {
+                tokio::time::sleep(Duration::from_secs(6)).await;
+                let _ = reply.send(true);
+            }
+        });
+        let allowed = control
+            .lead_allowed("https://github.com/o/r", "TEST-100")
+            .await;
+        answerer.abort();
+        assert_eq!(
+            allowed,
+            Ok(true),
+            "a 6s answer is admitted, not read as a revocation"
         );
     }
 }

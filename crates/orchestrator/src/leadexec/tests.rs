@@ -89,6 +89,14 @@ impl LeadHost for RecordingHost {
         {
             return Err(ADMISSION_REVOKED.into());
         }
+        // A read that is refused for admission ALONE, after a named effect has landed: the
+        // production `subject()` round-trips `lead_allowed`, which can refuse while
+        // `admit_action` still succeeded. Distinct from `deny_admission` (which also fails the
+        // action) and from `revoked` (which fails `admit_action`) so the effect path's read arms
+        // can be exercised on their own (STUDIO-1436).
+        if self.changed("subject-admission") {
+            return Err(ADMISSION_REVOKED.into());
+        }
         if self.read_err || self.changed("unreadable") {
             return Err("source unavailable".into());
         }
@@ -986,6 +994,190 @@ async fn an_admission_revoked_mid_effect_also_requeues() {
             "{action}: no decision row may read as an escalation"
         );
     }
+}
+
+fn commission_calls(host: &RecordingHost) -> usize {
+    host.calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .filter(|c| c.starts_with("commission:"))
+        .count()
+}
+
+/// STUDIO-1436 (B1): an admission refusal that arrives AFTER an action in the decision has landed
+/// must NOT re-queue. Re-queuing hands the item back to a fresh lead run, which decides again from
+/// scratch and replays the landed action — here a second `commission` ticket, orphaning the
+/// first. The landed actions stand, the item keeps the state they set (`parked`), no further
+/// action is applied, and no escalation hold is written; the decision row names what was skipped.
+///
+/// MUTATION: restore the unconditional `requeue_admission_refusal` (drop the `applied` guard in
+/// `refuse_admission`) and this reds — the item becomes `queued` and the decision row reads
+/// `admission refused: re-queued`.
+#[tokio::test]
+async fn an_admission_refused_after_a_landed_commission_keeps_it_and_never_replays() {
+    let (store, mut host, case) = setup("commission then release");
+    // Admission is revoked only once the commission call has been recorded, so the refusal lands
+    // on the second action's pre-effect gate — after the first action completed.
+    host.change_after = Some(("commission:", "revoked"));
+    let refused = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([
+            {"action":"commission","kind":"ticket","question":"diagnose only","hypothesis":"cold cache"},
+            {"action":"release","ticket":"TEST-100","reason":"the missing input now exists"}
+        ]),
+    )
+    .await;
+
+    assert_eq!(
+        refused.state, "parked",
+        "the landed commission stands: {refused:?}"
+    );
+    assert!(
+        refused.escalation.is_none(),
+        "not an escalation: {refused:?}"
+    );
+    assert_eq!(
+        commission_calls(&host),
+        1,
+        "the commission is applied exactly once"
+    );
+    assert_eq!(
+        store.load_lead_items().expect("items")[0].state,
+        "parked",
+        "the item parks on the commission and does NOT re-queue"
+    );
+    assert_eq!(
+        store
+            .lead_execution(case.item.id)
+            .expect("execution")
+            .expect("row")
+            .commission_ticket,
+        "TEST-200",
+        "the execution row still names the one commissioned ticket"
+    );
+    assert!(
+        store
+            .subject_hold(&case.subject.ticket.identifier)
+            .expect("hold")
+            .is_none(),
+        "no escalation hold is written"
+    );
+    assert_eq!(
+        store.load_lead_decisions().expect("rows")[0].decision,
+        "admission refused after 1 of 2 actions; unapplied: release",
+        "the decision row records the unapplied remainder"
+    );
+
+    // A later attempt cannot re-decide a parked item with no findings: `prepare` gates on
+    // `resume_on_findings` (leadexec.rs:353), which returns false here, so no later attempt runs
+    // and no second commission ticket is created.
+    assert!(
+        !resume_on_findings(store.as_ref(), &host, case.item.id)
+            .await
+            .expect("no findings"),
+        "a parked item with no findings is not re-admitted"
+    );
+    assert_eq!(
+        commission_calls(&host),
+        1,
+        "still exactly one commission across the refused attempt and the later one"
+    );
+}
+
+/// STUDIO-1436 (B1): the same rule for the CONFIRMATION read. A single `commission kind=ticket`
+/// runs to completion — `create_issue` has already happened and `result.state` is `parked` — and
+/// then the read that confirms the effect is refused for admission. Re-queuing here overwrites
+/// `parked` with `queued`, so `resume_on_findings` never consumes the commission's findings and a
+/// later admitted attempt can create a SECOND ticket. The landed commission must stand.
+///
+/// MUTATION: restore the unconditional `requeue_admission_refusal` and this reds — the item
+/// becomes `queued` with the decision row reading `admission refused: re-queued`.
+#[tokio::test]
+async fn an_admission_refused_at_the_confirmation_read_keeps_the_landed_commission() {
+    let (store, mut host, case) = setup("commission then confirm");
+    // The subject read refuses for admission ALONE, after the commission has landed, while
+    // `admit_action` still succeeds: exactly the confirmation read.
+    host.change_after = Some(("commission:", "subject-admission"));
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([
+            {"action":"commission","kind":"ticket","question":"diagnose only","hypothesis":"cold cache"}
+        ]),
+    )
+    .await;
+
+    assert_eq!(result.state, "parked", "{result:?}");
+    assert!(result.escalation.is_none(), "{result:?}");
+    assert_eq!(commission_calls(&host), 1);
+    assert_eq!(
+        store.load_lead_items().expect("items")[0].state,
+        "parked",
+        "the item stays parked for its findings"
+    );
+    assert_eq!(
+        store
+            .lead_execution(case.item.id)
+            .expect("execution")
+            .expect("row")
+            .commission_ticket,
+        "TEST-200"
+    );
+    assert!(
+        store
+            .subject_hold(&case.subject.ticket.identifier)
+            .expect("hold")
+            .is_none(),
+        "no escalation hold"
+    );
+    assert_eq!(
+        store.load_lead_decisions().expect("rows")[0].decision,
+        "admission refused after 1 of 1 actions; unapplied: none"
+    );
+}
+
+/// STUDIO-1436 (B1): the same rule for the FRESHNESS read before a later action. The first action
+/// landed, and the read that guards the second action is refused for admission. The landed action
+/// must stand and the remaining one must not be applied.
+///
+/// MUTATION: restore the unconditional `requeue_admission_refusal` and this reds — the item
+/// becomes `queued` and the decision row reads `admission refused: re-queued`.
+#[tokio::test]
+async fn an_admission_refused_at_the_freshness_read_keeps_the_landed_action() {
+    let (store, mut host, case) = setup("commission then release");
+    host.change_after = Some(("commission:", "subject-admission"));
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([
+            {"action":"commission","kind":"ticket","question":"diagnose only","hypothesis":"cold cache"},
+            {"action":"release","ticket":"TEST-100","reason":"the missing input now exists"}
+        ]),
+    )
+    .await;
+
+    assert_eq!(result.state, "parked", "{result:?}");
+    assert!(result.escalation.is_none(), "{result:?}");
+    assert_eq!(commission_calls(&host), 1);
+    assert_eq!(store.load_lead_items().expect("items")[0].state, "parked");
+    assert!(
+        !host
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .any(|c| c.starts_with("release:")),
+        "the unapplied release never runs"
+    );
+    assert_eq!(
+        store.load_lead_decisions().expect("rows")[0].decision,
+        "admission refused after 1 of 2 actions; unapplied: release"
+    );
 }
 
 #[tokio::test]
