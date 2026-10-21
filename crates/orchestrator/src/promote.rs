@@ -1148,13 +1148,14 @@ mod tests {
         ) -> Result<std::collections::HashMap<i64, String>, StoreError> {
             self.0.load_review_verdicts(run_ids)
         }
-        fn count_completed_review_runs(
+        fn count_changes_requested_review_runs(
             &self,
             owner: &str,
             repo: &str,
             number: i64,
         ) -> Result<i64, StoreError> {
-            self.0.count_completed_review_runs(owner, repo, number)
+            self.0
+                .count_changes_requested_review_runs(owner, repo, number)
         }
         fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError> {
             self.0.count_runs_for(identifier)

@@ -2782,24 +2782,31 @@ impl Store for Sqlite {
         Ok(out)
     }
 
-    fn count_completed_review_runs(
+    fn count_changes_requested_review_runs(
         &self,
         owner: &str,
         repo: &str,
         number: i64,
     ) -> Result<i64, StoreError> {
         let conn = self.lock();
-        // `ESCAPE '\'` makes `review_run_pattern`'s wildcard-escaping effective. `outcome =
-        // completed` is the whole point: the breaker bounds spend that HAPPENED, so a run that
-        // failed or was truncated never counts.
+        // `ESCAPE '\'` makes `review_run_pattern`'s wildcard-escaping effective. Three filters, each
+        // load-bearing (STUDIO-1440): `outcome = completed` (the breaker bounds spend that HAPPENED,
+        // so a failed or truncated run never counts); the verdict join keeps only rounds whose
+        // reviewer ASKED FOR CHANGES (an approval, or a run that declared no verdict, is not a
+        // runaway signal); and `NOT LIKE '%@manager'` drops a manager/intervention run, which is a
+        // `pr:` key but never a review round.
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM runs \
-              WHERE issue_identifier LIKE ?1 ESCAPE '\\' AND outcome = ?2 \
+            "SELECT COUNT(*) FROM runs r \
+               JOIN rhapsody_review_verdicts v ON v.run_id = r.id \
+              WHERE r.issue_identifier LIKE ?1 ESCAPE '\\' AND r.outcome = ?2 \
+                AND v.verdict = ?3 \
+                AND r.issue_identifier NOT LIKE '%@manager' \
                 AND NOT EXISTS (SELECT 1 FROM rhapsody_breaker_cleared_runs c \
-                                WHERE c.pr = ?3 AND c.run_id = runs.id)",
+                                WHERE c.pr = ?4 AND c.run_id = r.id)",
             params![
                 review_run_pattern(owner, repo, number),
                 OUTCOME_COMPLETED,
+                REVIEW_VERDICT_CHANGES_REQUESTED,
                 format!("{owner}/{repo}#{number}").to_ascii_lowercase()
             ],
             |row| row.get(0),
@@ -10461,35 +10468,46 @@ mod tests {
             .expect("provenance");
     }
 
-    /// The breaker's round counter: COMPLETED review runs of the coordinate only — its sibling
-    /// PR's runs, other reviewers' non-completed runs, and non-review runs never count.
+    /// The breaker's round counter (STUDIO-1440): COMPLETED review runs whose reviewer verdict
+    /// ASKED FOR CHANGES — an approving round, a manager run, a run whose coordinate is a different
+    /// pull request, a non-review run, and a failed review all never count.
     ///
-    /// Mutation: drop `outcome = completed` and the failed review is counted (3).
+    /// Mutation: drop `v.verdict = changes_requested` and the approving `bob` run is counted (2).
     #[test]
-    fn breaker_counts_only_completed_review_runs_of_the_coordinate() {
+    fn breaker_counts_only_changes_requested_review_runs_of_the_coordinate() {
         let store = Sqlite::open(StorePath::InMemory).expect("open");
         let at = "2026-09-20T00:00:00Z";
         let a = start_run_at(&store, "pr:makewhatis/rhapsody#12@alice", at);
         let b = start_run_at(&store, "pr:makewhatis/rhapsody#12@bob", at);
         let failed = start_run_at(&store, "pr:makewhatis/rhapsody#12@carol", at);
+        let manager = start_run_at(&store, "pr:makewhatis/rhapsody#12@manager", at);
         let other_pr = start_run_at(&store, "pr:makewhatis/rhapsody#13@alice", at);
         let author = start_run_at(&store, "STUDIO-988", at);
         end_run_with(&store, a, OUTCOME_COMPLETED, 10, at);
         end_run_with(&store, b, OUTCOME_COMPLETED, 10, at);
         end_run_with(&store, failed, OUTCOME_FAILED, 10, at);
+        end_run_with(&store, manager, OUTCOME_COMPLETED, 10, at);
         end_run_with(&store, other_pr, OUTCOME_COMPLETED, 10, at);
         end_run_with(&store, author, OUTCOME_COMPLETED, 10, at);
+        for id in [a, failed, manager, other_pr, author] {
+            store
+                .set_review_verdict(id, REVIEW_VERDICT_CHANGES_REQUESTED)
+                .expect("verdict");
+        }
+        store
+            .set_review_verdict(b, REVIEW_VERDICT_APPROVED)
+            .expect("verdict");
 
         assert_eq!(
             store
-                .count_completed_review_runs("makewhatis", "rhapsody", 12)
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
                 .expect("count"),
-            2,
-            "two completed review runs of #12"
+            1,
+            "only the one changes-requested review run of #12 counts"
         );
         assert_eq!(
             store
-                .count_completed_review_runs("makewhatis", "rhapsody", 99)
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 99)
                 .expect("count"),
             0,
             "a coordinate with no runs is zero, not an error"
@@ -10509,10 +10527,15 @@ mod tests {
         let wildcard_lookalike = start_run_at(&store, "pr:o/axb#1@alice", at);
         end_run_with(&store, underscore, OUTCOME_COMPLETED, 1, at);
         end_run_with(&store, wildcard_lookalike, OUTCOME_COMPLETED, 1, at);
+        for id in [underscore, wildcard_lookalike] {
+            store
+                .set_review_verdict(id, REVIEW_VERDICT_CHANGES_REQUESTED)
+                .expect("verdict");
+        }
 
         assert_eq!(
             store
-                .count_completed_review_runs("o", "a_b", 1)
+                .count_changes_requested_review_runs("o", "a_b", 1)
                 .expect("count"),
             1,
             "the underscore is literal, so only the matching repo counts"
@@ -12208,6 +12231,11 @@ mod tests {
         let other = start_run_at(&store, "pr:o/axb#1@alice", at);
         end_run_with(&store, cleared, OUTCOME_COMPLETED, 100, at);
         end_run_with(&store, other, OUTCOME_COMPLETED, 200, at);
+        for id in [cleared, other] {
+            store
+                .set_review_verdict(id, REVIEW_VERDICT_CHANGES_REQUESTED)
+                .expect("verdict");
+        }
         let mut watch = introduced(wkey("o", "a_b", 1, "alice"));
         watch.introduced_by = "adopt:STUDIO-1123".into();
         store.save_review_watch(watch).expect("adopt");
@@ -12226,13 +12254,13 @@ mod tests {
         let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
         assert_eq!(
             store
-                .count_completed_review_runs("O", "A_B", 1)
+                .count_changes_requested_review_runs("O", "A_B", 1)
                 .expect("count"),
             0
         );
         assert_eq!(
             store
-                .count_completed_review_runs("o", "axb", 1)
+                .count_changes_requested_review_runs("o", "axb", 1)
                 .expect("other PR"),
             1
         );
@@ -12266,9 +12294,12 @@ mod tests {
         assert_eq!(baseline, 0);
         let next = start_run_at(&store, "pr:o/a_b#1@alice", at);
         end_run_with(&store, next, OUTCOME_COMPLETED, 10, at);
+        store
+            .set_review_verdict(next, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("verdict");
         assert_eq!(
             store
-                .count_completed_review_runs("o", "a_b", 1)
+                .count_changes_requested_review_runs("o", "a_b", 1)
                 .expect("new count"),
             1
         );
@@ -12291,6 +12322,9 @@ mod tests {
             .expect("crossing");
         let id = start_run_at(&store, "pr:o/r#1@alice", "2026-10-08T00:00:00Z");
         end_run_with(&store, id, OUTCOME_COMPLETED, 10, "2026-10-08T00:00:00Z");
+        store
+            .set_review_verdict(id, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("verdict");
         let before = store.review_bound("o/r#1").expect("bound");
         let crossings = store.load_breaker_crossings().expect("crossings");
         store
@@ -12305,7 +12339,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .count_completed_review_runs("o", "r", 1)
+                .count_changes_requested_review_runs("o", "r", 1)
                 .expect("count"),
             1,
             "the baseline insertion rolls back with the generation and watermark"

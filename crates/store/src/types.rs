@@ -1018,8 +1018,9 @@ pub const REVIEW_COMPLETION_CHANGES: &str = "changes";
 pub struct BreakerCrossingRow {
     /// The human ticket id, e.g. `STUDIO-988`. The primary key.
     pub ticket: String,
-    /// How many COMPLETED review runs had HAPPENED when the last round-crossing notified. `0`
-    /// before the first crossing. The next crossing fires at
+    /// How many CHANGES-REQUESTED review rounds had HAPPENED when the last round-crossing notified
+    /// (STUDIO-1440; the count is the breaker's, see [`crate::Store::count_changes_requested_review_runs`]).
+    /// `0` before the first crossing. The next crossing fires at
     /// `notified_rounds + review.hold_after_rounds`.
     pub notified_rounds: i64,
     /// The providers whose per-ticket cap has already notified. Newline-joined in one column, like

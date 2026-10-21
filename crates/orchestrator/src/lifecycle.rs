@@ -2955,13 +2955,14 @@ mod tests {
         ) -> Result<std::collections::HashMap<i64, String>, rhapsody_store::StoreError> {
             self.0.load_review_verdicts(a0)
         }
-        fn count_completed_review_runs(
+        fn count_changes_requested_review_runs(
             &self,
             owner: &str,
             repo: &str,
             number: i64,
         ) -> Result<i64, rhapsody_store::StoreError> {
-            self.0.count_completed_review_runs(owner, repo, number)
+            self.0
+                .count_changes_requested_review_runs(owner, repo, number)
         }
         fn count_runs_for(&self, identifier: &str) -> Result<i64, rhapsody_store::StoreError> {
             self.0.count_runs_for(identifier)

@@ -905,16 +905,23 @@ pub trait Store {
     // --- runaway-loop breaker crossings (STUDIO-1026; no Go counterpart — see
     // [`BreakerCrossingRow`]) ------------------------------------------------------------------
 
-    /// How many COMPLETED review runs this daemon has recorded for one pull request — every `runs`
-    /// row whose `issue_identifier` is `pr:<owner>/<repo>#<number>@<any reviewer>` with
-    /// `outcome = completed`, excluding completions already present at the last operator clear.
+    /// How many COMPLETED review runs of one pull request ASKED FOR CHANGES — every `runs` row whose
+    /// `issue_identifier` is `pr:<owner>/<repo>#<number>@<reviewer>` with `outcome = completed` and a
+    /// recorded [`REVIEW_VERDICT_CHANGES_REQUESTED`] verdict in `rhapsody_review_verdicts`,
+    /// excluding completions already present at the last operator clear (STUDIO-1440).
+    ///
+    /// This is the runaway-loop breaker's Rounds input, and the whole point is that it is NOT every
+    /// completed round: a round that APPROVED, one whose run recorded no verdict (truncated, failed,
+    /// predating the ledger), and a manager/intervention run (`@manager`) are all NOT evidence of a
+    /// runaway and must not count. The approval verdict belongs to the run, not to the watch row, so
+    /// only the per-run ledger can answer this.
     ///
     /// ⚠️ NEVER [`Store::load_review_bounds`]' `dispatches`: that counts rounds the daemon ARMED and
     /// an operator's `clear` resets both counts (STUDIO-1134). The breaker counts only completed
     /// runs, including a run in flight at clear that completes later. Reads with the caller's explicit
     /// empty/whitespace identifiers truncated by
     /// LIKE's own escaping (see [`Sqlite`](crate::Sqlite)); a coordinate with no such runs answers 0.
-    fn count_completed_review_runs(
+    fn count_changes_requested_review_runs(
         &self,
         owner: &str,
         repo: &str,

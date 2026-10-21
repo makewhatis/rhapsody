@@ -2990,7 +2990,8 @@ mod tests {
             "limit"
         );
         assert_eq!(
-            st.count_completed_review_runs("owner", "repo", 1).unwrap(),
+            st.count_changes_requested_review_runs("owner", "repo", 1)
+                .unwrap(),
             0
         );
     }
@@ -3176,7 +3177,8 @@ mod tests {
         assert!(o.review_attempts.is_empty());
         assert!(o.review_rounds.is_empty());
         assert_eq!(
-            st.count_completed_review_runs("owner", "repo", 1).unwrap(),
+            st.count_changes_requested_review_runs("owner", "repo", 1)
+                .unwrap(),
             0
         );
     }

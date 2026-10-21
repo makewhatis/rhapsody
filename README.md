@@ -2005,8 +2005,13 @@ providers whose per-ticket cap has fired.
 
 The controls themselves are Rhapsody-only config, all off when unset: `teams.review.hold_after_rounds`
 (`0` = off), `budgets.<provider>.per_ticket` (`0` = unlimited), and a top-level `notify:` block
-(`macos`, `webhook`, `ntfy`). The breaker counts **completed review runs from the `runs` ledger**
-(`pr:<owner>/<repo>#<n>@*`), deliberately not the watcher's own dispatch counter. An operator
+(`macos`, `webhook`, `ntfy`). The breaker counts **completed review runs whose verdict asked for
+changes** from the `runs` ledger joined to the per-run `rhapsody_review_verdicts`
+(`pr:<owner>/<repo>#<n>@<reviewer>`), deliberately not the watcher's own dispatch counter — a round
+that approved, a re-review armed only by merging `main`, and the manager's own intervention run
+(`@manager`) are all evidence of convergence, not of a runaway (STUDIO-1440). A round crossing also
+does not apply the hold while the most recent completed verdict at the pull request's current head is
+an approval (every live watch row settled `approved` at the head it read). An operator
 `clear` resets both round counts (STUDIO-1134); only post-clear completed reviews count for the
 breaker. Spend sums the ticket's author runs plus its pull request's review runs, split by
 `rhapsody_run_provenance.provider`. The
