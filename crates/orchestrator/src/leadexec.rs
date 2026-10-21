@@ -1068,6 +1068,12 @@ pub async fn execute(
     let parsed = parse_lead_decision(text);
     let current = match host.subject().await {
         Ok(current) => current,
+        // An admission refusal here is the same transient class as one raised inside the effect
+        // loop (STUDIO-1436), not an unconfirmable subject: fall through to the effect path's own
+        // admission gate, which re-queues. Escalating would park the author on a refusal that is
+        // re-evaluated on the next attempt. If the subject really did move, the loop's freshness
+        // check catches it exactly as it does mid-effect.
+        Err(reason) if reason == ADMISSION_REVOKED => case.subject.clone(),
         Err(_) => {
             result.escalation =
                 Some("fresh subject could not be confirmed; operator must inspect".into());

@@ -81,6 +81,14 @@ impl LeadHost for RecordingHost {
         }
     }
     async fn subject(&self) -> Result<LeadSubject, String> {
+        // The production host reads admission on this path too (`subject` → `lead_allowed(repo,
+        // "")`), so a denied admission must fail the read as well as the action (STUDIO-1436).
+        if self
+            .deny_admission
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ADMISSION_REVOKED.into());
+        }
         if self.read_err || self.changed("unreadable") {
             return Err("source unavailable".into());
         }
@@ -888,6 +896,50 @@ async fn an_admission_refused_effect_requeues_and_applies_on_a_later_admitted_at
     assert!(
         calls.iter().any(|c| c.starts_with("todo:")),
         "and the ticket was moved for the author: {calls:?}"
+    );
+}
+
+/// STUDIO-1436: the same re-queue applies when admission is already revoked at the FIRST read of
+/// the effect path — before any effect is attempted. That read used to become "fresh subject could
+/// not be confirmed", which escalates and parks the author on a refusal that is re-evaluated on
+/// the next attempt.
+///
+/// MUTATION: drop the `Err(reason) if reason == ADMISSION_REVOKED` arm from that first read and
+/// this reds (the escalation is raised before the effect loop, so the item ends `done` and a hold
+/// appears).
+#[tokio::test]
+async fn an_admission_revoked_at_the_first_read_requeues() {
+    let (store, host, case) = setup("revoked before the effects");
+    host.deny_admission
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([{"action":"requeue","ticket":"TEST-100"}]),
+    )
+    .await;
+    assert_eq!(result.state, "queued", "{result:?}");
+    assert!(result.escalation.is_none(), "{result:?}");
+    assert!(
+        store
+            .subject_hold(&case.subject.ticket.identifier)
+            .expect("hold")
+            .is_none(),
+        "no escalation hold"
+    );
+    assert_eq!(
+        store.load_lead_items().expect("items")[0].state,
+        "queued",
+        "the item stays retryable"
+    );
+    assert!(
+        store
+            .load_lead_decisions()
+            .expect("rows")
+            .iter()
+            .all(|r| !r.decision.starts_with("escalate:")),
+        "no decision row may read as an escalation"
     );
 }
 
