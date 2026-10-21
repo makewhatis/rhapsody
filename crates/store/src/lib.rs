@@ -918,8 +918,8 @@ pub trait Store {
     ///
     /// ⚠️ NEVER [`Store::load_review_bounds`]' `dispatches`: that counts rounds the daemon ARMED and
     /// an operator's `clear` resets both counts (STUDIO-1134). The breaker counts only completed
-    /// runs, including a run in flight at clear that completes later. Reads with the caller's explicit
-    /// empty/whitespace identifiers truncated by
+    /// changes-requested rounds, including a run in flight at clear that completes later. Reads with
+    /// the caller's explicit empty/whitespace identifiers truncated by
     /// LIKE's own escaping (see [`Sqlite`](crate::Sqlite)); a coordinate with no such runs answers 0.
     fn count_changes_requested_review_runs(
         &self,

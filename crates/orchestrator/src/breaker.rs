@@ -1118,7 +1118,7 @@ mod tests {
     use rhapsody_config::room::{CaughtUp, Cursor, RoomError};
     use rhapsody_config::teams::{Identity, Review, ReviewMode, Teams};
     use rhapsody_store::{
-        OUTCOME_COMPLETED, REVIEW_STATUS_APPROVED, REVIEW_STATUS_REQUESTED,
+        OUTCOME_COMPLETED, REVIEW_STATUS_APPROVED, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_REVIEWED,
         REVIEW_VERDICT_APPROVED, REVIEW_VERDICT_CHANGES_REQUESTED, ReviewWatchKey, ReviewWatchRow,
         RunEnd, RunProvenance, RunStart, Sqlite, Store, StorePath,
     };
@@ -1344,6 +1344,29 @@ mod tests {
             plan.spend.iter().any(|s| s.provider == "anthropic"),
             "the plan reports the spend by provider"
         );
+    }
+
+    /// The boundary of the suppression: a head whose newest verdict ASKED FOR CHANGES is not
+    /// converged, so five changes-requested rounds still cross and hold (STUDIO-1440).
+    ///
+    /// Mutation: suppress on any live row rather than only an approval and this stops crossing.
+    #[test]
+    fn a_findings_verdict_at_head_still_crosses() {
+        let store = store();
+        seed_watch_status(&store, "STUDIO-988", REVIEW_STATUS_REVIEWED);
+        for r in ["alice", "bob", "carol", "dan", "erin"] {
+            seed_review_round(
+                &store,
+                &format!("pr:makewhatis/rhapsody#12@{r}"),
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+            );
+        }
+        let mut o = orch(store.clone(), 5, &[]);
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        let plan = rx.try_recv().expect("a not-converged PR still crosses");
+        assert_eq!(plan.kinds, vec![CrossingKind::Rounds]);
+        assert_eq!(plan.rounds, 5);
     }
 
     /// The booch#644 sequence (STUDIO-1440): two findings rounds, then three approvals at successive
