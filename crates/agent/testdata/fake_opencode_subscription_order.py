@@ -13,7 +13,6 @@ handler here reproduces that exact order deterministically: no sleep, no load, n
 import os
 import pathlib
 import sys
-import tempfile
 
 fixture, script = sys.argv[1], sys.argv[2]
 
@@ -34,7 +33,9 @@ class _NoServer:
 http.server.ThreadingHTTPServer = _NoServer
 sys.argv = [fixture, script, "serve", "--port", "1"]
 os.environ.setdefault("OPENCODE_SERVER_PASSWORD", "probe-password")
-os.environ.setdefault("XDG_DATA_HOME", tempfile.mkdtemp())
+# The fixture only reads this to derive a fallback session id, and the caller's script directory is
+# an existing one — nothing is created here, so the probe leaves no scratch directory behind.
+os.environ.setdefault("XDG_DATA_HOME", str(pathlib.Path(script).parent))
 
 module = {"__name__": "fake_opencode_server", "__file__": fixture}
 source = pathlib.Path(fixture).read_text()
