@@ -351,28 +351,15 @@ fn is_acceptance(text: &str) -> bool {
 /// `## Acceptance` example must not have that example taken for the real section, which would drop
 /// the real acceptance while the marker claimed it was quoted in full.
 ///
-/// A prepended route-back block is skipped too. The operator route-back PREPENDS its feedback (and
+/// Prepended route-back blocks are skipped too. The operator route-back PREPENDS its feedback (and
 /// sometimes an `## OPERATOR NOTE` section in front of that), and a pasted review carries an
 /// `### Acceptance` checklist of its own — so the FIRST acceptance heading in the description can be
 /// the REVIEWER's, and anchoring there quotes the feedback as the ticket's acceptance while the real
-/// section falls outside the window. A route-back heading that sits BEFORE that candidate marks the
-/// block in front of the ticket: everything through its own section is prepended, and the ticket's
-/// acceptance is the first one after it. A route-back heading that comes AFTER the candidate is not
-/// a prepend at all and changes nothing, which is what keeps a description that merely mentions one,
-/// past its acceptance, windowing on the real section.
+/// section falls outside the window. [`prepended_end`] gives the offset past every prepended block,
+/// and the ticket's acceptance is the first heading after it.
 fn acceptance_section(description: &str) -> Option<std::ops::Range<usize>> {
     let headings = headings(description);
-    let skip = headings
-        .iter()
-        .position(|(_, _, text)| is_acceptance(text))
-        .and_then(|candidate| {
-            headings[..candidate]
-                .iter()
-                .enumerate()
-                .find(|(_, (_, _, text))| is_route_back(text))
-                .map(|(i, (_, level, _))| section_end(&headings, i + 1, *level, description.len()))
-        })
-        .unwrap_or(0);
+    let skip = prepended_end(&headings, description.len());
     let (index, start, level) =
         headings
             .iter()
@@ -381,6 +368,47 @@ fn acceptance_section(description: &str) -> Option<std::ops::Range<usize>> {
                 (*line_start >= skip && is_acceptance(text)).then_some((i, *line_start, *level))
             })?;
     Some(start..section_end(&headings, index + 1, level, description.len()))
+}
+
+/// The byte offset at which the ticket's OWN text begins — past every prepended route-back block,
+/// or 0 when the description has none (STUDIO-1438).
+///
+/// The operator PREPENDS a `## REVIEW FEEDBACK` block on each route-back, so a ticket routed back
+/// more than once stacks several; each pasted review carries an `### Acceptance` checklist of its
+/// own. The prepended region is the contiguous run of route-back sections that begins at the first
+/// one, so the skip runs through the LAST block of that run — stopping at the first would leave the
+/// second block's checklist to capture the window, which is the very contested pull request this
+/// window exists for. An `## OPERATOR NOTE` in front of the run needs no special case: it sits
+/// before the run and is skipped along with it.
+///
+/// The run is only a prepend when it begins BEFORE the first acceptance heading. A route-back
+/// heading after the ticket's acceptance is not a prepend at all — it is the ticket's own text — so
+/// it leaves the offset at 0 and the real acceptance still windows.
+fn prepended_end(headings: &[(usize, usize, String)], len: usize) -> usize {
+    let first_acceptance = headings
+        .iter()
+        .position(|(_, _, text)| is_acceptance(text))
+        .unwrap_or(headings.len());
+    let Some(first) = headings
+        .iter()
+        .position(|(_, _, text)| is_route_back(text))
+        .filter(|first| *first < first_acceptance)
+    else {
+        return 0;
+    };
+    let level = headings[first].1;
+    let mut end = section_end(headings, first + 1, level, len);
+    for (i, (line_start, next_level, text)) in headings.iter().enumerate().skip(first + 1) {
+        if *line_start < end {
+            continue; // inside a route-back block already consumed
+        }
+        if *next_level == level && is_route_back(text) {
+            end = section_end(headings, i + 1, level, len);
+        } else {
+            break; // the ticket's own text begins here
+        }
+    }
+    end
 }
 
 /// The start of the first heading in `headings[from..]` at `level` or higher, or `fallback` when
@@ -1731,6 +1759,70 @@ mod tests {
         assert!(
             !acceptance_region.contains("- reviewer checklist item one"),
             "neither prepended block's checklist may be quoted as the ticket's acceptance:\n{text}"
+        );
+    }
+
+    /// A ticket routed back more than once stacks its route-back blocks — the very contested pull
+    /// request this window exists for. Skipping only the first block would leave the second block's
+    /// `### Acceptance` checklist to capture the window, so the skip runs through the LAST block
+    /// before the candidate.
+    ///
+    /// Mutation: skipping only the first route-back block (`.find` instead of `.filter(..).last()`)
+    /// reds here — the second block's checklist becomes the quoted acceptance.
+    #[test]
+    fn a_second_stacked_route_back_block_does_not_capture_the_window() {
+        let mut body = String::from(
+            "## REVIEW FEEDBACK (operator gate, 2026-10-21 ~07:00Z, on \
+             https://github.com/makewhatis/rhapsody/pull/363 at afcf29a)\n\n\
+             Round two feedback.\n\n### Acceptance\n\n- round two checklist item\n\n",
+        );
+        body.push_str(&"the operator asked for this change. ".repeat(200));
+        body.push_str(
+            "\n\n## REVIEW FEEDBACK (operator gate, 2026-10-20 ~07:00Z, on \
+             https://github.com/makewhatis/rhapsody/pull/363 at deadbee)\n\n\
+             Round one feedback.\n\n### Acceptance\n\n- round one checklist item\n\n",
+        );
+        body.push_str(&"an earlier round asked for this change. ".repeat(200));
+        body.push_str("\n\n## The defects\n\n1. one\n2. two\n3. three\n\n## Acceptance\n\n");
+        body.push_str("- THE REAL CRITERION\n- A SECOND REAL CRITERION\n");
+        assert!(body.len() > ORIGIN_TICKET_MAX_BYTES);
+
+        let text = rendered_with(&body);
+        let acceptance_region = text
+            .split_once("The acceptance criteria below are quoted in full.")
+            .map(|(_, after)| after)
+            .expect("the ticket's acceptance must be quoted");
+        assert!(
+            acceptance_region.contains("- THE REAL CRITERION")
+                && acceptance_region.contains("- A SECOND REAL CRITERION"),
+            "every real acceptance bullet must be the quoted section:\n{text}"
+        );
+        assert!(
+            !acceptance_region.contains("- round two checklist item")
+                && !acceptance_region.contains("- round one checklist item"),
+            "no stacked route-back checklist may be quoted as the ticket's acceptance:\n{text}"
+        );
+    }
+
+    /// A route-back heading that sits AFTER the ticket's own acceptance is not a prepend — it is the
+    /// ticket's own text (a description that documents the mechanism, or an old block that was
+    /// appended rather than prepended). It must not drag the skip past the real acceptance.
+    ///
+    /// Mutation: dropping the `first < first_acceptance` guard in [`prepended_end`] reds here — the
+    /// skip runs to the end and the real acceptance falls outside a head-truncated window.
+    #[test]
+    fn a_route_back_heading_after_the_acceptance_is_not_a_prepend() {
+        let mut body = String::from("## Requirement\n\n");
+        body.push_str(&"filler. ".repeat(1400)); // over budget before the acceptance
+        body.push_str(
+            "\n\n## Acceptance\n\n- THE REAL CRITERION\n\n## REVIEW FEEDBACK\n\nappended note\n",
+        );
+        assert!(body.len() > ORIGIN_TICKET_MAX_BYTES);
+
+        let text = rendered_with(&body);
+        assert!(
+            text.contains("- THE REAL CRITERION"),
+            "the ticket's acceptance must survive a route-back heading after it:\n{text}"
         );
     }
 }
