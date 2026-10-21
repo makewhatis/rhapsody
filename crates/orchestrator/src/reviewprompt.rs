@@ -307,10 +307,30 @@ fn origin_ticket_window(description: &str) -> (String, usize) {
 /// Matched case-insensitively on `Acceptance` and `Acceptance criteria`, at any heading level, so
 /// `## Acceptance`, `## acceptance criteria` and `### ACCEPTANCE` all resolve. A `###` sub-heading
 /// INSIDE the section does not end it; a following `## Out of scope` does.
+///
+/// Fenced code blocks are skipped: a ticket that DOCUMENTS the acceptance format with a fenced
+/// `## Acceptance` example must not have that example taken for the real section, which would drop
+/// the real acceptance while the marker claimed it was quoted in full.
 fn acceptance_section(description: &str) -> Option<std::ops::Range<usize>> {
     let mut start: Option<(usize, usize)> = None;
+    let mut fence: Option<(char, usize)> = None;
     for (line_start, line_end) in line_spans(description) {
-        let Some((level, text)) = atx_heading(&description[line_start..line_end]) else {
+        let line = &description[line_start..line_end];
+        if let Some((open_char, open_len)) = fence {
+            // Inside a fenced block: only a matching closing fence is prompt structure.
+            let closes = fence_marker(line).is_some_and(|(close_char, close_len)| {
+                close_char == open_char && close_len >= open_len
+            });
+            if closes {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(marker) = fence_marker(line) {
+            fence = Some(marker);
+            continue;
+        }
+        let Some((level, text)) = atx_heading(line) else {
             continue;
         };
         match start {
@@ -323,6 +343,20 @@ fn acceptance_section(description: &str) -> Option<std::ops::Range<usize>> {
         }
     }
     start.map(|(begin, _)| begin..description.len())
+}
+
+/// The character and length of a fenced code block's opening or closing marker, or `None`.
+///
+/// A minimal CommonMark reading — three or more backticks or tildes at the start of a line — which
+/// is enough to tell a documented example from the ticket's own structure.
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let fence_char = match trimmed.chars().next()? {
+        c @ ('`' | '~') => c,
+        _ => return None,
+    };
+    let len = trimmed.chars().take_while(|c| *c == fence_char).count();
+    (len >= 3).then_some((fence_char, len))
 }
 
 /// The level and lowercased text of an ATX heading, or `None` when the line is not one.
@@ -1378,6 +1412,34 @@ mod tests {
         assert!(
             !section.contains("- drop me"),
             "the next `##` heading ends the section:\n{section}"
+        );
+    }
+
+    /// A fenced `## Acceptance` is a DOCUMENTED EXAMPLE, not the ticket's acceptance. Anchoring the
+    /// window on it would drop the real section while the marker claimed the acceptance was quoted
+    /// in full — the same class of defect this ticket exists to fix.
+    #[test]
+    fn a_fenced_acceptance_example_is_not_the_acceptance_section() {
+        let mut body =
+            String::from("## Example\n\n```md\n## Acceptance\n- example bullet\n```\n\n");
+        body.push_str(&"filler. ".repeat(1200));
+        body.push_str("\n\n## Acceptance\n\n- THE REAL CRITERION\n");
+        assert!(body.len() > ORIGIN_TICKET_MAX_BYTES);
+
+        let text = rendered_with(&body);
+        // The window must be anchored on the real heading: everything after the elision marker is
+        // the acceptance section, and it is the real one — not the fenced example.
+        let acceptance_region = text
+            .split_once("were elided here")
+            .map(|(_, after)| after)
+            .expect("the filler between the example and the real heading must be elided");
+        assert!(
+            acceptance_region.contains("- THE REAL CRITERION"),
+            "the real acceptance section must be the window's tail:\n{text}"
+        );
+        assert!(
+            !acceptance_region.contains("- example bullet"),
+            "the fenced example must not be taken for the acceptance section:\n{text}"
         );
     }
 
