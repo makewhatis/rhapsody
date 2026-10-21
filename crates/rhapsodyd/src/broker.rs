@@ -114,7 +114,7 @@ impl BrokerRuntime {
 ///   agreed outcome when the shutdown beats the serving task into its accept loop (a fast-fail boot
 ///   cancels before the task is ever polled): the task returns `Ok(())` having never accepted, and
 ///   the broker stays **available**, because nothing failed — pinned by
-///   [`tests::a_shutdown_before_the_accept_loop_is_still_clean`]. The `biased` select below is what
+///   `tests::a_shutdown_before_the_accept_loop_is_still_clean`. The `biased` select below is what
 ///   makes that independent of which future happens to complete first.
 /// * If the serving task ends **while the daemon is still live** (an accept error, or a task that
 ///   died silently), the broker is atomically marked unavailable and every grant is revoked, and
