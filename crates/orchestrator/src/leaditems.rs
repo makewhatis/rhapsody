@@ -500,6 +500,7 @@ impl Orchestrator {
             let description = issue.description.clone().unwrap_or_default();
             let state = &issue.state;
             let human = crate::teams::is_human(issue);
+            let human_hold_removed = snapshot.human && !human;
             let changed = snapshot
                 .description
                 .as_ref()
@@ -508,17 +509,40 @@ impl Orchestrator {
                     .state
                     .as_ref()
                     .is_some_and(|old| !state.is_empty() && old != state)
-                || (snapshot.human && !human);
+                || human_hold_removed;
             if changed {
-                return self
-                    .store()
-                    .release_subject_episode(
+                // A park released because `rhapsody:human` came off must NOT grant the one durable
+                // author admission a deliberate release grants (STUDIO-1443): the park closes — the
+                // ticket is a candidate again and the merge lock lifts — but the author is
+                // re-engaged only by a summons newer than the last run's end, never by the release
+                // itself. The operator's EXPLICIT "Human step done → resume" (STUDIO-1053) is a
+                // different thing and says so: it records a durable authorization on the open
+                // episode AND seeds the note into `pending_reopen_summons` BEFORE removing the
+                // label, so that path keeps its admission. The DURABLE mark is what makes a
+                // successful resume survive a restart between the label removal and this pass — the
+                // in-memory seed alone did not (STUDIO-1443 B2), and losing it silently reverted the
+                // authorized resume to a bare label removal. Every other material change (a
+                // description or state edit) keeps the admission too, so an operator's change is not
+                // swallowed by linked-PR suppression (STUDIO-1156).
+                let authorized = self.pending_reopen_summons.contains_key(&issue.id)
+                    || self
+                        .store()
+                        .subject_resume_authorized(&issue.identifier)
+                        .map_err(|e| e.to_string())?;
+                let release = if human_hold_removed && !authorized {
+                    self.store().release_subject_episode_without_resume(
                         hold.id,
                         &hold.kind,
                         "ticket description/state/hold label changed",
                     )
-                    .map(|_| ())
-                    .map_err(|e| e.to_string());
+                } else {
+                    self.store().release_subject_episode(
+                        hold.id,
+                        &hold.kind,
+                        "ticket description/state/hold label changed",
+                    )
+                };
+                return release.map(|_| ()).map_err(|e| e.to_string());
             }
             snapshot.description = Some(description);
             if !state.is_empty() {
@@ -938,9 +962,16 @@ mod tests {
                 change == "unchanged",
                 "{change}"
             );
+            // STUDIO-1443: removing `rhapsody:human` is the one release that grants NO resume. It
+            // still releases the park — the ticket is a candidate again and the merge lock lifts —
+            // but the author is re-engaged only by a summons newer than the last run's end. A
+            // description or state change keeps the durable admission (STUDIO-1156), so the
+            // operator's edit is not swallowed by linked-PR suppression.
+            let grants_resume = matches!(change, "description" | "state");
             assert_eq!(
                 o.store().subject_resume_pending("TEST-1").unwrap(),
-                change != "unchanged"
+                grants_resume,
+                "{change}"
             );
         }
     }

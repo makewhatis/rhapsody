@@ -47,6 +47,24 @@ impl Store for Noop {
     ) -> Result<bool, StoreError> {
         Ok(false)
     }
+    fn release_subject_episode_without_resume(
+        &self,
+        _id: i64,
+        _kind: &str,
+        _reason: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn set_subject_resume_authorization(
+        &self,
+        _subject: &str,
+        _authorized: bool,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn subject_resume_authorized(&self, _subject: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn resolve_lead_escalation(&self, _decision: i64, _reason: &str) -> Result<bool, StoreError> {
         Ok(false)
     }

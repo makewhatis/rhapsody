@@ -19,7 +19,9 @@
 //!     start and end), not its start alone, so a summon-token comment created while the author run
 //!     was live (or before it handed off) does not re-engage the author. The divergence from Go's
 //!     run-START boundary is recorded in the README "Divergences" entry for GitHub summons
-//!     (STUDIO-875/882).
+//!     (STUDIO-875/882). **STUDIO-1443 extends the same rule to a released park:** the reopen ladder
+//!     re-engages ONLY on a summons newer than the run's end, so releasing `rhapsody:human` (which
+//!     grants the store's `subject_resume_pending`) un-parks the ticket without dispatching it.
 //!   * The otherwise-silent blocked-skip diagnostic (INF-249) logs via `tracing` (as the sibling
 //!     crates do) instead of a threaded `slog` logger; the fields (`issue_identifier`, `blocker`,
 //!     `blocker_state`) and per-blocker cadence are preserved.
@@ -884,6 +886,15 @@ impl Orchestrator {
             .subject_resume_pending(&iss.identifier)
             .unwrap_or(false)
         {
+            // Kept here, unlike `review_reopen_eligible` (STUDIO-1443). This predicate is reached
+            // only for an ACTIVE-state fresh pickup, where the two flows that DO grant a resume both
+            // need it: a landing auto-revert reopen (the REVIEW FEEDBACK the ticket now carries; it
+            // has no summons to offer, so the `linked_pr` suppression below would wedge it) and the
+            // operator's explicit "Human step done → resume". Removing `rhapsody:human` by hand is
+            // NOT one of them any more — the material-change observer releases the park without
+            // granting the resume (`release_subject_episode_without_resume`), so this branch is no
+            // longer reachable from a plain label removal. The reopen ladder has neither flow — it
+            // exists to answer a summons, so a released hold must not answer it for a stale one.
             return false;
         }
         if !iss.linked_pr {
@@ -928,6 +939,16 @@ impl Orchestrator {
     /// `reviewReopenEligible`, except for the run-END boundary (STUDIO-1045 — see README
     /// "Divergences"): a comment created while the ticket's own author run was live, or before it
     /// handed off, is not a summons and must not re-engage the author.
+    ///
+    /// A RELEASED PARK is not a summons either (STUDIO-1443). The park's release — an operator
+    /// removing `rhapsody:human`, a state or description change — clears `subject_parked` above and
+    /// (through `release_subject`) grants the store's `subject_resume_pending`. Reading that flag as
+    /// an unconditional `true` here was the defect: it re-engaged the author WITHOUT ever comparing a
+    /// summons to the last run's window, so a breaker-held, already-approved ticket re-dispatched on
+    /// the STALE summons the STUDIO-885 watermark had put back on the candidate — the author rebased
+    /// an approved branch and invalidated its own review. The ladder has exactly one way in, and this
+    /// is it: a summons strictly newer than the run's end. Releasing the hold still releases the
+    /// PARK (the merge lock, and the ticket is a candidate again), it simply no longer dispatches.
     pub(crate) fn review_reopen_eligible(&self, iss: &Issue, running: &HashSet<String>) -> bool {
         if self.subject_parked(&iss.identifier, "author") {
             return false;
@@ -948,13 +969,9 @@ impl Orchestrator {
         if running.contains(&iss.id) || self.claimed.contains(&iss.id) {
             return false;
         }
-        if self
-            .store()
-            .subject_resume_pending(&iss.identifier)
-            .unwrap_or(false)
-        {
-            return true;
-        }
+        // Deliberately NOT consulted here: the store's `subject_resume_pending` (STUDIO-1443). A
+        // released park admits the ticket to the ordinary ladders again, but the reopen ladder
+        // re-engages the author ONLY through the run-window rule below — see the doc comment.
         let summon = match iss.latest_summon_at {
             Some(s) => s,
             None => return false,
@@ -1094,7 +1111,7 @@ impl IgnoredSummonLog {
 
 #[cfg(test)]
 mod tests {
-    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+    use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
     use rhapsody_config::DEPENDENCY_MODE_DISABLED;
     use rhapsody_core::{BlockerRef, Issue, normalize_state};
 
@@ -1704,6 +1721,98 @@ mod tests {
         assert!(
             o.review_reopen_eligible(&outside_review, &HashSet::new()),
             "a summons after the run window still reopens"
+        );
+    }
+
+    /// Parks the breaker's `rhapsody:human` hold and releases it through the DELIBERATE release
+    /// (STUDIO-1156), so the store's `subject_resume_pending` IS granted. The reported incident
+    /// (STUDIO-1443) came through the material-change observer, which now releases WITHOUT that
+    /// admission; these predicate tests deliberately keep the stronger fixture — a released park
+    /// with a resume already granted must still not reopen on a spent summons.
+    fn release_breaker_hold(o: &Orchestrator, ticket: &str) {
+        let id = o
+            .store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: ticket.into(),
+                kind: "breaker".into(),
+                snapshot: "{\"state\":\"In Review\",\"human\":true,\"heads\":{}}".into(),
+                ..Default::default()
+            })
+            .expect("park the breaker hold");
+        assert!(id > 0, "the breaker hold must be open");
+        o.store()
+            .release_subject_episode(id, "breaker", "ticket description/state/hold label changed")
+            .expect("release the breaker hold");
+        assert!(
+            o.store().subject_resume_pending(ticket).expect("read"),
+            "the deliberate release must grant resume, or this fixture tests nothing"
+        );
+    }
+
+    /// A review-state ticket on `MT-1` whose only summons is the SPENT one — created inside the last
+    /// author run's window, exactly as the STUDIO-885 watermark restores it (the incident's
+    /// `06:43:55` inside run 4233's `06:28:32 → 09:36:05`).
+    fn review_issue_with_a_spent_summons(win_start: DateTime<Utc>) -> Issue {
+        let mut review = base_issue();
+        review.id = "ID-1".into();
+        review.identifier = "MT-1".into();
+        review.state = "In Review".into();
+        review.team_id = "team-1".into();
+        review.latest_summon_at = Some(win_start + ChronoDuration::seconds(30));
+        review
+    }
+
+    // STUDIO-1443, the reported incident. A breaker-held, already-approved ticket whose label the
+    // operator removed must NOT re-engage its author on a summons that was already spent. The
+    // review-reopen ladder used to answer this predicate with an unconditional `true` BEFORE the run
+    // window was ever read, so the stale summons the watermark had restored dispatched the author —
+    // which then rebased the approved branch and invalidated its own review.
+    //
+    // MUTATION: restore the `subject_resume_pending` early return in `review_reopen_eligible` and
+    // this reds.
+    #[test]
+    fn a_released_breaker_hold_does_not_reopen_on_a_spent_summons() {
+        let (o, st) = orch_with_store();
+        // `seed_run` windows the run as `[ended_at - 1m, ended_at]`.
+        let win_start = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        seed_run(
+            st.as_ref(),
+            "ID-1",
+            "MT-1",
+            win_start + ChronoDuration::minutes(1),
+        );
+        release_breaker_hold(&o, "MT-1");
+
+        assert!(
+            !o.review_reopen_eligible(
+                &review_issue_with_a_spent_summons(win_start),
+                &HashSet::new()
+            ),
+            "a released human hold must not re-engage the author on a spent summons"
+        );
+    }
+
+    // STUDIO-1443, the other half of the rule: the SAME released hold DOES reopen when a summons
+    // newer than the last run's end exists. Releasing the hold must not wedge the ticket — it hands
+    // it back to the ordinary rule, which a genuine re-engagement still satisfies.
+    #[test]
+    fn a_released_breaker_hold_reopens_on_a_newer_summons() {
+        let (o, st) = orch_with_store();
+        let win_start = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        seed_run(
+            st.as_ref(),
+            "ID-1",
+            "MT-1",
+            win_start + ChronoDuration::minutes(1),
+        );
+        release_breaker_hold(&o, "MT-1");
+
+        let mut review = review_issue_with_a_spent_summons(win_start);
+        review.latest_summon_at = Some(win_start + ChronoDuration::hours(1));
+
+        assert!(
+            o.review_reopen_eligible(&review, &HashSet::new()),
+            "a summons after the run window still reopens a released hold"
         );
     }
 
