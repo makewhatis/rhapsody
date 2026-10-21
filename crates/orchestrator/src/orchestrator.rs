@@ -382,6 +382,16 @@ pub struct Orchestrator {
     pub(crate) landing_requests: Vec<crate::landing::LandingRequest>,
     pub(crate) pending_landing: HashMap<String, crate::landing::LandingRun>,
     pub(crate) landing_refusals: HashSet<(crate::prstate::PrCoord, String)>,
+    /// The `(pull request, head)` pairs for which the watcher has already logged that an APPROVED
+    /// pull request is not being offered to auto-merge because its origin subject is parked for a
+    /// human (STUDIO-1441), mirroring [`landing_refusals`](Orchestrator::landing_refusals).
+    ///
+    /// The park gate is the ONE early return in `service_review_pr` that can refuse an approved,
+    /// at-head pull request without any auto-merge line — in booch#641 it did exactly that for 1.5h
+    /// while the daemon kept ticking. The log is the fix; this set is only its once-per-head guard,
+    /// so the watcher does not repeat the same sentence about the same commit every 22s. Dropped
+    /// with the pull request when it leaves the watch set.
+    pub(crate) parked_merge_refusals: HashSet<(crate::prstate::PrCoord, String)>,
     pub(crate) landing_operator_pending: HashSet<i64>,
     pub(crate) landing_task: Option<crate::landing::LandingTask>,
     /// Landing-enabled merge plans reserve project admission before GitHub runs, through the
@@ -1212,6 +1222,7 @@ impl Orchestrator {
             landing_requests: Vec::new(),
             pending_landing: HashMap::new(),
             landing_refusals: HashSet::new(),
+            parked_merge_refusals: HashSet::new(),
             landing_operator_pending: HashSet::new(),
             landing_merges: HashMap::new(),
             capabilities_registry: None,
