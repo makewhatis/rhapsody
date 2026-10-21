@@ -52,12 +52,19 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if not self.authorized():
             return
         if self.path == "/event":
+            # Record the subscription BEFORE the first response byte. The adapter is required to
+            # subscribe before it creates a session or prompts, and it treats the arrival of
+            # `server.connected` as proof that it has. If the flag were set after that event were
+            # written, a client that acted on it could reach the session guard below first and be
+            # refused — the STUDIO-1439 flake. Setting it first makes "the client has seen a byte of
+            # the event stream" imply "the subscription is recorded", so the guard can never race a
+            # correct client.
+            subscribed.set()
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Connection", "close")
             self.end_headers()
             self.send_event({"type": "server.connected", "properties": {}})
-            subscribed.set()
             while True:
                 event = events.get()
                 if event is None:
