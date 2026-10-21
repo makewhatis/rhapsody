@@ -110,7 +110,12 @@ impl BrokerRuntime {
 /// Supervise the broker serving task for the daemon's lifetime.
 ///
 /// * On a clean daemon shutdown (`shutdown` fires first), the serving task is already draining —
-///   its own shutdown signal is the same one — so this only bounds the wait.
+///   its own shutdown signal is the same one — so this only bounds the wait. That is also the
+///   agreed outcome when the shutdown beats the serving task into its accept loop (a fast-fail boot
+///   cancels before the task is ever polled): the task returns `Ok(())` having never accepted, and
+///   the broker stays **available**, because nothing failed — pinned by
+///   [`tests::a_shutdown_before_the_accept_loop_is_still_clean`]. The `biased` select below is what
+///   makes that independent of which future happens to complete first.
 /// * If the serving task ends **while the daemon is still live** (an accept error, or a task that
 ///   died silently), the broker is atomically marked unavailable and every grant is revoked, and
 ///   one bounded error is logged. The daemon keeps running: legacy native-login work may continue,
@@ -272,9 +277,63 @@ mod tests {
         let mut runtime = BrokerRuntime::bind().expect("bind");
         let listener = runtime.take_listener().expect("the bound listener");
         let shutdown = CancelSignal::new();
+        // The serving task reports readiness by polling its shutdown future for the first time,
+        // which `run_with_shutdown` does only once it has entered its accept loop. Waiting on that
+        // report — rather than sleeping and hoping the task was scheduled — is what makes this
+        // test's ordering deterministic on a loaded runner (STUDIO-1439).
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
         let serve = {
             let mut wait = shutdown.wait();
             tokio::spawn(async move {
+                listener
+                    .run_with_shutdown(async move {
+                        let _ = ready_tx.send(());
+                        wait.cancelled().await
+                    })
+                    .await
+            })
+        };
+        let monitor = tokio::spawn(supervise(
+            serve,
+            runtime.broker_handle(),
+            shutdown.wait(),
+            Duration::from_secs(2),
+        ));
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("the serving task must report it entered its accept loop")
+            .expect("the readiness report");
+        // Now shut the daemon down, with the serving task provably inside its accept loop.
+        shutdown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), monitor)
+            .await
+            .expect("the supervisor must drain within its bounded window")
+            .expect("supervisor join");
+        assert!(
+            runtime.broker_handle().is_available(),
+            "a clean daemon shutdown must not mark the broker unavailable"
+        );
+    }
+
+    /// The agreed outcome for a shutdown that beats the serving task into its accept loop: a fast
+    /// fail-and-exit boot cancels the daemon's shutdown before the broker's serving task is ever
+    /// polled. The task then returns `Ok(())` without accepting anything, and that is a CLEAN
+    /// shutdown — nothing failed, so the broker must not be marked unavailable (which would revoke
+    /// grants and log a loud error for an ordinary exit).
+    ///
+    /// The serving task is held at the door with a oneshot, so the cancel provably happens-before
+    /// it reaches `run_with_shutdown` — no sleep, no reliance on scheduling.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_shutdown_before_the_accept_loop_is_still_clean() {
+        let mut runtime = BrokerRuntime::bind().expect("bind");
+        let listener = runtime.take_listener().expect("the bound listener");
+        let shutdown = CancelSignal::new();
+        let (enter_tx, enter_rx) = tokio::sync::oneshot::channel::<()>();
+        let serve = {
+            let mut wait = shutdown.wait();
+            tokio::spawn(async move {
+                // Not started until the test has already cancelled the daemon's shutdown.
+                let _ = enter_rx.await;
                 listener
                     .run_with_shutdown(async move { wait.cancelled().await })
                     .await
@@ -286,16 +345,15 @@ mod tests {
             shutdown.wait(),
             Duration::from_secs(2),
         ));
-        // Let the serving task enter its accept loop, then shut the daemon down.
-        tokio::time::sleep(Duration::from_millis(20)).await;
         shutdown.cancel();
+        let _ = enter_tx.send(());
         tokio::time::timeout(Duration::from_secs(5), monitor)
             .await
             .expect("the supervisor must drain within its bounded window")
             .expect("supervisor join");
         assert!(
             runtime.broker_handle().is_available(),
-            "a clean daemon shutdown must not mark the broker unavailable"
+            "a clean daemon shutdown before the accept loop must not mark the broker unavailable"
         );
     }
 }
