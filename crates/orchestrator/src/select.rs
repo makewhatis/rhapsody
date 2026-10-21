@@ -44,6 +44,24 @@ pub(crate) fn sort_tagged_stable(tagged: &mut [TaggedIssue]) {
     tagged.sort_by(|a, b| dispatch_cmp(&a.iss, &b.iss));
 }
 
+/// What one project GROUP held back for want of project budget this pass (STUDIO-1437). `cap` is the
+/// effective `max_concurrent` the gate tested against — carried because the gate memoizes on first
+/// touch and a later re-derivation could read a different project's cap for a shared group.
+struct ProjectHold {
+    cap: i64,
+    held: Vec<String>,
+}
+
+/// What one STATE held back for want of its per-state limit this pass (STUDIO-1437). `count` and
+/// `limit` are recorded at the FIRST refusal for the state: `count` is the pass-local
+/// global-in-state tally the gate compared, and `limit` the owning project's override or the global
+/// fallback (it can differ per project, so the first refusal's pair is the one reported).
+struct StateHold {
+    count: i64,
+    limit: i64,
+    held: Vec<String>,
+}
+
 impl Orchestrator {
     /// Returns the issues to dispatch this tick: sorted, intrinsically eligible, and within global +
     /// per-state concurrency (upstream §8.1–§8.3). ACTIVE-state picks only. Mirrors Go
@@ -453,6 +471,29 @@ impl Orchestrator {
         i64::try_from(running + preparing).unwrap_or(i64::MAX)
     }
 
+    /// How many of the entries [`running_in_project_group`](Orchestrator::running_in_project_group)
+    /// counts for `group` are ticketless REVIEW runs (STUDIO-1437). The project-budget skip line
+    /// names the split, because a project sitting at its cap entirely on reviews is the shape the
+    /// incident took — the group's slots were held by reviews while a High-priority implementation
+    /// waited — and an operator cannot tell that from a project full of implementations without it.
+    ///
+    /// Counts the same two shapes `running_in_project_group` does: a running entry carrying `review`
+    /// coordinates ([`Orchestrator::running_ticketless_reviews`]) and a `preparing` review
+    /// reservation. It is therefore never larger than the group's running count.
+    pub(crate) fn running_reviews_in_project_group(&self, group: &str) -> i64 {
+        let running = self
+            .running
+            .values()
+            .filter(|re| re.project_group == group && re.review.is_some())
+            .count();
+        let preparing = self
+            .preparing
+            .values()
+            .filter(|e| e.project_group() == group && e.is_review())
+            .count();
+        i64::try_from(running + preparing).unwrap_or(i64::MAX)
+    }
+
     /// How many running entries currently spend the IMPLEMENTATION global pool (STUDIO-950). With
     /// `agent.max_concurrent_reviews` set, ticketless review runs draw their own pool and must NOT
     /// occupy an implementation slot: leaving them in this count would admit one fewer
@@ -596,6 +637,11 @@ impl Orchestrator {
         let mut reopen = Vec::new();
         let mut held_for_triage = false;
         let mut held_for_capacity: HashMap<String, i64> = HashMap::new();
+        // STUDIO-1437: the candidates each project group and each state turned away this pass, so the
+        // pass can emit ONE INFO line per group/state AFTER the walk rather than one per candidate.
+        // Both stay empty until something is actually refused, so a pass with room pays nothing.
+        let mut project_holds: HashMap<String, ProjectHold> = HashMap::new();
+        let mut state_holds: HashMap<String, StateHold> = HashMap::new();
         let mut tagged = tagged.into_iter();
         while let Some(ti) = tagged.next() {
             if self.subject_parked(&ti.iss.identifier, "author") {
@@ -708,19 +754,33 @@ impl Orchestrator {
                     continue;
                 }
                 if !self.ensure_project_budget(&mut per_project, &p.group, p.max_concurrent) {
+                    // STUDIO-1437: name the project that turned this reopen away, once per pass.
+                    note_project_hold(
+                        &mut project_holds,
+                        &p.group,
+                        p.max_concurrent,
+                        &ti.iss.identifier,
+                    );
                     continue;
                 }
                 if !self.limit_dispatch_ready(&ti.iss, &p.slug) {
                     continue;
                 }
                 let pst = normalize_state(&eff.review_promote_state);
-                if count(&state_counts, &pst)
-                    >= state_limit(
-                        &eff.review_promote_state,
-                        &p.per_state_limits,
-                        eff.max_concurrent,
-                    )
-                {
+                let pst_limit = state_limit(
+                    &eff.review_promote_state,
+                    &p.per_state_limits,
+                    eff.max_concurrent,
+                );
+                if count(&state_counts, &pst) >= pst_limit {
+                    // STUDIO-1437: the promote state's own per-state limit, named once per pass.
+                    note_state_hold(
+                        &mut state_holds,
+                        &pst,
+                        count(&state_counts, &pst),
+                        pst_limit,
+                        &ti.iss.identifier,
+                    );
                     continue;
                 }
                 if !self.select_credential_canary(&ti.iss, &p.slug, &mut canaries) {
@@ -872,13 +932,27 @@ impl Orchestrator {
                 continue;
             }
             if !self.ensure_project_budget(&mut per_project, &p.group, p.max_concurrent) {
+                // STUDIO-1437: name the project that turned this candidate away, once per pass.
+                note_project_hold(
+                    &mut project_holds,
+                    &p.group,
+                    p.max_concurrent,
+                    &ti.iss.identifier,
+                );
                 continue;
             }
             // The per-state cap is a shared GLOBAL ceiling (stateCounts across ALL projects), so its
             // fallback must be the GLOBAL cap — not the per-project cap — matching single-project.
-            if count(&state_counts, &st)
-                >= state_limit(&ti.iss.state, &p.per_state_limits, eff.max_concurrent)
-            {
+            let st_limit = state_limit(&ti.iss.state, &p.per_state_limits, eff.max_concurrent);
+            if count(&state_counts, &st) >= st_limit {
+                // STUDIO-1437: the state's own limit, named once per pass.
+                note_state_hold(
+                    &mut state_holds,
+                    &st,
+                    count(&state_counts, &st),
+                    st_limit,
+                    &ti.iss.identifier,
+                );
                 continue;
             }
             // Reserve all three counters per admit.
@@ -897,6 +971,16 @@ impl Orchestrator {
                 *impl_tally.entry(name).or_insert(0) += 1;
             }
             picked.push(ti);
+        }
+        // STUDIO-1437: one INFO line per project group and per state that held something this pass,
+        // emitted AFTER the walk so the global-cap `break` still flushes them (and so a project that
+        // refused three candidates gets one line, not three). Nothing here changes an admission — the
+        // refusals above already happened.
+        for (group, hold) in &project_holds {
+            self.log_project_budget_hold(group, hold.cap, &hold.held);
+        }
+        for (state, hold) in &state_holds {
+            self.log_state_limit_hold(state, hold.count, hold.limit, &hold.held);
         }
         self.kick_triage(held_for_triage);
         (picked, reopen, held_for_capacity)
@@ -942,6 +1026,39 @@ impl Orchestrator {
 /// A running-count lookup with the Go `map[key]` zero-value default (0 for a missing key).
 fn count(counts: &HashMap<String, i64>, key: &str) -> i64 {
     counts.get(key).copied().unwrap_or(0)
+}
+
+/// Records that `group` held `id` back for want of project budget this pass (STUDIO-1437), keeping
+/// the cap the first refusal tested against.
+fn note_project_hold(holds: &mut HashMap<String, ProjectHold>, group: &str, cap: i64, id: &str) {
+    holds
+        .entry(group.to_string())
+        .or_insert_with(|| ProjectHold {
+            cap,
+            held: Vec::new(),
+        })
+        .held
+        .push(id.to_string());
+}
+
+/// Records that `state` held `id` back for want of its per-state limit this pass (STUDIO-1437),
+/// keeping the count/limit pair of the FIRST refusal.
+fn note_state_hold(
+    holds: &mut HashMap<String, StateHold>,
+    state: &str,
+    count: i64,
+    limit: i64,
+    id: &str,
+) {
+    holds
+        .entry(state.to_string())
+        .or_insert_with(|| StateHold {
+            count,
+            limit,
+            held: Vec::new(),
+        })
+        .held
+        .push(id.to_string());
 }
 
 #[cfg(test)]
@@ -2485,6 +2602,263 @@ mod tests {
         let from_a = ids.contains("1") || ids.contains("2");
         let from_b = ids.contains("3") || ids.contains("4");
         assert!(from_a && from_b, "one issue from EACH project");
+    }
+
+    // --- STUDIO-1437: the project-budget and per-state-limit skips are not silent ---------------
+
+    const PROJECT_CAP_SKIP: &str =
+        "skipping dispatch: project at its concurrency cap; candidates not considered this tick";
+    const STATE_LIMIT_SKIP: &str =
+        "skipping dispatch: state at its per-state limit; candidates not considered this tick";
+
+    /// A ticketless review run stamped into a project group (STUDIO-1437's fixture: the incident was
+    /// a project held entirely by review runs).
+    fn review_run_in_group(id: &str, group: &str) -> RunningEntry {
+        let mut re = ticketless_review_run(id);
+        re.project_slug = group.to_string();
+        re.project_group = group.to_string();
+        re
+    }
+
+    /// The incident: a project at its cap because of REVIEW runs, holding an implementation
+    /// candidate, must say so — one INFO line naming the group, its running count, its cap, the
+    /// review split, and the held ticket. Before STUDIO-1437 the pass refused in silence and a High
+    /// ticket sat for fourteen minutes while the global pool had a free slot.
+    ///
+    /// MUTATION: delete the `log_project_budget_hold` call from the multi active ladder and the
+    /// `.find(..)` below has nothing to return — the test reds.
+    #[test]
+    fn a_project_at_its_cap_logs_the_refusal_with_its_review_split() {
+        let running = HashMap::from([("rev-1".to_string(), review_run_in_group("rev-1", "a"))]);
+        let o = orch_for_multi(10, vec![proj("a", 1, HashMap::new())], Some(running));
+
+        let (picked, events) =
+            capture_events(|| o.select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")])));
+
+        assert!(picked.is_empty(), "project cap 1, one review running");
+        let ev = events
+            .iter()
+            .find(|e| e.message == PROJECT_CAP_SKIP)
+            .expect("a project-budget line");
+        assert_eq!(
+            ev.fields.get("project_group").map(String::as_str),
+            Some("a")
+        );
+        assert_eq!(ev.fields.get("running").map(String::as_str), Some("1"));
+        assert_eq!(
+            ev.fields.get("reviews").map(String::as_str),
+            Some("1"),
+            "the review split is what explained the incident"
+        );
+        assert_eq!(
+            ev.fields.get("max_concurrent").map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-1")
+        );
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    /// The same refusal on the REOPEN ladder (`select.rs`'s `ensure_project_budget` call in the
+    /// review-state branch) — two ladders, two call sites, or the line is silently absent for one.
+    ///
+    /// MUTATION: delete the `note_project_hold` from the multi reopen branch and this reds.
+    #[test]
+    fn the_reopen_ladder_logs_a_project_at_its_cap() {
+        let mut projects = vec![proj("a", 1, HashMap::new())];
+        projects[0].review_states = set_of(&["in review"]);
+        let running = HashMap::from([("rev-1".to_string(), review_run_in_group("rev-1", "a"))]);
+        let mut o = orch_for_multi(10, projects, Some(running));
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let run = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "A-1".to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        o.store().end_run(run, RunEnd::default()).expect("end run");
+
+        let ((picked, reopen, _), events) = capture_events(|| {
+            o.select_dispatch_multi_with_reopens(tag_for(0, vec![summoned_review_issue(false)]))
+        });
+
+        assert!(picked.is_empty(), "no active picks");
+        assert!(reopen.is_empty(), "the project cap held the reopen");
+        let ev = events
+            .iter()
+            .find(|e| e.message == PROJECT_CAP_SKIP)
+            .expect("a project-budget line on the reopen ladder");
+        assert_eq!(
+            ev.fields.get("project_group").map(String::as_str),
+            Some("a")
+        );
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-1")
+        );
+    }
+
+    /// A project that held SEVERAL candidates gets ONE line, not one per candidate, with the sample
+    /// naming them — the "per tick per project" cadence the ticket asks for. A plain implementation
+    /// run holds the slot here, so the line's review split must read `0`.
+    ///
+    /// MUTATION: log inside the refusal branch instead of after the walk and this reds with three
+    /// lines (the `.filter(..).count()` becomes 3).
+    #[test]
+    fn a_project_holding_several_candidates_logs_one_line_with_a_sample() {
+        let running = HashMap::from([(
+            "run-1".to_string(),
+            running_entry(issue("run-1", "A-0", "In Progress"), "a", "a"),
+        )]);
+        let o = orch_for_multi(10, vec![proj("a", 1, HashMap::new())], Some(running));
+
+        let (picked, events) = capture_events(|| {
+            o.select_dispatch_multi(tag_for(
+                0,
+                vec![
+                    issue("1", "A-1", "Todo"),
+                    issue("2", "A-2", "Todo"),
+                    issue("3", "A-3", "Todo"),
+                ],
+            ))
+        });
+
+        assert!(picked.is_empty(), "project cap 1 already spent by the run");
+        let lines: Vec<_> = events
+            .iter()
+            .filter(|e| e.message == PROJECT_CAP_SKIP)
+            .collect();
+        assert_eq!(lines.len(), 1, "one line per project per tick: {events:?}");
+        assert_eq!(
+            lines[0].fields.get("reviews").map(String::as_str),
+            Some("0"),
+            "the holder is an implementation, not a review"
+        );
+        assert_eq!(
+            lines[0]
+                .fields
+                .get("not_considered_count")
+                .map(String::as_str),
+            Some("3")
+        );
+        assert_eq!(
+            lines[0].fields.get("not_considered").map(String::as_str),
+            Some("A-1, A-2, A-3")
+        );
+    }
+
+    /// The per-state limit's silence (STUDIO-1437): one line naming the state, the count that hit
+    /// the limit, the limit, and the held ticket.
+    ///
+    /// MUTATION: delete the `log_state_limit_hold` call from the multi active ladder and the
+    /// `.find(..)` below has nothing to return.
+    #[test]
+    fn a_state_at_its_limit_logs_the_refusal() {
+        let cap = || HashMap::from([("in progress".to_string(), 1i64)]);
+        let o = orch_for_multi(10, vec![proj("a", 10, cap())], None);
+
+        let (picked, events) = capture_events(|| {
+            o.select_dispatch_multi(tag_for(
+                0,
+                vec![
+                    issue("1", "A-1", "In Progress"),
+                    issue("2", "A-2", "In Progress"),
+                ],
+            ))
+        });
+
+        assert_eq!(picked.len(), 1, "the per-state limit admits exactly one");
+        let ev = events
+            .iter()
+            .find(|e| e.message == STATE_LIMIT_SKIP)
+            .expect("a per-state-limit line");
+        assert_eq!(
+            ev.fields.get("state").map(String::as_str),
+            Some("in progress")
+        );
+        assert_eq!(ev.fields.get("running").map(String::as_str), Some("1"));
+        assert_eq!(ev.fields.get("limit").map(String::as_str), Some("1"));
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-2"),
+            "the second candidate is the one the limit held"
+        );
+    }
+
+    /// The per-state skip on the REOPEN ladder: its own call site, so a test on the active ladder
+    /// alone would leave this one deletable. The promote state is at its limit, so the summoned
+    /// reopen is refused and named.
+    ///
+    /// MUTATION: delete the `note_state_hold` from the multi reopen branch and this reds while the
+    /// active-ladder state test stays green.
+    #[test]
+    fn the_reopen_ladder_logs_a_state_at_its_limit() {
+        let mut projects = vec![proj("a", 10, HashMap::from([("todo".to_string(), 1i64)]))];
+        projects[0].review_states = set_of(&["in review"]);
+        // One implementation already in the promote state (`Todo`), spending the limit of 1.
+        let running = HashMap::from([(
+            "run-1".to_string(),
+            running_entry(issue("run-1", "A-0", "Todo"), "a", "a"),
+        )]);
+        let mut o = orch_for_multi(10, projects, Some(running));
+        o.eff.as_mut().expect("eff").review_promote_state = "Todo".to_string();
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let run = o
+            .store()
+            .start_run(RunStart {
+                issue_identifier: "A-1".to_string(),
+                ..RunStart::default()
+            })
+            .expect("start run");
+        o.store().end_run(run, RunEnd::default()).expect("end run");
+
+        let ((picked, reopen, _), events) = capture_events(|| {
+            o.select_dispatch_multi_with_reopens(tag_for(0, vec![summoned_review_issue(false)]))
+        });
+
+        assert!(picked.is_empty(), "no active picks");
+        assert!(reopen.is_empty(), "the promote-state limit held the reopen");
+        let ev = events
+            .iter()
+            .find(|e| e.message == STATE_LIMIT_SKIP)
+            .expect("a per-state-limit line on the reopen ladder");
+        assert_eq!(ev.fields.get("state").map(String::as_str), Some("todo"));
+        assert_eq!(ev.fields.get("running").map(String::as_str), Some("1"));
+        assert_eq!(ev.fields.get("limit").map(String::as_str), Some("1"));
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-1")
+        );
+    }
+
+    /// A project UNDER its cap must log nothing new (STUDIO-1437): the lines are refusals, not a
+    /// running commentary. Both new messages are asserted absent.
+    #[test]
+    fn a_project_under_its_cap_logs_no_budget_or_state_line() {
+        let o = orch_for_multi(10, vec![proj("a", 5, HashMap::new())], None);
+
+        let (picked, events) =
+            capture_events(|| o.select_dispatch_multi(tag_for(0, vec![issue("1", "A-1", "Todo")])));
+
+        assert_eq!(picked.len(), 1, "room under both caps admits the candidate");
+        assert!(
+            !events.iter().any(|e| e.message == PROJECT_CAP_SKIP),
+            "no project-budget line when the project has room: {events:?}"
+        );
+        assert!(
+            !events.iter().any(|e| e.message == STATE_LIMIT_SKIP),
+            "no per-state-limit line when the state has room: {events:?}"
+        );
     }
 
     // Mirrors Go `TestSelectDispatchMultiEligibilityUsesProjectStates`.
