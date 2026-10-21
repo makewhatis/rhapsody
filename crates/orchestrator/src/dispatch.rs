@@ -887,10 +887,13 @@ impl Orchestrator {
             .unwrap_or(false)
         {
             // Kept here, unlike `review_reopen_eligible` (STUDIO-1443). This predicate is reached
-            // only for an ACTIVE-state fresh pickup, where the two flows that grant a resume both
+            // only for an ACTIVE-state fresh pickup, where the two flows that DO grant a resume both
             // need it: a landing auto-revert reopen (the REVIEW FEEDBACK the ticket now carries; it
             // has no summons to offer, so the `linked_pr` suppression below would wedge it) and the
-            // operator's explicit "Human step done → resume". The reopen ladder has neither — it
+            // operator's explicit "Human step done → resume". Removing `rhapsody:human` by hand is
+            // NOT one of them any more — the material-change observer releases the park without
+            // granting the resume (`release_subject_episode_without_resume`), so this branch is no
+            // longer reachable from a plain label removal. The reopen ladder has neither flow — it
             // exists to answer a summons, so a released hold must not answer it for a stale one.
             return false;
         }
@@ -1721,10 +1724,11 @@ mod tests {
         );
     }
 
-    /// Leaves the store in the exact state an operator removing `rhapsody:human` from a
-    /// breaker-held ticket produces (STUDIO-1443): the subject park is RELEASED — so
-    /// `subject_parked` stops refusing — and `release_subject` grants the store's
-    /// `subject_resume_pending`. That flag, read as an unconditional reopen, was the defect.
+    /// Parks the breaker's `rhapsody:human` hold and releases it through the DELIBERATE release
+    /// (STUDIO-1156), so the store's `subject_resume_pending` IS granted. The reported incident
+    /// (STUDIO-1443) came through the material-change observer, which now releases WITHOUT that
+    /// admission; these predicate tests deliberately keep the stronger fixture — a released park
+    /// with a resume already granted must still not reopen on a spent summons.
     fn release_breaker_hold(o: &Orchestrator, ticket: &str) {
         let id = o
             .store()
@@ -1741,7 +1745,7 @@ mod tests {
             .expect("release the breaker hold");
         assert!(
             o.store().subject_resume_pending(ticket).expect("read"),
-            "a released hold must grant resume, or this fixture is not the incident's state"
+            "the deliberate release must grant resume, or this fixture tests nothing"
         );
     }
 
@@ -1759,10 +1763,10 @@ mod tests {
     }
 
     // STUDIO-1443, the reported incident. A breaker-held, already-approved ticket whose label the
-    // operator removed must NOT re-engage its author on a summons that was already spent: the
-    // release of the human hold used to answer this predicate with an unconditional `true` BEFORE
-    // the run window was ever read, so the stale summons the watermark had restored dispatched the
-    // author — which then rebased the approved branch and invalidated its own review.
+    // operator removed must NOT re-engage its author on a summons that was already spent. The
+    // review-reopen ladder used to answer this predicate with an unconditional `true` BEFORE the run
+    // window was ever read, so the stale summons the watermark had restored dispatched the author —
+    // which then rebased the approved branch and invalidated its own review.
     //
     // MUTATION: restore the `subject_resume_pending` early return in `review_reopen_eligible` and
     // this reds.

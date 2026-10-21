@@ -437,7 +437,10 @@ never imply a move or release a park.
 The operator-guarded `POST /api/v1/lead/decisions/{id}/resolve {note}` records the resolution
 reason and lifts that escalation episode; it never resolves a newer episode through a stale id.
 Material releases grant one durable author admission, consumed with the next stored author run,
-so linked-PR suppression cannot swallow the operator's change. Existing escalations are folded at
+so linked-PR suppression cannot swallow the operator's change. Removing the `rhapsody:human` hold
+is the one exception (STUDIO-1443, below): it releases the park without granting the admission,
+because a ticket coming off a human hold is re-engaged only by a summons newer than the last run's
+end. Existing escalations are folded at
 upgrade; already-delivered latest-decision pages keep their delivery reservation.
 
 Migration **36** defers folded ticket escalations until that same bounded, scoped observer
@@ -3846,11 +3849,21 @@ comment older than the last run's end. The park's release was read as an uncondi
 the run-window rule above was never consulted; one of the two runs rebased an approved branch,
 invalidated its review and restarted its CI for nothing.
 
-The review-reopen ladder now has exactly one way in: a summons strictly newer than the last run's
-end. Releasing the hold still releases the park, so the ticket is dispatched by the ordinary rules —
-including a genuine summons posted after the release. `pr_suppressed` deliberately keeps its
-released-park exemption: an ACTIVE-state resume is what a landing auto-revert reopen means, and that
-reopen has no summons to offer.
+The release itself now grants no author admission. The material-change observer that notices the
+label coming off releases the park through `release_subject_episode_without_resume`, so the ticket
+is a candidate again and the merge lock lifts, but nothing admits the author: both ladders — the
+review-reopen ladder and `pr_suppressed` on the ordinary ACTIVE-state ladder — then apply the
+summons rule, and a spent summons refuses. A description, state or PR-head change keeps the ordinary
+resume-granting release (STUDIO-1156), so an operator's edit is still not swallowed by linked-PR
+suppression.
+
+The operator's **explicit** "Human step done → resume" (STUDIO-1053) is a different thing and says
+so: it seeds its note into `pending_reopen_summons` *before* it removes the label, and that seed is
+the authorization the observer looks for — so the same label removal does grant the admission on
+that path. A ticket coming off a human hold is otherwise re-engaged only by a summons strictly newer
+than the last run's end. `pr_suppressed` keeps its released-park exemption because the landing
+auto-revert reopen sets the landing's own resume and has no summons to offer; the human-hold release
+no longer reaches it.
 
 ### A second agent backend — `opencode` (STUDIO-902)
 

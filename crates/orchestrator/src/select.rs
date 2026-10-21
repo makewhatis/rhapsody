@@ -1066,7 +1066,7 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::Arc;
 
-    use chrono::{Duration as ChronoDuration, TimeZone, Utc};
+    use chrono::{DateTime, Duration as ChronoDuration, TimeZone, Utc};
     use rhapsody_core::Issue;
     use rhapsody_store::{RunEnd, RunStart, Sqlite, StorePath};
     use rhapsody_tracker::fake::Fake;
@@ -1844,31 +1844,11 @@ mod tests {
         assert_eq!(held[0].project, "a");
     }
 
-    // STUDIO-1443, through the ladder the incident used. The breaker parks the ticket while it wears
-    // `rhapsody:human` and records that in the park snapshot; the operator then removes the label.
-    // This pass OBSERVES the label change — releasing the park, exactly as production does, so the
-    // merge lock releases and the ticket is a candidate again — and must still refuse the reopen,
-    // because the only summons is the SPENT one the STUDIO-885 watermark restored (it was created
-    // while the last author run was live). Before the fix, the release's `subject_resume_pending`
-    // answered the reopen with an unconditional `true` and the author was dispatched on it.
-    //
-    // MUTATION: restore the `subject_resume_pending` early return in `review_reopen_eligible` and
-    // this reds with `reopen = ["A-1"]`.
-    #[test]
-    fn a_released_breaker_hold_is_not_reopened_on_a_spent_summons() {
-        let mut o = orch_for_select(10, HashMap::new(), None);
-        if let Some(eff) = o.eff.as_mut() {
-            eff.review_states = set_of(&["in review"]);
-        }
-        o.set_store(Arc::new(
-            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
-        ));
-        // The last author run: `seed_run` windows it as `[ended_at - 1m, ended_at]`.
-        let ended = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
-        seed_run(o.store(), "1", "A-1", ended);
-
-        // The breaker's park, snapshotted while the ticket wore the human label.
-        let mut held = issue("1", "A-1", "In Review");
+    /// Parks the breaker's `rhapsody:human` hold on `A-1` exactly as `reconcile_breaker` does: the
+    /// snapshot records that the ticket wore the label. Returns nothing; the hold id is asserted
+    /// open so a broken fixture cannot silently pass.
+    fn park_breaker_hold_wearing_the_human_label(o: &Orchestrator, state: &str) {
+        let mut held = issue("1", "A-1", state);
         held.team_id = "team-1".into();
         held.labels = Some(vec!["rhapsody:human".into()]);
         let snapshot =
@@ -1883,6 +1863,37 @@ mod tests {
             })
             .expect("park the breaker hold");
         assert!(id > 0, "the breaker hold must be open");
+    }
+
+    /// The last author run ends at `12:00:00` (`seed_run` windows it `[11:59:00, 12:00:00]`), so a
+    /// summons at `11:59:30` was created while the run was live — the SPENT summons the STUDIO-885
+    /// watermark restores.
+    fn spent_summons_end() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap()
+    }
+
+    // STUDIO-1443, through the review ladder the incident used. The breaker parks the ticket while it
+    // wears `rhapsody:human`; the operator then removes the label. This pass OBSERVES the label
+    // change — releasing the park, exactly as production does, so the merge lock releases and the
+    // ticket is a candidate again — and must still refuse the reopen, because the only summons is
+    // the SPENT one the STUDIO-885 watermark restored (it was created while the last author run was
+    // live). The release itself grants no admission (STUDIO-1443): a ticket coming off a human hold
+    // is re-engaged only by a summons newer than the last run's end.
+    //
+    // MUTATION: let the observer grant the resume again (`release_subject_episode` instead of
+    // `release_subject_episode_without_resume`) and this reds with `reopen = ["A-1"]`.
+    #[test]
+    fn a_released_breaker_hold_is_not_reopened_on_a_spent_summons() {
+        let mut o = orch_for_select(10, HashMap::new(), None);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_states = set_of(&["in review"]);
+        }
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let ended = spent_summons_end();
+        seed_run(o.store(), "1", "A-1", ended);
+        park_breaker_hold_wearing_the_human_label(&o, "In Review");
 
         // The operator removed the label; the summons is the one the watermark put back — created
         // 30s into the last run, so older than the run's end.
@@ -1897,8 +1908,109 @@ mod tests {
             "a released human hold must not reopen on a spent summons"
         );
         assert!(
-            o.store().subject_resume_pending("A-1").expect("read"),
+            o.store().subject_hold("A-1").expect("read").is_none(),
             "the pass must have released the park, or this test is not the incident's state"
+        );
+        assert!(
+            !o.store().subject_resume_pending("A-1").expect("read"),
+            "removing the label must not grant the author a resume"
+        );
+    }
+
+    // STUDIO-1443, review round 1 finding B1: the ACTIVE-state half of the same rule, through the
+    // ordinary ladder the reviewer's scratch test used. The ticket is kept in `In Progress` with a
+    // linked PR — work already materialized — so the summons window rule applies; the breaker's
+    // hold is released by the label removal, and the author must STILL not be dispatched on the
+    // spent summons. Before the store-level distinction, the release granted `subject_resume_pending`
+    // and `pr_suppressed` returned `false` on it before it ever read the summons.
+    //
+    // MUTATION: grant the resume in the observer again and this reds with `active = ["A-1"]`.
+    #[test]
+    fn a_released_breaker_hold_is_not_dispatched_as_active_work_on_a_spent_summons() {
+        let mut o = orch_for_select(10, HashMap::new(), None);
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let ended = spent_summons_end();
+        seed_run(o.store(), "1", "A-1", ended);
+        park_breaker_hold_wearing_the_human_label(&o, "In Progress");
+
+        let mut opened = issue("1", "A-1", "In Progress");
+        opened.team_id = "team-1".into();
+        opened.linked_pr = true;
+        opened.latest_summon_at = Some(ended - ChronoDuration::seconds(30));
+
+        let (active, reopen, _held) = o.select_dispatch_with_reopens(vec![opened]);
+        assert!(
+            active.is_empty(),
+            "a released human hold must not dispatch the author on a spent summons"
+        );
+        assert!(reopen.is_empty());
+        assert!(
+            o.store().subject_hold("A-1").expect("read").is_none(),
+            "the park must still release, or the merge lock never lifts"
+        );
+    }
+
+    // STUDIO-1443, the other half: the SAME released breaker hold DOES dispatch the author when a
+    // summons newer than the last run's end exists. Releasing the hold must not wedge the ticket —
+    // it hands it back to the ordinary rule, which a genuine re-engagement still satisfies.
+    #[test]
+    fn a_released_breaker_hold_is_dispatched_as_active_work_on_a_newer_summons() {
+        let mut o = orch_for_select(10, HashMap::new(), None);
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let ended = spent_summons_end();
+        seed_run(o.store(), "1", "A-1", ended);
+        park_breaker_hold_wearing_the_human_label(&o, "In Progress");
+
+        let mut opened = issue("1", "A-1", "In Progress");
+        opened.team_id = "team-1".into();
+        opened.linked_pr = true;
+        opened.latest_summon_at = Some(ended + ChronoDuration::hours(1));
+
+        let (active, _reopen, _held) = o.select_dispatch_with_reopens(vec![opened]);
+        assert_eq!(
+            active.len(),
+            1,
+            "a summons newer than the run's end still re-engages the author"
+        );
+    }
+
+    // STUDIO-1443 must not break the operator's EXPLICIT "Human step done → resume" (STUDIO-1053).
+    // That action seeds its note into `pending_reopen_summons` BEFORE it removes the label, and the
+    // seed is the authorization the observer looks for: with it, the same label removal DOES grant
+    // the durable admission, and the author is dispatched even though the summons is spent.
+    #[test]
+    fn an_explicit_resume_still_admits_the_author_after_the_label_is_removed() {
+        let mut o = orch_for_select(10, HashMap::new(), None);
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        let ended = spent_summons_end();
+        seed_run(o.store(), "1", "A-1", ended);
+        park_breaker_hold_wearing_the_human_label(&o, "In Progress");
+        // `handle_seed_resume_note` writes exactly this, keyed by the issue id, before the label
+        // comes off.
+        o.pending_reopen_summons.insert(
+            "1".to_string(),
+            (
+                Utc.with_ymd_and_hms(2026, 6, 3, 13, 0, 0).unwrap(),
+                "added the secrets".into(),
+            ),
+        );
+
+        let mut opened = issue("1", "A-1", "In Progress");
+        opened.team_id = "team-1".into();
+        opened.linked_pr = true;
+        opened.latest_summon_at = Some(ended - ChronoDuration::seconds(30));
+
+        let (active, _reopen, _held) = o.select_dispatch_with_reopens(vec![opened]);
+        assert_eq!(
+            active.len(),
+            1,
+            "an explicit resume is an authorization, not a spent summons"
         );
     }
 
