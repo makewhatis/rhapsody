@@ -24,6 +24,13 @@ struct RecordingHost {
     /// Refuses every admission from the start, unlike `change_after`'s `revoked`, which revokes
     /// only AFTER a named effect has landed (STUDIO-1436).
     deny_admission: std::sync::atomic::AtomicBool,
+    /// Refuses the Nth `subject()` read AFTER the named effect has landed (STUDIO-1436). The reads
+    /// that follow an effect are its own CONFIRMATION read and then the FRESHNESS read guarding the
+    /// next action, so N=2 reaches the freshness read past a confirmation read that a refusal on
+    /// every read would always hit first (the arm B3 found untested).
+    subject_refuse_after: Option<(&'static str, usize)>,
+    /// Counts `subject()` reads taken since `subject_refuse_after`'s effect landed.
+    subject_reads_after: std::sync::atomic::AtomicUsize,
 }
 
 impl RecordingHost {
@@ -31,16 +38,17 @@ impl RecordingHost {
         self.calls.lock().expect("calls").push(text);
     }
 
+    fn recorded(&self, effect: &str) -> bool {
+        self.calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .any(|c| c.starts_with(effect))
+    }
+
     fn changed(&self, change: &str) -> bool {
-        self.change_after.is_some_and(|(effect, kind)| {
-            kind == change
-                && self
-                    .calls
-                    .lock()
-                    .expect("calls")
-                    .iter()
-                    .any(|c| c.starts_with(effect))
-        })
+        self.change_after
+            .is_some_and(|(effect, kind)| kind == change && self.recorded(effect))
     }
 
     fn after_effect(&self, effect: &str) {
@@ -96,6 +104,20 @@ impl LeadHost for RecordingHost {
         // can be exercised on their own (STUDIO-1436).
         if self.changed("subject-admission") {
             return Err(ADMISSION_REVOKED.into());
+        }
+        // A read refused for admission on the Nth read after a named effect: reaches the
+        // FRESHNESS read guarding a later action, past the effect's own confirmation read that
+        // `subject-admission` always hits first (STUDIO-1436, B3).
+        if let Some((effect, nth)) = self.subject_refuse_after
+            && self.recorded(effect)
+        {
+            let read = self
+                .subject_reads_after
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if read == nth {
+                return Err(ADMISSION_REVOKED.into());
+            }
         }
         if self.read_err || self.changed("unreadable") {
             return Err("source unavailable".into());
@@ -1140,16 +1162,21 @@ async fn an_admission_refused_at_the_confirmation_read_keeps_the_landed_commissi
     );
 }
 
-/// STUDIO-1436 (B1): the same rule for the FRESHNESS read before a later action. The first action
-/// landed, and the read that guards the second action is refused for admission. The landed action
-/// must stand and the remaining one must not be applied.
+/// STUDIO-1436 (B1): the same rule for the FRESHNESS read before a LATER action — the arm a review
+/// found untested (B3). The first action landed and the read guarding the second is refused for
+/// admission, so the landed action must stand and the remaining one must not run. The refusal is
+/// aimed at the SECOND read after the commission: its confirmation read is the first, and a
+/// refusal that fires on every read would stop there and never reach the freshness read.
 ///
-/// MUTATION: restore the unconditional `requeue_admission_refusal` and this reds — the item
-/// becomes `queued` and the decision row reads `admission refused: re-queued`.
+/// MUTATION: drop the `admission_unconfirmed` arm on that freshness read (leadexec.rs:1320) and
+/// this reds — the refusal falls to `Err(_)` and escalates ("fresh subject read failed during
+/// effects"), writing the durable hold this ticket exists to remove.
 #[tokio::test]
 async fn an_admission_refused_at_the_freshness_read_keeps_the_landed_action() {
     let (store, mut host, case) = setup("commission then release");
-    host.change_after = Some(("commission:", "subject-admission"));
+    // The commission's confirmation read (the first read after it lands) passes; the freshness
+    // read for `release` (the second) is refused for admission.
+    host.subject_refuse_after = Some(("commission:", 2));
     let result = replay(
         store.as_ref(),
         &host,
