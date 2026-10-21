@@ -246,6 +246,10 @@ pub fn origin_ticket_section(ticket: Option<&OriginTicket>) -> String {
 /// therefore keeps, in priority order, the acceptance section in full (or its start when the
 /// section alone is over budget), then the start of the description with the remaining budget,
 /// with an explicit byte-counted marker wherever text was elided.
+///
+/// Each elision is marked WHERE it falls: the head gap between the two quotes, the tail gap after
+/// the acceptance quote. A single marker between them named the wrong location for a tail-only
+/// elision — a head quoted in full, and everything missing sitting after the acceptance.
 fn origin_ticket_window(description: &str) -> (String, usize) {
     if description.len() <= ORIGIN_TICKET_MAX_BYTES {
         return (quote(description), 0);
@@ -264,26 +268,42 @@ fn origin_ticket_window(description: &str) -> (String, usize) {
         ));
         return (out, dropped);
     };
-    let acceptance = description[section.start..section.end].trim_end();
+    let acceptance = &description[section.start..section.end];
     if acceptance.len() <= ORIGIN_TICKET_MAX_BYTES {
         let remaining = ORIGIN_TICKET_MAX_BYTES - acceptance.len();
-        let (head, _) = truncate_bytes(&description[..section.start], remaining);
-        let dropped = description.len() - head.len() - acceptance.len();
+        let head = &description[..section.start];
+        let (head_kept, _) = truncate_bytes(head, remaining);
+        let head_gap = head.len() - head_kept.len();
+        // The tail after the acceptance section is dropped, not quoted — the ticket's priority is
+        // the acceptance first and the description's start second — but it is a REAL elision (the
+        // `## Out of scope` our template puts right after `## Acceptance` lives here) and is marked
+        // after the acceptance quote, where it actually falls.
+        let tail = &description[section.end..];
         let mut out = String::new();
-        if !head.is_empty() {
-            out.push_str(&quote(head));
+        if !head_kept.is_empty() {
+            out.push_str(&quote(head_kept));
             out.push('\n');
         }
-        out.push_str(&format!(
-            "\n**{} here:** the ticket is longer than this review's \
-             {ORIGIN_TICKET_MAX_BYTES}-byte budget, so the text between the start above and the \
-             acceptance section below is not quoted. This run has no way to read the parts of the \
-             ticket that are not quoted here. The acceptance criteria below are quoted in full.\n",
-            bytes_elided(dropped)
-        ));
-        out.push('\n');
+        if head_gap > 0 {
+            out.push_str(&format!(
+                "\n**{} here:** the ticket is longer than this review's \
+                 {ORIGIN_TICKET_MAX_BYTES}-byte budget, so the text between the start above and the \
+                 acceptance section below is not quoted. This run has no way to read the parts of \
+                 the ticket that are not quoted here.\n",
+                bytes_elided(head_gap)
+            ));
+        }
+        out.push_str("\n**The acceptance criteria below are quoted in full.**\n\n");
         out.push_str(&quote(acceptance));
-        return (out, dropped);
+        if !tail.is_empty() {
+            out.push_str(&format!(
+                "\n**{} after the acceptance section:** the ticket continues past its acceptance \
+                 criteria, and that text is not quoted here. This run has no way to read the parts \
+                 of the ticket that are not quoted here.\n",
+                bytes_elided(tail.len())
+            ));
+        }
+        return (out, head_gap + tail.len());
     }
     // The acceptance section alone is over budget: keep its start, where the criteria begin.
     let (kept, _) = truncate_bytes(acceptance, ORIGIN_TICKET_MAX_BYTES);
@@ -293,12 +313,16 @@ fn origin_ticket_window(description: &str) -> (String, usize) {
     out.push_str(&format!(
         "\n**This description was cut:** the acceptance section alone is longer than this review's \
          {ORIGIN_TICKET_MAX_BYTES}-byte budget, so only its start is quoted above and {} not in \
-         this prompt. This run has no way to read the ticket's remaining text; judge the criteria \
-         you can see, and say plainly if one cannot be checked.\n",
+         this prompt — including everything before it. This run has no way to read the ticket's \
+         remaining text; judge the criteria you can see, and say plainly if one cannot be \
+         checked.\n",
         bytes_are(dropped)
     ));
     (out, dropped)
 }
+
+/// The heading an operator route-back block carries, lowercased.
+const ROUTE_BACK_HEADING: &str = "review feedback";
 
 /// The byte range of the ticket's acceptance section — its heading line to the next ATX heading of
 /// the same or higher level — or `None` when the description has no acceptance heading
@@ -311,8 +335,51 @@ fn origin_ticket_window(description: &str) -> (String, usize) {
 /// Fenced code blocks are skipped: a ticket that DOCUMENTS the acceptance format with a fenced
 /// `## Acceptance` example must not have that example taken for the real section, which would drop
 /// the real acceptance while the marker claimed it was quoted in full.
+///
+/// Leading route-back blocks are skipped too. The operator route-back PREPENDS its feedback, and a
+/// review carries an `### Acceptance` checklist of its own — so on a re-review the FIRST matching
+/// heading is the REVIEWER's, and anchoring there quotes the feedback as the ticket's acceptance
+/// while the real section falls outside the window. The ticket's own text begins after the
+/// prepended blocks, so the first acceptance heading there is the one that counts.
 fn acceptance_section(description: &str) -> Option<std::ops::Range<usize>> {
-    let mut start: Option<(usize, usize)> = None;
+    let headings = headings(description);
+    let mut skip = 0;
+    for (i, (line_start, level, text)) in headings.iter().enumerate() {
+        if *line_start < skip || text != ROUTE_BACK_HEADING {
+            break;
+        }
+        skip = section_end(&headings, i + 1, *level, description.len());
+    }
+    let (index, start, level) =
+        headings
+            .iter()
+            .enumerate()
+            .find_map(|(i, (line_start, level, text))| {
+                (*line_start >= skip && (text == "acceptance" || text == "acceptance criteria"))
+                    .then_some((i, *line_start, *level))
+            })?;
+    Some(start..section_end(&headings, index + 1, level, description.len()))
+}
+
+/// The start of the first heading in `headings[from..]` at `level` or higher, or `fallback` when
+/// none follows — the boundary that ends a section headed at `level`.
+fn section_end(
+    headings: &[(usize, usize, String)],
+    from: usize,
+    level: usize,
+    fallback: usize,
+) -> usize {
+    headings[from..]
+        .iter()
+        .find(|(_, next_level, _)| *next_level <= level)
+        .map(|(next_start, _, _)| *next_start)
+        .unwrap_or(fallback)
+}
+
+/// Every ATX heading in `description` outside a fenced code block, in order, as
+/// `(line_start, level, lowercased text)`.
+fn headings(description: &str) -> Vec<(usize, usize, String)> {
+    let mut out = Vec::new();
     let mut fence: Option<(char, usize)> = None;
     for (line_start, line_end) in line_spans(description) {
         let line = &description[line_start..line_end];
@@ -330,19 +397,11 @@ fn acceptance_section(description: &str) -> Option<std::ops::Range<usize>> {
             fence = Some(marker);
             continue;
         }
-        let Some((level, text)) = atx_heading(line) else {
-            continue;
-        };
-        match start {
-            Some((begin, first_level)) if level <= first_level => return Some(begin..line_start),
-            Some(_) => {}
-            None if text == "acceptance" || text == "acceptance criteria" => {
-                start = Some((line_start, level));
-            }
-            None => {}
+        if let Some((level, text)) = atx_heading(line) {
+            out.push((line_start, level, text));
         }
     }
-    start.map(|(begin, _)| begin..description.len())
+    out
 }
 
 /// The character and length of a fenced code block's opening or closing marker, or `None`.
@@ -1311,6 +1370,10 @@ mod tests {
             text.contains("bytes are not in this prompt"),
             "the marker must say how much was dropped:\n{text}"
         );
+        assert!(
+            text.contains("> - x"),
+            "an over-budget acceptance keeps its START, where the criteria begin:\n{text}"
+        );
         let (_, dropped) = origin_ticket_window(&body);
         assert!(
             body.len() - dropped <= ORIGIN_TICKET_MAX_BYTES,
@@ -1472,13 +1535,15 @@ mod tests {
         }
     }
 
-    /// A one-byte elision is reachable (a ticket that is its acceptance section plus a trailing
-    /// newline), and a reviewer reads this prompt — so the marker must agree with its number.
+    /// A one-byte elision is reachable — the byte that does not fit is the newline ending the
+    /// head — and a reviewer reads this prompt, so the marker must agree with its number.
     #[test]
     fn a_one_byte_elision_is_phrased_in_the_singular() {
-        let mut body = String::from("## Acceptance\n");
-        body.push_str(&"a".repeat(ORIGIN_TICKET_MAX_BYTES - "## Acceptance\n".len()));
+        let acceptance = "## Acceptance\n- a criterion";
+        let head_len = ORIGIN_TICKET_MAX_BYTES - acceptance.len() + 1; // one byte more than fits
+        let mut body = "h".repeat(head_len - 1);
         body.push('\n');
+        body.push_str(acceptance);
         assert_eq!(body.len(), ORIGIN_TICKET_MAX_BYTES + 1);
 
         let text = rendered_with(&body);
@@ -1488,5 +1553,91 @@ mod tests {
         );
         assert!(!text.contains("1 bytes"), "{text}");
         assert!(!text.contains("1 byte are"), "{text}");
+    }
+
+    // ── STUDIO-1438 review: the route-back prefix and the tail elision ──────────────────────────
+
+    /// B1 (STUDIO-1438 review): the operator route-back PREPENDS its feedback, and a review carries
+    /// an `### Acceptance` checklist of its own. Anchoring on the FIRST matching heading takes the
+    /// REVIEWER's checklist for the ticket's acceptance and labels it as the acceptance source of
+    /// truth — the exact re-review this ticket exists for.
+    ///
+    /// Mutation: removing the leading route-back skip in [`acceptance_section`] reds both
+    /// assertions below — the window is anchored on the reviewer's `### Acceptance`, which is then
+    /// quoted as the acceptance while the ticket's own section falls outside it.
+    #[test]
+    fn a_route_back_block_with_its_own_acceptance_checklist_does_not_capture_the_window() {
+        let mut body =
+            String::from("## REVIEW FEEDBACK\n\nHere is what I found.\n\n### Acceptance\n\n");
+        body.push_str("- reviewer checklist item one\n- reviewer checklist item two\n\n");
+        body.push_str(&"the operator asked for this change. ".repeat(300));
+        body.push_str("\n\n## The defects\n\n1. one\n2. two\n3. three\n\n## Acceptance\n\n");
+        body.push_str("- THE REAL CRITERION\n- A SECOND REAL CRITERION\n");
+        assert!(body.len() > ORIGIN_TICKET_MAX_BYTES);
+
+        let text = rendered_with(&body);
+        let acceptance_region = text
+            .split_once("The acceptance criteria below are quoted in full.")
+            .map(|(_, after)| after)
+            .expect("the ticket's acceptance must be quoted");
+        assert!(
+            acceptance_region.contains("- THE REAL CRITERION")
+                && acceptance_region.contains("- A SECOND REAL CRITERION"),
+            "every real acceptance bullet must be the quoted section:\n{text}"
+        );
+        assert!(
+            !acceptance_region.contains("- reviewer checklist item one"),
+            "the reviewer's own checklist must not be quoted as the ticket's acceptance:\n{text}"
+        );
+    }
+
+    /// B2 (STUDIO-1438 review): text AFTER the acceptance section — our ticket template's
+    /// `## Out of scope`, which is what stops a reviewer blocking on something the ticket excluded —
+    /// was dropped with no marker at all, and the one marker claimed the elision sat between the
+    /// head and the acceptance even when the head was quoted in full.
+    ///
+    /// Mutation: dropping the tail marker reds the placement assertion below.
+    #[test]
+    fn an_elision_after_the_acceptance_section_is_marked_where_it_falls() {
+        let mut body = String::from(
+            "## Requirement\n\nshort head\n\n## Acceptance\n\n- crit a\n\n## Out of scope\n\n\
+             - NOT THIS\n",
+        );
+        body.push_str(&"out of scope filler. ".repeat(600));
+        assert!(body.len() > ORIGIN_TICKET_MAX_BYTES);
+
+        let text = rendered_with(&body);
+        assert!(
+            !text.contains("bytes were elided here"),
+            "the head was quoted in full, so nothing was elided between it and the acceptance:\n{text}"
+        );
+        let after_acceptance = text
+            .split_once("- crit a")
+            .map(|(_, after)| after)
+            .expect("the acceptance must be quoted");
+        assert!(
+            after_acceptance.contains("bytes were elided after the acceptance section"),
+            "the tail elision must be marked after the acceptance quote, where it falls:\n{text}"
+        );
+    }
+
+    /// A route-back block whose only acceptance heading is its own pasted checklist leaves the
+    /// ticket with no acceptance of its own — so it head-truncates, exactly as a ticket with no
+    /// acceptance heading does, rather than windowing on the reviewer's list.
+    #[test]
+    fn a_route_back_block_without_a_real_acceptance_still_head_truncates() {
+        let mut body = String::from("## REVIEW FEEDBACK\n\n### Acceptance\n\n- reviewer item\n\n");
+        body.push_str(&"the operator asked for this change. ".repeat(300));
+        assert!(body.len() > ORIGIN_TICKET_MAX_BYTES);
+
+        let text = rendered_with(&body);
+        assert!(
+            text.contains("This description was cut"),
+            "a ticket with no acceptance of its own is still cut, not windowed:\n{text}"
+        );
+        assert!(
+            !text.contains("bytes were elided here"),
+            "the reviewer's checklist must not open an acceptance window:\n{text}"
+        );
     }
 }
