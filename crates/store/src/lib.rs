@@ -928,25 +928,6 @@ pub trait Store {
         number: i64,
     ) -> Result<i64, StoreError>;
 
-    /// The VERDICT of the MOST RECENT completed review round of one pull request (STUDIO-1440) —
-    /// the newest `runs` row whose `issue_identifier` is
-    /// `pr:<owner>/<repo>#<number>@<reviewer>` with `outcome = completed` (by `ended_at`, then
-    /// `id`), a recorded verdict in `rhapsody_review_verdicts`, and not a manager/intervention run
-    /// (`@manager`). `Ok(None)` when the coordinate has no completed verdict yet.
-    ///
-    /// This is the breaker's convergence question: the watch set holds only the LATEST status per
-    /// (PR, reviewer), so it can say whether a reviewer's own verdict is an approval but cannot
-    /// order two reviewers' verdicts against each other — only the per-run ledger can answer "the
-    /// most recent completed verdict". An approving round therefore never lets a LATER
-    /// changes-requested round be mistaken for it, and a pending sibling (no verdict row at all)
-    /// is not a completed verdict and cannot shadow the approval either.
-    fn latest_review_verdict(
-        &self,
-        owner: &str,
-        repo: &str,
-        number: i64,
-    ) -> Result<Option<String>, StoreError>;
-
     /// How many runs this daemon has recorded for one exact `issue_identifier` — a ticket's
     /// "attempts" for the breaker's notification, counting every author run whatever its outcome.
     /// `0` for an identifier with no runs.

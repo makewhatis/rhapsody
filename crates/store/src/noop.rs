@@ -335,14 +335,6 @@ impl Store for Noop {
     fn count_runs_for(&self, _identifier: &str) -> Result<i64, StoreError> {
         Ok(0)
     }
-    fn latest_review_verdict(
-        &self,
-        _owner: &str,
-        _repo: &str,
-        _number: i64,
-    ) -> Result<Option<String>, StoreError> {
-        Ok(None)
-    }
 
     fn account_credit_spend(&self, _account: &str, _since: &str) -> Result<f64, StoreError> {
         Ok(0.0)
