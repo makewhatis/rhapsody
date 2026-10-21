@@ -590,6 +590,23 @@ pub(crate) fn blocker_identifier(b: &BlockerRef) -> String {
 /// candidates does not need fifty of them on one line every poll.
 const HELD_SAMPLE: usize = 10;
 
+/// Renders a held-candidate list for a skip log: the first [`HELD_SAMPLE`] identifiers joined by
+/// `", "`, plus a ` (+N more)` remainder when the list is longer. Shared by every "held" line
+/// (STUDIO-885's global cap and STUDIO-1437's project/state lines) so one cap cannot drift from
+/// another.
+fn held_sample(held: &[String]) -> String {
+    let mut sample = held
+        .iter()
+        .take(HELD_SAMPLE)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if held.len() > HELD_SAMPLE {
+        sample.push_str(&format!(" (+{} more)", held.len() - HELD_SAMPLE));
+    }
+    sample
+}
+
 /// Returns the blocker's state name for log output, with original casing preserved (e.g.
 /// `"In Review"`). A `None`/empty state logs as `"unknown"` — the same value eligibility treats as
 /// non-terminal (conservative; INF-249). Mirrors Go `blockerStateName`.
@@ -741,15 +758,7 @@ impl Orchestrator {
         if held.is_empty() {
             return;
         }
-        let mut sample = held
-            .iter()
-            .take(HELD_SAMPLE)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(", ");
-        if held.len() > HELD_SAMPLE {
-            sample.push_str(&format!(" (+{} more)", held.len() - HELD_SAMPLE));
-        }
+        let sample = held_sample(held);
         tracing::info!(
             not_considered = %sample,
             not_considered_count = held.len(),
@@ -757,6 +766,70 @@ impl Orchestrator {
             running = self.implementation_pool_holders(),
             live_runs = self.running.len(),
             "skipping dispatch: no global concurrency slot; candidates not considered this tick"
+        );
+    }
+
+    /// Surfaces the otherwise-SILENT drop of the candidates a multi-project selection pass never
+    /// admitted because their PROJECT GROUP was at its `max_concurrent` (STUDIO-1437): one
+    /// `tracing::info!` line per group that held something, naming the group, its running count and
+    /// cap, how many of those running entries are ticketless REVIEW runs, and a [`HELD_SAMPLE`]-capped
+    /// sample of the held tickets.
+    ///
+    /// The sibling of [`Orchestrator::log_capacity_hold`], for the budget that binds next. The
+    /// incident it exists for: a project at 7/7 held a High-priority ticket for fourteen minutes
+    /// while the GLOBAL pool had a free slot, and nothing was logged at any level — the global line
+    /// had stopped because global room existed, and the project refusal said nothing. The
+    /// `reviews` split is the fact that explained it (the group's slots were held by review runs,
+    /// which count against a project cap by design — STUDIO-950), so an operator can tell "my
+    /// project is full of reviews" from "my project is full of implementations".
+    ///
+    /// `running` and `reviews` are read live ([`Orchestrator::running_in_project_group`] /
+    /// [`Orchestrator::running_reviews_in_project_group`]); `held` is the pass's own list of the
+    /// candidates the gate turned away. An empty `held` logs nothing.
+    pub(crate) fn log_project_budget_hold(&self, group: &str, cap: i64, held: &[String]) {
+        if held.is_empty() {
+            return;
+        }
+        let sample = held_sample(held);
+        tracing::info!(
+            project_group = %group,
+            running = self.running_in_project_group(group),
+            reviews = self.running_reviews_in_project_group(group),
+            max_concurrent = cap,
+            not_considered = %sample,
+            not_considered_count = held.len(),
+            "skipping dispatch: project at its concurrency cap; candidates not considered this tick"
+        );
+    }
+
+    /// Surfaces the otherwise-SILENT drop of the candidates a selection pass never admitted because
+    /// their STATE was at its per-state limit (STUDIO-1437): one `tracing::info!` line per state that
+    /// held something, naming the state, the count that hit the limit, the limit itself, and a
+    /// [`HELD_SAMPLE`]-capped sample of the held tickets.
+    ///
+    /// `count` and `limit` are the two values the gate actually compared (the count is the pass-local
+    /// global-in-state tally, the limit the owning project's override or the global fallback), so the
+    /// line reproduces the comparison rather than a re-derivation that could disagree with it. The
+    /// `state` is the normalized key the tally is kept under — the same normalization the gate used.
+    /// An empty `held` logs nothing.
+    pub(crate) fn log_state_limit_hold(
+        &self,
+        state: &str,
+        count: i64,
+        limit: i64,
+        held: &[String],
+    ) {
+        if held.is_empty() {
+            return;
+        }
+        let sample = held_sample(held);
+        tracing::info!(
+            state = %state,
+            running = count,
+            limit,
+            not_considered = %sample,
+            not_considered_count = held.len(),
+            "skipping dispatch: state at its per-state limit; candidates not considered this tick"
         );
     }
 
