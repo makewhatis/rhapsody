@@ -110,12 +110,12 @@ impl BrokerRuntime {
 /// Supervise the broker serving task for the daemon's lifetime.
 ///
 /// * On a clean daemon shutdown (`shutdown` fires first), the serving task is already draining —
-///   its own shutdown signal is the same one — so this only bounds the wait. That is also the
-///   agreed outcome when the shutdown beats the serving task into its accept loop (a fast-fail boot
-///   cancels before the task is ever polled): the task returns `Ok(())` having never accepted, and
-///   the broker stays **available**, because nothing failed — pinned by
-///   `tests::a_shutdown_before_the_accept_loop_is_still_clean`. The `biased` select below is what
-///   makes that independent of which future happens to complete first.
+///   its own shutdown signal is the same one — so this only bounds the wait. The agreed outcome is
+///   the same when the shutdown beats the serving task into its accept loop (a fast-fail boot
+///   cancels before the task is ever polled): the daemon asked to stop, so the exit is clean and
+///   the broker stays **available** — nothing failed, so nothing is revoked and nothing is logged
+///   loudly. Pinned by `tests::a_shutdown_before_the_accept_loop_is_still_clean`; the `biased`
+///   select below is what keeps that independent of which future happens to complete first.
 /// * If the serving task ends **while the daemon is still live** (an accept error, or a task that
 ///   died silently), the broker is atomically marked unavailable and every grant is revoked, and
 ///   one bounded error is logged. The daemon keeps running: legacy native-login work may continue,
