@@ -698,6 +698,49 @@ mod tests {
 
     type Requests = std::sync::Arc<std::sync::Mutex<Vec<(String, Value)>>>;
 
+    /// ⚠️ THE STUDIO-1439 REGRESSION GUARD for the fake server's `/event` handshake. The adapter's
+    /// contract is "subscribe before creating a session", and it takes the arrival of
+    /// `server.connected` as proof that it has. The fixture therefore has to record the
+    /// subscription before it writes the first byte of that response: recorded afterwards, a
+    /// correct adapter can reach the session guard first and the turn dies with
+    /// `opencode_control_failed: HTTP request failed` (the CI flake).
+    ///
+    /// `testdata/fake_opencode_subscription_order.py` drives the fixture's REAL `/event` handler
+    /// with a recording response and asserts the order. That is the deterministic reproduction of
+    /// the failing order — a turn-level test could only catch it under load, which the ticket
+    /// forbids. MUTATION: recording the subscription after `server.connected` turns it red.
+    #[test]
+    fn the_fake_server_records_the_subscription_before_its_first_event_byte() {
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../harness/stubs/fake-opencode-server.py"
+        );
+        let probe = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/fake_opencode_subscription_order.py"
+        );
+        let dir = TempDir::new();
+        let script = dir.path().join("clean.sh");
+        std::fs::write(
+            &script,
+            "printf '{\"type\":\"text\",\"sessionID\":\"ses_x\"}\\n'\n",
+        )
+        .expect("write the probe's scenario script");
+
+        let out = std::process::Command::new("python3")
+            .arg(probe)
+            .arg(fixture)
+            .arg(&script)
+            .output()
+            .expect("python3 runs the fixture probe");
+        assert!(
+            out.status.success(),
+            "the fake server's /event handshake is out of order:\n{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     async fn fake_transport(disconnect: bool, public: bool) -> (Control, Task, Requests) {
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
