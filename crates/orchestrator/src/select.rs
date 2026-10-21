@@ -1844,6 +1844,64 @@ mod tests {
         assert_eq!(held[0].project, "a");
     }
 
+    // STUDIO-1443, through the ladder the incident used. The breaker parks the ticket while it wears
+    // `rhapsody:human` and records that in the park snapshot; the operator then removes the label.
+    // This pass OBSERVES the label change — releasing the park, exactly as production does, so the
+    // merge lock releases and the ticket is a candidate again — and must still refuse the reopen,
+    // because the only summons is the SPENT one the STUDIO-885 watermark restored (it was created
+    // while the last author run was live). Before the fix, the release's `subject_resume_pending`
+    // answered the reopen with an unconditional `true` and the author was dispatched on it.
+    //
+    // MUTATION: restore the `subject_resume_pending` early return in `review_reopen_eligible` and
+    // this reds with `reopen = ["A-1"]`.
+    #[test]
+    fn a_released_breaker_hold_is_not_reopened_on_a_spent_summons() {
+        let mut o = orch_for_select(10, HashMap::new(), None);
+        if let Some(eff) = o.eff.as_mut() {
+            eff.review_states = set_of(&["in review"]);
+        }
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::InMemory).expect("open in-memory store"),
+        ));
+        // The last author run: `seed_run` windows it as `[ended_at - 1m, ended_at]`.
+        let ended = Utc.with_ymd_and_hms(2026, 6, 3, 12, 0, 0).unwrap();
+        seed_run(o.store(), "1", "A-1", ended);
+
+        // The breaker's park, snapshotted while the ticket wore the human label.
+        let mut held = issue("1", "A-1", "In Review");
+        held.team_id = "team-1".into();
+        held.labels = Some(vec!["rhapsody:human".into()]);
+        let snapshot =
+            crate::leaditems::park_snapshot(o.store(), &held, None, false).expect("park snapshot");
+        let id = o
+            .store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "A-1".into(),
+                kind: "breaker".into(),
+                snapshot,
+                ..Default::default()
+            })
+            .expect("park the breaker hold");
+        assert!(id > 0, "the breaker hold must be open");
+
+        // The operator removed the label; the summons is the one the watermark put back — created
+        // 30s into the last run, so older than the run's end.
+        let mut opened = issue("1", "A-1", "In Review");
+        opened.team_id = "team-1".into();
+        opened.latest_summon_at = Some(ended - ChronoDuration::seconds(30));
+
+        let (active, reopen, _held) = o.select_dispatch_with_reopens(vec![opened]);
+        assert!(active.is_empty(), "never dispatched as active work");
+        assert!(
+            reopen.is_empty(),
+            "a released human hold must not reopen on a spent summons"
+        );
+        assert!(
+            o.store().subject_resume_pending("A-1").expect("read"),
+            "the pass must have released the park, or this test is not the incident's state"
+        );
+    }
+
     // STUDIO-988 review round 5 (alice #1): a REFUSED reopen stays in its review state (the promote
     // is deferred to acceptance), so this ladder re-enters the reopen branch every tick. Before the
     // fix the branch reserved the only slot BEFORE `begin_preparation` could report `Suppressed`, so

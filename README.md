@@ -3835,6 +3835,23 @@ summons.
 is `None` and the pre-INF-448 PR-activity fallback applies — byte-identical to a daemon built before
 this change, and the reason the fallback was kept rather than removed.
 
+#### A released human hold does not re-engage the author by itself (STUDIO-1443)
+
+Removing `rhapsody:human` releases the hold — the ticket is a candidate again and the merge lock
+lifts — but it is **not** a summons. On
+[STUDIO-1443](https://linear.app/studio49/issue/STUDIO-1443/removing-a-breakers-rhapsodyhuman-hold-reopens-the-author-on-a-stale)
+the operator released two breaker-held, already-approved tickets and the review-reopen ladder
+re-dispatched the author within seconds, on the summons the STUDIO-885 watermark had restored — a
+comment older than the last run's end. The park's release was read as an unconditional reopen, so
+the run-window rule above was never consulted; one of the two runs rebased an approved branch,
+invalidated its review and restarted its CI for nothing.
+
+The review-reopen ladder now has exactly one way in: a summons strictly newer than the last run's
+end. Releasing the hold still releases the park, so the ticket is dispatched by the ordinary rules —
+including a genuine summons posted after the release. `pr_suppressed` deliberately keeps its
+released-park exemption: an ACTIVE-state resume is what a landing auto-revert reopen means, and that
+reopen has no summons to offer.
+
 ### A second agent backend — `opencode` (STUDIO-902)
 
 The frozen reference runs exactly one coding-agent backend. Rhapsody now ships two: `claude` and
