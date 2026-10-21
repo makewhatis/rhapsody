@@ -21,6 +21,16 @@ struct RecordingHost {
     action_err: bool,
     change_after: Option<(&'static str, &'static str)>,
     advise: bool,
+    /// Refuses every admission from the start, unlike `change_after`'s `revoked`, which revokes
+    /// only AFTER a named effect has landed (STUDIO-1436).
+    deny_admission: std::sync::atomic::AtomicBool,
+    /// Refuses the Nth `subject()` read AFTER the named effect has landed (STUDIO-1436). The reads
+    /// that follow an effect are its own CONFIRMATION read and then the FRESHNESS read guarding the
+    /// next action, so N=2 reaches the freshness read past a confirmation read that a refusal on
+    /// every read would always hit first (the arm B3 found untested).
+    subject_refuse_after: Option<(&'static str, usize)>,
+    /// Counts `subject()` reads taken since `subject_refuse_after`'s effect landed.
+    subject_reads_after: std::sync::atomic::AtomicUsize,
 }
 
 impl RecordingHost {
@@ -28,16 +38,17 @@ impl RecordingHost {
         self.calls.lock().expect("calls").push(text);
     }
 
+    fn recorded(&self, effect: &str) -> bool {
+        self.calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .any(|c| c.starts_with(effect))
+    }
+
     fn changed(&self, change: &str) -> bool {
-        self.change_after.is_some_and(|(effect, kind)| {
-            kind == change
-                && self
-                    .calls
-                    .lock()
-                    .expect("calls")
-                    .iter()
-                    .any(|c| c.starts_with(effect))
-        })
+        self.change_after
+            .is_some_and(|(effect, kind)| kind == change && self.recorded(effect))
     }
 
     fn after_effect(&self, effect: &str) {
@@ -67,13 +78,47 @@ impl LeadHost for RecordingHost {
         self.advise
     }
     async fn admit_action(&self) -> Result<(), String> {
-        if self.changed("revoked") {
-            Err("admission revoked".into())
+        if self
+            .deny_admission
+            .load(std::sync::atomic::Ordering::SeqCst)
+            || self.changed("revoked")
+        {
+            Err(ADMISSION_REVOKED.into())
         } else {
             Ok(())
         }
     }
     async fn subject(&self) -> Result<LeadSubject, String> {
+        // The production host reads admission on this path too (`subject` → `lead_allowed(repo,
+        // "")`), so a denied admission must fail the read as well as the action (STUDIO-1436).
+        if self
+            .deny_admission
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(ADMISSION_REVOKED.into());
+        }
+        // A read that is refused for admission ALONE, after a named effect has landed: the
+        // production `subject()` round-trips `lead_allowed`, which can refuse while
+        // `admit_action` still succeeded. Distinct from `deny_admission` (which also fails the
+        // action) and from `revoked` (which fails `admit_action`) so the effect path's read arms
+        // can be exercised on their own (STUDIO-1436).
+        if self.changed("subject-admission") {
+            return Err(ADMISSION_REVOKED.into());
+        }
+        // A read refused for admission on the Nth read after a named effect: reaches the
+        // FRESHNESS read guarding a later action, past the effect's own confirmation read that
+        // `subject-admission` always hits first (STUDIO-1436, B3).
+        if let Some((effect, nth)) = self.subject_refuse_after
+            && self.recorded(effect)
+        {
+            let read = self
+                .subject_reads_after
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if read == nth {
+                return Err(ADMISSION_REVOKED.into());
+            }
+        }
         if self.read_err || self.changed("unreadable") {
             return Err("source unavailable".into());
         }
@@ -749,14 +794,10 @@ async fn stale_subject_rechecked_before_action() {
 
 async fn refuses_subject_change_between_effects(action: serde_json::Value) {
     for (effect, attached_pr) in [("prepend:", false), ("prepend:", true), ("clear:", true)] {
-        for change in [
-            "closed",
-            "moved",
-            "relabeled",
-            "head",
-            "unreadable",
-            "revoked",
-        ] {
+        // `revoked` is deliberately absent (STUDIO-1436): an admission refusal mid-effect is not a
+        // subject change, and it re-queues rather than escalating — see
+        // `an_admission_refused_effect_requeues_and_applies_on_a_later_admitted_attempt`.
+        for change in ["closed", "moved", "relabeled", "head", "unreadable"] {
             let (store, mut host, mut case) = setup("concurrent subject change");
             if !attached_pr {
                 case.subject.pr = None;
@@ -807,6 +848,363 @@ async fn author_commission_refuses_subject_change_between_effects() {
         "action":"commission", "kind":"author", "question":"diagnose", "hypothesis":"cold cache"
     }))
     .await;
+}
+
+/// STUDIO-1436: an effect refused ONLY for admission is not a judgement that a human is needed. It
+/// re-queues, as preparation already does, instead of writing an `escalation` hold — in the
+/// reported incident that hold parked the very author the refused commission was about to ask for
+/// help, and the refusal's only cause was the lead-admission round-trip timing out (no author run
+/// live, no hold in existence, authority untouched).
+///
+/// MUTATION: restore `result.escalation = Some("lead effect admission revoked; ...")` on the
+/// pre-effect gate and this reds three ways — a `rhapsody_subject_holds` row appears, the item is
+/// `done` instead of `queued`, and the decision row reads `escalate:`.
+#[tokio::test]
+async fn an_admission_refused_effect_requeues_and_applies_on_a_later_admitted_attempt() {
+    let (store, host, case) = setup("verify alice's finding");
+    let actions = serde_json::json!([{
+        "action":"commission", "kind":"author",
+        "question":"independently verify alice:B3", "hypothesis":"the parser stops early"
+    }]);
+    host.deny_admission
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let refused = replay(store.as_ref(), &host, &case, actions.clone()).await;
+    assert_eq!(refused.state, "queued", "an admission refusal re-queues");
+    assert!(
+        refused.escalation.is_none(),
+        "it is not an escalation: {refused:?}"
+    );
+    assert!(
+        store
+            .subject_hold(&case.subject.ticket.identifier)
+            .expect("hold")
+            .is_none(),
+        "no escalation hold may be written for an admission refusal"
+    );
+    assert_eq!(
+        store.load_lead_items().expect("items")[0].state,
+        "queued",
+        "the item stays retryable"
+    );
+    assert!(
+        store
+            .load_lead_decisions()
+            .expect("rows")
+            .iter()
+            .all(|r| !r.decision.starts_with("escalate:")),
+        "no decision row may read as an escalation: {:?}",
+        store
+            .load_lead_decisions()
+            .expect("rows")
+            .iter()
+            .map(|r| &r.decision)
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        !host
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .any(|c| c.starts_with("prepend:")
+                || c.starts_with("todo:")
+                || c.starts_with("retain:")),
+        "a refused admission writes nothing, paper trail included"
+    );
+
+    // A later admitted attempt applies the SAME decided action.
+    host.deny_admission
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    let applied = replay(store.as_ref(), &host, &case, actions).await;
+    assert_eq!(applied.state, "parked", "the author commission is applied");
+    let calls = host.calls.lock().expect("calls");
+    assert!(
+        calls.iter().any(|c| c.starts_with("prepend:")),
+        "the commission answer reached the ticket: {calls:?}"
+    );
+    assert!(
+        calls.iter().any(|c| c.starts_with("todo:")),
+        "and the ticket was moved for the author: {calls:?}"
+    );
+}
+
+/// STUDIO-1436: the same re-queue applies when admission is already revoked at the FIRST read of
+/// the effect path — before any effect is attempted. That read used to become "fresh subject could
+/// not be confirmed", which escalates and parks the author on a refusal that is re-evaluated on
+/// the next attempt.
+///
+/// MUTATION: drop the `Err(reason) if reason == ADMISSION_REVOKED` arm from that first read and
+/// this reds (the escalation is raised before the effect loop, so the item ends `done` and a hold
+/// appears).
+#[tokio::test]
+async fn an_admission_revoked_at_the_first_read_requeues() {
+    let (store, host, case) = setup("revoked before the effects");
+    host.deny_admission
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([{"action":"requeue","ticket":"TEST-100"}]),
+    )
+    .await;
+    assert_eq!(result.state, "queued", "{result:?}");
+    assert!(result.escalation.is_none(), "{result:?}");
+    assert!(
+        store
+            .subject_hold(&case.subject.ticket.identifier)
+            .expect("hold")
+            .is_none(),
+        "no escalation hold"
+    );
+    assert_eq!(
+        store.load_lead_items().expect("items")[0].state,
+        "queued",
+        "the item stays retryable"
+    );
+    assert!(
+        store
+            .load_lead_decisions()
+            .expect("rows")
+            .iter()
+            .all(|r| !r.decision.starts_with("escalate:")),
+        "no decision row may read as an escalation"
+    );
+}
+
+/// STUDIO-1436: the same re-queue applies when admission is revoked MID-effect — after a write has
+/// already landed. The incident's own refusal surfaced exactly this way (out of `apply_action`,
+/// not the pre-effect gate), and the refused action's own writes are idempotent: the lead answer
+/// block is keyed by item id and replaced in place, and the Todo move and the review clear are
+/// idempotent, so a retry cannot double-apply.
+///
+/// MUTATION: drop the `reason == ADMISSION_REVOKED` arm on the `apply_action` error and this reds
+/// (an escalation hold appears and the item ends `done`).
+#[tokio::test]
+async fn an_admission_revoked_mid_effect_also_requeues() {
+    for action in [
+        serde_json::json!({"action":"route_back","ticket":"TEST-100","answer":"Use LimitObs."}),
+        serde_json::json!({
+            "action":"commission", "kind":"author",
+            "question":"diagnose", "hypothesis":"cold cache"
+        }),
+    ] {
+        let (store, mut host, case) = setup("revoked mid-effect");
+        host.change_after = Some(("prepend:", "revoked"));
+        let result = replay(store.as_ref(), &host, &case, serde_json::json!([action])).await;
+        assert_eq!(result.state, "queued", "{action}");
+        assert!(result.escalation.is_none(), "{action}: {result:?}");
+        assert!(
+            store
+                .subject_hold(&case.subject.ticket.identifier)
+                .expect("hold")
+                .is_none(),
+            "{action}: no escalation hold"
+        );
+        assert_eq!(
+            store.load_lead_items().expect("items")[0].state,
+            "queued",
+            "{action}: the item stays retryable"
+        );
+        assert!(
+            store
+                .load_lead_decisions()
+                .expect("rows")
+                .iter()
+                .all(|r| !r.decision.starts_with("escalate:")),
+            "{action}: no decision row may read as an escalation"
+        );
+    }
+}
+
+fn commission_calls(host: &RecordingHost) -> usize {
+    host.calls
+        .lock()
+        .expect("calls")
+        .iter()
+        .filter(|c| c.starts_with("commission:"))
+        .count()
+}
+
+/// STUDIO-1436 (B1): an admission refusal that arrives AFTER an action in the decision has landed
+/// must NOT re-queue. Re-queuing hands the item back to a fresh lead run, which decides again from
+/// scratch and replays the landed action — here a second `commission` ticket, orphaning the
+/// first. The landed actions stand, the item keeps the state they set (`parked`), no further
+/// action is applied, and no escalation hold is written; the decision row names what was skipped.
+///
+/// MUTATION: restore the unconditional `requeue_admission_refusal` (drop the `applied` guard in
+/// `refuse_admission`) and this reds — the item becomes `queued` and the decision row reads
+/// `admission refused: re-queued`.
+#[tokio::test]
+async fn an_admission_refused_after_a_landed_commission_keeps_it_and_never_replays() {
+    let (store, mut host, case) = setup("commission then release");
+    // Admission is revoked only once the commission call has been recorded, so the refusal lands
+    // on the second action's pre-effect gate — after the first action completed.
+    host.change_after = Some(("commission:", "revoked"));
+    let refused = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([
+            {"action":"commission","kind":"ticket","question":"diagnose only","hypothesis":"cold cache"},
+            {"action":"release","ticket":"TEST-100","reason":"the missing input now exists"}
+        ]),
+    )
+    .await;
+
+    assert_eq!(
+        refused.state, "parked",
+        "the landed commission stands: {refused:?}"
+    );
+    assert!(
+        refused.escalation.is_none(),
+        "not an escalation: {refused:?}"
+    );
+    assert_eq!(
+        commission_calls(&host),
+        1,
+        "the commission is applied exactly once"
+    );
+    assert_eq!(
+        store.load_lead_items().expect("items")[0].state,
+        "parked",
+        "the item parks on the commission and does NOT re-queue"
+    );
+    assert_eq!(
+        store
+            .lead_execution(case.item.id)
+            .expect("execution")
+            .expect("row")
+            .commission_ticket,
+        "TEST-200",
+        "the execution row still names the one commissioned ticket"
+    );
+    assert!(
+        store
+            .subject_hold(&case.subject.ticket.identifier)
+            .expect("hold")
+            .is_none(),
+        "no escalation hold is written"
+    );
+    assert_eq!(
+        store.load_lead_decisions().expect("rows")[0].decision,
+        "admission refused after 1 of 2 actions; unapplied: release",
+        "the decision row records the unapplied remainder"
+    );
+
+    // A later attempt cannot re-decide a parked item with no findings: `prepare` gates on
+    // `resume_on_findings` (leadexec.rs:353), which returns false here, so no later attempt runs
+    // and no second commission ticket is created.
+    assert!(
+        !resume_on_findings(store.as_ref(), &host, case.item.id)
+            .await
+            .expect("no findings"),
+        "a parked item with no findings is not re-admitted"
+    );
+    assert_eq!(
+        commission_calls(&host),
+        1,
+        "still exactly one commission across the refused attempt and the later one"
+    );
+}
+
+/// STUDIO-1436 (B1): the same rule for the CONFIRMATION read. A single `commission kind=ticket`
+/// runs to completion — `create_issue` has already happened and `result.state` is `parked` — and
+/// then the read that confirms the effect is refused for admission. Re-queuing here overwrites
+/// `parked` with `queued`, so `resume_on_findings` never consumes the commission's findings and a
+/// later admitted attempt can create a SECOND ticket. The landed commission must stand.
+///
+/// MUTATION: restore the unconditional `requeue_admission_refusal` and this reds — the item
+/// becomes `queued` with the decision row reading `admission refused: re-queued`.
+#[tokio::test]
+async fn an_admission_refused_at_the_confirmation_read_keeps_the_landed_commission() {
+    let (store, mut host, case) = setup("commission then confirm");
+    // The subject read refuses for admission ALONE, after the commission has landed, while
+    // `admit_action` still succeeds: exactly the confirmation read.
+    host.change_after = Some(("commission:", "subject-admission"));
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([
+            {"action":"commission","kind":"ticket","question":"diagnose only","hypothesis":"cold cache"}
+        ]),
+    )
+    .await;
+
+    assert_eq!(result.state, "parked", "{result:?}");
+    assert!(result.escalation.is_none(), "{result:?}");
+    assert_eq!(commission_calls(&host), 1);
+    assert_eq!(
+        store.load_lead_items().expect("items")[0].state,
+        "parked",
+        "the item stays parked for its findings"
+    );
+    assert_eq!(
+        store
+            .lead_execution(case.item.id)
+            .expect("execution")
+            .expect("row")
+            .commission_ticket,
+        "TEST-200"
+    );
+    assert!(
+        store
+            .subject_hold(&case.subject.ticket.identifier)
+            .expect("hold")
+            .is_none(),
+        "no escalation hold"
+    );
+    assert_eq!(
+        store.load_lead_decisions().expect("rows")[0].decision,
+        "admission refused after 1 of 1 actions; unapplied: none"
+    );
+}
+
+/// STUDIO-1436 (B1): the same rule for the FRESHNESS read before a LATER action — the arm a review
+/// found untested (B3). The first action landed and the read guarding the second is refused for
+/// admission, so the landed action must stand and the remaining one must not run. The refusal is
+/// aimed at the SECOND read after the commission: its confirmation read is the first, and a
+/// refusal that fires on every read would stop there and never reach the freshness read.
+///
+/// MUTATION: drop the `admission_unconfirmed` arm on that freshness read (leadexec.rs:1320) and
+/// this reds — the refusal falls to `Err(_)` and escalates ("fresh subject read failed during
+/// effects"), writing the durable hold this ticket exists to remove.
+#[tokio::test]
+async fn an_admission_refused_at_the_freshness_read_keeps_the_landed_action() {
+    let (store, mut host, case) = setup("commission then release");
+    // The commission's confirmation read (the first read after it lands) passes; the freshness
+    // read for `release` (the second) is refused for admission.
+    host.subject_refuse_after = Some(("commission:", 2));
+    let result = replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([
+            {"action":"commission","kind":"ticket","question":"diagnose only","hypothesis":"cold cache"},
+            {"action":"release","ticket":"TEST-100","reason":"the missing input now exists"}
+        ]),
+    )
+    .await;
+
+    assert_eq!(result.state, "parked", "{result:?}");
+    assert!(result.escalation.is_none(), "{result:?}");
+    assert_eq!(commission_calls(&host), 1);
+    assert_eq!(store.load_lead_items().expect("items")[0].state, "parked");
+    assert!(
+        !host
+            .calls
+            .lock()
+            .expect("calls")
+            .iter()
+            .any(|c| c.starts_with("release:")),
+        "the unapplied release never runs"
+    );
+    assert_eq!(
+        store.load_lead_decisions().expect("rows")[0].decision,
+        "admission refused after 1 of 2 actions; unapplied: release"
+    );
 }
 
 #[tokio::test]

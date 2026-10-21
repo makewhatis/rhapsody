@@ -138,6 +138,29 @@ const ANSWER_BEGIN: &str = "<!-- rhapsody:lead-answer:begin id=";
 const ANSWER_END: &str = "<!-- rhapsody:lead-answer:end -->";
 const COMMISSION_SCOPE: &str = "Diagnose, do not fix for this run; once findings are published, the ticket's own implementation scope applies.";
 
+/// The one effect refusal that is NOT a judgement that a human is needed (STUDIO-1436): lead
+/// authority or subject admission was revoked. It is transient by construction — the same
+/// admission is re-evaluated on the next attempt — so the item re-queues instead of escalating.
+/// Shared as a constant so the effect path can recognise it coming back out of
+/// [`LeadHost::admit_action`] or [`LeadHost::subject`], which report it as a plain string error.
+pub(crate) const ADMISSION_REVOKED: &str = "lead authority or subject admission revoked";
+
+/// The control task did not answer the lead admission round-trip within
+/// [`crate::control_loop::LEAD_ADMISSION_WAIT`] (STUDIO-1436).
+///
+/// Distinct from [`ADMISSION_REVOKED`] on purpose: an expiry is not a verdict, so it must never be
+/// read as a durable revocation. It is still an admission that could not be confirmed, though, so
+/// no effect may be applied — [`admission_unconfirmed`] groups the two.
+pub(crate) const ADMISSION_WAIT_EXPIRED: &str = "lead admission wait expired";
+
+/// Whether `reason` is an admission that could not be CONFIRMED, as opposed to an effect that
+/// failed. Both [`ADMISSION_REVOKED`] and [`ADMISSION_WAIT_EXPIRED`] mean "no effect may be
+/// applied": the first is the control task's real verdict, the second is its not answering within
+/// the generous wait. Neither is a judgement that a human is needed.
+fn admission_unconfirmed(reason: &str) -> bool {
+    reason == ADMISSION_REVOKED || reason == ADMISSION_WAIT_EXPIRED
+}
+
 /// Only marked blocks belong to us. Refuse broken/duplicate markers rather than guessing where
 /// the author's description ends. The entire byte range outside the block is copied verbatim.
 fn lead_answer_span(
@@ -476,28 +499,32 @@ impl LeadHost for RuntimeHost<'_> {
         self.runtime.teams.manager.lead.authority == rhapsody_config::teams::LeadAuthority::Advise
     }
     async fn admit_action(&self) -> Result<(), String> {
-        if self
+        match self
             .runtime
             .control
             .lead_allowed(&self.project.repo_url, &self.ticket)
             .await
         {
-            Ok(())
-        } else {
-            Err("lead authority or subject admission revoked".into())
+            Ok(true) => Ok(()),
+            // The control task's own verdict: a real revocation.
+            Ok(false) => Err(ADMISSION_REVOKED.into()),
+            // The loop did not answer in time — not a verdict, so never `ADMISSION_REVOKED`.
+            Err(_) => Err(ADMISSION_WAIT_EXPIRED.into()),
         }
     }
     async fn subject(&self) -> Result<LeadSubject, String> {
         if crate::review::is_non_tracker_key(&self.ticket) {
             return Err("lead subject is a local run key".into());
         }
-        if !self
+        match self
             .runtime
             .control
             .lead_allowed(&self.project.repo_url, "")
             .await
         {
-            return Err("lead authority or subject admission revoked".into());
+            Ok(true) => {}
+            Ok(false) => return Err(ADMISSION_REVOKED.into()),
+            Err(_) => return Err(ADMISSION_WAIT_EXPIRED.into()),
         }
         let ticket = if self.ticket.is_empty() {
             Issue::default()
@@ -929,6 +956,18 @@ pub struct LeadResult {
     pub state: String,
     pub commission_ticket: Option<String>,
     pub escalation: Option<String>,
+    /// Set when the decided action was refused ONLY for admission
+    /// ([`ADMISSION_REVOKED`]): the item re-queues for a later admitted attempt instead of
+    /// escalating (STUDIO-1436). It selects the decision summary, which must not read as an
+    /// escalation — `Store::save_lead_decision` turns any `escalate: ` prefix into a durable
+    /// `escalation` hold.
+    pub admission_requeued: bool,
+    /// Set when an admission refusal arrived AFTER at least one action in this decision had
+    /// already landed (STUDIO-1436). A re-queue would replay that action — a second commission
+    /// ticket, a second Todo move — so it must not: the landed actions stand, no further action is
+    /// applied, no `escalation` hold is written, and this string names the unapplied remainder for
+    /// the decision row. Mutually exclusive with [`Self::admission_requeued`].
+    pub admission_partial: Option<String>,
 }
 
 #[async_trait]
@@ -1022,6 +1061,87 @@ fn same_subject(a: &LeadSubject, b: &LeadSubject) -> bool {
         && a.open == b.open
 }
 
+/// Turns an admission refusal into a RE-QUEUE rather than an escalation (STUDIO-1436).
+///
+/// A refusal for admission alone — lead authority revoked, or the subject busy — is not a
+/// judgement that a human is needed: the same admission is re-evaluated on the next attempt, and
+/// preparation already treats its own refusals this way (`item remains queued`). Converting it
+/// into an `escalation` hold instead parked the very author the refused effect was about to ask
+/// for help, and in the reported incident did so on a refusal whose only cause was a bounded-wait
+/// timeout. The item re-queues; no `rhapsody_subject_holds` row is written.
+fn requeue_admission_refusal(result: &mut LeadResult, item: i64, ticket: &str) {
+    result.state = "queued".into();
+    result.admission_requeued = true;
+    tracing::warn!(
+        item,
+        ticket,
+        "lead effect admission refused; item remains queued for a later admitted attempt"
+    );
+}
+
+/// The wire name of an action, matching [`LeadAction`]'s `snake_case` serde tag, so a decision row
+/// names an unapplied action exactly as the model wrote it.
+fn action_name(action: &LeadAction) -> &'static str {
+    match action {
+        LeadAction::Resolve { .. } => "resolve",
+        LeadAction::Release { .. } => "release",
+        LeadAction::RouteBack { .. } => "route_back",
+        LeadAction::Requeue { .. } => "requeue",
+        LeadAction::ClearReview { .. } => "clear_review",
+        LeadAction::Reassign { .. } => "reassign",
+        LeadAction::Commission { .. } => "commission",
+        LeadAction::AuthorizeCredential { .. } => "authorize_credential",
+        LeadAction::Escalate { .. } => "escalate",
+    }
+}
+
+/// Records an admission refusal on the effect path (STUDIO-1436).
+///
+/// While NOTHING in the decision has landed (`applied == 0`) the item simply re-queues: the
+/// refusal is re-evaluated on the next attempt and no effect was applied, so a replay is safe. The
+/// partial writes [`return_to_author`] makes are idempotent — the lead answer block is keyed by
+/// item id and replaced in place, and the Todo move and review clear are idempotent — so a refusal
+/// raised inside the FIRST action after such a write may re-queue too.
+///
+/// Once an action HAS landed (`apply_action` returned `Ok`) a re-queue would REPLAY it: a second
+/// commission ticket, a second Todo move. So it must not. The landed actions stand, no further
+/// action is applied, and no `escalation` hold is written; the decision row instead names the
+/// unapplied remainder so an operator can see what was skipped.
+fn refuse_admission(
+    result: &mut LeadResult,
+    applied: usize,
+    actions: &[LeadAction],
+    item: i64,
+    ticket: &str,
+) {
+    if applied == 0 {
+        requeue_admission_refusal(result, item, ticket);
+        return;
+    }
+    let unapplied = actions[applied..]
+        .iter()
+        .map(action_name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let unapplied = if unapplied.is_empty() {
+        "none".to_string()
+    } else {
+        unapplied
+    };
+    tracing::warn!(
+        item,
+        ticket,
+        applied,
+        total = actions.len(),
+        unapplied = %unapplied,
+        "lead effect admission refused after an action landed; remaining actions refused, no replay"
+    );
+    result.admission_partial = Some(format!(
+        "admission refused after {applied} of {} actions; unapplied: {unapplied}",
+        actions.len()
+    ));
+}
+
 pub async fn execute(
     store: &(dyn Store + Sync),
     host: &dyn LeadHost,
@@ -1037,6 +1157,12 @@ pub async fn execute(
     let parsed = parse_lead_decision(text);
     let current = match host.subject().await {
         Ok(current) => current,
+        // An admission that could not be confirmed here is the same transient class as one raised
+        // inside the effect loop (STUDIO-1436), not an unconfirmable subject: fall through to the
+        // effect path's own admission gate, which re-queues. Escalating would park the author on a
+        // refusal that is re-evaluated on the next attempt. If the subject really did move, the
+        // loop's freshness check catches it exactly as it does mid-effect.
+        Err(reason) if admission_unconfirmed(&reason) => case.subject.clone(),
         Err(_) => {
             result.escalation =
                 Some("fresh subject could not be confirmed; operator must inspect".into());
@@ -1173,16 +1299,34 @@ pub async fn execute(
             })
             .collect::<Vec<_>>()
             .join("\n");
+        // How many actions of this decision have COMPLETED. A refusal while it is still zero may
+        // re-queue; once it is not, `refuse_admission` keeps what landed instead (STUDIO-1436).
+        let mut applied = 0usize;
         for action in &actions {
             if host.admit_action().await.is_err() {
-                result.escalation =
-                    Some("lead effect admission revoked; remaining actions refused".into());
+                refuse_admission(
+                    &mut result,
+                    applied,
+                    &actions,
+                    case.item.id,
+                    &case.subject.ticket.identifier,
+                );
                 break;
             }
             // Fresh read before EACH external action; our own confirmed state/label changes are
             // carried forward, unrelated changes halt the remaining effects.
             let fresh = match host.subject().await {
                 Ok(fresh) => fresh,
+                Err(reason) if admission_unconfirmed(&reason) => {
+                    refuse_admission(
+                        &mut result,
+                        applied,
+                        &actions,
+                        case.item.id,
+                        &case.subject.ticket.identifier,
+                    );
+                    break;
+                }
                 Err(_) => {
                     result.escalation = Some(
                         "fresh subject read failed during effects; operator must reconcile".into(),
@@ -1200,14 +1344,37 @@ pub async fn execute(
             let effect =
                 apply_action(store, host, &action_case, action, &grants, &mut result).await;
             if let Err(reason) = effect {
+                if admission_unconfirmed(&reason) {
+                    refuse_admission(
+                        &mut result,
+                        applied,
+                        &actions,
+                        case.item.id,
+                        &case.subject.ticket.identifier,
+                    );
+                    break;
+                }
                 // External requests can have landed even on an error. Never replay a commission
                 // or a route-back on uncertainty; the row gives the operator a reconciliation root.
                 result.escalation = Some(format!("lead effect failed or uncertain: {reason}"));
                 result.state = "done".into();
                 break;
             }
+            // The action landed. Count it BEFORE the confirmation read, so a refusal there cannot
+            // replay it (STUDIO-1436).
+            applied += 1;
             let confirmed = match host.subject().await {
                 Ok(confirmed) => confirmed,
+                Err(reason) if admission_unconfirmed(&reason) => {
+                    refuse_admission(
+                        &mut result,
+                        applied,
+                        &actions,
+                        case.item.id,
+                        &case.subject.ticket.identifier,
+                    );
+                    break;
+                }
                 Err(_) => {
                     result.escalation =
                         Some("effect confirmation failed; operator must reconcile".into());
@@ -1258,7 +1425,14 @@ pub async fn execute(
     if result.escalation.is_some() {
         result.state = "done".into();
     }
-    let summary = if result.state == "queued" {
+    let summary = if let Some(partial) = &result.admission_partial {
+        // The decision was applied in part: the landed actions stand and the row names what was
+        // skipped. It must not read as an escalation, or `save_lead_decision` would park the
+        // subject on a hold the refusal was never a judgement for (STUDIO-1436).
+        partial.clone()
+    } else if result.admission_requeued {
+        "admission refused: re-queued".to_string()
+    } else if result.state == "queued" {
         "stale: re-queued".to_string()
     } else if let Some(need) = &result.escalation {
         format!("escalate: {need}")
@@ -1311,6 +1485,13 @@ pub async fn execute(
             &result.state
         },
     ))?;
+    if result.admission_requeued {
+        // A re-queued refusal is not a report for the ticket: the decision was never applied, the
+        // item retries, and preparation's own refusals write nothing either. It also means writing
+        // to a subject whose admission was just refused — the one write the refusal exists to
+        // prevent (STUDIO-1436). The durable decision row above carries the audit trail.
+        return Ok(result);
+    }
     let trail = LeadTrail {
         text: crate::managerapply::strip_summon_tokens(&format!(
             "Lead decision {} ({} via {}): {summary}\nReasoning: {}\nEvidence and memories: {}",
