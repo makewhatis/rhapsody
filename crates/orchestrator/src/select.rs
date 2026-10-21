@@ -2122,6 +2122,86 @@ mod tests {
         assert_eq!(count_messages(&events, HELD_FOR_HUMAN), 1);
     }
 
+    // STUDIO-1436: a subject with an active hold that refuses author work is not a capacity
+    // casualty either. Both ladders refuse such a subject at the TOP of their loops, so it would be
+    // refused with every seat free — reporting it as "waiting for a slot" told the operator to wait
+    // for a slot that would not admit it. In the reported incident the lead's own `escalation` hold
+    // parked STUDIO-1407 for 2h20m while every capacity line named it as merely held by the cap,
+    // which is why the operator had to read the code to find the ticket.
+    //
+    // MUTATION: drop the `subject_parked` term from `is_unworked_candidate` and this reds
+    // (`not_considered` becomes "A-2, A-3").
+    #[test]
+    fn a_capacity_hold_never_counts_a_parked_subject() {
+        let mut o = orch_for_select(1, HashMap::new(), None);
+        o.set_store(Arc::new(Sqlite::open(StorePath::InMemory).expect("open")));
+        o.store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "A-3".into(),
+                kind: "escalation".into(),
+                ..Default::default()
+            })
+            .expect("park");
+        let input = vec![
+            issue("1", "A-1", "Todo"),
+            issue("2", "A-2", "Todo"),
+            issue("3", "A-3", "Todo"),
+        ];
+        let (got, events) = capture_events(|| o.select_dispatch(input));
+        assert_eq!(ids(&got), vec!["A-1"], "cap 1 admits exactly one");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-2"),
+            "only the genuine casualty; a parked subject is not billed to the cap"
+        );
+        assert_eq!(
+            ev.fields.get("not_considered_count").map(String::as_str),
+            Some("1")
+        );
+    }
+
+    // The same decision on the multi-project ladder — the pass a `projects:` install actually runs.
+    //
+    // MUTATION: drop the `subject_parked` term from `is_unworked_candidate` and this reds
+    // (`not_considered` becomes "A-2, A-3").
+    #[test]
+    fn the_multi_project_capacity_hold_never_counts_a_parked_subject() {
+        let mut o = orch_for_multi(1, vec![proj("a", 10, HashMap::new())], None);
+        o.set_store(Arc::new(Sqlite::open(StorePath::InMemory).expect("open")));
+        o.store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "A-3".into(),
+                kind: "escalation".into(),
+                ..Default::default()
+            })
+            .expect("park");
+        let input = tag_for(
+            0,
+            vec![
+                issue("1", "A-1", "Todo"),
+                issue("2", "A-2", "Todo"),
+                issue("3", "A-3", "Todo"),
+            ],
+        );
+        let (got, events) = capture_events(|| o.select_dispatch_multi(input));
+        assert_eq!(got.len(), 1, "global cap 1");
+
+        let ev = events
+            .iter()
+            .find(|e| e.message == HELD_FOR_CAPACITY)
+            .expect("a capacity-hold line on the multi ladder");
+        assert_eq!(
+            ev.fields.get("not_considered").map(String::as_str),
+            Some("A-2"),
+            "only the genuine casualty; a parked subject is not billed to the cap"
+        );
+    }
+
     // The diagnostic is for a pass that ran OUT of slots, not for every pass: a board with room to
     // spare must stay quiet, or the line joins the background it exists to be noticed against.
     #[test]

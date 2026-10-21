@@ -638,6 +638,37 @@ impl Orchestrator {
         }
     }
 
+    /// Reports the otherwise-SILENT backstop refusal in
+    /// [`Orchestrator::dispatch_issue_on_engine`] (STUDIO-1436): a prepared dispatch whose subject
+    /// was parked between selection and dispatch is dropped there, its claim released, and until
+    /// this line existed the log's last word about the ticket was `preparation accepted;
+    /// dispatching` — the ticket simply vanished, and the operator only found it by reading the
+    /// code. In the reported incident the hold that parked it was the lead's own `escalation`
+    /// episode (hold 49 on STUDIO-1407), so the line also names the hold and its kind.
+    ///
+    /// One line, always. A subject hold that cannot be READ is still a refusal
+    /// ([`Orchestrator::subject_parked`] fails closed), so that case names the ticket and the
+    /// read failure instead of the hold's id — the alternative is the silence this replaces.
+    pub(crate) fn log_subject_parked_dispatch(&self, identifier: &str) {
+        match self.store().subject_hold(identifier) {
+            Ok(Some(hold)) => tracing::warn!(
+                issue_identifier = %identifier,
+                hold_id = hold.id,
+                hold_kind = %hold.kind,
+                "skipping dispatch: subject parked; the claim is released"
+            ),
+            Ok(None) => tracing::warn!(
+                issue_identifier = %identifier,
+                "skipping dispatch: subject parked; the claim is released"
+            ),
+            Err(error) => tracing::warn!(
+                issue_identifier = %identifier,
+                %error,
+                "skipping dispatch: subject hold unreadable; refusing new work and releasing the claim"
+            ),
+        }
+    }
+
     /// Records and reports a `rhapsody:human` hold (STUDIO-949). The refusal itself is
     /// [`eligibility`]'s; this is the otherwise-silent half — one `tracing::info!` line the FIRST
     /// time the ticket is held, and the entry the console reads. A hold that repeats every tick is
@@ -735,6 +766,13 @@ impl Orchestrator {
     /// down the pass. Used only by [`Orchestrator::log_capacity_hold`], which stops ABOVE that
     /// point and would otherwise report a ticket that is running right now as one waiting for a
     /// slot.
+    ///
+    /// A subject with an active hold that refuses author work is excluded for the same reason
+    /// (STUDIO-1436). Both selection ladders refuse such a subject at the top of their loops
+    /// (`select.rs`), so it is not a capacity casualty: it would be refused with every seat free,
+    /// and reporting it as "waiting for a slot" tells an operator to wait for a slot that would
+    /// not admit it. In the reported incident the lead's own `escalation` hold parked STUDIO-1407
+    /// for 2h20m while every capacity line named it as merely held by the cap.
     pub(crate) fn is_unworked_candidate(
         &self,
         iss: &Issue,
@@ -744,6 +782,7 @@ impl Orchestrator {
         !running.contains(&iss.id)
             && !self.claimed.contains(&iss.id)
             && !recovered.contains(&iss.identifier)
+            && !self.subject_parked(&iss.identifier, "author")
     }
 
     /// Reports whether a FRESH dispatch of `iss` should be suppressed because a prior run already
