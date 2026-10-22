@@ -74,12 +74,12 @@ opens a 0.3.7 store. These are the behaviour changes a 0.3.6 installation will n
 
 4. **Harness versions are checked.** Before a run is provisioned, the daemon runs
    `<command> --version` for the selected harness. A Claude CLI must be at least **1.0.109** — the
-   release that added `--include-partial-messages`, which every turn passes. An OpenCode CLI must be
-   **1.18.30** (the pinned `serve --pure` HTTP executor; `@ai-sdk/openai-compatible` 2.0.41). A version
-   outside the requirement is a terminal refusal (`CliVersionUnsupported`, naming the version found,
-   the version required and how to upgrade) recorded as failed once with no retry, not a run that
-   loops. Upgrade with `claude update` (or reinstall `@anthropic-ai/claude-code`) for Claude, or
-   `opencode upgrade 1.18.30` for OpenCode. A version that cannot be read permits dispatch.
+   release that added `--include-partial-messages`, which every turn passes. An OpenCode CLI must
+   be **1.18.30** (the pinned `serve --pure` HTTP executor; `@ai-sdk/openai-compatible` 2.0.41). A
+   version outside the requirement is a terminal refusal (`CliVersionUnsupported`, naming the version
+   found, the version required and how to upgrade) recorded as failed once with no retry, not a run
+   that loops. Upgrade with `claude update` (or reinstall `@anthropic-ai/claude-code`) for Claude,
+   or `opencode upgrade 1.18.30` for OpenCode. A version that cannot be read permits dispatch.
    <!-- crates/agent/src/harness_version.rs:30-48,179-186; crates/agent/src/opencode/probe.rs:60-66; crates/orchestrator/src/worker.rs:931-953 -->
 
 5. **An idle Claude usage probe reads the subscription's windows.** On an installation that
