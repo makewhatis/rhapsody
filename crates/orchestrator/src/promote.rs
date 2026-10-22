@@ -861,6 +861,10 @@ mod tests {
     struct ErrHistStore(Noop);
 
     impl Store for ErrHistStore {
+        fn distinct_issue_ids(&self, project: &str) -> Result<Vec<(String, String)>, StoreError> {
+            self.0.distinct_issue_ids(project)
+        }
+
         fn save_manager_intervention(
             &self,
             row: rhapsody_store::ManagerInterventionRow,

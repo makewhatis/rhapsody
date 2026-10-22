@@ -112,6 +112,31 @@ cleanup; every later publication and every cleanup effect is unchanged. The pass
 would have taken too, since removing a missing worktree is already a no-op, so it is not an
 observable divergence. No configuration, schema, API payload or golden-fixture changes.
 
+### Startup terminal cleanup walks the worktrees on disk (STUDIO-1466)
+
+The frozen Go reference's `startupCleanup` asks Linear for EVERY ticket in the team's terminal states
+(`FetchIssuesByStates`) and then checks each against the workspace root. On a mature install that is
+thousands of tickets paged out of Linear to find a handful of worktrees; on the 2026-10-22 rc.30 boot
+it was 1,248 tickets (~25 requests, ~32 s) to find 3 worktrees out of 72 on disk, and both the time
+and the request count grow with every Done ticket forever.
+
+Rhapsody inverts the pass: for each project it lists the worktrees that actually exist on disk, maps
+each to its tracker id through the durable store's `runs` ledger, and resolves every state in ONE
+batched `fetch_issue_states_by_ids` call per project — plus a per-identifier
+`fetch_issue_by_identifier` for any worktree the store cannot map (a `--no-store` install, or a
+worktree with no run row). The removal SET is unchanged: a worktree is removed only when its ticket
+comes back in that project's terminal states, and one whose ticket the tracker does not return, or
+one in an active state, is left alone — exactly the reference's "remove only what comes back
+terminal". The pass stays on the same side of the boot snapshot (STUDIO-1465) and logs one summary
+line, now reporting `worktrees`, `terminal`, `removed` and `elapsed_ms`.
+
+The one behavioural consequence of driving the pass by disk rather than by Linear: a retained
+opencode session is discarded only for terminal tickets that still have a worktree at boot, where the
+reference had every terminal ticket in hand and discarded them all. A session left behind by a
+worktree removed through some other path is no longer caught at startup; the terminal-transition
+paths (`reconcile_run`, `retry`) and the retention sweep still discard sessions. No configuration,
+schema, API payload or golden-fixture changes.
+
 ### Worker self-messages carry agent attribution (STUDIO-1414)
 
 The worker MCP `symphony_send_message` / `agent_send_message` tools only accept their own

@@ -417,6 +417,17 @@ pub trait Store {
         identifiers: &[String],
         limit: i64,
     ) -> Result<Vec<RunSummary>, StoreError>;
+    /// Every distinct (`issue_identifier`, `issue_id`) pair this store has recorded across its runs
+    /// (any outcome), one pair per identifier. `project == ""` means no project filter, matching
+    /// [`RunFilter::project`]; a non-empty value matches `runs.project_slug` exactly. Runs with an
+    /// empty identifier or an empty id are skipped — they name no ticket to map.
+    ///
+    /// Rhapsody-only and additive: it backs startup terminal cleanup's worktree→ticket mapping
+    /// (STUDIO-1466). The cleanup walks the worktrees on disk and needs each one's tracker id so it
+    /// can resolve every state in ONE `fetch_issue_states_by_ids` call, instead of paging every
+    /// terminal ticket out of Linear. The `runs` table is the daemon's own record of which id each
+    /// worktree's ticket had, so no network read is needed for the mapping.
+    fn distinct_issue_ids(&self, project: &str) -> Result<Vec<(String, String)>, StoreError>;
     /// Returns a single run row by id. `Ok(None)` (not an error) when no such run exists, so the
     /// caller can answer 404 without treating "missing" as an error.
     fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError>;
