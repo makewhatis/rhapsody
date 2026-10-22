@@ -964,8 +964,11 @@ impl Orchestrator {
         // Within that head scope the question is which verdict is NEWEST, and only the ledger knows:
         // two reviewers can complete different verdicts at the SAME head, in either order, so "every
         // reviewer at this head approves" is not "the most recent completed verdict approves" (round
-        // 3, B3). The store ranks the head-scoped reviewers' completed rounds by `ended_at` (the
-        // moment the verdict was DECLARED) then `id`, and returns the newest one's verdict.
+        // 3, B3). The store ranks the head-scoped reviewers' completed rounds by a durable
+        // COMPLETION SEQUENCE assigned at the verdict write — not by `ended_at`, which is truncated
+        // to seconds and would fall through to `runs.id` (allocated at run START) for a same-second
+        // pair, letting an older findings round outrank a newer approval (round 4) — and returns the
+        // newest one's verdict.
         //
         // The current head is the watcher's last observation of the coordinate. With no observation
         // the head is unknown, so the hold fails CLOSED (it applies) rather than claim an approval
@@ -2037,6 +2040,158 @@ mod tests {
             tracker.add_label_calls().is_empty(),
             "the newest completed CURRENT-head verdict approves, but an older sibling's findings \
              wrote {:?}",
+            tracker.add_label_calls()
+        );
+        assert!(
+            store
+                .load_breaker_crossings()
+                .expect("crossings")
+                .is_empty(),
+            "no crossing is persisted for an approved head"
+        );
+    }
+
+    /// Completion ORDER within one wall-clock second (STUDIO-1440 round 4): two reviewers can
+    /// complete different verdicts at the SAME head inside a single second, and `ended_at` is
+    /// truncated to seconds while `runs.id` is allocated at run START — so the OLDER findings round
+    /// must not be named the newest completed verdict merely because its run started later. The
+    /// suppression ranks by the durable completion sequence, so the approval that COMPLETED last
+    /// wins and no `rhapsody:human` label is written.
+    ///
+    /// Mutation: order the ledger by `ended_at DESC, id DESC` instead of the completion sequence and
+    /// carol's older findings (higher start id) shadows alice's approval, writing the label.
+    #[tokio::test]
+    async fn a_same_second_completion_orders_by_completion_not_start() {
+        let store = store();
+        for _ in 0..4 {
+            seed_review_round(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+            );
+        }
+        seed_watch_row(&store, "STUDIO-988", "alice", REVIEW_STATUS_REQUESTED);
+        seed_watch_row(&store, "STUDIO-988", "carol", REVIEW_STATUS_REQUESTED);
+        let mut o = orch(store.clone(), 5, &[]);
+        let config = o.teams.as_mut().expect("teams");
+        config.review.reviewers = 2;
+        config.roster.push(Identity {
+            name: "carol".into(),
+            ..Default::default()
+        });
+        observe_head(&mut o, "sha");
+        // Pin the clock so BOTH completions persist the SAME `ended_at` second — the case that used
+        // to fall through to start order.
+        o.now = Box::new(|| {
+            chrono::DateTime::from_timestamp(1_760_000_000, 0).expect("a fixed, in-range instant")
+        });
+        // Start ALICE first (lower run id), then CAROL.
+        let mut runs = Vec::new();
+        for reviewer in ["alice", "carol"] {
+            let run = crate::review::ReviewRun {
+                owner: "makewhatis".into(),
+                repo: "rhapsody".into(),
+                number: 12,
+                reviewer: reviewer.into(),
+                head_sha: "sha".into(),
+                generation: 1,
+                introduced_by: "handoff:STUDIO-988".into(),
+                ..Default::default()
+            };
+            let id = store
+                .start_run(RunStart {
+                    issue_identifier: run.key(),
+                    started_at: "2026-09-20T00:04:00Z".into(),
+                    ..Default::default()
+                })
+                .expect("start review");
+            store
+                .mark_review_requested(&run.watch_key(), "sha")
+                .expect("dispatch review");
+            runs.push((run, id));
+        }
+        // Complete CAROL (findings — the fifth counted round) FIRST, then ALICE (approval): the
+        // reverse of their start order, inside one second.
+        for (index, last_state) in [
+            (1usize, crate::review::REVIEW_STATE_FINDINGS),
+            (0usize, crate::review::REVIEW_STATE_APPROVED),
+        ] {
+            let (run, id) = runs[index].clone();
+            let re = crate::orchestrator::RunningEntry {
+                issue: rhapsody_core::Issue {
+                    id: run.key(),
+                    identifier: run.key(),
+                    ..Default::default()
+                },
+                run_id: id,
+                review: Some(run.clone()),
+                ..crate::testsupport::running_entry(
+                    rhapsody_core::Issue::default(),
+                    "rhapsody",
+                    "rhapsody",
+                )
+            };
+            o.on_review_exit(
+                &re,
+                &run,
+                &crate::retry::EvWorkerExit {
+                    declared_handoff: true,
+                    last_state: last_state.into(),
+                    issue_id: run.key(),
+                    started_at: Utc::now(),
+                    failed: false,
+                    err_msg: String::new(),
+                    review_verdict: None,
+                    verdict_text: None,
+                    refused: false,
+                    auth_needed: false,
+                },
+            );
+        }
+        let alice_run = store.get_run(runs[0].1).expect("get").expect("alice run");
+        let carol_run = store.get_run(runs[1].1).expect("get").expect("carol run");
+        assert!(
+            alice_run.id < carol_run.id,
+            "alice's approving round started first, so it carries the lower run id"
+        );
+        assert_eq!(
+            alice_run.ended_at, carol_run.ended_at,
+            "both rounds completed inside the same second"
+        );
+        assert_eq!(carol_run.outcome, OUTCOME_COMPLETED);
+        assert_eq!(alice_run.outcome, OUTCOME_COMPLETED);
+        assert_eq!(
+            store
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            5,
+            "carol's findings is the fifth counted round"
+        );
+        let rows = store.load_live_review_watch().expect("rows");
+        assert!(rows.iter().any(|r| r.key.reviewer == "carol"
+            && r.status == REVIEW_STATUS_REVIEWED
+            && r.last_reviewed_sha == "sha"));
+        assert!(rows.iter().any(|r| r.key.reviewer == "alice"
+            && r.status == REVIEW_STATUS_APPROVED
+            && r.last_reviewed_sha == "sha"));
+        let mut rx = o.open_breaker_channel();
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let hold_tracker = tracker.clone();
+        let deps = BreakerDeps {
+            hold: Some(Arc::new(TrackerHoldSink::new(move || {
+                Some(hold_tracker.clone() as Arc<dyn Tracker>)
+            }))),
+            room: None,
+            channels: Vec::new(),
+        };
+        o.reconcile_breaker();
+        while let Ok(plan) = rx.try_recv() {
+            perform_crossing(&plan, &deps, Utc::now()).await;
+        }
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "the newest completed CURRENT-head verdict approves, but a same-second older sibling's \
+             findings wrote {:?}",
             tracker.add_label_calls()
         );
         assert!(

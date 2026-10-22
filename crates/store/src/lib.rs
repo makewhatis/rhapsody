@@ -932,9 +932,13 @@ pub trait Store {
     /// most recently, restricted to `reviewers` — the reviewers the watcher holds a terminal verdict
     /// for at the pull request's current head (STUDIO-1440).
     ///
-    /// Ordered by `ended_at DESC, id DESC`: the moment a verdict was DECLARED, not the dispatch, so
-    /// two reviewers who completed different verdicts at the SAME head are ranked by who finished
-    /// last — "the most recent completed verdict at the current head". A manager/intervention run
+    /// Ordered by the durable COMPLETION SEQUENCE (`completed_seq`, assigned monotonically at the
+    /// verdict write), not `ended_at`: that column is truncated to seconds and `runs.id` is
+    /// allocated at run START, so a same-second pair would rank by start order and let an older
+    /// findings round outrank a newer approval. Two reviewers who completed different verdicts at
+    /// the SAME head are therefore ranked by who finished last — "the most recent completed verdict
+    /// at the current head". `ended_at`/`id` break ties only for pre-migration rows (all at the 0
+    /// default). A manager/intervention run
     /// (`@manager`) is a `pr:` key but never a review round, so it is excluded exactly as in
     /// [`Store::count_changes_requested_review_runs`]. `None` when none of `reviewers` has a
     /// completed review round, which the breaker reads as "no approval stands at the head" (fail
