@@ -323,7 +323,7 @@ async fn file_tracker_limits_flow_from_runner_to_accounts_and_release_without_st
     ft.o.set_store(Arc::new(rhapsody_store::Noop));
     let script = dir.child("limit.sh");
     let fixture = include_str!("../../agent/testdata/limits/allowed.jsonl");
-    std::fs::write(&script, format!("#!/bin/bash\nhead -n 1 >/dev/null\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}}'\nsleep 0.3\nprintf '%s\\n' '{}'\nsleep 30\n", fixture.trim())).unwrap();
+    std::fs::write(&script, format!("#!/bin/bash\nif [ \"${{1:-}}\" = \"--version\" ]; then printf '2.1.307 (Claude Code)\\n'; exit 0; fi\nhead -n 1 >/dev/null\nprintf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s\",\"apiKeySource\":\"none\"}}'\nsleep 0.3\nprintf '%s\\n' '{}'\nsleep 30\n", fixture.trim())).unwrap();
     let eff = ft.o.eff.as_mut().unwrap();
     eff.agent = Arc::new(claude::Runner::new(claude::Config {
         command: format!("bash {script}"),
@@ -390,7 +390,7 @@ async fn file_tracker_opencode_wall_flow_uses_actual_api_auth_and_releases_on_fa
     // Source-shaped 429, not a recorded capture; no provider request or credential involved.
     let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../harness/stubs/fake-opencode-server.py");
-    std::fs::write(&script, format!("if [ \"$1\" = serve ]; then exec python3 '{}' \"$0\" \"$@\"; fi\nprintf '%s\\n' '{{\"type\":\"error\",\"error\":{{\"name\":\"APIError\",\"data\":{{\"message\":\"rate limited\",\"statusCode\":429,\"isRetryable\":true}}}}}}'\nexit 1\n",bridge.display())).unwrap();
+    std::fs::write(&script, format!("if [ \"${{1:-}}\" = \"--version\" ]; then printf '1.18.30\\n'; exit 0; fi\nif [ \"$1\" = serve ]; then exec python3 '{}' \"$0\" \"$@\"; fi\nprintf '%s\\n' '{{\"type\":\"error\",\"error\":{{\"name\":\"APIError\",\"data\":{{\"message\":\"rate limited\",\"statusCode\":429,\"isRetryable\":true}}}}}}'\nexit 1\n",bridge.display())).unwrap();
     let auth = dir.child("auth.json");
     std::fs::write(&auth, br#"{"openai":{"type":"api","key":"test-only-key"}}"#).unwrap();
     let mut ft = build_file_tracker_orch(&src, "");
@@ -455,7 +455,7 @@ async fn file_tracker_silent_opencode_run_binds_account_while_active() {
     );
     let script = dir.child("silent.sh");
     let ready = dir.child("ready");
-    std::fs::write(&script, format!("touch '{ready}'\nsleep 30\n")).unwrap();
+    std::fs::write(&script, format!("if [ \"${{1:-}}\" = \"--version\" ]; then printf '1.18.30\\n'; exit 0; fi\ntouch '{ready}'\nsleep 30\n")).unwrap();
     let auth = dir.child("auth.json");
     std::fs::write(&auth, br#"{"openai":{"type":"api","key":"test-only-key"}}"#).unwrap();
     let mut ft = build_file_tracker_orch(&src, "");

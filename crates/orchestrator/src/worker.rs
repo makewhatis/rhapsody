@@ -924,6 +924,43 @@ pub async fn run_agent_attempt(
             }
         }
     }
+    // STUDIO-1468: the installed CLI must be able to run THIS build's per-turn argv, checked before
+    // anything is provisioned. An old `claude` (no `--include-partial-messages`) or an unpinned
+    // `opencode` fails every turn at zero tokens, and the credential preflight still passes, so
+    // without this gate the failure looks retryable and the dispatcher loops forever. The probe
+    // shells out, so it runs off the worker thread; a refusal becomes the SAME terminal
+    // [`WorkerError::CapabilityRefused`] a capability gap gets — recorded failed once, NO retry.
+    if let Some(command) = deps.agent.cli_command() {
+        let harness = deps.agent.id();
+        match tokio::task::spawn_blocking(move || {
+            rhapsody_agent::harness_version::check(harness, &command)
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(refusal)) => {
+                tracing::warn!(
+                    issue_identifier = %issue.identifier,
+                    reason = %refusal,
+                    "refusing dispatch: the installed harness CLI version is unsupported"
+                );
+                return (
+                    issue.state.clone(),
+                    WorkerDeclaration::default(),
+                    Some(WorkerError::CapabilityRefused(refusal)),
+                );
+            }
+            Err(error) => {
+                // The probe task itself failed (a panic or cancellation), which is NOT evidence of an
+                // old CLI: an internal fault must not block every dispatch of a healthy harness.
+                tracing::warn!(
+                    issue_identifier = %issue.identifier,
+                    %error,
+                    "harness CLI version probe did not answer; dispatching without a version verdict"
+                );
+            }
+        }
+    }
     // Manager mode (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3): a manager run has NO
     // repository, so it takes an entirely separate provisioning path — an empty daemon-owned cwd and
     // the isolated session posture — and creates no worktree, runs no before_run/after_run hooks and
@@ -2265,6 +2302,7 @@ fi
         let script = root.child("missing-session.sh");
         let calls = root.child("calls");
         std::fs::write(&script, format!(r#"
+if [ "${{1:-}}" = "--version" ]; then printf '2.1.307 (Claude Code)\n'; exit 0; fi
 printf '%s\n' "$*" >> '{calls}'
 read -r prompt
 case "$prompt" in
@@ -2333,6 +2371,7 @@ printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"
         let calls = root.child("calls");
         let script = root.child("failed-turn.sh");
         std::fs::write(&script, format!(r#"
+if [ "${{1:-}}" = "--version" ]; then printf '2.1.307 (Claude Code)\n'; exit 0; fi
 printf '%s\n' "$*" >> '{calls}'
 read -r prompt
 printf '%s\n' '{{"type":"system","subtype":"init","session_id":"saved-session","apiKeySource":"none"}}'
@@ -2948,6 +2987,127 @@ exit 1
             "the refusal must name the harness: {msg}"
         );
         assert_eq!(ag.start_calls(), 0, "no fall back may start a session");
+    }
+
+    /// Writes a fake harness CLI whose `--version` prints `version`, and returns a command string
+    /// that runs it through `sh` (so the probe never execs the script directly, dodging the Linux
+    /// `ETXTBSY` window a sibling test's fork opens).
+    fn fake_cli(dir: &TempDir, version: &str) -> String {
+        let path = dir.child("harness-cli");
+        std::fs::write(&path, format!("#!/bin/sh\necho '{version}'\n")).expect("write fake cli");
+        format!("sh {path}")
+    }
+
+    /// STUDIO-1468 acceptance: an OLD claude CLI is refused before anything is provisioned — no
+    /// worktree, no session, no turn — with a refusal naming the found and required versions. The
+    /// refusal is `CapabilityRefused`, the terminal no-retry path, so the ticket is held instead of
+    /// looping.
+    ///
+    /// MUTATION GUARD: delete the `harness_version::check` call in `run_agent_attempt` and the
+    /// attempt dispatches normally (`start_calls() == 1`), reding this.
+    #[tokio::test]
+    async fn an_old_claude_cli_is_refused_before_any_turn() {
+        let dir = TempDir::new();
+        let mut fake = agentfake::Fake::new();
+        fake.turns = vec![succeeded_turn()];
+        fake.cli_command = Some(fake_cli(&dir, "1.0.108 (Claude Code)"));
+        let ag = Arc::new(fake);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        let msg = format!("{err:?}");
+        assert!(
+            matches!(
+                err,
+                Some(WorkerError::CapabilityRefused(
+                    rhapsody_agent::CapabilityRefusal::CliVersionUnsupported { .. }
+                ))
+            ),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("1.0.108") && msg.contains("1.0.109"),
+            "the refusal must name the found and required versions: {msg}"
+        );
+        assert_eq!(ag.start_calls(), 0, "an old CLI must never start a session");
+    }
+
+    /// STUDIO-1468 acceptance: a SUPPORTED claude CLI dispatches normally — the gate is inert on an
+    /// install already on a supported version.
+    #[tokio::test]
+    async fn a_supported_claude_cli_dispatches_normally() {
+        let dir = TempDir::new();
+        let mut fake = agentfake::Fake::new();
+        fake.turns = vec![succeeded_turn()];
+        fake.cli_command = Some(fake_cli(&dir, "2.1.307 (Claude Code)"));
+        let ag = Arc::new(fake);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "a supported CLI must dispatch: {err:?}");
+        assert_eq!(ag.start_calls(), 1);
+    }
+
+    /// STUDIO-1468 acceptance for the second harness: the same gate refuses an unpinned opencode CLI
+    /// before any turn, and accepts the pinned version. MUTATION: drop the version check and the
+    /// refusal case dispatches.
+    #[tokio::test]
+    async fn opencode_cli_versions_are_gated_the_same_way() {
+        for (version, refused) in [("1.17.0", true), ("1.18.30", false)] {
+            let dir = TempDir::new();
+            let mut fake = agentfake::Fake::new();
+            fake.turns = vec![succeeded_turn()];
+            fake.harness = rhapsody_agent::HarnessId::Opencode;
+            fake.cli_command = Some(fake_cli(&dir, version));
+            let ag = Arc::new(fake);
+            let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+
+            let (_last, _declared, err) =
+                run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+            if refused {
+                let msg = format!("{err:?}");
+                assert!(
+                    matches!(
+                        err,
+                        Some(WorkerError::CapabilityRefused(
+                            rhapsody_agent::CapabilityRefusal::CliVersionUnsupported { .. }
+                        ))
+                    ),
+                    "{version}: {msg}"
+                );
+                assert!(
+                    msg.contains(version) && msg.contains("1.18.30"),
+                    "{version}: the refusal must name both versions: {msg}"
+                );
+                assert_eq!(ag.start_calls(), 0, "{version}: no turn may start");
+            } else {
+                assert!(err.is_none(), "{version}: {err:?}");
+                assert_eq!(ag.start_calls(), 1, "{version}: the pinned CLI dispatches");
+            }
+        }
+    }
+
+    /// A harness with no versioned CLI (`cli_command() == None`, the default for the fake) is never
+    /// gated, so every pre-STUDIO-1468 test stays byte-identical.
+    #[tokio::test]
+    async fn a_harness_without_a_cli_command_is_not_gated() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "{err:?}");
+        assert_eq!(ag.start_calls(), 1);
     }
 
     /// STUDIO-978, the §5.1 dividing line: a `FinalTextOnly` harness cannot feed the Trace spine,

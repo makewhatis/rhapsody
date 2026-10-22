@@ -213,6 +213,13 @@ impl Harness for Runner {
         &CAPABILITIES
     }
 
+    /// The configured `claude` command (default `"claude"`), the subject of the pre-dispatch CLI
+    /// version gate (STUDIO-1468): this build adds `--include-partial-messages` to every turn, which
+    /// only a CLI at or above [`crate::harness_version::MIN_CLAUDE_VERSION`] accepts.
+    fn cli_command(&self) -> Option<String> {
+        Some(self.cfg.command.clone())
+    }
+
     /// The manager run's isolated launch (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3):
     /// a session whose every security-relevant flag is the [`crate::manager::manager_config`]
     /// posture — `--permission-mode default`, the manager MCP tools as the only allowlist, every

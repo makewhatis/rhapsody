@@ -508,6 +508,13 @@ impl Harness for Runner {
         &CAPABILITIES
     }
 
+    /// The configured `opencode` command (default `"opencode"`), the subject of the pre-dispatch CLI
+    /// version gate (STUDIO-1468): every mode drives the pinned 1.18.30 HTTP API, not only the
+    /// brokered path that already probes it.
+    fn cli_command(&self) -> Option<String> {
+        Some(self.cfg.command.clone())
+    }
+
     /// The manager uses the ordinary stream runner with a separate, daemon-controlled posture.
     /// Its credential can never refresh, retry from a copy, or survive the run for resume.
     fn start_manager_session(
