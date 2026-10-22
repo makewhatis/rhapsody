@@ -139,13 +139,21 @@ schema, API payload or golden-fixture changes.
 
 ### Worker self-messages carry agent attribution (STUDIO-1414)
 
-The worker MCP `symphony_send_message` / `agent_send_message` tools only accept their own
-`SYMPHONY_RUN_ID`; a foreign target or missing/invalid caller binding returns an error before
-any HTTP call. Worker requests carry `X-Rhapsody-Agent-Run-Id`. The daemon requires that marker
-to match the destination and derives the identity from the live run, then delivers an **AGENT
-MESSAGE** explicitly marked as information, not operator instructions. This banner survives both
-live mailbox delivery and the durable next-turn queue/history. Self-messages remain useful for
-run-local notes but cannot release operator holds or resume ended runs. Use `teams_post` for peers.
+An MCP process with `SYMPHONY_RUN_ID` set is a dispatched worker: its `symphony_send_message` /
+`agent_send_message` tools only accept their own run — a foreign target, or a caller binding that is
+present but malformed, returns an error before any HTTP call — and its requests carry
+`X-Rhapsody-Agent-Run-Id`. The daemon requires that marker to match the destination and derives the
+identity from the live run, then delivers an **AGENT MESSAGE** explicitly marked as information, not
+operator instructions. This banner survives both live mailbox delivery and the durable next-turn
+queue/history. Self-messages remain useful for run-local notes but cannot release operator holds or
+resume ended runs. Use `teams_post` for peers.
+
+An MCP process with NO `SYMPHONY_RUN_ID` is the operator's own `rhapsodyd mcp`: it may message any
+live run, and its requests carry no agent marker, so the daemon takes the operator path with the
+same attribution the HTTP `POST /api/v1/runs/{id}/message` endpoint uses — the pre-STUDIO-1414
+behavior, restored by STUDIO-1470. This is a tool-surface boundary for the MCP server the daemon
+hands an agent, not a security boundary: any local process can call the operator HTTP API with
+`X-Rhapsody-Operator: 1`, so it only keeps an agent's own tool call off a peer run.
 
 Go's `operatorWrap` and unmarked human console/API messages retain their existing operator banner;
 the manager posture is unchanged. The marker and the existing `X-Rhapsody-Operator: 1` header are

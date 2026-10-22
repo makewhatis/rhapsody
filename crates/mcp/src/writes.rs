@@ -13,6 +13,22 @@
 //!     handoff (a NEW capability beyond Go v0.4.0; the Go facade has no analog). It proxies the daemon's
 //!     `POST /api/v1/runs/{id}/handoff`, so it reuses the shared `run_action` result-shaping exactly
 //!     like stop/resume.
+//!
+//! # Message-scoping threat model (STUDIO-1414, STUDIO-1470)
+//!
+//! `symphony_send_message` is scoped by the *process environment*, not by an authenticated
+//! identity. `SYMPHONY_RUN_ID` **set** ⇒ this is a dispatched worker's facade: it may message only
+//! that one run, and its requests carry `X-Rhapsody-Agent-Run-Id` so the daemon attributes the
+//! message to the agent rather than the operator (STUDIO-1414). `SYMPHONY_RUN_ID` **absent** ⇒ this
+//! is the operator's own `rhapsodyd mcp`: it may message any live run and its requests carry no
+//! agent marker, taking the same operator attribution as the HTTP `POST /api/v1/runs/{id}/message`
+//! path (STUDIO-1470). A binding that is present but malformed is a worker, so it fails closed.
+//!
+//! This is a **tool-surface boundary** for the MCP server the daemon hands an agent — it stops an
+//! agent's tool call from reaching a peer run — and **not a security boundary**. Any local process
+//! can call the operator HTTP API directly (with `X-Rhapsody-Operator: 1`) or forge the marker;
+//! nothing here contains a hostile same-user process. Read it as a guardrail against an agent
+//! doing by accident, or by prompt injection, what its tool surface does not offer — not a sandbox.
 
 use crate::client::FacadeError;
 use crate::server::{Facade, Role, RunArgs, err_result, or_default, text_result};
@@ -28,7 +44,8 @@ use serde::Deserialize;
 /// text is still caught at runtime as `empty_text`, exactly as Go's handler does.
 #[derive(Debug, Default, Deserialize, JsonSchema)]
 pub(crate) struct SendMessageArgs {
-    /// the target run id (numeric). Workers may only use their own SYMPHONY_RUN_ID; defaults to it.
+    /// the target run id (numeric). A worker may only use its own SYMPHONY_RUN_ID, and defaults to
+    /// it; the operator (no SYMPHONY_RUN_ID) may target any run.
     #[serde(default)]
     run_id: String,
     /// the message text to deliver to the running agent (required, max 4000 chars).
@@ -39,7 +56,7 @@ pub(crate) struct SendMessageArgs {
 impl Facade {
     #[tool(
         name = "symphony_send_message",
-        description = "Deliver a message to your own live run (INF-250 mailbox), attributed as agent information, not operator instructions. Workers can only target SYMPHONY_RUN_ID (the default). Use teams_post to talk to teammates. Proxies POST /api/v1/runs/{id}/message. A not-running or backlog-full run returns an error result."
+        description = "Deliver a message to a live run's agent (INF-250 mailbox). A facade with SYMPHONY_RUN_ID set may only target that run (the default), and the message is attributed as agent information, not operator instructions. A facade with no SYMPHONY_RUN_ID is the operator's own and may target any run, with operator attribution. Use teams_post to talk to teammates. Proxies POST /api/v1/runs/{id}/message. A not-running or backlog-full run returns an error result."
     )]
     async fn symphony_send_message(
         &self,
@@ -52,7 +69,12 @@ impl Facade {
                 "no run_id given and SYMPHONY_RUN_ID is not set",
             ));
         }
-        if self.opts.role != Role::Manager
+        // STUDIO-1470: an EMPTY `SYMPHONY_RUN_ID` means the operator's own facade, not a dispatched
+        // worker, so it may message any run. A binding that is PRESENT but malformed is still a
+        // worker with a broken run binding, and fails closed rather than widening to operator
+        // authority. The manager role is exempt from worker scoping (STUDIO-1014), unchanged.
+        let worker = self.opts.role != Role::Manager && !self.opts.default_run_id.is_empty();
+        if worker
             && (self
                 .opts
                 .default_run_id
@@ -70,10 +92,13 @@ impl Facade {
         if args.text.is_empty() {
             return err_result(&FacadeError::new("empty_text", "message text is required"));
         }
-        let result = if self.opts.role == Role::Manager {
-            self.client.post_message(&id, &args.text).await
-        } else {
+        // A worker's message carries the agent marker (agent attribution); the operator's does not,
+        // so it takes the daemon's operator delivery path — the same attribution the HTTP
+        // `POST /api/v1/runs/{id}/message` path uses.
+        let result = if worker {
             self.client.post_agent_message(&id, &args.text).await
+        } else {
+            self.client.post_message(&id, &args.text).await
         };
         match result {
             Ok(body) => text_result(&body),
@@ -349,8 +374,11 @@ mod tests {
     }
 
     // STUDIO-1414: both spellings must refuse a foreign run before even contacting the daemon.
+    // A binding that is PRESENT but malformed ("not-a-run", "0") is a dispatched worker with a
+    // broken run binding — it fails closed rather than widening to operator authority. An EMPTY
+    // binding is not a worker at all; that is the operator case (STUDIO-1470), below.
     #[tokio::test]
-    async fn worker_message_cannot_target_another_run_or_run_without_a_binding() {
+    async fn worker_message_cannot_target_another_run_or_a_malformed_binding() {
         let requests = Arc::new(Mutex::new(0));
         let sink = requests.clone();
         let port = spawn_router(Router::new().fallback(any(move || {
@@ -361,7 +389,7 @@ mod tests {
             }
         })))
         .await;
-        for binding in ["7", "", "not-a-run", "0"] {
+        for binding in ["7", "not-a-run", "0"] {
             let client = connect(Facade::new(
                 &cfg_with(true, false, false, false),
                 Client::for_port(port as i64),
@@ -388,6 +416,72 @@ mod tests {
             }
             let _ = client.cancel().await;
         }
+    }
+
+    // STUDIO-1470: no SYMPHONY_RUN_ID in the facade's environment means the operator's own MCP, not
+    // a dispatched worker. It may message ANY run, with the operator attribution of the HTTP
+    // `POST /api/v1/runs/{id}/message` path — i.e. the request carries NO `X-Rhapsody-Agent-Run-Id`
+    // marker, which is what routes it to the daemon's operator delivery path.
+    // MUTATION: restoring STUDIO-1414's unconditional scoping (treating the empty binding as a
+    // forbidden worker) turns this red — the call would return an IsError and make no HTTP request.
+    #[tokio::test]
+    async fn operator_without_a_run_binding_may_message_any_run_as_the_operator() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let port = spawn_router(Router::new().fallback(any(
+            move |headers: axum::http::HeaderMap| {
+                let sink = sink.clone();
+                async move {
+                    sink.lock().unwrap().push(headers);
+                    "{}"
+                }
+            },
+        )))
+        .await;
+        // No SYMPHONY_RUN_ID: `Options::default()` leaves `default_run_id` empty, exactly as
+        // `rhapsodyd mcp` does for an operator who is not inside an agent run.
+        let client = connect(Facade::new(
+            &cfg_with(true, false, false, false),
+            Client::for_port(port as i64),
+            Options::default(),
+        ))
+        .await;
+        for (name, input) in [
+            (
+                "symphony_send_message",
+                serde_json::json!({"run_id": "8", "text": "status from the operator"}),
+            ),
+            (
+                "agent_send_message",
+                serde_json::json!({"run_id": "9", "text": "and another run"}),
+            ),
+        ] {
+            let res = client
+                .call_tool(call(name).with_arguments(args(input)))
+                .await
+                .expect("tool result");
+            assert_ne!(res.is_error, Some(true), "{name}: {}", result_text(&res));
+        }
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.len(),
+            2,
+            "both operator messages must reach the daemon"
+        );
+        for headers in seen.iter() {
+            assert!(
+                headers.get("x-rhapsody-agent-run-id").is_none(),
+                "operator messages must not carry the agent marker: {headers:?}"
+            );
+            assert_eq!(
+                headers
+                    .get("x-rhapsody-operator")
+                    .and_then(|v| v.to_str().ok()),
+                Some("1"),
+                "operator messages keep the operator header: {headers:?}"
+            );
+        }
+        let _ = client.cancel().await;
     }
 
     #[tokio::test]
