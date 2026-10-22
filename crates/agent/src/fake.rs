@@ -45,6 +45,14 @@ pub struct Fake {
     /// without installing any CLI. Defaults to a fully-capable harness, so every pre-STUDIO-978 test
     /// that never touches this field keeps passing the validator.
     pub capabilities: HarnessCapabilities,
+    /// The harness this fake reports from [`Harness::id`] (STUDIO-1468). Defaults to
+    /// [`HarnessId::Claude`], matching the capabilities above; a test driving the CLI version gate
+    /// for the other harness sets it.
+    pub harness: HarnessId,
+    /// The CLI command this fake reports from [`Harness::cli_command`], or `None` (the default) for
+    /// "no version gate" — which keeps every pre-STUDIO-1468 test byte-identical. A test sets it to
+    /// a fake CLI script to drive the pre-dispatch version gate.
+    pub cli_command: Option<String>,
     /// Recorded state mutated by the `&self` methods, shared with started sessions.
     recorded: Arc<Mutex<Recorded>>,
 }
@@ -114,6 +122,8 @@ impl Fake {
             start_err: None,
             resume_err: None,
             capabilities: default_capabilities(),
+            harness: HarnessId::Claude,
+            cli_command: None,
             recorded: Arc::new(Mutex::new(Recorded::default())),
         }
     }
@@ -242,11 +252,15 @@ impl Runner for Fake {
 /// through the orchestrator's name-based seam, not through this identity.
 impl Harness for Fake {
     fn id(&self) -> HarnessId {
-        HarnessId::Claude
+        self.harness
     }
 
     fn capabilities(&self) -> &HarnessCapabilities {
         &self.capabilities
+    }
+
+    fn cli_command(&self) -> Option<String> {
+        self.cli_command.clone()
     }
 
     /// Answers a manager session exactly like an ordinary one, recording the request so a worker

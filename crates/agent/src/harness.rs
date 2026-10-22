@@ -433,6 +433,15 @@ pub trait Harness: Runner {
     fn id(&self) -> HarnessId;
     fn capabilities(&self) -> &HarnessCapabilities;
 
+    /// The harness's configured CLI command, when it runs an external CLI whose version this build
+    /// depends on — the subject of the pre-dispatch CLI version gate (STUDIO-1468,
+    /// [`crate::harness_version::check`]). The default `None` means "this harness does not shell out
+    /// to a versioned CLI", so no version check runs: the in-process test double, and any future
+    /// adapter that is not a CLI. `claude` and `opencode` return their configured command.
+    fn cli_command(&self) -> Option<String> {
+        None
+    }
+
     /// Start a BROKERED session for an explicit-provider dispatch (PB7, STUDIO-1002): the session's
     /// turns run through [`crate::Session::run_turn_brokered`] against the broker loopback rather
     /// than a harness-native login. `None` (the default) refuses with a typed, non-secret reason
@@ -531,6 +540,19 @@ pub enum CapabilityRefusal {
     /// A profile named a harness this build has no runner for (known-but-unimplemented, e.g. codex,
     /// or unknown). A typed refusal — NEVER a fall back to `agent.backend`.
     HarnessNotImplemented { name: String },
+    /// The installed CLI for `harness` is too old to run this build's per-turn argv (STUDIO-1468):
+    /// the Claude CLI must accept `--include-partial-messages`, and the OpenCode CLI must be inside
+    /// [`SUPPORTED_OPENCODE_VERSIONS`](crate::SUPPORTED_OPENCODE_VERSIONS). A typed refusal — an old
+    /// CLI fails every turn at zero tokens, so the honest answer is to hold, not to retry forever.
+    CliVersionUnsupported {
+        harness: HarnessId,
+        /// The version the CLI reported (a version that could not be read never refuses).
+        found: String,
+        /// The minimum/required version(s), as a human-readable string.
+        required: String,
+        /// How the operator upgrades the CLI.
+        upgrade: String,
+    },
 }
 
 impl fmt::Display for CapabilityRefusal {
@@ -559,6 +581,17 @@ impl fmt::Display for CapabilityRefusal {
                 f,
                 "harness {name:?} is not implemented by this build; refusing rather than falling \
                  back to another harness"
+            ),
+            Self::CliVersionUnsupported {
+                harness,
+                found,
+                required,
+                upgrade,
+            } => write!(
+                f,
+                "the installed {} CLI version {found:?} is unsupported; this build requires \
+                 {required} — {upgrade}",
+                harness.name()
             ),
         }
     }

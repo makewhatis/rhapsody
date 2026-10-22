@@ -904,7 +904,13 @@ mod tests {
     fn claude_liveness_case(body: &str) -> (Orchestrator, TempDir) {
         let (mut o, dir) = liveness_orch(std::time::Duration::from_millis(750));
         let script = dir.child("claude.sh");
-        std::fs::write(&script, body).unwrap();
+        // A faithful fake claude answers `--version` (STUDIO-1468's pre-dispatch CLI version gate
+        // probes it) without running any turn machinery, so the probe is instant and side-effect-free.
+        std::fs::write(
+            &script,
+            format!("if [ \"${{1:-}}\" = \"--version\" ]; then printf '2.1.307 (Claude Code)\\n'; exit 0; fi\n{body}"),
+        )
+        .unwrap();
         let eff = o.eff.as_mut().unwrap();
         eff.cfg.claude.stall_timeout_ms = 750;
         eff.agent = Arc::new(agent::claude::Runner::new(agent::claude::Config {
