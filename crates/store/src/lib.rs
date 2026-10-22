@@ -167,6 +167,43 @@ pub trait Store {
     ) -> Result<bool, StoreError> {
         Ok(false)
     }
+    /// Release an open episode WITHOUT the one durable author admission a deliberate release grants
+    /// ([`Store::release_subject_episode`]). The material-change observer uses it when the ticket's
+    /// `rhapsody:human` hold comes off (STUDIO-1443): the park must release — the ticket is a
+    /// candidate again and the merge lock lifts — but the author is re-engaged only by a summons
+    /// newer than the last run's end, never by the release itself. Every other material change
+    /// keeps the deliberate release, so an operator's edit is not swallowed by linked-PR
+    /// suppression (STUDIO-1156).
+    fn release_subject_episode_without_resume(
+        &self,
+        _id: i64,
+        _kind: &str,
+        _reason: &str,
+    ) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    /// Record or clear a DURABLE explicit-resume authorization on an OPEN episode (STUDIO-1443 B2).
+    ///
+    /// The operator's "Human step done → resume" action writes this BEFORE it removes
+    /// `rhapsody:human`, so the material-change observer still recognizes the release as an
+    /// authorized resume after a restart — the in-memory reopen seed does not survive one, and
+    /// without this marker the observer mistakes the completed action for a bare label removal and
+    /// suppresses the requested author run. It lives on the open episode's `resume_pending` column,
+    /// which [`Store::subject_resume_pending`] deliberately ignores while the episode is still open;
+    /// the release consumes it either way. A refused label removal clears it, so a failed action
+    /// leaves nothing committed.
+    fn set_subject_resume_authorization(
+        &self,
+        _subject: &str,
+        _authorized: bool,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Whether an OPEN episode carries the durable explicit-resume authorization
+    /// ([`Store::set_subject_resume_authorization`]).
+    fn subject_resume_authorized(&self, _subject: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Idempotent operator resolution, bound to that decision's episode, never a newer park.
     fn resolve_lead_escalation(&self, _decision: i64, _reason: &str) -> Result<bool, StoreError> {
         Ok(false)
