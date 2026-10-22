@@ -819,6 +819,9 @@ mod tests {
         eff.cfg.agent.backend = "opencode".into();
         o.eff = Some(eff);
         let manager = rhapsody_config::teams::Manager {
+            harness: "opencode".into(),
+            provider: "fireworks".into(),
+            model: "fireworks-ai/model".into(),
             harnesses: vec![rhapsody_config::teams::ManagerHarnessEntry {
                 harness: "claude".into(),
                 model: String::new(),
