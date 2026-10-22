@@ -342,7 +342,7 @@ impl Store for Noop {
     // Runaway-loop breaker crossings (STUDIO-1026). With persistence off there is no run history to
     // count and nowhere to remember a crossing, so the breaker simply never fires — the same "no
     // history ⇒ no spend signal" the rest of this backend gives every cost surface.
-    fn count_completed_review_runs(
+    fn count_changes_requested_review_runs(
         &self,
         _owner: &str,
         _repo: &str,
@@ -352,6 +352,15 @@ impl Store for Noop {
     }
     fn count_runs_for(&self, _identifier: &str) -> Result<i64, StoreError> {
         Ok(0)
+    }
+    fn newest_completed_review_verdict_among(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _number: i64,
+        _reviewers: &[String],
+    ) -> Result<Option<String>, StoreError> {
+        Ok(None)
     }
 
     fn account_credit_spend(&self, _account: &str, _since: &str) -> Result<f64, StoreError> {

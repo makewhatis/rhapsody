@@ -1297,8 +1297,8 @@ impl Teams {
         }
     }
 
-    /// The number of COMPLETED review runs on a pull request that trips the runaway-loop breaker
-    /// (STUDIO-1026), or `None` when the breaker is off.
+    /// The number of COMPLETED review runs whose verdict ASKED FOR CHANGES on a pull request that
+    /// trips the runaway-loop breaker (STUDIO-1026, STUDIO-1440), or `None` when the breaker is off.
     ///
     /// Gated on [`review_ticketless`](Self::review_ticketless) for
     /// [`review_done_state`](Self::review_done_state)'s reason: the `pr:` run ledger this counts is
@@ -1306,7 +1306,7 @@ impl Teams {
     /// must read as off rather than promise a hold that can never fire.
     ///
     /// Floored at one: a non-positive value is "off", and the smallest meaningful threshold is one
-    /// completed review run.
+    /// changes-requested review round.
     pub fn review_hold_after_rounds(&self) -> Option<usize> {
         if !self.review_ticketless() {
             return None;

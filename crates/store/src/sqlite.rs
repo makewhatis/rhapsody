@@ -56,16 +56,17 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 20 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 39 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
 /// ledger, then the structured review findings, then the breaker's persisted crossings, then the
 /// review evidence ledger, then the
 /// provider origin + broker usage record, then the manager approval record, then the manager
 /// exchange authorizations, then the durable UTC-day provider budget authority, then the manager
-/// evidence-access log, then the manager intervention lifecycle) and are
+/// evidence-access log, then the manager intervention lifecycle, then the verdict ledger's durable
+/// completion sequence, STUDIO-1440) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 38;
+const SCHEMA_VERSION: i64 = 39;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -801,6 +802,20 @@ CREATE TABLE rhapsody_landing (
     UNIQUE(owner, repo, pr)
 );
 CREATE INDEX rhapsody_landing_project ON rhapsody_landing(project_slug, id);
+"#,
+    // v38 -> v39: a durable COMPLETION ORDER for the per-run verdict ledger (STUDIO-1440). The
+    // breaker must name the MOST RECENT completed verdict at a pull request's current head, and the
+    // ledger's only durable order was `runs.ended_at`, which `persist::rfc3339` truncates to
+    // SECONDS — so two reviewers who complete within the same second fall back to `runs.id`, which
+    // is allocated at run START, and an OLDER findings round can outrank a NEWER approval. That held
+    // a converged pull request with the `rhapsody:human` label. `completed_seq` is a monotonic
+    // counter assigned at the verdict write (the moment the round DECLARED its answer), so it
+    // preserves completion order whatever the clock's resolution. Rhapsody-only, and a column on a
+    // Rhapsody-only table, so the `rhapsody_` prefix gates it out of the Go-recaptured schema golden
+    // by name exactly as steps 7-38 are. Existing rows keep the 0 default (a pre-migration
+    // completion); every new completion is >= 1 and therefore orders after them.
+    r#"
+ALTER TABLE rhapsody_review_verdicts ADD COLUMN completed_seq INTEGER NOT NULL DEFAULT 0;
 "#,
 ];
 
@@ -2784,9 +2799,18 @@ impl Store for Sqlite {
         let conn = self.lock();
         // UPSERT on the run id: the verdict is written once at the run's exit, but a re-dispatch of
         // the same run id (impossible today) must overwrite rather than fail a PRIMARY KEY.
+        //
+        // `completed_seq` is assigned here, at the write, as a MONOTONIC counter over the whole
+        // ledger (`MAX + 1`) — the durable record of COMPLETION ORDER the breaker needs and
+        // `ended_at` cannot give (it is truncated to seconds, while `runs.id` is allocated at run
+        // START, so a same-second pair falls back to start order; STUDIO-1440 round 4). The store
+        // serializes every write on one connection, so the counter is assigned atomically and no two
+        // completions share a sequence.
         conn.execute(
-            "INSERT INTO rhapsody_review_verdicts (run_id, verdict) VALUES (?1, ?2) \
-             ON CONFLICT(run_id) DO UPDATE SET verdict = excluded.verdict",
+            "INSERT INTO rhapsody_review_verdicts (run_id, verdict, completed_seq) \
+             VALUES (?1, ?2, (SELECT COALESCE(MAX(completed_seq), 0) + 1 FROM rhapsody_review_verdicts)) \
+             ON CONFLICT(run_id) DO UPDATE SET \
+                 verdict = excluded.verdict, completed_seq = excluded.completed_seq",
             params![run_id, verdict],
         )?;
         Ok(())
@@ -2833,29 +2857,80 @@ impl Store for Sqlite {
         Ok(out)
     }
 
-    fn count_completed_review_runs(
+    fn count_changes_requested_review_runs(
         &self,
         owner: &str,
         repo: &str,
         number: i64,
     ) -> Result<i64, StoreError> {
         let conn = self.lock();
-        // `ESCAPE '\'` makes `review_run_pattern`'s wildcard-escaping effective. `outcome =
-        // completed` is the whole point: the breaker bounds spend that HAPPENED, so a run that
-        // failed or was truncated never counts.
+        // `ESCAPE '\'` makes `review_run_pattern`'s wildcard-escaping effective. Three filters, each
+        // load-bearing (STUDIO-1440): `outcome = completed` (the breaker bounds spend that HAPPENED,
+        // so a failed or truncated run never counts); the verdict join keeps only rounds whose
+        // reviewer ASKED FOR CHANGES (an approval, or a run that declared no verdict, is not a
+        // runaway signal); and `NOT LIKE '%@manager'` drops a manager/intervention run, which is a
+        // `pr:` key but never a review round.
         let n: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM runs \
-              WHERE issue_identifier LIKE ?1 ESCAPE '\\' AND outcome = ?2 \
+            "SELECT COUNT(*) FROM runs r \
+               JOIN rhapsody_review_verdicts v ON v.run_id = r.id \
+              WHERE r.issue_identifier LIKE ?1 ESCAPE '\\' AND r.outcome = ?2 \
+                AND v.verdict = ?3 \
+                AND r.issue_identifier NOT LIKE '%@manager' \
                 AND NOT EXISTS (SELECT 1 FROM rhapsody_breaker_cleared_runs c \
-                                WHERE c.pr = ?3 AND c.run_id = runs.id)",
+                                WHERE c.pr = ?4 AND c.run_id = r.id)",
             params![
                 review_run_pattern(owner, repo, number),
                 OUTCOME_COMPLETED,
+                REVIEW_VERDICT_CHANGES_REQUESTED,
                 format!("{owner}/{repo}#{number}").to_ascii_lowercase()
             ],
             |row| row.get(0),
         )?;
         Ok(n)
+    }
+
+    fn newest_completed_review_verdict_among(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        reviewers: &[String],
+    ) -> Result<Option<String>, StoreError> {
+        if reviewers.is_empty() {
+            return Ok(None);
+        }
+        // One EXACT `pr:<owner>/<repo>#<n>@<reviewer>` pattern per reviewer, each escaped so a repo
+        // or reviewer name carrying a LIKE wildcard (`_`, `%`) cannot match a different coordinate.
+        //
+        // The order is the DURABLE completion sequence (`completed_seq`, assigned at the verdict
+        // write), not `ended_at`: that column is truncated to SECONDS, so two reviewers completing
+        // within one second would fall through to `runs.id` — allocated at run START — and let an
+        // older findings round outrank a newer approval (STUDIO-1440 round 4). `ended_at`/`id`
+        // remain only as a deterministic tie-break for pre-migration rows, which all carry the 0
+        // default and are therefore always ordered before every post-migration completion.
+        // `outcome = completed` and the `%@manager` exclusion are the same two the counting query
+        // uses (a manager run is a `pr:` key but never a review round, and only a completed run has a
+        // verdict to weigh).
+        let clause = vec!["r.issue_identifier LIKE ? ESCAPE '\\'"; reviewers.len()].join(" OR ");
+        let mut args: Vec<Value> = Vec::with_capacity(reviewers.len() + 1);
+        args.push(Value::Text(OUTCOME_COMPLETED.to_string()));
+        for reviewer in reviewers {
+            args.push(Value::Text(escape_like(&format!(
+                "pr:{owner}/{repo}#{number}@{reviewer}"
+            ))));
+        }
+        let conn = self.lock();
+        let q = format!(
+            "SELECT v.verdict FROM runs r \
+               JOIN rhapsody_review_verdicts v ON v.run_id = r.id \
+              WHERE r.outcome = ? AND r.issue_identifier NOT LIKE '%@manager' \
+                AND ({clause}) \
+              ORDER BY v.completed_seq DESC, r.ended_at DESC, r.id DESC LIMIT 1"
+        );
+        let verdict: Option<String> = conn
+            .query_row(&q, params_from_iter(args), |row| row.get(0))
+            .optional()?;
+        Ok(verdict)
     }
 
     fn count_runs_for(&self, identifier: &str) -> Result<i64, StoreError> {
@@ -5329,12 +5404,42 @@ mod tests {
             .lock()
             .pragma_query_value(None, "user_version", |r| r.get(0))
             .unwrap();
-        assert_eq!(version, 38);
+        assert_eq!(version, SCHEMA_VERSION);
         assert!(
             store
                 .lock()
                 .prepare("SELECT * FROM rhapsody_landing")
                 .is_ok()
+        );
+    }
+
+    // A database written before the completion-sequence step upgrades forward and gains the
+    // `completed_seq` column on the verdict ledger, empty for every existing verdict row (no
+    // fabricated completion order). MUTATION: reuse a step index or skip the SCHEMA_VERSION bump
+    // and the version assert reds.
+    #[test]
+    fn schema_39_migration_applies_on_38_db() {
+        let dir = scratch_dir();
+        let path = dir.path.join("v38.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            for migration in &MIGRATIONS[..38] {
+                conn.execute_batch(migration).unwrap();
+            }
+            conn.pragma_update(None, "user_version", 38).unwrap();
+        }
+        let store = Sqlite::open(StorePath::Disk(path)).unwrap();
+        let version: i64 = store
+            .lock()
+            .pragma_query_value(None, "user_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert!(
+            store
+                .lock()
+                .prepare("SELECT run_id, verdict, completed_seq FROM rhapsody_review_verdicts")
+                .is_ok(),
+            "the verdict ledger carries the completion sequence after the step"
         );
     }
 
@@ -10600,38 +10705,178 @@ mod tests {
             .expect("provenance");
     }
 
-    /// The breaker's round counter: COMPLETED review runs of the coordinate only — its sibling
-    /// PR's runs, other reviewers' non-completed runs, and non-review runs never count.
+    /// The breaker's round counter (STUDIO-1440): COMPLETED review runs whose reviewer verdict
+    /// ASKED FOR CHANGES — an approving round, a manager run, a run whose coordinate is a different
+    /// pull request, a non-review run, and a failed review all never count.
     ///
-    /// Mutation: drop `outcome = completed` and the failed review is counted (3).
+    /// Mutation: drop `v.verdict = changes_requested` and the approving `bob` run is counted (2).
     #[test]
-    fn breaker_counts_only_completed_review_runs_of_the_coordinate() {
+    fn breaker_counts_only_changes_requested_review_runs_of_the_coordinate() {
         let store = Sqlite::open(StorePath::InMemory).expect("open");
         let at = "2026-09-20T00:00:00Z";
         let a = start_run_at(&store, "pr:makewhatis/rhapsody#12@alice", at);
         let b = start_run_at(&store, "pr:makewhatis/rhapsody#12@bob", at);
         let failed = start_run_at(&store, "pr:makewhatis/rhapsody#12@carol", at);
+        let manager = start_run_at(&store, "pr:makewhatis/rhapsody#12@manager", at);
         let other_pr = start_run_at(&store, "pr:makewhatis/rhapsody#13@alice", at);
         let author = start_run_at(&store, "STUDIO-988", at);
         end_run_with(&store, a, OUTCOME_COMPLETED, 10, at);
         end_run_with(&store, b, OUTCOME_COMPLETED, 10, at);
         end_run_with(&store, failed, OUTCOME_FAILED, 10, at);
+        end_run_with(&store, manager, OUTCOME_COMPLETED, 10, at);
         end_run_with(&store, other_pr, OUTCOME_COMPLETED, 10, at);
         end_run_with(&store, author, OUTCOME_COMPLETED, 10, at);
+        for id in [a, failed, manager, other_pr, author] {
+            store
+                .set_review_verdict(id, REVIEW_VERDICT_CHANGES_REQUESTED)
+                .expect("verdict");
+        }
+        store
+            .set_review_verdict(b, REVIEW_VERDICT_APPROVED)
+            .expect("verdict");
 
         assert_eq!(
             store
-                .count_completed_review_runs("makewhatis", "rhapsody", 12)
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
                 .expect("count"),
-            2,
-            "two completed review runs of #12"
+            1,
+            "only the one changes-requested review run of #12 counts"
         );
         assert_eq!(
             store
-                .count_completed_review_runs("makewhatis", "rhapsody", 99)
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 99)
                 .expect("count"),
             0,
             "a coordinate with no runs is zero, not an error"
+        );
+    }
+
+    /// The breaker's "most recent completed verdict at the current head" ORDER (STUDIO-1440): among
+    /// a reviewer SET, the verdict whose round COMPLETED last wins — ordered by the durable
+    /// completion sequence assigned at the verdict write, NOT by `ended_at` (truncated to seconds) or
+    /// `id` (allocated at run START) — while a manager run, a non-completed run, another coordinate
+    /// and a reviewer outside the set are all invisible. This is the ordering the live watch rows
+    /// cannot supply (one terminal verdict per reviewer, no completion time).
+    ///
+    /// Mutation: order by `ended_at DESC, id DESC` instead of the completion sequence and the
+    /// same-second pair below picks carol's older findings round (higher start id), not alice's newer
+    /// approval.
+    #[test]
+    fn breaker_newest_completed_verdict_among_orders_by_completion() {
+        let store = Sqlite::open(StorePath::InMemory).expect("open");
+        // Two rounds that COMPLETE within the SAME second: alice's approving round STARTED first
+        // (lower run id), carol's findings round started later — but carol COMPLETES first and alice
+        // last. Both `ended_at`s truncate to the same second, so the completion sequence is the only
+        // durable order that names alice's approval the newest.
+        let alice = start_run_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            "2026-09-20T00:09:59Z",
+        );
+        let carol = start_run_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@carol",
+            "2026-09-20T00:09:59Z",
+        );
+        assert!(
+            carol > alice,
+            "alice's round started first, so it carries the lower run id"
+        );
+        end_run_with(&store, carol, OUTCOME_COMPLETED, 10, "2026-09-20T00:10:00Z");
+        end_run_with(&store, alice, OUTCOME_COMPLETED, 10, "2026-09-20T00:10:00Z");
+        // The verdict WRITE order is completion order: carol's findings first, alice's approval last.
+        store
+            .set_review_verdict(carol, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("verdict");
+        store
+            .set_review_verdict(alice, REVIEW_VERDICT_APPROVED)
+            .expect("verdict");
+
+        let both = vec!["alice".to_string(), "carol".to_string()];
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among("makewhatis", "rhapsody", 12, &both)
+                .expect("newest")
+                .as_deref(),
+            Some(REVIEW_VERDICT_APPROVED),
+            "the round that COMPLETED last is the newest completed verdict, whatever the start order"
+        );
+        // A reviewer OUTSIDE the set is invisible: only carol's findings remains.
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among(
+                    "makewhatis",
+                    "rhapsody",
+                    12,
+                    &["carol".to_string()],
+                )
+                .expect("newest")
+                .as_deref(),
+            Some(REVIEW_VERDICT_CHANGES_REQUESTED)
+        );
+        // A manager/intervention run is a `pr:` key but never a review round: even named explicitly
+        // it does not answer.
+        let manager = start_run_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@manager",
+            "2026-09-20T00:20:00Z",
+        );
+        end_run_with(
+            &store,
+            manager,
+            OUTCOME_COMPLETED,
+            10,
+            "2026-09-20T00:21:00Z",
+        );
+        store
+            .set_review_verdict(manager, REVIEW_VERDICT_APPROVED)
+            .expect("verdict");
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among(
+                    "makewhatis",
+                    "rhapsody",
+                    12,
+                    &["manager".to_string()],
+                )
+                .expect("manager"),
+            None,
+            "a manager run is not a review round"
+        );
+        // Only a COMPLETED run counts.
+        let failed = start_run_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@bob",
+            "2026-09-20T00:30:00Z",
+        );
+        end_run_with(&store, failed, OUTCOME_FAILED, 10, "2026-09-20T00:31:00Z");
+        store
+            .set_review_verdict(failed, REVIEW_VERDICT_APPROVED)
+            .expect("verdict");
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among(
+                    "makewhatis",
+                    "rhapsody",
+                    12,
+                    &["bob".to_string()],
+                )
+                .expect("failed"),
+            None,
+            "only a completed round counts"
+        );
+        // An empty reviewer set and a coordinate with no rounds both answer None.
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among("makewhatis", "rhapsody", 12, &[])
+                .expect("empty"),
+            None
+        );
+        assert_eq!(
+            store
+                .newest_completed_review_verdict_among("makewhatis", "rhapsody", 99, &both)
+                .expect("none"),
+            None
         );
     }
 
@@ -10648,10 +10893,15 @@ mod tests {
         let wildcard_lookalike = start_run_at(&store, "pr:o/axb#1@alice", at);
         end_run_with(&store, underscore, OUTCOME_COMPLETED, 1, at);
         end_run_with(&store, wildcard_lookalike, OUTCOME_COMPLETED, 1, at);
+        for id in [underscore, wildcard_lookalike] {
+            store
+                .set_review_verdict(id, REVIEW_VERDICT_CHANGES_REQUESTED)
+                .expect("verdict");
+        }
 
         assert_eq!(
             store
-                .count_completed_review_runs("o", "a_b", 1)
+                .count_changes_requested_review_runs("o", "a_b", 1)
                 .expect("count"),
             1,
             "the underscore is literal, so only the matching repo counts"
@@ -12347,6 +12597,11 @@ mod tests {
         let other = start_run_at(&store, "pr:o/axb#1@alice", at);
         end_run_with(&store, cleared, OUTCOME_COMPLETED, 100, at);
         end_run_with(&store, other, OUTCOME_COMPLETED, 200, at);
+        for id in [cleared, other] {
+            store
+                .set_review_verdict(id, REVIEW_VERDICT_CHANGES_REQUESTED)
+                .expect("verdict");
+        }
         let mut watch = introduced(wkey("o", "a_b", 1, "alice"));
         watch.introduced_by = "adopt:STUDIO-1123".into();
         store.save_review_watch(watch).expect("adopt");
@@ -12365,13 +12620,13 @@ mod tests {
         let store = Sqlite::open(StorePath::Disk(db)).expect("reopen");
         assert_eq!(
             store
-                .count_completed_review_runs("O", "A_B", 1)
+                .count_changes_requested_review_runs("O", "A_B", 1)
                 .expect("count"),
             0
         );
         assert_eq!(
             store
-                .count_completed_review_runs("o", "axb", 1)
+                .count_changes_requested_review_runs("o", "axb", 1)
                 .expect("other PR"),
             1
         );
@@ -12405,9 +12660,12 @@ mod tests {
         assert_eq!(baseline, 0);
         let next = start_run_at(&store, "pr:o/a_b#1@alice", at);
         end_run_with(&store, next, OUTCOME_COMPLETED, 10, at);
+        store
+            .set_review_verdict(next, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("verdict");
         assert_eq!(
             store
-                .count_completed_review_runs("o", "a_b", 1)
+                .count_changes_requested_review_runs("o", "a_b", 1)
                 .expect("new count"),
             1
         );
@@ -12430,6 +12688,9 @@ mod tests {
             .expect("crossing");
         let id = start_run_at(&store, "pr:o/r#1@alice", "2026-10-08T00:00:00Z");
         end_run_with(&store, id, OUTCOME_COMPLETED, 10, "2026-10-08T00:00:00Z");
+        store
+            .set_review_verdict(id, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("verdict");
         let before = store.review_bound("o/r#1").expect("bound");
         let crossings = store.load_breaker_crossings().expect("crossings");
         store
@@ -12444,7 +12705,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .count_completed_review_runs("o", "r", 1)
+                .count_changes_requested_review_runs("o", "r", 1)
                 .expect("count"),
             1,
             "the baseline insertion rolls back with the generation and watermark"

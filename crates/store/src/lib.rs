@@ -942,21 +942,51 @@ pub trait Store {
     // --- runaway-loop breaker crossings (STUDIO-1026; no Go counterpart — see
     // [`BreakerCrossingRow`]) ------------------------------------------------------------------
 
-    /// How many COMPLETED review runs this daemon has recorded for one pull request — every `runs`
-    /// row whose `issue_identifier` is `pr:<owner>/<repo>#<number>@<any reviewer>` with
-    /// `outcome = completed`, excluding completions already present at the last operator clear.
+    /// How many COMPLETED review runs of one pull request ASKED FOR CHANGES — every `runs` row whose
+    /// `issue_identifier` is `pr:<owner>/<repo>#<number>@<reviewer>` with `outcome = completed` and a
+    /// recorded [`REVIEW_VERDICT_CHANGES_REQUESTED`] verdict in `rhapsody_review_verdicts`,
+    /// excluding completions already present at the last operator clear (STUDIO-1440).
+    ///
+    /// This is the runaway-loop breaker's Rounds input, and the whole point is that it is NOT every
+    /// completed round: a round that APPROVED, one whose run recorded no verdict (truncated, failed,
+    /// predating the ledger), and a manager/intervention run (`@manager`) are all NOT evidence of a
+    /// runaway and must not count. The approval verdict belongs to the run, not to the watch row, so
+    /// only the per-run ledger can answer this.
     ///
     /// ⚠️ NEVER [`Store::load_review_bounds`]' `dispatches`: that counts rounds the daemon ARMED and
     /// an operator's `clear` resets both counts (STUDIO-1134). The breaker counts only completed
-    /// runs, including a run in flight at clear that completes later. Reads with the caller's explicit
-    /// empty/whitespace identifiers truncated by
+    /// changes-requested rounds, including a run in flight at clear that completes later. Reads with
+    /// the caller's explicit empty/whitespace identifiers truncated by
     /// LIKE's own escaping (see [`Sqlite`](crate::Sqlite)); a coordinate with no such runs answers 0.
-    fn count_completed_review_runs(
+    fn count_changes_requested_review_runs(
         &self,
         owner: &str,
         repo: &str,
         number: i64,
     ) -> Result<i64, StoreError>;
+
+    /// The verdict of the reviewer whose newest COMPLETED review round on one pull request FINISHED
+    /// most recently, restricted to `reviewers` — the reviewers the watcher holds a terminal verdict
+    /// for at the pull request's current head (STUDIO-1440).
+    ///
+    /// Ordered by the durable COMPLETION SEQUENCE (`completed_seq`, assigned monotonically at the
+    /// verdict write), not `ended_at`: that column is truncated to seconds and `runs.id` is
+    /// allocated at run START, so a same-second pair would rank by start order and let an older
+    /// findings round outrank a newer approval. Two reviewers who completed different verdicts at
+    /// the SAME head are therefore ranked by who finished last — "the most recent completed verdict
+    /// at the current head". `ended_at`/`id` break ties only for pre-migration rows (all at the 0
+    /// default). A manager/intervention run
+    /// (`@manager`) is a `pr:` key but never a review round, so it is excluded exactly as in
+    /// [`Store::count_changes_requested_review_runs`]. `None` when none of `reviewers` has a
+    /// completed review round, which the breaker reads as "no approval stands at the head" (fail
+    /// closed). An empty `reviewers` is `None`.
+    fn newest_completed_review_verdict_among(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        reviewers: &[String],
+    ) -> Result<Option<String>, StoreError>;
 
     /// How many runs this daemon has recorded for one exact `issue_identifier` — a ticket's
     /// "attempts" for the breaker's notification, counting every author run whatever its outcome.

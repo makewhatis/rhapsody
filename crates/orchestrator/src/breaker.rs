@@ -13,11 +13,27 @@
 //!
 //! # What it counts, and why that matters
 //!
-//! ⚠️ Round crossings count COMPLETED REVIEW RUNS read from the `runs` ledger
+//! ⚠️ Round crossings count COMPLETED REVIEW RUNS whose reviewer verdict ASKED FOR CHANGES
+//! (STUDIO-1440), read from the `runs` ledger joined to the per-run `rhapsody_review_verdicts`
 //! (`pr:<owner>/<repo>#<n>@*`), never the review watcher's own dispatch counter
-//! (`rhapsody_review_bound.dispatches`). An operator `clear` resets both counters (STUDIO-1134),
-//! but a dispatched round that never ran spent nothing: only completed runs since clear count.
-//! [`crate::reviewwatch`]'s in-memory round count is the same story — it does not survive a restart.
+//! (`rhapsody_review_bound.dispatches`). The limit exists to stop a loop that is NOT converging, so
+//! it must not count rounds that are evidence of convergence: a round that APPROVED, a re-review
+//! armed only by merging main, and the manager's own intervention run (`@manager`) are all
+//! non-events. A `@manager` run is not a review round at all. An operator `clear` resets both
+//! counters (STUDIO-1134), but a dispatched round that never ran spent nothing: only completed runs
+//! since clear count. [`crate::reviewwatch`]'s in-memory round count is the same story — it does not
+//! survive a restart.
+//!
+//! A round crossing also does NOT apply the hold while the most recent completed verdict at the
+//! pull request's CURRENT HEAD is an approval: an approved-and-open pull request has converged, and
+//! holding it would be the exact false action the limit exists to avoid. The HEAD SCOPE comes from
+//! the LIVE WATCH ROWS (`last_reviewed_sha` == head, or a head proven patch-identical) — never from
+//! the per-run verdict ledger, which carries no head, so a round that completed at a SUPERSEDED head
+//! (an in-flight review that finished after the head moved on) would otherwise shadow the approval. A
+//! sibling still owing a round is not a completed verdict and does not defeat the approval. Within
+//! that head scope the ORDER comes from the ledger: two reviewers can complete different verdicts at
+//! the SAME head, in either order, so the NEWEST completed verdict at the head is the one that
+//! decides — an approval suppresses only when it is that newest verdict.
 //!
 //! Spend crossings sum the ticket's author runs PLUS the review runs on its pull request, split by
 //! provider through `rhapsody_run_provenance` — exactly the join STUDIO-957 introduced, because the
@@ -72,7 +88,7 @@ pub const MAX_NOTIFICATIONS: usize = 32;
 /// Which limit a [`BreakerPlan`] crossed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CrossingKind {
-    /// The pull request's completed review-run count crossed `review.hold_after_rounds`.
+    /// The pull request's changes-requested review-round count crossed `review.hold_after_rounds`.
     Rounds,
     /// A provider's per-ticket token spend crossed `budgets.<provider>.per_ticket`.
     Spend,
@@ -208,7 +224,7 @@ pub fn crossing_body(plan: &BreakerPlan) -> String {
     };
     if plan.kinds.contains(&CrossingKind::Rounds) {
         body.push_str(&format!(
-            "Rounds: **{}** completed review run(s) (threshold {}). ",
+            "Rounds: **{}** review round(s) that asked for changes (threshold {}). ",
             plan.rounds, plan.threshold
         ));
     }
@@ -914,29 +930,86 @@ impl Orchestrator {
             .unwrap_or_default();
         let rounds = self
             .store()
-            .count_completed_review_runs(owner, repo, number)
+            .count_changes_requested_review_runs(owner, repo, number)
             .unwrap_or(0);
         let attempts = self.store().count_runs_for(ticket).unwrap_or(0);
-        // The latest review's OUTCOME: the newest live watch row's status for this coordinate.
-        let latest_review = self
-            .store()
-            .load_live_review_watch()
-            .ok()
-            .and_then(|rows| {
-                rows.into_iter()
-                    .filter(|r| {
-                        r.key.owner == owner && r.key.repo == repo && r.key.number == number
-                    })
-                    .map(|r| r.status)
-                    .next()
+        // This coordinate's live watch rows, read once: their statuses give each reviewer's LATEST
+        // review OUTCOME and the head it was made at.
+        let live = self.store().load_live_review_watch().unwrap_or_default();
+        let mine: Vec<&rhapsody_store::ReviewWatchRow> = live
+            .iter()
+            .filter(|r| r.key.owner == owner && r.key.repo == repo && r.key.number == number)
+            .collect();
+        let latest_review = mine.first().map(|r| r.status.clone()).unwrap_or_default();
+        // "The most recent completed verdict at the PR's current head is an approval" (STUDIO-1440).
+        //
+        // Two sources, each answering the half it can: the LIVE ROWS give the HEAD SCOPE, the per-run
+        // LEDGER gives the ORDER. The ledger is keyed by run and carries no head, so it cannot name a
+        // head by itself — a review that was IN FLIGHT when the head moved completes against the head
+        // pinned at its dispatch (F-SHA), so its verdict is the newest by `ended_at` while being about
+        // a head the pull request has already left. A PR-wide "newest verdict" therefore let that
+        // superseded completion shadow a genuine approval at the head (PR #368 round 2, B2).
+        //
+        // The live rows carry the head each round READ (`last_reviewed_sha`, advanced only by a
+        // completed round), so a terminal row is a verdict at the head it read:
+        //   * `approved`/`reviewed` with `last_reviewed_sha == current_head` is a completed verdict
+        //     AT the current head — a patch-changing advance re-arms every row it can reach back to
+        //     `requested`, so a surviving terminal row read the head the pull request still stands
+        //     at (a patch-preserving move advances `last_reviewed_sha` and keeps the status);
+        //   * `requested`/`in_flight`/`truncated` is no completed verdict at the current head at all,
+        //     so a sibling still owing a round must not defeat an approval (round 1, B1).
+        // A head proven patch-identical to the current one (a base-branch merge) counts too — the
+        // same carried-approval proof auto-merge uses.
+        //
+        // Within that head scope the question is which verdict is NEWEST, and only the ledger knows:
+        // two reviewers can complete different verdicts at the SAME head, in either order, so "every
+        // reviewer at this head approves" is not "the most recent completed verdict approves" (round
+        // 3, B3). The store ranks the head-scoped reviewers' completed rounds by a durable
+        // COMPLETION SEQUENCE assigned at the verdict write — not by `ended_at`, which is truncated
+        // to seconds and would fall through to `runs.id` (allocated at run START) for a same-second
+        // pair, letting an older findings round outrank a newer approval (round 4) — and returns the
+        // newest one's verdict.
+        //
+        // The current head is the watcher's last observation of the coordinate. With no observation
+        // the head is unknown, so the hold fails CLOSED (it applies) rather than claim an approval
+        // stands at a head the daemon cannot name.
+        let coord = crate::prstate::PrCoord::new(owner, repo, number);
+        let (current_head, proven) = match self.review_observed_head.get(&coord) {
+            Some(observed) => (observed.head.as_str(), observed.unchanged_from.as_slice()),
+            None => ("", &[][..]),
+        };
+        let at_head_reviewers: Vec<String> = mine
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r.status.as_str(),
+                    rhapsody_store::REVIEW_STATUS_APPROVED | rhapsody_store::REVIEW_STATUS_REVIEWED
+                ) && !r.last_reviewed_sha.is_empty()
+                    && !current_head.is_empty()
+                    && (r.last_reviewed_sha == current_head
+                        || proven.iter().any(|p| p == &r.last_reviewed_sha))
             })
-            .unwrap_or_default();
+            .map(|r| r.key.reviewer.clone())
+            .collect();
+        // Suppress only when the NEWEST completed verdict among those head-scoped reviewers approves
+        // — the pull request has converged at the head. A `reviewed` (findings) verdict that is the
+        // newest at the head is an unanswered round, so the hold still applies; so is an empty set or
+        // an unreadable ledger (fail closed).
+        let approved_at_head = !at_head_reviewers.is_empty()
+            && self
+                .store()
+                .newest_completed_review_verdict_among(owner, repo, number, &at_head_reviewers)
+                .ok()
+                .flatten()
+                .as_deref()
+                == Some(rhapsody_store::REVIEW_VERDICT_APPROVED);
 
         let mut kinds = Vec::new();
         let mut threshold = 0i64;
         let mut notified_rounds = prev.notified_rounds;
         if let Some(h) = self.round_threshold()
             && rounds >= notified_rounds + h
+            && !approved_at_head
         {
             kinds.push(CrossingKind::Rounds);
             threshold = h;
@@ -1101,8 +1174,9 @@ mod tests {
     use rhapsody_config::room::{CaughtUp, Cursor, RoomError};
     use rhapsody_config::teams::{Identity, Review, ReviewMode, Teams};
     use rhapsody_store::{
-        OUTCOME_COMPLETED, REVIEW_STATUS_REQUESTED, ReviewWatchKey, ReviewWatchRow, RunEnd,
-        RunProvenance, RunStart, Sqlite, Store, StorePath,
+        OUTCOME_COMPLETED, REVIEW_STATUS_APPROVED, REVIEW_STATUS_REQUESTED, REVIEW_STATUS_REVIEWED,
+        REVIEW_VERDICT_APPROVED, REVIEW_VERDICT_CHANGES_REQUESTED, ReviewWatchKey, ReviewWatchRow,
+        RunEnd, RunProvenance, RunStart, Sqlite, Store, StorePath,
     };
     use rhapsody_tracker::fake::Fake;
 
@@ -1174,6 +1248,106 @@ mod tests {
             .expect("save watch");
     }
 
+    /// Seeds one COMPLETED review run for `key` and records `verdict` against it — the shape the
+    /// breaker's Rounds count reads (STUDIO-1440). A completed review run with NO verdict row (or an
+    /// approving one) is not a round the limit counts. The run carries the `anthropic` provider, so
+    /// the per-ticket spend join sees it as the original incident's reviews did.
+    fn seed_review_round(store: &SharedStore, key: &str, verdict: &str) {
+        seed_review_round_at(store, key, verdict, "2026-09-20T00:00:00Z");
+    }
+
+    /// [`seed_review_round`] with an explicit completion time. Ordering no longer matters to the
+    /// breaker's suppression (it is head-scoped off the live rows, not the ledger), but the round
+    /// timestamps keep the seeds realistic and distinct (STUDIO-1440).
+    fn seed_review_round_at(store: &SharedStore, key: &str, verdict: &str, at: &str) {
+        let id = store
+            .start_run(RunStart {
+                issue_id: format!("iss-{key}"),
+                issue_identifier: key.into(),
+                team_id: "team-1".into(),
+                started_at: at.into(),
+                ..Default::default()
+            })
+            .expect("start_run");
+        store
+            .end_run(
+                id,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    total_tokens: 10,
+                    ended_at: at.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("end_run");
+        store
+            .set_run_provenance(
+                id,
+                &RunProvenance {
+                    provider: "anthropic".into(),
+                    harness: "claude".into(),
+                    model: "m".into(),
+                    ..Default::default()
+                },
+            )
+            .expect("provenance");
+        store.set_review_verdict(id, verdict).expect("verdict");
+    }
+
+    /// A live watch row already settled at `status` on the head it read — the shape that makes
+    /// `plan_crossing` read "the most recent completed verdict at the current head".
+    fn seed_watch_status(store: &SharedStore, ticket: &str, status: &str) {
+        seed_watch_row(store, ticket, "alice", status);
+    }
+
+    /// [`seed_watch_status`] for a named reviewer — so a test can put a pending SIBLING beside the
+    /// approving reviewer (STUDIO-1440).
+    fn seed_watch_row(store: &SharedStore, ticket: &str, reviewer: &str, status: &str) {
+        seed_watch_row_at(store, ticket, reviewer, status, "sha");
+    }
+
+    /// [`seed_watch_row`] with an explicit head the row READ — the head the breaker scopes its
+    /// suppression to (`last_reviewed_sha`), so a test can place a verdict at a head other than the
+    /// one the watcher observes (STUDIO-1440).
+    fn seed_watch_row_at(
+        store: &SharedStore,
+        ticket: &str,
+        reviewer: &str,
+        status: &str,
+        read_sha: &str,
+    ) {
+        store
+            .save_review_watch(ReviewWatchRow {
+                key: ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "rhapsody".into(),
+                    number: 12,
+                    reviewer: reviewer.into(),
+                },
+                author: "bob".into(),
+                introduced_by: format!("handoff:{ticket}"),
+                requested_sha: read_sha.into(),
+                last_reviewed_sha: read_sha.into(),
+                status: status.into(),
+                open: true,
+            })
+            .expect("save watch");
+    }
+
+    /// The watcher's last observation of this test PR's head — the head the breaker scopes its
+    /// suppression to (STUDIO-1440). With no observation the head is unknown and the hold fails
+    /// closed.
+    fn observe_head(o: &mut Orchestrator, head: &str) {
+        o.review_observed_head.insert(
+            crate::prstate::PrCoord::new("makewhatis", "rhapsody", 12),
+            crate::prepare::ReviewHeadObservation {
+                open: true,
+                head: head.into(),
+                unchanged_from: Vec::new(),
+            },
+        );
+    }
+
     fn teams(hold_after: i64) -> Teams {
         Teams {
             enabled: true,
@@ -1215,23 +1389,21 @@ mod tests {
         o
     }
 
-    /// The acceptance shape: at the fifth completed review run the ticket is planned for a hold,
-    /// the crossing is persisted, and the plan names the PR, the rounds and the spend.
+    /// The acceptance shape: at the fifth changes-requested review round the ticket is planned for a
+    /// hold, the crossing is persisted, and the plan names the PR, the rounds and the spend.
     ///
-    /// Mutation: count DISPATCHES instead of completed runs (or drop the threshold) and no crossing
-    /// is planned at five.
+    /// Mutation: count every completed review run (or DISPATCHES, or drop the threshold) and either
+    /// no crossing is planned at five or an approving round counts toward it.
     #[test]
-    fn the_fifth_completed_review_run_crosses_and_names_pr_rounds_and_spend() {
+    fn the_fifth_changes_requested_round_crosses_and_names_pr_rounds_and_spend() {
         let store = store();
         seed_watch(&store, "STUDIO-988");
         seed_run(&store, "STUDIO-988", OUTCOME_COMPLETED, 100, "anthropic");
         for r in ["alice", "bob", "carol", "dan", "erin"] {
-            seed_run(
+            seed_review_round(
                 &store,
                 &format!("pr:makewhatis/rhapsody#12@{r}"),
-                OUTCOME_COMPLETED,
-                10,
-                "fireworks-ai",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
             );
         }
         // Not completed: must not push the count to six.
@@ -1269,17 +1441,777 @@ mod tests {
         );
     }
 
+    /// The "at the current head" half of the suppression (STUDIO-1440): an approving verdict that
+    /// was read at an OLD head — the author pushed since — is not a verdict at the head the pull
+    /// request stands at, so the hold still applies.
+    ///
+    /// Mutation: drop the head comparison (count any terminal row) and a stale approval holds a pull
+    /// request nobody has approved at its current head.
+    #[test]
+    fn a_stale_approval_does_not_suppress_the_rounds_hold() {
+        let store = store();
+        // The reviewer approved, but at the head the author has since moved off; the watcher's
+        // observation names a different current head.
+        seed_watch_row_at(
+            &store,
+            "STUDIO-988",
+            "alice",
+            REVIEW_STATUS_APPROVED,
+            "old-sha",
+        );
+        for at in [
+            "2026-09-20T00:00:00Z",
+            "2026-09-20T00:01:00Z",
+            "2026-09-20T00:02:00Z",
+            "2026-09-20T00:03:00Z",
+            "2026-09-20T00:04:00Z",
+        ] {
+            seed_review_round_at(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+                at,
+            );
+        }
+        let mut o = orch(store.clone(), 5, &[]);
+        observe_head(&mut o, "sha");
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        let plan = rx
+            .try_recv()
+            .expect("a stale approval must not suppress the hold");
+        assert_eq!(plan.kinds, vec![CrossingKind::Rounds]);
+        assert_eq!(plan.rounds, 5);
+    }
+
+    /// The boundary of the suppression: a head whose newest verdict ASKED FOR CHANGES is not
+    /// converged, so five changes-requested rounds still cross and hold (STUDIO-1440).
+    ///
+    /// Mutation: suppress on any live row rather than only an approval and this stops crossing.
+    #[test]
+    fn a_findings_verdict_at_head_still_crosses() {
+        let store = store();
+        seed_watch_status(&store, "STUDIO-988", REVIEW_STATUS_REVIEWED);
+        for r in ["alice", "bob", "carol", "dan", "erin"] {
+            seed_review_round(
+                &store,
+                &format!("pr:makewhatis/rhapsody#12@{r}"),
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+            );
+        }
+        let mut o = orch(store.clone(), 5, &[]);
+        observe_head(&mut o, "sha");
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        let plan = rx.try_recv().expect("a not-converged PR still crosses");
+        assert_eq!(plan.kinds, vec![CrossingKind::Rounds]);
+        assert_eq!(plan.rounds, 5);
+    }
+
+    /// The booch#644 sequence (STUDIO-1440): two findings rounds, then three approvals at successive
+    /// heads (the last two merge-from-main re-reviews). Only the two findings rounds count, so the
+    /// five-round limit is never reached — and the PR sits approved at its current head, so the hold
+    /// could not apply even if the count had crossed.
+    ///
+    /// Mutation: restore the old counting (every completed review run of the coordinate) and the
+    /// count is five, not two.
+    #[test]
+    fn a_converged_pr_with_a_few_findings_rounds_does_not_cross() {
+        let store = store();
+        // The PR's final state: the reviewer approved the head the last round read.
+        seed_watch_status(&store, "STUDIO-1426", REVIEW_STATUS_APPROVED);
+        for r in ["alice", "bob"] {
+            seed_review_round(
+                &store,
+                &format!("pr:makewhatis/rhapsody#12@{r}"),
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+            );
+        }
+        for r in ["carol", "dan", "erin"] {
+            seed_review_round(
+                &store,
+                &format!("pr:makewhatis/rhapsody#12@{r}"),
+                REVIEW_VERDICT_APPROVED,
+            );
+        }
+        assert_eq!(
+            store
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            2,
+            "only the two findings rounds count toward the limit"
+        );
+        let mut o = orch(store.clone(), 5, &[]);
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        assert!(
+            rx.try_recv().is_err(),
+            "two findings rounds never reach a five-round limit"
+        );
+        assert!(
+            store
+                .load_breaker_crossings()
+                .expect("crossings")
+                .is_empty(),
+            "no crossing is persisted"
+        );
+    }
+
+    /// The booch#641 sequence (STUDIO-1440): three findings rounds, one approval, then the
+    /// reconciliation sweep's manager intervention run, which approves. A `@manager` run is not a
+    /// review round, so only the three findings rounds count and nothing crosses.
+    ///
+    /// Mutation: restore the old counting (every completed review run of the coordinate, the
+    /// approving round and the `@manager` run included) and the count is five, not three.
+    #[test]
+    fn a_manager_intervention_is_not_a_review_round() {
+        let store = store();
+        seed_watch_status(&store, "STUDIO-1417", REVIEW_STATUS_APPROVED);
+        for r in ["alice", "bob", "carol"] {
+            seed_review_round(
+                &store,
+                &format!("pr:makewhatis/rhapsody#12@{r}"),
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+            );
+        }
+        seed_review_round(
+            &store,
+            "pr:makewhatis/rhapsody#12@dan",
+            REVIEW_VERDICT_APPROVED,
+        );
+        // The manager intervention: a `pr:` key, but never a review round.
+        seed_run(
+            &store,
+            "pr:makewhatis/rhapsody#12@manager",
+            OUTCOME_COMPLETED,
+            10,
+            "anthropic",
+        );
+        assert_eq!(
+            store
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            3,
+            "the approval and the manager run are not counted rounds"
+        );
+        let mut o = orch(store.clone(), 5, &[]);
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        assert!(
+            rx.try_recv().is_err(),
+            "three findings rounds never reach a five-round limit"
+        );
+        assert!(
+            store
+                .load_breaker_crossings()
+                .expect("crossings")
+                .is_empty()
+        );
+    }
+
+    /// An approval at the current head suppresses the Rounds hold: five findings rounds have counted,
+    /// but the pull request converged, so no `rhapsody:human` label is written (STUDIO-1440).
+    ///
+    /// Mutation: drop the `!approved_at_head` guard and the crossing applies the hold.
+    #[tokio::test]
+    async fn an_approval_at_head_suppresses_the_rounds_hold() {
+        let store = store();
+        seed_watch_status(&store, "STUDIO-988", REVIEW_STATUS_APPROVED);
+        for r in ["alice", "bob", "carol", "dan", "erin"] {
+            seed_review_round(
+                &store,
+                &format!("pr:makewhatis/rhapsody#12@{r}"),
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+            );
+        }
+        // The reviewer's live row stands approved at the head the watcher observes.
+        seed_review_round_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            REVIEW_VERDICT_APPROVED,
+            "2026-09-20T00:05:00Z",
+        );
+        let mut o = orch(store.clone(), 5, &[]);
+        observe_head(&mut o, "sha");
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        assert!(
+            rx.try_recv().is_err(),
+            "a converged pull request must not be held"
+        );
+        // And no actual label write, the way the acceptance states it: drive anything the pass
+        // queued through the real hold sink.
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let hold_tracker = tracker.clone();
+        let deps = BreakerDeps {
+            hold: Some(Arc::new(TrackerHoldSink::new(move || {
+                Some(hold_tracker.clone() as Arc<dyn Tracker>)
+            }))),
+            room: None,
+            channels: Vec::new(),
+        };
+        while let Ok(plan) = rx.try_recv() {
+            perform_crossing(&plan, &deps, Utc::now()).await;
+        }
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "an approval at the current head must write no rhapsody:human label"
+        );
+        assert!(
+            store
+                .load_breaker_crossings()
+                .expect("crossings")
+                .is_empty(),
+            "no crossing is persisted for an approved head"
+        );
+    }
+
+    /// A pending SIBLING must not defeat an approval at head (PR #368 round 1, B1). Five findings
+    /// rounds, then a LATER approving round for alice, with alice's live row `approved` at the head
+    /// she read — while carol's row still owes a round (`requested`) and has no completed verdict.
+    /// The most recent COMPLETED verdict at the current head is alice's approval, so nothing crosses
+    /// and no `rhapsody:human` label is written.
+    ///
+    /// Mutation: require every live row to approve (`mine.iter().all(..)`) and carol's pending row
+    /// arms the hold again, writing the label.
+    #[tokio::test]
+    async fn a_pending_sibling_does_not_defeat_an_approval_at_head() {
+        let store = store();
+        for at in [
+            "2026-09-20T00:00:00Z",
+            "2026-09-20T00:01:00Z",
+            "2026-09-20T00:02:00Z",
+            "2026-09-20T00:03:00Z",
+            "2026-09-20T00:04:00Z",
+        ] {
+            seed_review_round_at(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+                at,
+            );
+        }
+        seed_review_round_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            REVIEW_VERDICT_APPROVED,
+            "2026-09-20T00:05:00Z",
+        );
+        seed_watch_row(&store, "STUDIO-988", "alice", REVIEW_STATUS_APPROVED);
+        seed_watch_row(&store, "STUDIO-988", "carol", REVIEW_STATUS_REQUESTED);
+        assert_eq!(
+            store
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            5,
+            "five findings rounds are counted"
+        );
+        let mut o = orch(store.clone(), 5, &[]);
+        observe_head(&mut o, "sha");
+        let mut rx = o.open_breaker_channel();
+        o.reconcile_breaker();
+        // Perform anything the pass queued, against a real tracker sink: the assertion is that NO
+        // label write happens, which is exactly what B1 reported.
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let hold_tracker = tracker.clone();
+        let deps = BreakerDeps {
+            hold: Some(Arc::new(TrackerHoldSink::new(move || {
+                Some(hold_tracker.clone() as Arc<dyn Tracker>)
+            }))),
+            room: None,
+            channels: Vec::new(),
+        };
+        while let Ok(plan) = rx.try_recv() {
+            perform_crossing(&plan, &deps, Utc::now()).await;
+        }
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "a pending sibling must not defeat the approval at head and write rhapsody:human"
+        );
+        assert!(
+            store
+                .load_breaker_crossings()
+                .expect("crossings")
+                .is_empty(),
+            "no crossing is persisted for an approved head"
+        );
+    }
+
+    /// A review that completed at a SUPERSEDED head must not shadow an approval at the current head
+    /// (PR #368 round 2, B2). Five findings rounds; carol is reviewing `old-sha` in flight when alice
+    /// approves the current head `sha`; carol then completes her findings against `old-sha` — the
+    /// head pinned at her dispatch (F-SHA) — and the watcher re-arms her. The per-run verdict
+    /// ledger's newest verdict is carol's old-head findings, but the most recent completed verdict
+    /// at the CURRENT head is alice's approval, so nothing crosses and no `rhapsody:human` label is
+    /// written.
+    ///
+    /// Mutation: read the PR-wide newest verdict from the ledger (drop the head scoping) and carol's
+    /// late old-head completion arms the hold, writing the label.
+    #[tokio::test]
+    async fn a_late_old_head_findings_verdict_does_not_shadow_a_current_head_approval() {
+        let store = store();
+        seed_run(&store, "STUDIO-988", OUTCOME_COMPLETED, 100, "anthropic");
+        for _ in 0..5 {
+            seed_review_round(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+            );
+        }
+        seed_watch_row(&store, "STUDIO-988", "alice", REVIEW_STATUS_APPROVED);
+        seed_watch_row(&store, "STUDIO-988", "carol", REVIEW_STATUS_REQUESTED);
+        // Carol is dispatched against `old-sha` and is still running when the head moves on.
+        let run = crate::review::ReviewRun {
+            owner: "makewhatis".into(),
+            repo: "rhapsody".into(),
+            number: 12,
+            reviewer: "carol".into(),
+            head_sha: "old-sha".into(),
+            generation: 1,
+            introduced_by: "handoff:STUDIO-988".into(),
+            ..Default::default()
+        };
+        let id = store
+            .start_run(RunStart {
+                issue_identifier: run.key(),
+                started_at: "2026-09-20T00:04:00Z".into(),
+                ..Default::default()
+            })
+            .expect("start old-head review");
+        store
+            .mark_review_requested(&run.watch_key(), "old-sha")
+            .expect("dispatch carol at old head");
+        // Alice approves the CURRENT head.
+        seed_review_round_at(
+            &store,
+            "pr:makewhatis/rhapsody#12@alice",
+            REVIEW_VERDICT_APPROVED,
+            "2026-09-20T00:05:00Z",
+        );
+        let mut o = orch(store.clone(), 5, &[]);
+        observe_head(&mut o, "sha");
+        let re = crate::orchestrator::RunningEntry {
+            issue: rhapsody_core::Issue {
+                id: run.key(),
+                identifier: run.key(),
+                ..Default::default()
+            },
+            run_id: id,
+            review: Some(run.clone()),
+            ..crate::testsupport::running_entry(
+                rhapsody_core::Issue::default(),
+                "rhapsody",
+                "rhapsody",
+            )
+        };
+        o.running.insert(run.key(), re.clone());
+        let pr = crate::prstate::PrCoord::new("makewhatis", "rhapsody", 12);
+        // The real head-advance handler skips an in-flight row.
+        o.handle_review_head_advanced(&pr, "sha", &[]);
+        assert_eq!(
+            store
+                .get_review_watch(&run.watch_key())
+                .expect("watch")
+                .expect("carol")
+                .status,
+            rhapsody_store::REVIEW_STATUS_IN_FLIGHT
+        );
+        o.running.remove(&run.key());
+        // The real completion writes the head pinned at dispatch, not the now-current head.
+        o.on_review_exit(
+            &re,
+            &run,
+            &crate::retry::EvWorkerExit {
+                declared_handoff: true,
+                last_state: "findings".into(),
+                issue_id: run.key(),
+                started_at: Utc::now(),
+                failed: false,
+                err_msg: String::new(),
+                review_verdict: None,
+                verdict_text: None,
+                refused: false,
+                auth_needed: false,
+            },
+        );
+        let carol = store
+            .get_review_watch(&run.watch_key())
+            .expect("watch")
+            .expect("carol");
+        assert_eq!(carol.status, REVIEW_STATUS_REVIEWED);
+        assert_eq!(carol.last_reviewed_sha, "old-sha");
+        let alice_key = ReviewWatchKey {
+            reviewer: "alice".into(),
+            ..run.watch_key()
+        };
+        let alice = store
+            .get_review_watch(&alice_key)
+            .expect("watch")
+            .expect("alice");
+        assert_eq!(alice.status, REVIEW_STATUS_APPROVED);
+        assert_eq!(alice.last_reviewed_sha, "sha");
+        let mut rx = o.open_breaker_channel();
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let hold_tracker = tracker.clone();
+        let deps = BreakerDeps {
+            hold: Some(Arc::new(TrackerHoldSink::new(move || {
+                Some(hold_tracker.clone() as Arc<dyn Tracker>)
+            }))),
+            room: None,
+            channels: Vec::new(),
+        };
+        // (a) BEFORE the watcher re-arms carol: her findings row is TERMINAL, but at the OLD head.
+        // The HEAD scoping — not her status — is what must keep it from shadowing the approval.
+        o.reconcile_breaker();
+        while let Ok(plan) = rx.try_recv() {
+            perform_crossing(&plan, &deps, Utc::now()).await;
+        }
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "a terminal old-head findings verdict must not shadow the current-head approval; wrote \
+             {:?}",
+            tracker.add_label_calls()
+        );
+        // A subsequent watcher sweep re-arms carol, but cannot change the per-run verdict ledger.
+        o.handle_review_head_advanced(&pr, "sha", &[]);
+        assert_eq!(
+            store
+                .get_review_watch(&run.watch_key())
+                .expect("watch")
+                .expect("carol")
+                .status,
+            REVIEW_STATUS_REQUESTED
+        );
+        assert_eq!(
+            store
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            6,
+            "the five findings rounds and carol's late old-head findings are all counted"
+        );
+        // (b) The re-armed state suppresses too.
+        o.reconcile_breaker();
+        while let Ok(plan) = rx.try_recv() {
+            perform_crossing(&plan, &deps, Utc::now()).await;
+        }
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "a re-armed sibling must not shadow the current-head approval; wrote {:?}",
+            tracker.add_label_calls()
+        );
+        assert!(
+            store
+                .load_breaker_crossings()
+                .expect("crossings")
+                .is_empty(),
+            "no crossing is persisted for an approved head"
+        );
+    }
+
+    /// An older SAME-head findings verdict must not defeat a NEWER approval at that head (PR #368
+    /// round 3, B3). Two reviewers complete different verdicts at the SAME current head, in order:
+    /// carol asks for changes (the fifth counted round), then alice approves — both at `sha`, neither
+    /// superseded. The most recent COMPLETED verdict at the head is alice's approval, so nothing
+    /// crosses and no `rhapsody:human` label is written. (The stricter all-reviewer merge gate may
+    /// still refuse to merge; the Rounds hold is not that gate.)
+    ///
+    /// Mutation: require EVERY head-scoped verdict to approve (`at_head_verdicts.iter().all(..)`)
+    /// and carol's older findings arm the hold again, writing the label.
+    #[tokio::test]
+    async fn a_newer_approval_at_head_beats_an_older_sibling_findings_verdict() {
+        let store = store();
+        for _ in 0..4 {
+            seed_review_round(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+            );
+        }
+        seed_watch_row(&store, "STUDIO-988", "alice", REVIEW_STATUS_REQUESTED);
+        seed_watch_row(&store, "STUDIO-988", "carol", REVIEW_STATUS_REQUESTED);
+        let mut o = orch(store.clone(), 5, &[]);
+        let config = o.teams.as_mut().expect("teams");
+        config.review.reviewers = 2;
+        config.roster.push(Identity {
+            name: "carol".into(),
+            ..Default::default()
+        });
+        observe_head(&mut o, "sha");
+        // Real production exits, in order: carol asks for changes at `sha` (the fifth counted
+        // round), then alice approves the SAME head.
+        let mut ended = Vec::new();
+        for (reviewer, last_state) in [
+            ("carol", crate::review::REVIEW_STATE_FINDINGS),
+            ("alice", crate::review::REVIEW_STATE_APPROVED),
+        ] {
+            let run = crate::review::ReviewRun {
+                owner: "makewhatis".into(),
+                repo: "rhapsody".into(),
+                number: 12,
+                reviewer: reviewer.into(),
+                head_sha: "sha".into(),
+                generation: 1,
+                introduced_by: "handoff:STUDIO-988".into(),
+                ..Default::default()
+            };
+            let id = store
+                .start_run(RunStart {
+                    issue_identifier: run.key(),
+                    started_at: "2026-09-20T00:04:00Z".into(),
+                    ..Default::default()
+                })
+                .expect("start review");
+            store
+                .mark_review_requested(&run.watch_key(), "sha")
+                .expect("dispatch review");
+            let re = crate::orchestrator::RunningEntry {
+                issue: rhapsody_core::Issue {
+                    id: run.key(),
+                    identifier: run.key(),
+                    ..Default::default()
+                },
+                run_id: id,
+                review: Some(run.clone()),
+                ..crate::testsupport::running_entry(
+                    rhapsody_core::Issue::default(),
+                    "rhapsody",
+                    "rhapsody",
+                )
+            };
+            o.on_review_exit(
+                &re,
+                &run,
+                &crate::retry::EvWorkerExit {
+                    declared_handoff: true,
+                    last_state: last_state.into(),
+                    issue_id: run.key(),
+                    started_at: Utc::now(),
+                    failed: false,
+                    err_msg: String::new(),
+                    review_verdict: None,
+                    verdict_text: None,
+                    refused: false,
+                    auth_needed: false,
+                },
+            );
+            ended.push(id);
+        }
+        // Both completions are at `sha`; alice's is the NEWER by completion order.
+        let carol_run = store.get_run(ended[0]).expect("get").expect("carol run");
+        let alice_run = store.get_run(ended[1]).expect("get").expect("alice run");
+        assert_eq!(carol_run.outcome, OUTCOME_COMPLETED);
+        assert_eq!(alice_run.outcome, OUTCOME_COMPLETED);
+        assert!(
+            alice_run.id > carol_run.id,
+            "alice's approving round completed after carol's findings round"
+        );
+        assert_eq!(
+            store
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            5,
+            "carol's findings is the fifth counted round"
+        );
+        let rows = store.load_live_review_watch().expect("rows");
+        assert!(rows.iter().any(|r| r.key.reviewer == "carol"
+            && r.status == REVIEW_STATUS_REVIEWED
+            && r.last_reviewed_sha == "sha"));
+        assert!(rows.iter().any(|r| r.key.reviewer == "alice"
+            && r.status == REVIEW_STATUS_APPROVED
+            && r.last_reviewed_sha == "sha"));
+        // A head advance at the SAME head leaves both terminal rows where they are.
+        let pr = crate::prstate::PrCoord::new("makewhatis", "rhapsody", 12);
+        o.handle_review_head_advanced(&pr, "sha", &[]);
+        let mut rx = o.open_breaker_channel();
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let hold_tracker = tracker.clone();
+        let deps = BreakerDeps {
+            hold: Some(Arc::new(TrackerHoldSink::new(move || {
+                Some(hold_tracker.clone() as Arc<dyn Tracker>)
+            }))),
+            room: None,
+            channels: Vec::new(),
+        };
+        o.reconcile_breaker();
+        while let Ok(plan) = rx.try_recv() {
+            perform_crossing(&plan, &deps, Utc::now()).await;
+        }
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "the newest completed CURRENT-head verdict approves, but an older sibling's findings \
+             wrote {:?}",
+            tracker.add_label_calls()
+        );
+        assert!(
+            store
+                .load_breaker_crossings()
+                .expect("crossings")
+                .is_empty(),
+            "no crossing is persisted for an approved head"
+        );
+    }
+
+    /// Completion ORDER within one wall-clock second (STUDIO-1440 round 4): two reviewers can
+    /// complete different verdicts at the SAME head inside a single second, and `ended_at` is
+    /// truncated to seconds while `runs.id` is allocated at run START — so the OLDER findings round
+    /// must not be named the newest completed verdict merely because its run started later. The
+    /// suppression ranks by the durable completion sequence, so the approval that COMPLETED last
+    /// wins and no `rhapsody:human` label is written.
+    ///
+    /// Mutation: order the ledger by `ended_at DESC, id DESC` instead of the completion sequence and
+    /// carol's older findings (higher start id) shadows alice's approval, writing the label.
+    #[tokio::test]
+    async fn a_same_second_completion_orders_by_completion_not_start() {
+        let store = store();
+        for _ in 0..4 {
+            seed_review_round(
+                &store,
+                "pr:makewhatis/rhapsody#12@alice",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
+            );
+        }
+        seed_watch_row(&store, "STUDIO-988", "alice", REVIEW_STATUS_REQUESTED);
+        seed_watch_row(&store, "STUDIO-988", "carol", REVIEW_STATUS_REQUESTED);
+        let mut o = orch(store.clone(), 5, &[]);
+        let config = o.teams.as_mut().expect("teams");
+        config.review.reviewers = 2;
+        config.roster.push(Identity {
+            name: "carol".into(),
+            ..Default::default()
+        });
+        observe_head(&mut o, "sha");
+        // Pin the clock so BOTH completions persist the SAME `ended_at` second — the case that used
+        // to fall through to start order.
+        o.now = Box::new(|| {
+            chrono::DateTime::from_timestamp(1_760_000_000, 0).expect("a fixed, in-range instant")
+        });
+        // Start ALICE first (lower run id), then CAROL.
+        let mut runs = Vec::new();
+        for reviewer in ["alice", "carol"] {
+            let run = crate::review::ReviewRun {
+                owner: "makewhatis".into(),
+                repo: "rhapsody".into(),
+                number: 12,
+                reviewer: reviewer.into(),
+                head_sha: "sha".into(),
+                generation: 1,
+                introduced_by: "handoff:STUDIO-988".into(),
+                ..Default::default()
+            };
+            let id = store
+                .start_run(RunStart {
+                    issue_identifier: run.key(),
+                    started_at: "2026-09-20T00:04:00Z".into(),
+                    ..Default::default()
+                })
+                .expect("start review");
+            store
+                .mark_review_requested(&run.watch_key(), "sha")
+                .expect("dispatch review");
+            runs.push((run, id));
+        }
+        // Complete CAROL (findings — the fifth counted round) FIRST, then ALICE (approval): the
+        // reverse of their start order, inside one second.
+        for (index, last_state) in [
+            (1usize, crate::review::REVIEW_STATE_FINDINGS),
+            (0usize, crate::review::REVIEW_STATE_APPROVED),
+        ] {
+            let (run, id) = runs[index].clone();
+            let re = crate::orchestrator::RunningEntry {
+                issue: rhapsody_core::Issue {
+                    id: run.key(),
+                    identifier: run.key(),
+                    ..Default::default()
+                },
+                run_id: id,
+                review: Some(run.clone()),
+                ..crate::testsupport::running_entry(
+                    rhapsody_core::Issue::default(),
+                    "rhapsody",
+                    "rhapsody",
+                )
+            };
+            o.on_review_exit(
+                &re,
+                &run,
+                &crate::retry::EvWorkerExit {
+                    declared_handoff: true,
+                    last_state: last_state.into(),
+                    issue_id: run.key(),
+                    started_at: Utc::now(),
+                    failed: false,
+                    err_msg: String::new(),
+                    review_verdict: None,
+                    verdict_text: None,
+                    refused: false,
+                    auth_needed: false,
+                },
+            );
+        }
+        let alice_run = store.get_run(runs[0].1).expect("get").expect("alice run");
+        let carol_run = store.get_run(runs[1].1).expect("get").expect("carol run");
+        assert!(
+            alice_run.id < carol_run.id,
+            "alice's approving round started first, so it carries the lower run id"
+        );
+        assert_eq!(
+            alice_run.ended_at, carol_run.ended_at,
+            "both rounds completed inside the same second"
+        );
+        assert_eq!(carol_run.outcome, OUTCOME_COMPLETED);
+        assert_eq!(alice_run.outcome, OUTCOME_COMPLETED);
+        assert_eq!(
+            store
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
+                .expect("count"),
+            5,
+            "carol's findings is the fifth counted round"
+        );
+        let rows = store.load_live_review_watch().expect("rows");
+        assert!(rows.iter().any(|r| r.key.reviewer == "carol"
+            && r.status == REVIEW_STATUS_REVIEWED
+            && r.last_reviewed_sha == "sha"));
+        assert!(rows.iter().any(|r| r.key.reviewer == "alice"
+            && r.status == REVIEW_STATUS_APPROVED
+            && r.last_reviewed_sha == "sha"));
+        let mut rx = o.open_breaker_channel();
+        let tracker = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let hold_tracker = tracker.clone();
+        let deps = BreakerDeps {
+            hold: Some(Arc::new(TrackerHoldSink::new(move || {
+                Some(hold_tracker.clone() as Arc<dyn Tracker>)
+            }))),
+            room: None,
+            channels: Vec::new(),
+        };
+        o.reconcile_breaker();
+        while let Ok(plan) = rx.try_recv() {
+            perform_crossing(&plan, &deps, Utc::now()).await;
+        }
+        assert!(
+            tracker.add_label_calls().is_empty(),
+            "the newest completed CURRENT-head verdict approves, but a same-second older sibling's \
+             findings wrote {:?}",
+            tracker.add_label_calls()
+        );
+        assert!(
+            store
+                .load_breaker_crossings()
+                .expect("crossings")
+                .is_empty(),
+            "no crossing is persisted for an approved head"
+        );
+    }
+
     #[tokio::test]
     async fn breaker_crossing_holds_with_lead_enabled() {
         let store = store();
         seed_watch(&store, "STUDIO-1123");
         for _ in 0..5 {
-            seed_run(
+            seed_review_round(
                 &store,
                 "pr:makewhatis/rhapsody#12@alice",
-                OUTCOME_COMPLETED,
-                10,
-                "",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
             );
         }
         let mut o = orch(store.clone(), 5, &[]);
@@ -1338,12 +2270,10 @@ mod tests {
         let store = store();
         seed_watch(&store, "STUDIO-1123");
         for _ in 0..5 {
-            seed_run(
+            seed_review_round(
                 &store,
                 "pr:makewhatis/rhapsody#12@alice",
-                OUTCOME_COMPLETED,
-                10,
-                "anthropic",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
             );
         }
         let mut o = orch(store.clone(), 5, &[("anthropic", 40)]);
@@ -1365,12 +2295,10 @@ mod tests {
         let path = std::path::PathBuf::from(dir.child("queue-failure.db"));
         let store: SharedStore = Arc::new(Sqlite::open(StorePath::Disk(path.clone())).unwrap());
         seed_watch(&store, "STUDIO-1156");
-        seed_run(
+        seed_review_round(
             &store,
             "pr:makewhatis/rhapsody#12@alice",
-            OUTCOME_COMPLETED,
-            10,
-            "",
+            REVIEW_VERDICT_CHANGES_REQUESTED,
         );
         let mut o = orch(store.clone(), 1, &[]);
         o.teams.as_mut().unwrap().manager.lead.enabled = true;
@@ -1394,12 +2322,10 @@ mod tests {
         let store = store();
         seed_watch(&store, "STUDIO-1123");
         for _ in 0..7 {
-            seed_run(
+            seed_review_round(
                 &store,
                 "pr:makewhatis/rhapsody#12@alice",
-                OUTCOME_COMPLETED,
-                10,
-                "",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
             );
         }
         let in_flight = store
@@ -1419,7 +2345,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .count_completed_review_runs("makewhatis", "rhapsody", 12)
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
                 .expect("rounds"),
             0
         );
@@ -1441,13 +2367,16 @@ mod tests {
                 },
             )
             .expect("complete after clear");
+        // A run that was in flight at clear and completes afterwards still counts, and it counts
+        // only once it carries a changes-requested verdict.
+        store
+            .set_review_verdict(in_flight, REVIEW_VERDICT_CHANGES_REQUESTED)
+            .expect("verdict");
         for _ in 0..3 {
-            seed_run(
+            seed_review_round(
                 &store,
                 "pr:makewhatis/rhapsody#12@alice",
-                OUTCOME_COMPLETED,
-                10,
-                "",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
             );
         }
         // Lifetime count is 11 here: the former next lifetime multiple must NOT hold.
@@ -1459,12 +2388,10 @@ mod tests {
         seed_run(&store, "pr:makewhatis/rhapsody#12@alice", "failed", 10, "");
         o.reconcile_breaker();
         assert!(rx.try_recv().is_err(), "failed reviews are not rounds");
-        seed_run(
+        seed_review_round(
             &store,
             "pr:makewhatis/rhapsody#12@alice",
-            OUTCOME_COMPLETED,
-            10,
-            "",
+            REVIEW_VERDICT_CHANGES_REQUESTED,
         );
         o.reconcile_breaker();
         assert_eq!(rx.try_recv().expect("new threshold").rounds, 5);
@@ -1478,7 +2405,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .count_completed_review_runs("makewhatis", "rhapsody", 12)
+                .count_changes_requested_review_runs("makewhatis", "rhapsody", 12)
                 .expect("rounds"),
             0
         );
@@ -1490,12 +2417,10 @@ mod tests {
         let store = store();
         seed_watch(&store, "STUDIO-988");
         for r in ["alice", "bob", "carol", "dan", "erin"] {
-            seed_run(
+            seed_review_round(
                 &store,
                 &format!("pr:makewhatis/rhapsody#12@{r}"),
-                OUTCOME_COMPLETED,
-                10,
-                "anthropic",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
             );
         }
         let mut o = orch(store.clone(), 5, &[]);
@@ -1526,12 +2451,10 @@ mod tests {
         let store = store();
         seed_watch(&store, "STUDIO-988");
         for r in ["alice", "bob", "carol", "dan", "erin"] {
-            seed_run(
+            seed_review_round(
                 &store,
                 &format!("pr:makewhatis/rhapsody#12@{r}"),
-                OUTCOME_COMPLETED,
-                10,
-                "anthropic",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
             );
         }
         let mut o = orch(store.clone(), 5, &[]);
@@ -1551,12 +2474,10 @@ mod tests {
         );
         // The NEXT multiple can notify again (round ten after five).
         for r in ["f", "g", "h", "i", "j"] {
-            seed_run(
+            seed_review_round(
                 &store,
                 &format!("pr:makewhatis/rhapsody#12@{r}"),
-                OUTCOME_COMPLETED,
-                10,
-                "anthropic",
+                REVIEW_VERDICT_CHANGES_REQUESTED,
             );
         }
         let planned = o2
@@ -1573,12 +2494,10 @@ mod tests {
         let store = store();
         seed_watch(&store, "STUDIO-988");
         seed_run(&store, "STUDIO-988", OUTCOME_COMPLETED, 40_000, "anthropic");
-        seed_run(
+        seed_review_round(
             &store,
             "pr:makewhatis/rhapsody#12@alice",
-            OUTCOME_COMPLETED,
-            10,
-            "anthropic",
+            REVIEW_VERDICT_CHANGES_REQUESTED,
         );
         let o = orch(store.clone(), 5, &[("anthropic", 30_000)]);
         let persisted = Vec::new();
@@ -1656,6 +2575,11 @@ mod tests {
         assert!(body.contains("makewhatis/rhapsody#218"), "{body}");
         assert!(body.contains("STUDIO-988"), "{body}");
         assert!(body.contains("**5**"), "names the rounds: {body}");
+        assert!(
+            body.contains("round(s) that asked for changes"),
+            "the Rounds line must name the counted rounds as changes-requested, not every \
+             completed review run: {body}"
+        );
         assert!(body.contains("14"), "names the attempts: {body}");
         assert!(body.contains("259.0M"), "names the spend: {body}");
     }
