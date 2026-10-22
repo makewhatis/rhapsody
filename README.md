@@ -34,6 +34,71 @@ expected failure as success. Do not enable this feature for ordinary test runs. 
 checkout-scoped test processes before testing and checks for new survivors on every job exit;
 it names and cleans up leaks while preserving pre-existing processes and other checkouts.
 
+## Upgrading from 0.3.6
+
+0.3.7 moves the store from schema 11 to 39. The migrations are additive, so a 0.3.6 binary still
+opens a 0.3.7 store. These are the behaviour changes a 0.3.6 installation will notice.
+
+1. **The account limit policy is on by default.** With no `limits:` block, a limited account is
+   warned at 80% of a window, stops taking new work at 90% and hands its work off at 95%, with
+   `credits: never` — on every window, including the 7-day one. A ticket the policy suspends keeps
+   its claim, so ordinary dispatch will not pick it up; it resumes from its recorded wait, or when
+   an operator presses Resume. To opt out, set all three thresholds to 100 and `credits: always`.
+   <!-- defaults: crates/config/src/limits.rs:44-93; per-window level: crates/orchestrator/src/limitpolicy.rs:90-99 -->
+
+2. **The write API is guarded.** Every mutating `/api/v1` route now requires
+   `X-Rhapsody-Operator: 1` and a `Host` of exactly `127.0.0.1:<port>` — the daemon's own bound
+   port, never `localhost`, a forwarding header or a tunnel's rewritten host. A cookie, a form
+   content type, or a CORS preflight is refused with `403 operator_write_forbidden`:
+
+   ```sh
+   curl -X POST http://127.0.0.1:$PORT/api/v1/refresh \
+     -H 'X-Rhapsody-Operator: 1' -H 'Content-Type: application/json' -d '{}'
+   ```
+
+   A dashboard opened at `http://localhost:<port>/` rather than `http://127.0.0.1:<port>/` can no
+   longer write. The desktop app and `rhapsodyd mcp` already send the header.
+   <!-- crates/httpapi/src/operator_guard.rs; README §"…guarded loopback writes…" -->
+
+3. **MCP `send_message` is scoped to the sender.** A worker's `symphony_send_message` reaches only
+   its own run (its `SYMPHONY_RUN_ID`); a call naming any other run is refused with
+   `message_run_forbidden`, and `teams_post` is the way to reach a teammate. The operator's own
+   `rhapsodyd mcp` has no `SYMPHONY_RUN_ID`, so it is not a worker and can still message any run,
+   with operator attribution.
+   <!-- crates/mcp/src/writes.rs:44-82 (STUDIO-1414; STUDIO-1470 restores the operator path) -->
+
+4. **Harness versions are checked.** A managed OpenCode must be **1.18.30** (the `serve --pure` HTTP
+   executor; `@ai-sdk/openai-compatible` 2.0.41); any other version, or one that cannot be read as a
+   single exact version, is refused with `unsupported_harness_version` rather than run or silently
+   downgraded. A Claude CLI must support `--include-partial-messages`; one that does not is refused
+   with a clear error instead of being run without partial-message liveness.
+   <!-- crates/agent/src/opencode/probe.rs:29-30,60-66,177-183 (never falls back) -->
+
+5. **An idle Claude usage probe reads the subscription's windows.** Rhapsody spends one cheap Haiku
+   turn, in its own empty directory, to learn a Claude subscription's rate-limit windows when it
+   needs them — at boot, and while Claude work is queued or limit-suspended — but never while a
+   Claude run is live, and never more often than `limits.claude_probe_interval_s` (default `600`
+   seconds). Set `limits.claude_probe_interval_s: 0` to turn it off.
+   <!-- crates/orchestrator/src/accounts.rs:400-427; crates/config/src/limits.rs:71,84 -->
+
+6. **Stall detection on macOS.** Where CPU sampling is unavailable (macOS has no `/proc`), a run
+   with no agent events and no open tool call for twice `claude.stall_timeout_ms` (default `300000`
+   ms) is stopped. Separately, `claude.result_grace_ms` (default `30000` ms) bounds how long the
+   runner waits after Claude's final `result` before it kills the CLI's process tree.
+   <!-- crates/config/src/decode.rs:224,56; README §"Bounded CPU-based stall liveness…" -->
+
+7. **Teams installs.** The manager's boot self-test runs one real model turn, off-loop, once the API
+   listener is up (and again whenever the CLI version changes). Under `review.mode: ticketless`, a
+   pull request from a run outside the team — a `rhapsody:solo` dispatch — is now reviewed by any
+   eligible roster reviewer, with no teammate author excluded. A profile naming a harness this build
+   cannot run is refused rather than falling back to another backend.
+   <!-- crates/orchestrator/src/managerselftest.rs:1-22,2109; reviewwatch solo PRs (STUDIO-1173); crates/orchestrator/src/worker.rs:2923 -->
+
+8. **Rollback is safe.** A 0.3.6 binary opens a 0.3.7 store and ignores the tables it does not know:
+   the migrations are additive, and the daemon applies only the steps between the store's recorded
+   schema version and its own.
+   <!-- crates/store/src/sqlite.rs:69,1119-1131 -->
+
 ## Features
 
 - **Opt-in [Landing](LANDING.md):** observe the merged application revision, watch repo-owned
