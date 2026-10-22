@@ -36,7 +36,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use rhapsody_agent as agent;
 use rhapsody_config::CLAIM_MODE_POOL;
-use rhapsody_core::Issue;
+use rhapsody_core::{Issue, normalize_state};
 use rhapsody_tracker::Tracker;
 use rhapsody_workspace::Manager;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -756,12 +756,14 @@ fn worker_deps_for(
     deps
 }
 
-/// What one [`Orchestrator::startup_cleanup`] pass did: how many terminal tickets it looked at and
-/// how many worktrees it actually removed (STUDIO-1465). The pass returns it so a test can pin the
-/// counts directly, and logs the same numbers as its one INFO summary line.
+/// What one [`Orchestrator::startup_cleanup`] pass did: how many worktrees it found on disk, how
+/// many of those whose ticket came back terminal, and how many it actually removed (STUDIO-1466).
+/// The pass returns it so a test can pin the counts directly, and logs the same numbers as its one
+/// INFO summary line.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct StartupCleanupSummary {
-    pub(crate) checked: usize,
+    pub(crate) worktrees: usize,
+    pub(crate) terminal: usize,
     pub(crate) removed: usize,
 }
 
@@ -2033,18 +2035,25 @@ impl Orchestrator {
 
     /// Removes workspaces for issues already in terminal states at startup (§8.6). Per-project when
     /// projects are resolved (each project's slug-bound tracker + its own terminal-state list);
-    /// single-project degenerates to today's behavior. Mirrors Go `startupCleanup`.
+    /// single-project degenerates to today's behavior. Mirrors Go `startupCleanup` in OUTCOME only
+    /// — the mechanism is inverted (STUDIO-1466, see the README Divergences entry).
     ///
-    /// STUDIO-1465: a terminal ticket with no workspace on disk is skipped entirely — `remove_worktree`
-    /// would no-op, but this pass runs over EVERY terminal ticket in the team (thousands on a mature
-    /// install, nearly all of them with no worktree), so it must not even build the removal call for
-    /// them. Returns the counts it logs as its one INFO summary line.
+    /// STUDIO-1466: the pass is driven by the worktrees ON DISK, not by Linear. For each project it
+    /// lists the worktrees that actually exist, maps each to its tracker id through the store's
+    /// `runs` ledger, and resolves every state in ONE batched `fetch_issue_states_by_ids` call per
+    /// project — plus a per-identifier `fetch_issue_by_identifier` for any worktree the store cannot
+    /// map (a store-off install, or a worktree with no run row). The reference instead asks Linear
+    /// for EVERY terminal ticket in the team (thousands on a mature install, ~25 paged requests to
+    /// find a handful of worktrees). A worktree is removed only when its ticket comes back in that
+    /// project's terminal states; a ticket the tracker does not return, or one in an active state,
+    /// is left alone — exactly the reference's "remove only what comes back terminal". Returns the
+    /// counts it logs as its one INFO summary line.
     async fn startup_cleanup(&self) -> StartupCleanupSummary {
         let started = std::time::Instant::now();
         let mut summary = StartupCleanupSummary::default();
         struct Group {
             tracker: Arc<dyn Tracker>,
-            terminal: Vec<String>,
+            terminal: std::collections::HashSet<String>,
             workspace: Arc<Manager>,
             repo: String,
             slug: String,
@@ -2058,7 +2067,13 @@ impl Orchestrator {
                     .iter()
                     .map(|p| Group {
                         tracker: Arc::clone(&p.tracker),
-                        terminal: p.mcfg.tracker.terminal_states.clone(),
+                        terminal: p
+                            .mcfg
+                            .tracker
+                            .terminal_states
+                            .iter()
+                            .map(|s| normalize_state(s))
+                            .collect(),
                         workspace: Arc::clone(&p.workspace),
                         repo: p.repo.clone(),
                         slug: p.slug.clone(),
@@ -2067,7 +2082,13 @@ impl Orchestrator {
             } else {
                 vec![Group {
                     tracker: Arc::clone(&eff.tracker),
-                    terminal: eff.cfg.tracker.terminal_states.clone(),
+                    terminal: eff
+                        .cfg
+                        .tracker
+                        .terminal_states
+                        .iter()
+                        .map(|s| normalize_state(s))
+                        .collect(),
                     workspace: Arc::clone(&eff.workspace),
                     repo: String::new(),
                     slug: String::new(),
@@ -2075,18 +2096,79 @@ impl Orchestrator {
             }
         };
         for g in groups {
-            let issues = match g.tracker.fetch_issues_by_states(&g.terminal).await {
-                Ok(i) => i,
+            // 1. The worktrees that actually exist on disk, one key each.
+            let keys = g.workspace.worktree_keys(&g.repo);
+            summary.worktrees += keys.len();
+            if keys.is_empty() {
+                continue;
+            }
+            // 2. Map each key to its tracker id from the store's `runs` ledger so the state read is
+            //    batched. The ledger records the identifier, not the sanitized directory key, so the
+            //    match is made on the key the worktree path is derived from. A store read that fails
+            //    (or a store that is off) leaves every key unmapped and takes the fallback below.
+            //
+            //    A review/manager/landing worktree is keyed by a synthetic `pr:…`/`lead:…` run key
+            //    that no tracker can resolve, so it is skipped rather than mapped: the reference's
+            //    by-state page never returned it either (no such issue exists), and sending the
+            //    non-UUID key in the batched id read would fail the whole request (STUDIO-831).
+            let mut by_key: HashMap<String, Option<String>> = HashMap::new();
+            match self.store.distinct_issue_ids(&g.slug) {
+                Ok(pairs) => {
+                    for (identifier, id) in pairs {
+                        let mapped = if crate::review::is_non_tracker_key(&identifier) {
+                            None
+                        } else {
+                            Some(id)
+                        };
+                        by_key
+                            .entry(rhapsody_workspace::sanitize_key(&identifier))
+                            .or_insert(mapped);
+                    }
+                }
                 Err(e) => {
-                    tracing::warn!(project_slug = %g.slug, err = %e, "startup terminal cleanup fetch failed; continuing");
+                    tracing::warn!(project_slug = %g.slug, err = %e, "startup terminal cleanup store read failed; falling back to per-identifier reads");
+                }
+            }
+            let mut ids: Vec<String> = Vec::new();
+            let mut unmapped: Vec<String> = Vec::new();
+            for key in &keys {
+                match by_key.get(key) {
+                    Some(Some(id)) => ids.push(id.clone()),
+                    Some(None) => {} // a review/manager/landing worktree: no tracker ticket to consult
+                    None => unmapped.push(key.clone()),
+                }
+            }
+            // 3. One batched state read per project, plus per-identifier reads for the stragglers.
+            let mut issues: Vec<Issue> = Vec::new();
+            let mut batch_ok = true;
+            if !ids.is_empty() {
+                match g.tracker.fetch_issue_states_by_ids(&ids).await {
+                    Ok(v) => issues.extend(v),
+                    Err(e) => {
+                        batch_ok = false;
+                        tracing::warn!(project_slug = %g.slug, err = %e, "startup terminal cleanup fetch failed; continuing");
+                    }
+                }
+            }
+            if batch_ok {
+                for identifier in unmapped {
+                    match g.tracker.fetch_issue_by_identifier(&identifier).await {
+                        Ok(Some(iss)) => issues.push(iss),
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(issue_identifier = %identifier, project_slug = %g.slug, err = %e, "startup terminal cleanup fetch failed; continuing")
+                        }
+                    }
+                }
+            }
+            // 4. Remove only the worktrees whose ticket came back terminal.
+            for iss in issues {
+                if !g.terminal.contains(&normalize_state(&iss.state)) {
                     continue;
                 }
-            };
-            for iss in issues {
-                summary.checked += 1;
-                // STUDIO-1465: only a ticket with a workspace on disk has anything to remove. Check
-                // the path first so a terminal ticket with no worktree costs one lstat, not a git
-                // command (and not the per-repo lock).
+                summary.terminal += 1;
+                // A worktree can vanish between the listing above and here; the guard keeps the
+                // removal (a no-op for a missing path) from being counted as a removal.
                 if g.workspace.worktree_exists(&g.repo, &iss.identifier) {
                     match g
                         .workspace
@@ -2105,7 +2187,8 @@ impl Orchestrator {
             }
         }
         tracing::info!(
-            checked = summary.checked,
+            worktrees = summary.worktrees,
+            terminal = summary.terminal,
             removed = summary.removed,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "startup terminal cleanup finished"
@@ -3374,24 +3457,54 @@ mod tests {
         }
     }
 
+    /// Seeds one `runs` row so the store can map a worktree's key back to its tracker id — the
+    /// ledger startup terminal cleanup reads (STUDIO-1466).
+    fn seed_run(o: &Orchestrator, identifier: &str, id: &str, project: &str) {
+        o.store()
+            .start_run(rhapsody_store::RunStart {
+                issue_id: id.to_string(),
+                issue_identifier: identifier.to_string(),
+                project_slug: project.to_string(),
+                ..Default::default()
+            })
+            .expect("seed run");
+    }
+
+    /// Creates a real commit in a fresh local repo at `dir` (the origin the worktree tests clone
+    /// from). Mirrors the `git_run` helper the manager-read tests use.
+    fn git_run(dir: &str, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     // Mirrors Go `reconcile_multi_test.go`'s `TestStartupCleanupMultiPerProject` (which exercises
     // `startupCleanup`, living in O7's `loop.go`): each project's slug-bound tracker + its own
-    // terminal-state list drive a per-project terminal-workspace cleanup.
+    // terminal-state list drive a per-project terminal-workspace cleanup. STUDIO-1466 keeps the
+    // per-project split but resolves each project's states in ONE batched by-id read instead of a
+    // by-state page.
     #[tokio::test(flavor = "multi_thread")]
     async fn startup_cleanup_multi_per_project() {
         use crate::testsupport::{
             TempDir, empty_resolved_project, mk_workspace, seed_opencode_session,
         };
         let mut fa = Fake::new();
-        fa.by_state = std::collections::HashMap::from([(
-            "done".to_string(),
-            vec![issue("a1", "A-1", "Done")],
-        )]);
+        fa.by_id =
+            std::collections::HashMap::from([("a1".to_string(), issue("a1", "A-1", "Done"))]);
         let mut fb = Fake::new();
-        fb.by_state = std::collections::HashMap::from([(
-            "shipped".to_string(),
-            vec![issue("b1", "B-1", "Shipped")],
-        )]);
+        fb.by_id =
+            std::collections::HashMap::from([("b1".to_string(), issue("b1", "B-1", "Shipped"))]);
         let tr_a = Arc::new(fa);
         let tr_b = Arc::new(fb);
         let dir_a = TempDir::new();
@@ -3401,6 +3514,11 @@ mod tests {
 
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.ctx = Some(CancelWait::default());
+        o.set_store(Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        ));
+        seed_run(&o, "A-1", "a1", "a");
+        seed_run(&o, "B-1", "b1", "b");
         // mcfg carries each project's terminal-state list (startup_cleanup reads it).
         let mut pa = empty_resolved_project("a", Arc::clone(&tr_a) as Arc<dyn Tracker>);
         pa.workspace = Arc::clone(&ws_a);
@@ -3442,43 +3560,29 @@ mod tests {
         assert!(!rec.exists(), "and its record removed");
         assert_eq!(
             tr_a.by_state_calls(),
-            1,
-            "project A tracker fetch_issues_by_states should be called once"
+            0,
+            "the reference's terminal-ticket page is never issued"
         );
         assert_eq!(
-            tr_b.by_state_calls(),
+            tr_a.by_id_calls(),
             1,
-            "project B tracker fetch_issues_by_states should be called once"
+            "project A resolves its worktrees in one batched by-id read"
+        );
+        assert_eq!(
+            tr_b.by_id_calls(),
+            1,
+            "project B resolves its worktrees in one batched by-id read"
         );
     }
 
-    /// Creates a real commit in a fresh local repo at `dir` (the origin the worktree tests clone
-    /// from). Mirrors the `git_run` helper the manager-read tests use.
-    fn git_run(dir: &str, args: &[&str]) {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .expect("git");
-        assert!(
-            out.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    // STUDIO-1465: the startup pass must not even CALL the remover for a terminal ticket with no
-    // worktree on disk — it walks the WHOLE team's terminal tickets (thousands on a mature install,
-    // nearly all of them without a worktree). Only the two tickets with a real worktree are removed.
+    // STUDIO-1466 acceptance: the pass is driven by the worktrees ON DISK, so a tracker holding 500
+    // terminal tickets costs ONE batched state read — the by-state page the reference would have
+    // paged is never issued. Exactly the worktrees whose ticket comes back terminal are removed.
     //
-    // MUTATION: drop the `worktree_exists` guard and `summary.removed` becomes 500 —
-    // `remove_worktree` no-ops with `Ok(())` for a missing path, so every call would count.
+    // MUTATION: restore the `fetch_issues_by_states` walk and `by_state_calls()` becomes 1 (and the
+    // by-id read disappears); drop the terminal-state filter and the active A-3 worktree is removed.
     #[tokio::test(flavor = "multi_thread")]
-    async fn startup_cleanup_removes_only_tickets_with_a_worktree() {
+    async fn startup_cleanup_walks_worktrees_and_batches_the_state_read() {
         use crate::testsupport::{TempDir, empty_resolved_project, issue};
 
         let origin = TempDir::new();
@@ -3487,11 +3591,18 @@ mod tests {
         git_run(&origin.path, &["add", "README.md"]);
         git_run(&origin.path, &["commit", "-m", "init"]);
 
-        let issues: Vec<Issue> = (0..500)
+        // 500 terminal tickets the reference would page for; the new pass must never ask for them.
+        let terminal_issues: Vec<Issue> = (0..500)
             .map(|n| issue(&format!("a{n}"), &format!("A-{n}"), "Done"))
             .collect();
         let mut tr = Fake::new();
-        tr.by_state = std::collections::HashMap::from([("done".to_string(), issues)]);
+        tr.by_state = std::collections::HashMap::from([("done".to_string(), terminal_issues)]);
+        // The three on-disk worktrees resolve by id: A-1 and A-2 terminal, A-3 active.
+        tr.by_id = std::collections::HashMap::from([
+            ("a1".to_string(), issue("a1", "A-1", "Done")),
+            ("a2".to_string(), issue("a2", "A-2", "Done")),
+            ("a3".to_string(), issue("a3", "A-3", "Todo")),
+        ]);
         let tr = Arc::new(tr);
 
         let dir = TempDir::new();
@@ -3504,9 +3615,14 @@ mod tests {
         eff.projects = vec![pa];
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.ctx = Some(CancelWait::default());
+        o.set_store(Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        ));
+        seed_run(&o, "A-1", "a1", "a");
+        seed_run(&o, "A-2", "a2", "a");
+        seed_run(&o, "A-3", "a3", "a");
         o.eff = Some(eff);
 
-        // Only A-1 and A-2 have a worktree; the other 498 terminal tickets have none.
         let w1 = ws
             .ensure_from_repo(&origin.path, "a", "A-1")
             .await
@@ -3515,36 +3631,92 @@ mod tests {
             .ensure_from_repo(&origin.path, "a", "A-2")
             .await
             .expect("provision A-2");
+        let w3 = ws
+            .ensure_from_repo(&origin.path, "a", "A-3")
+            .await
+            .expect("provision A-3");
 
         let summary = o.startup_cleanup().await;
 
-        assert_eq!(summary.checked, 500, "every terminal ticket is examined");
+        assert_eq!(summary.worktrees, 3, "three worktrees are on disk");
+        assert_eq!(summary.terminal, 2, "two of their tickets are terminal");
         assert_eq!(
             summary.removed, 2,
-            "only the two tickets with a real worktree are removed"
+            "exactly those two worktrees are removed"
         );
         assert!(
             std::fs::metadata(&w1.path).is_err(),
-            "the A-1 worktree must be removed"
+            "the terminal A-1 worktree must be removed"
         );
         assert!(
             std::fs::metadata(&w2.path).is_err(),
-            "the A-2 worktree must be removed"
+            "the terminal A-2 worktree must be removed"
+        );
+        assert!(
+            std::fs::metadata(&w3.path).is_ok(),
+            "the active A-3 worktree must survive"
+        );
+        assert_eq!(
+            tr.by_state_calls(),
+            0,
+            "the terminal-ticket page is never issued"
+        );
+        assert_eq!(
+            tr.by_id_calls(),
+            1,
+            "the state lookup is one batched call per project"
+        );
+        assert!(
+            tr.by_identifier_calls().is_empty(),
+            "every worktree mapped through the store, so no per-identifier read is needed"
         );
     }
 
-    // STUDIO-1465: the pass logs exactly one INFO summary line naming how many terminal tickets it
-    // checked, how many worktrees it removed and how long it took.
-    #[tokio::test]
-    async fn startup_cleanup_logs_a_summary() {
-        use crate::testsupport::{TempDir, empty_resolved_project, issue, recording_subscriber};
+    // STUDIO-1466 acceptance: a worktree whose ticket the tracker does NOT return is left alone —
+    // the pass removes only what comes back terminal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_cleanup_leaves_a_worktree_whose_ticket_is_not_returned() {
+        use crate::testsupport::{TempDir, empty_resolved_project};
 
-        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let tr = Arc::new(Fake::new()); // by_id empty: the store's id resolves to nothing
+        let dir = TempDir::new();
+        let ws = crate::testsupport::mk_workspace(&dir.path);
+        let mut pa = empty_resolved_project("a", Arc::clone(&tr) as Arc<dyn Tracker>);
+        pa.workspace = Arc::clone(&ws);
+        pa.mcfg.tracker.terminal_states = vec!["Done".to_string()];
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        eff.projects = vec![pa];
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        ));
+        seed_run(&o, "A-1", "a1", "a");
+        o.eff = Some(eff);
+
+        std::fs::create_dir_all(dir.child("A-1")).unwrap();
+        let summary = o.startup_cleanup().await;
+
+        assert_eq!(summary.worktrees, 1, "the one worktree is found");
+        assert_eq!(
+            summary.terminal, 0,
+            "its ticket is not returned, so it is not terminal"
+        );
+        assert_eq!(summary.removed, 0, "nothing is removed");
+        assert!(
+            std::fs::metadata(dir.child("A-1")).is_ok(),
+            "the worktree must survive a ticket the tracker does not return"
+        );
+    }
+
+    // STUDIO-1466 acceptance: a worktree whose ticket is in an ACTIVE state is left alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_cleanup_leaves_a_worktree_whose_ticket_is_active() {
+        use crate::testsupport::{TempDir, empty_resolved_project, issue};
 
         let mut tr = Fake::new();
-        tr.by_state = std::collections::HashMap::from([(
-            "done".to_string(),
-            vec![issue("a1", "A-1", "Done"), issue("a2", "A-2", "Done")],
+        tr.by_id = std::collections::HashMap::from([(
+            "a1".to_string(),
+            issue("a1", "A-1", "In Progress"),
         )]);
         let tr = Arc::new(tr);
         let dir = TempDir::new();
@@ -3555,8 +3727,90 @@ mod tests {
         let mut eff = empty_effective(Arc::new(Fake::new()));
         eff.projects = vec![pa];
         let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        ));
+        seed_run(&o, "A-1", "a1", "a");
         o.eff = Some(eff);
-        // Only A-1 has a legacy workspace on disk, so it is the one removal.
+
+        std::fs::create_dir_all(dir.child("A-1")).unwrap();
+        let summary = o.startup_cleanup().await;
+
+        assert_eq!(summary.worktrees, 1, "the one worktree is found");
+        assert_eq!(summary.terminal, 0, "an active ticket is not terminal");
+        assert_eq!(summary.removed, 0, "nothing is removed");
+        assert!(
+            std::fs::metadata(dir.child("A-1")).is_ok(),
+            "the worktree of an active ticket must survive"
+        );
+        assert_eq!(tr.by_id_calls(), 1, "the batched read still happens");
+    }
+
+    // STUDIO-1466: a ticketless review worktree is keyed by a synthetic `pr:…` run key that no
+    // tracker can resolve. It must never reach the batched id read (a non-UUID key fails the WHOLE
+    // Linear request, STUDIO-831) nor a per-identifier read, and it must be left alone — exactly as
+    // the reference's by-state page, which could never return it, left it alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_cleanup_skips_a_review_worktree() {
+        use crate::testsupport::{TempDir, empty_resolved_project};
+
+        let tr = Arc::new(Fake::new());
+        let dir = TempDir::new();
+        let ws = crate::testsupport::mk_workspace(&dir.path);
+        let mut pa = empty_resolved_project("a", Arc::clone(&tr) as Arc<dyn Tracker>);
+        pa.workspace = Arc::clone(&ws);
+        pa.mcfg.tracker.terminal_states = vec!["Done".to_string()];
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        eff.projects = vec![pa];
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.set_store(Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        ));
+        // A review run's id IS its key; the store would map the worktree key straight to it.
+        seed_run(&o, "pr:o/r#7@alice", "pr:o/r#7@alice", "a");
+        o.eff = Some(eff);
+
+        let leaf = dir.child(&rhapsody_workspace::sanitize_key("pr:o/r#7@alice"));
+        std::fs::create_dir_all(&leaf).unwrap();
+        let summary = o.startup_cleanup().await;
+
+        assert_eq!(summary.worktrees, 1, "the review worktree is found on disk");
+        assert_eq!(summary.terminal, 0, "it names no tracker ticket");
+        assert_eq!(summary.removed, 0, "so it is never removed");
+        assert!(
+            std::fs::metadata(&leaf).is_ok(),
+            "the review worktree must survive startup cleanup"
+        );
+        assert_eq!(tr.by_id_calls(), 0, "the review key is never batched");
+        assert!(
+            tr.by_identifier_calls().is_empty(),
+            "and never read per-identifier either"
+        );
+    }
+
+    // STUDIO-1466: the pass logs exactly one INFO summary line naming how many worktrees it found,
+    // how many of their tickets were terminal, how many it removed and how long it took.
+    #[tokio::test]
+    async fn startup_cleanup_logs_a_summary() {
+        use crate::testsupport::{TempDir, empty_resolved_project, issue, recording_subscriber};
+
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+
+        let mut tr = Fake::new();
+        tr.by_identifier =
+            std::collections::HashMap::from([("A-1".to_string(), issue("a1", "A-1", "Done"))]);
+        let tr = Arc::new(tr);
+        let dir = TempDir::new();
+        let ws = crate::testsupport::mk_workspace(&dir.path);
+        let mut pa = empty_resolved_project("a", Arc::clone(&tr) as Arc<dyn Tracker>);
+        pa.workspace = Arc::clone(&ws);
+        pa.mcfg.tracker.terminal_states = vec!["Done".to_string()];
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        eff.projects = vec![pa];
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        // Only A-1 has a legacy workspace on disk, so it is the one removal. With no store injected
+        // the key is unmapped and resolved by the per-identifier fallback read.
         std::fs::create_dir_all(dir.child("A-1")).unwrap();
 
         let (events, subscriber) = recording_subscriber();
@@ -3566,9 +3820,9 @@ mod tests {
         drop(guard);
 
         assert_eq!(
-            (summary.checked, summary.removed),
-            (2, 1),
-            "the summary counts every terminal ticket checked and every worktree removed"
+            (summary.worktrees, summary.terminal, summary.removed),
+            (1, 1, 1),
+            "one worktree found, its ticket terminal, and it was removed"
         );
         let events = events
             .lock()
@@ -3578,7 +3832,8 @@ mod tests {
             .find(|e| e.message == "startup terminal cleanup finished")
             .expect("the one startup cleanup summary line must be logged");
         assert_eq!(line.level, "INFO");
-        assert_eq!(line.fields.get("checked").map(String::as_str), Some("2"));
+        assert_eq!(line.fields.get("worktrees").map(String::as_str), Some("1"));
+        assert_eq!(line.fields.get("terminal").map(String::as_str), Some("1"));
         assert_eq!(line.fields.get("removed").map(String::as_str), Some("1"));
         assert!(
             line.fields.contains_key("elapsed_ms"),

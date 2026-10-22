@@ -261,6 +261,9 @@ impl Store for Noop {
     ) -> Result<Vec<RunSummary>, StoreError> {
         Ok(Vec::new())
     }
+    fn distinct_issue_ids(&self, _project: &str) -> Result<Vec<(String, String)>, StoreError> {
+        Ok(Vec::new())
+    }
     fn get_run(&self, _run_id: i64) -> Result<Option<RunSummary>, StoreError> {
         Ok(None)
     }

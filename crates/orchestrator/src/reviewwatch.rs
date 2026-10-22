@@ -5069,6 +5069,13 @@ mod tests {
     struct FailingLiveWatchStore(rs::Noop);
 
     impl rs::Store for FailingLiveWatchStore {
+        fn distinct_issue_ids(
+            &self,
+            project: &str,
+        ) -> Result<Vec<(String, String)>, rs::StoreError> {
+            self.0.distinct_issue_ids(project)
+        }
+
         fn save_manager_intervention(
             &self,
             row: rs::ManagerInterventionRow,

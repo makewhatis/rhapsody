@@ -2574,6 +2574,13 @@ mod tests {
     struct UnreadableEvents(Arc<dyn rhapsody_store::Store + Send + Sync>);
 
     impl rhapsody_store::Store for UnreadableEvents {
+        fn distinct_issue_ids(
+            &self,
+            project: &str,
+        ) -> Result<Vec<(String, String)>, rhapsody_store::StoreError> {
+            self.0.distinct_issue_ids(project)
+        }
+
         fn save_manager_intervention(
             &self,
             row: rhapsody_store::ManagerInterventionRow,

@@ -2715,6 +2715,36 @@ impl Store for Sqlite {
         self.query_runs(&q, args)
     }
 
+    fn distinct_issue_ids(&self, project: &str) -> Result<Vec<(String, String)>, StoreError> {
+        let conn = self.lock();
+        // One row per identifier: a ticket's runs all carry the same issue_id, so MAX() collapses
+        // the duplicates (and picks a stable value if a stale row ever disagreed).
+        let (q, args): (&str, Vec<Value>) = if project.is_empty() {
+            (
+                "SELECT issue_identifier, MAX(issue_id) FROM runs \
+                  WHERE issue_identifier <> '' AND issue_id <> '' \
+                  GROUP BY issue_identifier",
+                Vec::new(),
+            )
+        } else {
+            (
+                "SELECT issue_identifier, MAX(issue_id) FROM runs \
+                  WHERE issue_identifier <> '' AND issue_id <> '' AND project_slug = ?1 \
+                  GROUP BY issue_identifier",
+                vec![Value::Text(project.to_string())],
+            )
+        };
+        let mut stmt = conn.prepare(q)?;
+        let rows = stmt.query_map(params_from_iter(args), |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     fn get_run(&self, run_id: i64) -> Result<Option<RunSummary>, StoreError> {
         let q = format!("SELECT {RUN_COLS} FROM runs WHERE id = ?");
         let mut runs = self.query_runs(&q, vec![Value::Integer(run_id)])?;
@@ -7676,6 +7706,59 @@ mod tests {
         assert!(
             st.runs_for_issues(&[], 0).expect("empty set").is_empty(),
             "an empty set is an empty answer",
+        );
+    }
+
+    // STUDIO-1466: the distinct (identifier, id) ledger startup cleanup maps worktrees through. One
+    // pair per identifier even across several runs, scoped by project when one is given, and rows
+    // that name no ticket (empty identifier or id) are skipped.
+    #[test]
+    fn distinct_issue_ids_collapses_runs_and_scopes_by_project() {
+        let st = open_mem();
+        for (ident, id, project) in [
+            ("A-1", "id-a1", "a"),
+            ("A-1", "id-a1", "a"), // a second run of the same ticket: still one pair
+            ("A-2", "id-a2", "a"),
+            ("B-1", "id-b1", "b"),
+            ("", "id-orphan", "a"), // unattributed: skipped
+            ("A-9", "", "a"),       // no id: skipped
+        ] {
+            st.start_run(RunStart {
+                issue_identifier: ident.into(),
+                issue_id: id.into(),
+                project_slug: project.into(),
+                ..Default::default()
+            })
+            .expect("start run");
+        }
+
+        let mut all = st.distinct_issue_ids("").expect("all projects");
+        all.sort();
+        assert_eq!(
+            all,
+            vec![
+                ("A-1".to_string(), "id-a1".to_string()),
+                ("A-2".to_string(), "id-a2".to_string()),
+                ("B-1".to_string(), "id-b1".to_string()),
+            ],
+            "one pair per identifier, empty halves skipped, no project filter"
+        );
+
+        let mut project_a = st.distinct_issue_ids("a").expect("project a");
+        project_a.sort();
+        assert_eq!(
+            project_a,
+            vec![
+                ("A-1".to_string(), "id-a1".to_string()),
+                ("A-2".to_string(), "id-a2".to_string()),
+            ],
+            "a non-empty project matches runs.project_slug exactly"
+        );
+        assert!(
+            st.distinct_issue_ids("missing")
+                .expect("unknown")
+                .is_empty(),
+            "a project with no runs maps nothing"
         );
     }
 

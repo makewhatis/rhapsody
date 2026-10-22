@@ -148,7 +148,7 @@ impl Manager {
     /// Returns the set of RepoKeys that currently have a bare mirror under `<root>/.mirrors` (the
     /// `<key>.git` leaf, with the suffix stripped). A missing `.mirrors` dir yields the empty set, so
     /// every top-level dir is then classified as a legacy worktree (mirror of `mirrorKeySet`).
-    fn mirror_key_set(&self) -> HashSet<String> {
+    pub(crate) fn mirror_key_set(&self) -> HashSet<String> {
         let mut out = HashSet::new();
         let dir = join(&[&self.root, MIRRORS_DIR_NAME]);
         let rd = match std::fs::read_dir(&dir) {

@@ -913,6 +913,52 @@ impl Manager {
         std::fs::symlink_metadata(&path).is_ok()
     }
 
+    /// Lists the sanitized keys of every per-issue worktree present on disk for `repo_url`, in
+    /// arbitrary order, without touching git or taking the per-repo lock. `repo_url == ""` lists the
+    /// legacy one-level worktrees (`<root>/<key>`, skipping the reserved `.mirrors` store and any
+    /// repo-namespace parent — the same leaf classification [`Manager::prune_stale_worktrees`] uses);
+    /// otherwise it lists the children of the repo's namespace dir (`<root>/<RepoKey(repo_url)>/<key>`).
+    /// A key round-trips through [`Self::worktree_exists`] / [`Self::remove_worktree`].
+    ///
+    /// Rhapsody-only (STUDIO-1466): startup terminal cleanup walks these instead of paging every
+    /// terminal ticket out of Linear, so the pass costs one directory read rather than one API page
+    /// per thousand Done tickets.
+    pub fn worktree_keys(&self, repo_url: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        if repo_url.is_empty() {
+            let mirror_keys = self.mirror_key_set();
+            let Ok(rd) = std::fs::read_dir(&self.root) else {
+                return out;
+            };
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name == MIRRORS_DIR_NAME || !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    continue;
+                }
+                // Skip a repo-namespace parent (worktree or clone mode): its children are the
+                // worktrees, not it. Mirrors gc.rs's INF-418 leaf/parent split.
+                if mirror_keys.contains(&name)
+                    || (looks_like_repo_key(&name)
+                        && !dir_is_git_checkout(&join(&[&self.root, &name])))
+                {
+                    continue;
+                }
+                out.push(name);
+            }
+            return out;
+        }
+        let repo_dir = join(&[&self.root, &repo_key(repo_url)]);
+        let Ok(rd) = std::fs::read_dir(&repo_dir) else {
+            return out;
+        };
+        for e in rd.flatten() {
+            if e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                out.push(e.file_name().to_string_lossy().into_owned());
+            }
+        }
+        out
+    }
+
     /// Terminal cleanup of a repo-backed worktree. `repo_url == ""` delegates to the legacy
     /// [`Manager::remove`]. Otherwise it runs best-effort before_remove (logged+ignored), then
     /// `git worktree remove --force` + `git worktree prune` on the mirror, serialized by the
@@ -1701,6 +1747,43 @@ mod tests {
 
         // The reserved mirror dir is never a worktree (the removal path rejects it too).
         assert!(!m.worktree_exists("", ".mirrors"));
+    }
+
+    // STUDIO-1466: the listing startup terminal cleanup walks. It must name exactly the per-issue
+    // worktree directories each removal path addresses — no `.mirrors`, no repo-namespace parent,
+    // nothing from the other mode — so the cleanup never reports a worktree it cannot remove.
+    #[test]
+    fn worktree_keys_lists_the_worktree_dirs_for_each_mode() {
+        let origin = init_local_origin();
+        let (m, root) = repo_test_manager(HookScripts::default());
+
+        // Legacy (empty repo_url): top-level worktree dirs only.
+        std::fs::create_dir_all(join(&[&root.path, "MT-1"])).unwrap();
+        std::fs::create_dir_all(join(&[&root.path, "MT-2"])).unwrap();
+        // The reserved mirror store is never a worktree.
+        std::fs::create_dir_all(join(&[&root.path, ".mirrors"])).unwrap();
+        let legacy = m.worktree_keys("");
+        assert!(legacy.contains(&"MT-1".to_string()) && legacy.contains(&"MT-2".to_string()));
+        assert!(
+            !legacy.contains(&MIRRORS_DIR_NAME.to_string()),
+            "the reserved mirror store is never a worktree"
+        );
+
+        // Repo-backed: the children of <root>/<RepoKey>, files and the legacy dirs excluded.
+        let repo_dir = join(&[&root.path, &repo_key(&origin.path)]);
+        std::fs::create_dir_all(join(&[&repo_dir, &sanitize_key("MT-3")])).unwrap();
+        std::fs::create_dir_all(join(&[&repo_dir, &sanitize_key("MT-4")])).unwrap();
+        std::fs::write(join(&[&repo_dir, "notes.txt"]), "x").unwrap();
+        let mut backed = m.worktree_keys(&origin.path);
+        backed.sort();
+        assert_eq!(backed, vec!["MT-3".to_string(), "MT-4".to_string()]);
+
+        // The two modes never report each other's dirs.
+        assert!(!m.worktree_keys("").contains(&"MT-3".to_string()));
+        assert!(!m.worktree_keys(&origin.path).contains(&"MT-1".to_string()));
+
+        // A repo with no namespace dir yet is an empty listing, not a panic.
+        assert!(m.worktree_keys("https://example.com/absent.git").is_empty());
     }
 
     // Mirror of TestRemoveWorktree_RejectsSymlinkWorktree.
