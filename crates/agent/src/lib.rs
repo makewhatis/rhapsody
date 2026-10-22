@@ -22,6 +22,7 @@ pub mod claude;
 pub mod dispatch;
 pub mod fake;
 pub mod harness;
+pub mod harness_version;
 pub mod humanize;
 pub mod lander;
 pub mod manager;

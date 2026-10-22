@@ -214,23 +214,64 @@ pub fn probe_with_timeout(
 /// final drain cannot reach EOF, and [`ProbeError::DescendantHeldStdout`] refuses the command
 /// rather than accepting a version from a wrapper the probe could not contain (§9.1).
 fn run_bounded(command: &str, timeout: Duration) -> Result<String, ProbeError> {
-    let mut child = Command::new(command)
+    run_bounded_env(command, &[], EnvPolicy::AllowList, timeout)
+}
+
+/// Runs `name args --version` bounded in bytes and by a process-tree timeout, returning its stdout.
+/// Shared by the managed-OpenCode probe (the allow-listed environment, §9.1) and the pre-dispatch
+/// CLI version gate (STUDIO-1468), which probes a configured command that may carry base arguments
+/// (`npx opencode`) and must resolve the CLI on the daemon's own `PATH`.
+pub(crate) fn run_version(
+    name: &str,
+    args: &[String],
+    timeout: Duration,
+) -> Result<String, ProbeError> {
+    run_bounded_env(name, args, EnvPolicy::Inherit, timeout)
+}
+
+/// Which environment the version child runs with. `AllowList` is the hostile `env_clear` + minimal
+/// allow-list the managed-OpenCode probe requires (§9.1); `Inherit` keeps the daemon's environment
+/// so a configured command (`claude`, `opencode`, `npx opencode`) resolves on the real `PATH`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvPolicy {
+    AllowList,
+    Inherit,
+}
+
+fn run_bounded_env(
+    name: &str,
+    args: &[String],
+    env: EnvPolicy,
+    timeout: Duration,
+) -> Result<String, ProbeError> {
+    let mut command = Command::new(name);
+    command
+        .args(args)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .env_clear()
-        .envs(probe_env())
         // The probe runs OUTSIDE the target worktree (§9.1); a neutral cwd keeps a configured
         // wrapper from discovering a project even though `--version` never reads one itself.
         .current_dir("/")
         // Its own process group, so the tree kill catches anything the probe spawned — the same
         // shape the agent runners use before arming `proctree::kill_tree`.
-        .process_group(0)
-        .spawn()
-        .map_err(|e| ProbeError::Spawn {
-            message: e.to_string(),
-        })?;
+        .process_group(0);
+    if env == EnvPolicy::AllowList {
+        command.env_clear().envs(probe_env());
+    } else {
+        // Inherited for PATH resolution, but the runner's own scrub set is still removed: a version
+        // probe has no business carrying the tracker credential or a metered-API key into a child.
+        for name in crate::claude::TRACKER_ENV_VARS
+            .iter()
+            .chain(crate::claude::BILLING_ENV_VARS)
+        {
+            command.env_remove(name);
+        }
+    }
+    let mut child = command.spawn().map_err(|e| ProbeError::Spawn {
+        message: e.to_string(),
+    })?;
 
     let pid = child.id();
     // Every return AFTER the spawn must contain the child; a failure to set up the read would

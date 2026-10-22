@@ -508,6 +508,13 @@ impl Harness for Runner {
         &CAPABILITIES
     }
 
+    /// The configured `opencode` command (default `"opencode"`), the subject of the pre-dispatch CLI
+    /// version gate (STUDIO-1468): every mode drives the pinned 1.18.30 HTTP API, not only the
+    /// brokered path that already probes it.
+    fn cli_command(&self) -> Option<String> {
+        Some(self.cfg.command.clone())
+    }
+
     /// The manager uses the ordinary stream runner with a separate, daemon-controlled posture.
     /// Its credential can never refresh, retry from a copy, or survive the run for resume.
     fn start_manager_session(
@@ -3419,6 +3426,20 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
             err.is_some(),
             "a workspace outside the root must be refused"
         );
+    }
+
+    /// STUDIO-1468 (review B1): the gate is only live because the REAL opencode runner exposes its
+    /// configured command to it. The acceptance tests in `rhapsody-orchestrator` drive the stand-in
+    /// `agentfake::Fake` with the command injected by hand, so before this test they never touched
+    /// this wiring — returning `None` here left the whole workspace green while the gate went inert
+    /// in production. MUTATION: return `None` here and this test reds.
+    #[test]
+    fn opencode_runner_exposes_its_configured_command_to_the_version_gate() {
+        let r = Runner::new(Config {
+            command: "my-opencode".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(r.cli_command().as_deref(), Some("my-opencode"));
     }
 
     /// CAPABILITY HONESTY (design §8; the ticket's mutation discipline). Every declared capability

@@ -213,6 +213,13 @@ impl Harness for Runner {
         &CAPABILITIES
     }
 
+    /// The configured `claude` command (default `"claude"`), the subject of the pre-dispatch CLI
+    /// version gate (STUDIO-1468): this build adds `--include-partial-messages` to every turn, which
+    /// only a CLI at or above [`crate::harness_version::MIN_CLAUDE_VERSION`] accepts.
+    fn cli_command(&self) -> Option<String> {
+        Some(self.cfg.command.clone())
+    }
+
     /// The manager run's isolated launch (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3):
     /// a session whose every security-relevant flag is the [`crate::manager::manager_config`]
     /// posture — `--permission-mode default`, the manager MCP tools as the only allowlist, every
@@ -3356,6 +3363,20 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"complete-sessi
         );
         assert_eq!(caps.tool_naming, ToolNaming::McpDoubleUnderscore);
         assert_eq!(caps.stdin, StdinPolicy::HeldOpen);
+    }
+
+    /// STUDIO-1468 (review B1): the gate is only live because the REAL claude runner exposes its
+    /// configured command to it. The acceptance tests in `rhapsody-orchestrator` drive the stand-in
+    /// `agentfake::Fake` with the command injected by hand, so before this test they never touched
+    /// this wiring — returning `None` here left the whole workspace green while the gate went inert
+    /// in production. MUTATION: return `None` here and this test reds.
+    #[test]
+    fn claude_runner_exposes_its_configured_command_to_the_version_gate() {
+        let r = Runner::new(Config {
+            command: "my-claude".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(r.cli_command().as_deref(), Some("my-claude"));
     }
 
     /// CAPABILITY HONESTY (design §8; the ticket's mutation discipline: "flip an adapter declaration

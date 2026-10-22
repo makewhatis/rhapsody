@@ -48,6 +48,15 @@
 #
 set -u
 
+# CLI version probe (STUDIO-1468): the daemon's pre-dispatch version gate runs `<command>
+# --version` before any turn. A real claude answers with its version; answer the same way and
+# exit BEFORE the stdin drain, the FAKE_CLAUDE_ESCAPE child, or any JSONL, so the gate reads a
+# supported version and leaves no side effects.
+if [ "${1:-}" = "--version" ]; then
+	printf '2.1.307 (Claude Code)\n'
+	exit 0
+fi
+
 # Bare print-mode probe (BO-59 credential-liveness check): `-p '<prompt>'` with the prompt
 # as `-p`'s own argument, never `--output-format`. Answer directly and exit before touching
 # any of the turn-execution/JSONL machinery below — a probe never sends stdin and never
