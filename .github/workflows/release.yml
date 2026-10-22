@@ -14,8 +14,11 @@ on:
     branches: [main]
   # Manual dry-run (RD2 acceptance): point `tag` at an existing draft/prerelease and this builds,
   # signs, notarizes, spctl-verifies, and uploads the installer assets to that Release — no need to
-  # wait for a real release-PR merge. release-please stays a no-op on this event (it only cuts a
-  # release when a release-PR merge lands on main), so the build job keys off the `tag` input here.
+  # wait for a real release-PR merge. The `Run release-please` step is event-gated to `push`
+  # (STUDIO-1483), so on this event release-please does not run at all: it cannot page through
+  # GitHub's merge-commit history and fail the job, which is what took the rc.31 build down with it.
+  # The job itself still runs and succeeds (its only steps are that one and a push-only reporter), so
+  # `needs` stays satisfied and the build job keys off the `tag` input here.
   workflow_dispatch:
     inputs:
       tag:
@@ -48,7 +51,14 @@ jobs:
       release_created: ${{ steps.release.outputs.release_created }}
       tag_name: ${{ steps.release.outputs.tag_name }}
     steps:
+      # STUDIO-1483: event-gate the ACTION to `push`. release-please's GraphQL query pages through
+      # merge commits back to the previous release (~17 pages here), and GitHub's endpoint failed
+      # ~30% of those requests on 2026-10-22 — a dispatch only needs the build, so paying for (and
+      # risking) that query on `workflow_dispatch` skipped the rc.31 build. Gating the STEP (not the
+      # job) leaves the job green with `release_created` empty, so `build`'s `needs` stays satisfied
+      # and its `workflow_dispatch` arm still fires.
       - name: Run release-please
+        if: ${{ github.event_name == 'push' }}
         id: release
         uses: googleapis/release-please-action@v4
         with:
@@ -107,8 +117,9 @@ jobs:
     name: Signed dmg build & release upload
     needs: release-please
     # Real path: release-please created a release this run. Dry-run path: a human dispatched the
-    # workflow with a `tag` input. release-please always *runs* (never event-gated, so never skipped),
-    # which keeps `needs` satisfied and lets this be a plain condition — no always()/status gymnastics.
+    # workflow with a `tag` input. release-please's `Run release-please` step is event-gated to
+    # `push` (STUDIO-1483), but its job still runs and succeeds on a dispatch, so `needs` is
+    # satisfied and this stays a plain condition — no always()/status gymnastics.
     if: ${{ needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: [self-hosted, macOS, ARM64]
     steps:
