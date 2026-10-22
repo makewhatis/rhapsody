@@ -781,6 +781,34 @@ impl Orchestrator {
             .unwrap_or_default()
     }
 
+    /// Whether the profile an identity wears can dispatch the `claude` harness — as its primary
+    /// harness or through one of its ordered fallback engines (STUDIO-1469 review).
+    ///
+    /// [`identity_harness`](Orchestrator::identity_harness) answers only the primary, but the
+    /// fallbacks are real dispatch paths: `limitpolicy::engine_list` appends them and the limit
+    /// gate can select one, so a sole-Claude fallback must keep the usage probe on. An
+    /// unreadable profile resolves to no Claude path, exactly as the primary-only read does.
+    fn identity_profile_uses_claude(&self, teams: &Teams, identity: &str) -> bool {
+        let profile = teams
+            .roster
+            .iter()
+            .find(|i| i.name == identity)
+            .map(|i| i.profile.clone())
+            .unwrap_or_default();
+        if profile.is_empty() {
+            return false;
+        }
+        let Some(dir) = self.teams_profiles_dir.as_ref() else {
+            return false;
+        };
+        rhapsody_config::profiles::resolve(dir, &profile)
+            .map(|p| {
+                self.effective_harness(&p.harness) == "claude"
+                    || p.fallback.iter().any(|engine| engine.harness == "claude")
+            })
+            .unwrap_or(false)
+    }
+
     /// The configured `agent.backend` — what a run with no harness of its own actually uses, and
     /// the harness the legacy bare-scalar `review.model`/`review.effort` belongs to (STUDIO-908).
     pub(crate) fn configured_backend(&self) -> String {
@@ -794,7 +822,8 @@ impl Orchestrator {
     /// The idle Claude subscription usage probe spends a real Haiku turn and warns when it fails,
     /// so an installation that never dispatches Claude work must not run it. Every place a harness
     /// is configured is consulted: the installation-wide and per-project `agent.backend`; every
-    /// roster identity's own `harness` and the harness its profile names; the manager's one-shot
+    /// roster identity's own `harness` and the harnesses its profile names, primary and
+    /// fallback; the manager's one-shot
     /// harness and its manager-run harness list; and the harnesses `review.model` /
     /// `review.provider` / `review.effort` are scoped to. Any one of them resolving to `claude`
     /// keeps the probe on; with none of them, the probe is never admitted and nothing is logged
@@ -829,7 +858,7 @@ impl Orchestrator {
         }
         if teams.roster.iter().any(|identity| {
             self.effective_harness(&identity.harness) == "claude"
-                || self.effective_harness(&self.identity_harness(teams, &identity.name)) == "claude"
+                || self.identity_profile_uses_claude(teams, &identity.name)
         }) {
             return true;
         }

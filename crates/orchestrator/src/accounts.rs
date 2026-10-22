@@ -808,6 +808,56 @@ mod tests {
         );
     }
 
+    /// A profile whose ordered fallback engines name Claude is a Claude dispatch path even when the
+    /// profile's primary harness and the whole installation are OpenCode (STUDIO-1469 review). The
+    /// manager is pinned to `opencode` so the fallback is the only Claude path under test, and the
+    /// limit-suspended Claude run is the "queued or limit-suspended Claude work" arm: the probe
+    /// must be admitted off a fallback-only configuration.
+    #[test]
+    fn claude_probe_runs_when_a_teammate_profile_falls_back_to_claude() {
+        let dir = crate::testsupport::TempDir::new();
+        std::fs::write(
+            dir.child("worker.md"),
+            "---\nharness: opencode\nmodel: openai/gpt-test\nfallback:\n  - { harness: claude }\n---\nWorker\n",
+        )
+        .unwrap();
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.agent.backend = "opencode".into();
+        eff.cfg.claude.command = "bash /configured/wrapper.sh".into();
+        o.eff = Some(eff);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            manager: opencode_manager(),
+            roster: vec![rhapsody_config::teams::Identity {
+                name: "alice".into(),
+                profile: "worker".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(&dir.path));
+        let mut run = crate::RunningEntry::empty(rhapsody_core::Issue::default());
+        run.harness = "claude".into();
+        o.limit_policy.suspended.insert(
+            "held".into(),
+            crate::limitpolicy::Suspended {
+                run,
+                outcome: crate::limitpolicy::HandoffOutcome::Park { resume_at_s: 5000 },
+                park_reason: crate::limitpolicy::ParkReason::Account,
+                note: None,
+                worker_finished: true,
+                account: None,
+            },
+        );
+        assert_eq!(
+            o.claude_probe_request(false).unwrap().command,
+            "bash /configured/wrapper.sh"
+        );
+    }
+
     /// The manager's harness list is a Claude dispatch path independent of `agent.backend`
     /// (STUDIO-1469).
     #[test]
