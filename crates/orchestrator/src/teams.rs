@@ -793,17 +793,26 @@ impl Orchestrator {
     ///
     /// The idle Claude subscription usage probe spends a real Haiku turn and warns when it fails,
     /// so an installation that never dispatches Claude work must not run it. Every place a harness
-    /// is configured is consulted: the installation-wide `agent.backend`; every roster identity's
-    /// own `harness` and the harness its profile names; the manager's one-shot harness and its
-    /// manager-run harness list; and the harnesses `review.model` / `review.provider` /
-    /// `review.effort` are scoped to. Any one of them resolving to `claude` keeps the probe on;
-    /// with none of them, the probe is never admitted and nothing is logged about it.
+    /// is configured is consulted: the installation-wide and per-project `agent.backend`; every
+    /// roster identity's own `harness` and the harness its profile names; the manager's one-shot
+    /// harness and its manager-run harness list; and the harnesses `review.model` /
+    /// `review.provider` / `review.effort` are scoped to. Any one of them resolving to `claude`
+    /// keeps the probe on; with none of them, the probe is never admitted and nothing is logged
+    /// about it.
     ///
     /// `agent.backend` is checked first so the common Claude install short-circuits with no I/O.
     /// The Teams half is consulted only when Teams is enabled — with it off the manager, roster and
     /// review blocks are dead config and no run can reach them.
     pub(crate) fn claude_harness_configured(&self) -> bool {
-        if self.configured_backend() == "claude" {
+        let Some(eff) = self.eff.as_ref() else {
+            return false;
+        };
+        if eff.cfg.agent.backend == "claude"
+            || eff
+                .projects
+                .iter()
+                .any(|p| !p.disabled && p.mcfg.agent.backend == "claude")
+        {
             return true;
         }
         let Some(teams) = self.teams.as_ref().filter(|t| t.enabled) else {

@@ -881,6 +881,25 @@ mod tests {
         assert!(o.claude_probe_request(true).is_none());
     }
 
+    /// A project's own `agent.backend: claude` is a Claude dispatch path even when the
+    /// installation-wide backend is not (STUDIO-1469).
+    #[test]
+    fn claude_probe_runs_when_a_project_backend_is_claude() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.agent.backend = "opencode".into();
+        let mut project = crate::testsupport::empty_resolved_project(
+            "proj",
+            std::sync::Arc::new(rhapsody_tracker::fake::Fake::default()),
+        );
+        project.mcfg.agent.backend = "claude".into();
+        eff.projects = vec![project];
+        o.eff = Some(eff);
+        assert!(o.claude_probe_request(true).is_some());
+    }
+
     /// With Teams off the manager/roster/review blocks are dead config, so they must not keep the
     /// probe alive on a non-Claude backend (STUDIO-1469).
     #[test]
