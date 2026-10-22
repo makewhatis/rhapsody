@@ -98,6 +98,20 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Boot snapshot is published before startup cleanup (STUDIO-1465)
+
+The frozen Go reference runs `startupCleanup` before `runLoaded`, and its first snapshot is built
+inside the control loop — so `/api/v1/state` answers `503 snapshot_unavailable` until the whole
+terminal-ticket cleanup has finished. That cleanup walks every Done/Canceled ticket in the team
+(thousands on a mature install); on a 2026-10-22 restart the endpoint 503'd for over five minutes.
+
+Rhapsody publishes the boot snapshot (after `bootRecovery`, before `startupCleanup`), so
+`/api/v1/state` answers within seconds of boot. This only reorders the FIRST publication relative to
+cleanup; every later publication and every cleanup effect is unchanged. The pass also skips
+`remove_worktree` entirely for a terminal ticket with no workspace on disk — a skip the reference
+would have taken too, since removing a missing worktree is already a no-op, so it is not an
+observable divergence. No configuration, schema, API payload or golden-fixture changes.
+
 ### Worker self-messages carry agent attribution (STUDIO-1414)
 
 The worker MCP `symphony_send_message` / `agent_send_message` tools only accept their own

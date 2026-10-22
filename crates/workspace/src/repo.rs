@@ -890,6 +890,29 @@ impl Manager {
         Ok(ws)
     }
 
+    /// Whether the per-issue workspace/worktree for `identifier` exists on disk RIGHT NOW, without
+    /// touching git or taking the per-repo lock. [`Self::remove_worktree`] already no-ops for a
+    /// missing path, but a caller that walks a whole team's terminal tickets (STUDIO-1465's startup
+    /// cleanup — thousands of tickets on a mature install, nearly all of them with no worktree)
+    /// must be able to skip the call entirely rather than pay for it per ticket.
+    ///
+    /// `repo_url == ""` is the legacy one-level path (`<root>/<key>`, exactly what
+    /// [`Manager::remove`] would remove); otherwise it is the repo-namespaced worktree path
+    /// `<root>/<RepoKey(repo_url)>/<key>`. Reports a symlink as existing on purpose, so the removal
+    /// path still sees it and rejects it (the lstat guard) instead of silently skipping it.
+    pub fn worktree_exists(&self, repo_url: &str, identifier: &str) -> bool {
+        let key = sanitize_key(identifier);
+        if key == MIRRORS_DIR_NAME {
+            return false;
+        }
+        let path = if repo_url.is_empty() {
+            join(&[&self.root, &key])
+        } else {
+            join(&[&self.root, &repo_key(repo_url), &key])
+        };
+        std::fs::symlink_metadata(&path).is_ok()
+    }
+
     /// Terminal cleanup of a repo-backed worktree. `repo_url == ""` delegates to the legacy
     /// [`Manager::remove`]. Otherwise it runs best-effort before_remove (logged+ignored), then
     /// `git worktree remove --force` + `git worktree prune` on the mirror, serialized by the
@@ -1647,6 +1670,37 @@ mod tests {
             std::fs::metadata(join(&[&root.path, ".ran"])).is_err(),
             "before_remove must not run when the worktree does not exist"
         );
+    }
+
+    // STUDIO-1465: the cheap pre-check a whole-team cleanup pass uses to skip `remove_worktree`
+    // entirely for the thousands of terminal tickets that have no workspace on disk. It must agree
+    // with each removal path's own location, so a "no worktree" answer never hides a real one.
+    #[test]
+    fn worktree_exists_tracks_the_removal_paths() {
+        let origin = init_local_origin();
+        let (m, root) = repo_test_manager(HookScripts::default());
+
+        // Legacy (empty repo_url): <root>/<key>.
+        assert!(!m.worktree_exists("", "MT-1"), "no dir yet");
+        std::fs::create_dir_all(join(&[&root.path, "MT-1"])).unwrap();
+        assert!(m.worktree_exists("", "MT-1"), "legacy dir now exists");
+
+        // Repo-backed: <root>/<RepoKey(repo_url)>/<key>.
+        let repo_dir = join(&[&root.path, &repo_key(&origin.path)]);
+        let key = sanitize_key("MT-2");
+        assert!(!m.worktree_exists(&origin.path, "MT-2"), "no worktree yet");
+        std::fs::create_dir_all(join(&[&repo_dir, &key])).unwrap();
+        assert!(
+            m.worktree_exists(&origin.path, "MT-2"),
+            "worktree now exists"
+        );
+
+        // A path that exists only in the OTHER mode must not be reported as this mode's.
+        assert!(!m.worktree_exists(&origin.path, "MT-1"));
+        assert!(!m.worktree_exists("", "MT-2"));
+
+        // The reserved mirror dir is never a worktree (the removal path rejects it too).
+        assert!(!m.worktree_exists("", ".mirrors"));
     }
 
     // Mirror of TestRemoveWorktree_RejectsSymlinkWorktree.
