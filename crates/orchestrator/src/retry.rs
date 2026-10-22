@@ -1310,13 +1310,17 @@ impl Orchestrator {
             } else {
                 e.err_msg.clone()
             };
+            // The remedy is in `reason`: a typed refusal names the harness and the missing
+            // capability, or — for STUDIO-1468 — the found and required CLI versions and how to
+            // upgrade. Keep this line remedy-neutral so it is never wrong for the refusal it
+            // reports: a CLI-version hold is not fixed by editing a profile.
             tracing::warn!(
                 run_id = re.run_id,
                 issue_id = %e.issue_id,
                 issue_identifier = %re.issue.identifier,
                 reason = %reason,
                 "dispatch refused: the resolved harness cannot honor this run; recording failed \
-                 once and scheduling no retry (fix the profile and restart to re-offer it)"
+                 once and scheduling no retry (a restart re-offers it once the cause is fixed)"
             );
             self.persist_end_run(&re, store::OUTCOME_FAILED, &reason);
             self.persist_complete(&re.issue.identifier);

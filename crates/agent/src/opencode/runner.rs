@@ -3428,6 +3428,20 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         );
     }
 
+    /// STUDIO-1468 (review B1): the gate is only live because the REAL opencode runner exposes its
+    /// configured command to it. The acceptance tests in `rhapsody-orchestrator` drive the stand-in
+    /// `agentfake::Fake` with the command injected by hand, so they never touch this wiring: set
+    /// this method to `None` and the whole workspace stays green while the gate goes inert in
+    /// production. MUTATION: return `None` here and this test reds.
+    #[test]
+    fn opencode_runner_exposes_its_configured_command_to_the_version_gate() {
+        let r = Runner::new(Config {
+            command: "my-opencode".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(r.cli_command().as_deref(), Some("my-opencode"));
+    }
+
     /// CAPABILITY HONESTY (design §8; the ticket's mutation discipline). Every declared capability
     /// the committed STUDIO-869 capture can witness is crossed against it, so a declaration that
     /// claims something the measured CLI does not do reds here rather than silently breaking the

@@ -3365,6 +3365,20 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"complete-sessi
         assert_eq!(caps.stdin, StdinPolicy::HeldOpen);
     }
 
+    /// STUDIO-1468 (review B1): the gate is only live because the REAL claude runner exposes its
+    /// configured command to it. The acceptance tests in `rhapsody-orchestrator` drive the stand-in
+    /// `agentfake::Fake` with the command injected by hand, so they never touch this wiring: set
+    /// this method to `None` and the whole workspace stays green while the gate goes inert in
+    /// production. MUTATION: return `None` here and this test reds.
+    #[test]
+    fn claude_runner_exposes_its_configured_command_to_the_version_gate() {
+        let r = Runner::new(Config {
+            command: "my-claude".to_string(),
+            ..Default::default()
+        });
+        assert_eq!(r.cli_command().as_deref(), Some("my-claude"));
+    }
+
     /// CAPABILITY HONESTY (design §8; the ticket's mutation discipline: "flip an adapter declaration
     /// to claim resume or MCP support without fixture evidence; a capability-honesty test must
     /// fail"). Every declared capability that the committed STUDIO-869 capture can witness is

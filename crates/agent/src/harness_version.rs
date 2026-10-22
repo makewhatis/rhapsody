@@ -40,8 +40,12 @@ pub const MIN_CLAUDE_VERSION: &str = "1.0.109";
 pub const CLAUDE_UPGRADE: &str =
     "upgrade Claude Code (`claude update`, or reinstall @anthropic-ai/claude-code)";
 
-/// How an operator upgrades an unsupported `opencode` CLI.
-pub const OPENCODE_UPGRADE: &str = "upgrade OpenCode (`opencode upgrade`) to a supported version";
+/// How an operator upgrades an unsupported `opencode` CLI. `SUPPORTED` is an EXACT pin, so a bare
+/// `opencode upgrade` (which installs the latest release) can be refused again — the hint names the
+/// supported version to install. [`tests::the_opencode_upgrade_hint_names_the_required_version`]
+/// keeps it in step with the compatibility table.
+pub const OPENCODE_UPGRADE: &str =
+    "install the supported OpenCode version (`opencode upgrade 1.18.30`)";
 
 /// The process-tree timeout for one version probe. `--version` answers in milliseconds; this is a
 /// bound on a hung wrapper, not a production value anyone waits out.
@@ -211,6 +215,18 @@ mod tests {
     #[test]
     fn min_claude_version_is_the_release_that_added_the_flag() {
         assert_eq!(MIN_CLAUDE_VERSION, "1.0.109");
+    }
+
+    /// The upgrade hint must name the version it tells the operator to install: a bare
+    /// `opencode upgrade` installs the latest release, which the exact pin refuses again. A change
+    /// to the compatibility table that forgets this hint reds here.
+    #[test]
+    fn the_opencode_upgrade_hint_names_the_required_version() {
+        let required = opencode_required();
+        assert!(
+            OPENCODE_UPGRADE.contains(&required),
+            "the upgrade hint {OPENCODE_UPGRADE:?} must name the required version {required:?}"
+        );
     }
 
     #[test]

@@ -3095,6 +3095,81 @@ exit 1
         }
     }
 
+    /// STUDIO-1468 (review B1): the PRODUCTION wiring, for the real claude runner. Every acceptance
+    /// test above drives `agentfake::Fake` with `cli_command` injected by hand, so none of them
+    /// proves the REAL `claude::Runner` opts into the gate. This builds the real runner over a fake
+    /// CLI reporting an old version and asserts the gate refuses with the typed, no-retry refusal
+    /// before any turn. MUTATION: make `claude::runner::Runner::cli_command` return `None` and this
+    /// attempt proceeds past the gate, so the assertion reds.
+    #[tokio::test]
+    async fn the_real_claude_runner_wires_an_old_cli_into_the_gate() {
+        let dir = TempDir::new();
+        let runner = rhapsody_agent::claude::Runner::new(rhapsody_agent::claude::Config {
+            command: fake_cli(&dir, "1.0.108 (Claude Code)"),
+            ..Default::default()
+        });
+        let ag: Arc<dyn Harness> = Arc::new(runner);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag, tr, "p", 20);
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        let msg = format!("{err:?}");
+        assert!(
+            matches!(
+                err,
+                Some(WorkerError::CapabilityRefused(
+                    rhapsody_agent::CapabilityRefusal::CliVersionUnsupported {
+                        harness: rhapsody_agent::HarnessId::Claude,
+                        ..
+                    }
+                ))
+            ),
+            "the real claude runner must be refused through its own wiring: {msg}"
+        );
+        assert!(
+            msg.contains("1.0.108") && msg.contains("1.0.109"),
+            "the refusal must name the found and required versions: {msg}"
+        );
+    }
+
+    /// STUDIO-1468 (review B1): the same production-wiring proof for the real opencode runner.
+    /// MUTATION: make `opencode::runner::Runner::cli_command` return `None` and the attempt proceeds
+    /// past the gate, so the assertion reds.
+    #[tokio::test]
+    async fn the_real_opencode_runner_wires_an_old_cli_into_the_gate() {
+        let dir = TempDir::new();
+        let runner = rhapsody_agent::opencode::Runner::new(rhapsody_agent::opencode::Config {
+            command: fake_cli(&dir, "1.17.0"),
+            ..Default::default()
+        });
+        let ag: Arc<dyn Harness> = Arc::new(runner);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag, tr, "p", 20);
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        let msg = format!("{err:?}");
+        assert!(
+            matches!(
+                err,
+                Some(WorkerError::CapabilityRefused(
+                    rhapsody_agent::CapabilityRefusal::CliVersionUnsupported {
+                        harness: rhapsody_agent::HarnessId::Opencode,
+                        ..
+                    }
+                ))
+            ),
+            "the real opencode runner must be refused through its own wiring: {msg}"
+        );
+        assert!(
+            msg.contains("1.17.0") && msg.contains("1.18.30"),
+            "the refusal must name the found and required versions: {msg}"
+        );
+    }
+
     /// A harness with no versioned CLI (`cli_command() == None`, the default for the fake) is never
     /// gated, so every pre-STUDIO-1468 test stays byte-identical.
     #[tokio::test]
