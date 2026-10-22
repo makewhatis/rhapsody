@@ -401,7 +401,10 @@ impl crate::Orchestrator {
         let interval = cfg.limits.claude_probe_interval_s;
         let now = (self.now)().timestamp();
         let recent = |at: i64| now.saturating_sub(at) < i64::try_from(interval).unwrap_or(i64::MAX);
+        // An installation with no Claude dispatch path must never spend a probe turn or warn about
+        // one (STUDIO-1469); this precedes every other gate so nothing about the probe is observed.
         if interval == 0
+            || !self.claude_harness_configured()
             || self.claude_probe_in_flight
             || self.claude_run_live()
             || (!boot
@@ -739,6 +742,182 @@ mod tests {
         o.eff.as_mut().unwrap().cfg.limits.claude_probe_interval_s = 600;
         o.record_chatgpt_queue(std::iter::empty(), true);
         assert!(o.claude_probe_request(false).is_none(), "no work");
+    }
+
+    /// An install that dispatches nothing on Claude must never spend a probe turn, at boot or
+    /// otherwise, and must not log the failure warning the probe would emit (STUDIO-1469).
+    #[test]
+    fn claude_probe_never_runs_without_a_configured_claude_harness() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.agent.backend = "opencode".into();
+        eff.cfg.claude.command = "bash /configured/wrapper.sh".into();
+        o.eff = Some(eff);
+        o.now = Box::new(|| chrono::DateTime::from_timestamp(1000, 0).unwrap());
+        let issue = rhapsody_core::Issue {
+            id: "queued".into(),
+            ..Default::default()
+        };
+        o.record_chatgpt_queue(std::iter::once((&issue, "")), true);
+        let (_, events) = crate::testsupport::capture_events(|| {
+            // `boot` would bypass the queued-work gate, so `true` here isolates the
+            // configured-harness check: without it the probe is admitted.
+            assert!(o.claude_probe_request(true).is_none(), "boot");
+            assert!(o.claude_probe_request(false).is_none(), "idle");
+        });
+        assert!(
+            !events.iter().any(|e| e.level == "WARN"),
+            "an install with no Claude harness must log nothing about the probe: {events:?}"
+        );
+    }
+
+    /// A teammate profile naming `harness: claude` is a Claude dispatch path even when the
+    /// installation-wide backend is not Claude (STUDIO-1469). The manager is pinned to `opencode`
+    /// so the profile is the only Claude path under test.
+    #[test]
+    fn claude_probe_runs_when_a_teammate_profile_names_claude() {
+        let dir = crate::testsupport::TempDir::new();
+        std::fs::write(
+            dir.child("worker.md"),
+            "---\nharness: claude\n---\nWorker\n",
+        )
+        .unwrap();
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.agent.backend = "opencode".into();
+        eff.cfg.claude.command = "bash /configured/wrapper.sh".into();
+        o.eff = Some(eff);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            manager: opencode_manager(),
+            roster: vec![rhapsody_config::teams::Identity {
+                name: "alice".into(),
+                profile: "worker".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(&dir.path));
+        assert_eq!(
+            o.claude_probe_request(true).unwrap().command,
+            "bash /configured/wrapper.sh"
+        );
+    }
+
+    /// The manager's harness list is a Claude dispatch path independent of `agent.backend`
+    /// (STUDIO-1469).
+    #[test]
+    fn claude_probe_runs_when_the_manager_harness_list_names_claude() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.agent.backend = "opencode".into();
+        o.eff = Some(eff);
+        let manager = rhapsody_config::teams::Manager {
+            harnesses: vec![rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "claude".into(),
+                model: String::new(),
+                effort: String::new(),
+            }],
+            ..Default::default()
+        };
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            manager,
+            ..Default::default()
+        });
+        assert!(o.claude_probe_request(true).is_some());
+    }
+
+    /// A `review.model.<harness>` scoped to Claude is a Claude review dispatch path (STUDIO-1469).
+    /// The manager is pinned to `opencode` so the review scope is the only Claude path under test.
+    #[test]
+    fn claude_probe_runs_when_review_is_scoped_to_claude() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.agent.backend = "opencode".into();
+        o.eff = Some(eff);
+        let mut review = rhapsody_config::teams::Review::default();
+        review.model.insert("claude", "claude-opus-5");
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            manager: opencode_manager(),
+            review,
+            ..Default::default()
+        });
+        assert!(o.claude_probe_request(true).is_some());
+    }
+
+    /// A Teams-enabled install with every harness on `opencode` has no Claude dispatch path, so the
+    /// probe must stay off (STUDIO-1469).
+    #[test]
+    fn claude_probe_stays_off_when_no_teams_harness_is_claude() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.agent.backend = "opencode".into();
+        o.eff = Some(eff);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            manager: opencode_manager(),
+            roster: vec![rhapsody_config::teams::Identity {
+                name: "alice".into(),
+                harness: "opencode".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        assert!(o.claude_probe_request(true).is_none());
+    }
+
+    /// With Teams off the manager/roster/review blocks are dead config, so they must not keep the
+    /// probe alive on a non-Claude backend (STUDIO-1469).
+    #[test]
+    fn claude_probe_stays_off_for_a_disabled_teams_block_that_names_claude() {
+        let mut o = crate::Orchestrator::new("not-read.md");
+        let mut eff = crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        ));
+        eff.cfg.agent.backend = "opencode".into();
+        o.eff = Some(eff);
+        let manager = rhapsody_config::teams::Manager {
+            harnesses: vec![rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "claude".into(),
+                model: String::new(),
+                effort: String::new(),
+            }],
+            ..Default::default()
+        };
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: false,
+            manager,
+            ..Default::default()
+        });
+        assert!(o.claude_probe_request(true).is_none());
+    }
+
+    /// A manager whose one-shot harness and run harness list are both `opencode`, so a test can
+    /// isolate a different Claude path.
+    fn opencode_manager() -> rhapsody_config::teams::Manager {
+        rhapsody_config::teams::Manager {
+            harness: "opencode".into(),
+            provider: "fireworks".into(),
+            model: "fireworks-ai/model".into(),
+            harnesses: vec![rhapsody_config::teams::ManagerHarnessEntry {
+                harness: "opencode".into(),
+                model: "fireworks-ai/model".into(),
+                effort: String::new(),
+            }],
+            ..Default::default()
+        }
     }
 
     #[tokio::test]

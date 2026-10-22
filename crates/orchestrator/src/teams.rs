@@ -789,6 +789,56 @@ impl Orchestrator {
             .map_or_else(String::new, |e| e.cfg.agent.backend.clone())
     }
 
+    /// Whether any resolved dispatch path could run the `claude` harness (STUDIO-1469).
+    ///
+    /// The idle Claude subscription usage probe spends a real Haiku turn and warns when it fails,
+    /// so an installation that never dispatches Claude work must not run it. Every place a harness
+    /// is configured is consulted: the installation-wide `agent.backend`; every roster identity's
+    /// own `harness` and the harness its profile names; the manager's one-shot harness and its
+    /// manager-run harness list; and the harnesses `review.model` / `review.provider` /
+    /// `review.effort` are scoped to. Any one of them resolving to `claude` keeps the probe on;
+    /// with none of them, the probe is never admitted and nothing is logged about it.
+    ///
+    /// `agent.backend` is checked first so the common Claude install short-circuits with no I/O.
+    /// The Teams half is consulted only when Teams is enabled — with it off the manager, roster and
+    /// review blocks are dead config and no run can reach them.
+    pub(crate) fn claude_harness_configured(&self) -> bool {
+        if self.configured_backend() == "claude" {
+            return true;
+        }
+        let Some(teams) = self.teams.as_ref().filter(|t| t.enabled) else {
+            return false;
+        };
+        if teams.manager.effective_harness() == "claude"
+            || teams
+                .manager
+                .effective_harnesses()
+                .iter()
+                .any(|entry| entry.harness == "claude")
+        {
+            return true;
+        }
+        if teams.roster.iter().any(|identity| {
+            self.effective_harness(&identity.harness) == "claude"
+                || self.effective_harness(&self.identity_harness(teams, &identity.name)) == "claude"
+        }) {
+            return true;
+        }
+        let backend = self.configured_backend();
+        [
+            &teams.review.model,
+            &teams.review.provider,
+            &teams.review.effort,
+        ]
+        .iter()
+        .any(|scoped| {
+            scoped
+                .resolved(&backend)
+                .iter()
+                .any(|(harness, _)| *harness == "claude")
+        })
+    }
+
     /// The harness a run RESOLVES to, given the harness its profile named (STUDIO-908): the named
     /// harness whenever the profile names one, else the configured backend.
     ///
