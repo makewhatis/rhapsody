@@ -756,6 +756,15 @@ fn worker_deps_for(
     deps
 }
 
+/// What one [`Orchestrator::startup_cleanup`] pass did: how many terminal tickets it looked at and
+/// how many worktrees it actually removed (STUDIO-1465). The pass returns it so a test can pin the
+/// counts directly, and logs the same numbers as its one INFO summary line.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StartupCleanupSummary {
+    pub(crate) checked: usize,
+    pub(crate) removed: usize,
+}
+
 impl Orchestrator {
     /// Loads + validates the workflow (failing startup on error), builds the github-summons source,
     /// starts the async event writer, runs boot recovery, performs startup terminal-workspace cleanup,
@@ -780,6 +789,13 @@ impl Orchestrator {
         }
         self.start_event_writer();
         self.boot_recovery();
+        // STUDIO-1465: publish the boot snapshot BEFORE the startup terminal cleanup. Cleanup walks
+        // every terminal ticket in the team (thousands on a mature install) and is the one thing
+        // between boot recovery and the control loop; publishing first means `/api/v1/state` answers
+        // within seconds of boot instead of 503-ing `snapshot_unavailable` until cleanup finishes.
+        // The reference publishes only from `runLoaded`, AFTER cleanup — a deliberate divergence (see
+        // the README Divergences entry).
+        self.publish_snapshot();
         self.startup_cleanup().await;
         let watch = self.start_watch(ctx.clone());
         self.run_loaded(ctx).await;
@@ -2018,7 +2034,14 @@ impl Orchestrator {
     /// Removes workspaces for issues already in terminal states at startup (§8.6). Per-project when
     /// projects are resolved (each project's slug-bound tracker + its own terminal-state list);
     /// single-project degenerates to today's behavior. Mirrors Go `startupCleanup`.
-    async fn startup_cleanup(&self) {
+    ///
+    /// STUDIO-1465: a terminal ticket with no workspace on disk is skipped entirely — `remove_worktree`
+    /// would no-op, but this pass runs over EVERY terminal ticket in the team (thousands on a mature
+    /// install, nearly all of them with no worktree), so it must not even build the removal call for
+    /// them. Returns the counts it logs as its one INFO summary line.
+    async fn startup_cleanup(&self) -> StartupCleanupSummary {
+        let started = std::time::Instant::now();
+        let mut summary = StartupCleanupSummary::default();
         struct Group {
             tracker: Arc<dyn Tracker>,
             terminal: Vec<String>,
@@ -2028,7 +2051,7 @@ impl Orchestrator {
         }
         let groups: Vec<Group> = {
             let Some(eff) = self.eff.as_ref() else {
-                return;
+                return summary;
             };
             if !eff.projects.is_empty() {
                 eff.projects
@@ -2060,18 +2083,34 @@ impl Orchestrator {
                 }
             };
             for iss in issues {
-                if let Err(e) = g
-                    .workspace
-                    .remove_worktree(&g.repo, &g.slug, &iss.identifier)
-                    .await
-                {
-                    tracing::warn!(issue_identifier = %iss.identifier, project_slug = %g.slug, err = %e, "startup workspace cleanup failed");
+                summary.checked += 1;
+                // STUDIO-1465: only a ticket with a workspace on disk has anything to remove. Check
+                // the path first so a terminal ticket with no worktree costs one lstat, not a git
+                // command (and not the per-repo lock).
+                if g.workspace.worktree_exists(&g.repo, &iss.identifier) {
+                    match g
+                        .workspace
+                        .remove_worktree(&g.repo, &g.slug, &iss.identifier)
+                        .await
+                    {
+                        Ok(()) => summary.removed += 1,
+                        Err(e) => {
+                            tracing::warn!(issue_identifier = %iss.identifier, project_slug = %g.slug, err = %e, "startup workspace cleanup failed")
+                        }
+                    }
                 }
                 // The ticket is terminal: its retained opencode session (if any) is dead weight,
                 // in legacy mode a copy of the operator's credential included (STUDIO-1043).
                 self.discard_retained_opencode_session(&iss.identifier);
             }
         }
+        tracing::info!(
+            checked = summary.checked,
+            removed = summary.removed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "startup terminal cleanup finished"
+        );
+        summary
     }
 
     /// Cancels all workers + timers, then drains events until workers (and off-loop resolvers) exit,
@@ -3411,6 +3450,200 @@ mod tests {
             1,
             "project B tracker fetch_issues_by_states should be called once"
         );
+    }
+
+    /// Creates a real commit in a fresh local repo at `dir` (the origin the worktree tests clone
+    /// from). Mirrors the `git_run` helper the manager-read tests use.
+    fn git_run(dir: &str, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    // STUDIO-1465: the startup pass must not even CALL the remover for a terminal ticket with no
+    // worktree on disk — it walks the WHOLE team's terminal tickets (thousands on a mature install,
+    // nearly all of them without a worktree). Only the two tickets with a real worktree are removed.
+    //
+    // MUTATION: drop the `worktree_exists` guard and `summary.removed` becomes 500 —
+    // `remove_worktree` no-ops with `Ok(())` for a missing path, so every call would count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn startup_cleanup_removes_only_tickets_with_a_worktree() {
+        use crate::testsupport::{TempDir, empty_resolved_project, issue};
+
+        let origin = TempDir::new();
+        git_run(&origin.path, &["init", "-b", "main"]);
+        std::fs::write(origin.child("README.md"), "hi\n").unwrap();
+        git_run(&origin.path, &["add", "README.md"]);
+        git_run(&origin.path, &["commit", "-m", "init"]);
+
+        let issues: Vec<Issue> = (0..500)
+            .map(|n| issue(&format!("a{n}"), &format!("A-{n}"), "Done"))
+            .collect();
+        let mut tr = Fake::new();
+        tr.by_state = std::collections::HashMap::from([("done".to_string(), issues)]);
+        let tr = Arc::new(tr);
+
+        let dir = TempDir::new();
+        let ws = crate::testsupport::mk_workspace(&dir.path);
+        let mut pa = empty_resolved_project("a", Arc::clone(&tr) as Arc<dyn Tracker>);
+        pa.workspace = Arc::clone(&ws);
+        pa.repo = origin.path.clone();
+        pa.mcfg.tracker.terminal_states = vec!["Done".to_string()];
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        eff.projects = vec![pa];
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.ctx = Some(CancelWait::default());
+        o.eff = Some(eff);
+
+        // Only A-1 and A-2 have a worktree; the other 498 terminal tickets have none.
+        let w1 = ws
+            .ensure_from_repo(&origin.path, "a", "A-1")
+            .await
+            .expect("provision A-1");
+        let w2 = ws
+            .ensure_from_repo(&origin.path, "a", "A-2")
+            .await
+            .expect("provision A-2");
+
+        let summary = o.startup_cleanup().await;
+
+        assert_eq!(summary.checked, 500, "every terminal ticket is examined");
+        assert_eq!(
+            summary.removed, 2,
+            "only the two tickets with a real worktree are removed"
+        );
+        assert!(
+            std::fs::metadata(&w1.path).is_err(),
+            "the A-1 worktree must be removed"
+        );
+        assert!(
+            std::fs::metadata(&w2.path).is_err(),
+            "the A-2 worktree must be removed"
+        );
+    }
+
+    // STUDIO-1465: the pass logs exactly one INFO summary line naming how many terminal tickets it
+    // checked, how many worktrees it removed and how long it took.
+    #[tokio::test]
+    async fn startup_cleanup_logs_a_summary() {
+        use crate::testsupport::{TempDir, empty_resolved_project, issue, recording_subscriber};
+
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+
+        let mut tr = Fake::new();
+        tr.by_state = std::collections::HashMap::from([(
+            "done".to_string(),
+            vec![issue("a1", "A-1", "Done"), issue("a2", "A-2", "Done")],
+        )]);
+        let tr = Arc::new(tr);
+        let dir = TempDir::new();
+        let ws = crate::testsupport::mk_workspace(&dir.path);
+        let mut pa = empty_resolved_project("a", Arc::clone(&tr) as Arc<dyn Tracker>);
+        pa.workspace = Arc::clone(&ws);
+        pa.mcfg.tracker.terminal_states = vec!["Done".to_string()];
+        let mut eff = empty_effective(Arc::new(Fake::new()));
+        eff.projects = vec![pa];
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        // Only A-1 has a legacy workspace on disk, so it is the one removal.
+        std::fs::create_dir_all(dir.child("A-1")).unwrap();
+
+        let (events, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        tracing::callsite::rebuild_interest_cache();
+        let summary = o.startup_cleanup().await;
+        drop(guard);
+
+        assert_eq!(
+            (summary.checked, summary.removed),
+            (2, 1),
+            "the summary counts every terminal ticket checked and every worktree removed"
+        );
+        let events = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let line = events
+            .iter()
+            .find(|e| e.message == "startup terminal cleanup finished")
+            .expect("the one startup cleanup summary line must be logged");
+        assert_eq!(line.level, "INFO");
+        assert_eq!(line.fields.get("checked").map(String::as_str), Some("2"));
+        assert_eq!(line.fields.get("removed").map(String::as_str), Some("1"));
+        assert!(
+            line.fields.contains_key("elapsed_ms"),
+            "the summary must carry how long cleanup took"
+        );
+    }
+
+    // STUDIO-1465: `/api/v1/state` must answer within seconds of boot even while the startup
+    // terminal cleanup is still running — so `run` publishes the boot snapshot BEFORE cleanup.
+    //
+    // MUTATION: move the `publish_snapshot()` back after `startup_cleanup()` (the reference's order)
+    // and the wait below expires: the cell stays empty for the whole `before_remove` sleep.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn run_publishes_the_boot_snapshot_before_startup_cleanup() {
+        use crate::testsupport::TempDir;
+
+        let dir = TempDir::new();
+        let ws_root = dir.child("ws");
+        std::fs::create_dir_all(ws_root.clone()).unwrap();
+        // The one terminal ticket has a legacy workspace dir, so cleanup reaches before_remove,
+        // which sleeps: cleanup is still running while we assert on the snapshot cell.
+        std::fs::create_dir_all(format!("{ws_root}/A-1")).unwrap();
+        let tracker = dir.child("issues.json");
+        std::fs::write(
+            &tracker,
+            r#"{"issues":[{"id":"a1","identifier":"A-1","title":"t","state":"Done"}]}"#,
+        )
+        .unwrap();
+        let wf = dir.child("WORKFLOW.md");
+        std::fs::write(
+            &wf,
+            format!(
+                "---\ntracker:\n  kind: file\n  source: {tracker}\n  active_states: [Todo]\n  \
+                 terminal_states: [Done]\nworkspace:\n  root: {ws_root}\nhooks:\n  before_remove: \
+                 \"sleep 3\"\nagent:\n  backend: claude\nclaude:\n  command: claude\n---\nDo \
+                 {{{{ issue.identifier }}}}.\n"
+            ),
+        )
+        .unwrap();
+
+        let signal = CancelSignal::new();
+        let mut o = Orchestrator::new(wf);
+        o.ctx = Some(signal.wait());
+        let handle = o.control();
+        let run_ctx = signal.wait();
+        let task = tokio::spawn(async move {
+            let _ = o.run(run_ctx).await;
+            o
+        });
+
+        let published =
+            tokio::time::timeout(Duration::from_millis(1500), handle.wait_for_snapshot()).await;
+        // The cleanup target is still on disk: the snapshot landed while cleanup was still running,
+        // not after it finished (the `before_remove` hook is still sleeping).
+        let cleanup_still_running = std::fs::metadata(format!("{ws_root}/A-1")).is_ok();
+        signal.cancel();
+        assert!(
+            matches!(published, Ok(true)),
+            "the boot snapshot must be published before the (slow) startup cleanup finishes"
+        );
+        assert!(
+            cleanup_still_running,
+            "the snapshot must be published while cleanup is still running, not after it"
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
     }
 
     // --- loop_multi_test.go: onTick's multi-project poll → dedup → dispatch fan-out (O8 e2e) ------
