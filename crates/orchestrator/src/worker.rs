@@ -4608,25 +4608,27 @@ exit 1
     }
 
     /// The deps for a declaring-handoff ticket run with the park armed and a PR source stamped, over
-    /// the given scripted turns.
+    /// the given scripted turns. The [`TempDir`] guard is returned so the CALLER binds it for the
+    /// test's lifetime — dropping it here would delete the workspace root out from under the run,
+    /// which then recreates it and leaks it (the `check-tmp-leaks` guard).
     fn handoff_deps(
         turns: Vec<agentfake::TurnScript>,
         source: Option<Arc<dyn crate::ghsummons::OpenPrSource>>,
-    ) -> (WorkerDeps, Arc<trackerfake::Fake>) {
+    ) -> (WorkerDeps, Arc<trackerfake::Fake>, TempDir) {
         let ag = fake_agent(turns);
         let mut tr = trackerfake::Fake::new();
         tr.states_by_ids_func = Some(Box::new(|_ids: &[String]| {
             Ok(vec![issue("1", "MT-1", "In Progress")]) // never leaves active on its own
         }));
         let tr = Arc::new(tr);
-        let (ws, _root) = test_workspace(HookScripts::default());
+        let (ws, root) = test_workspace(HookScripts::default());
         let mut d = make_deps(ws, ag, tr.clone() as Arc<dyn Tracker>, "do it", 20);
         d.review_handoff_state = Some("in review".to_string());
         // The coordinate the lookup asks about. Kept off `repo_url` so the test does not have to
         // provision a real workspace from a GitHub remote; production stamps both from the same URL.
         d.run_pr_repo = Some(("o".to_string(), "r".to_string()));
         d.run_pr_source = source;
-        (d, tr)
+        (d, tr, root)
     }
 
     fn declaring_turn() -> agentfake::TurnScript {
@@ -4648,7 +4650,7 @@ exit 1
     // `run_turns`) and this reds — the ticket lands in `in review`.
     #[tokio::test]
     async fn a_handoff_that_opened_no_pull_request_does_not_park_in_review() {
-        let (mut d, tr) = handoff_deps(vec![declaring_turn()], Some(Arc::new(StubPr(None))));
+        let (mut d, tr, _root) = handoff_deps(vec![declaring_turn()], Some(Arc::new(StubPr(None))));
         let iss = Issue {
             team_id: "team-1".to_string(),
             ..issue("1", "MT-1", "In Progress")
@@ -4676,7 +4678,7 @@ exit 1
     // parks exactly as before.
     #[tokio::test]
     async fn a_handoff_with_a_pull_request_parks_exactly_as_before() {
-        let (mut d, tr) = handoff_deps(
+        let (mut d, tr, _root) = handoff_deps(
             vec![declaring_turn()],
             Some(Arc::new(StubPr(Some("https://github.com/o/r/pull/7")))),
         );
@@ -4706,7 +4708,7 @@ exit 1
             Some(Arc::new(BrokenPr) as Arc<dyn crate::ghsummons::OpenPrSource>),
             None,
         ] {
-            let (mut d, tr) = handoff_deps(vec![declaring_turn()], source);
+            let (mut d, tr, _root) = handoff_deps(vec![declaring_turn()], source);
             let iss = Issue {
                 team_id: "team-1".to_string(),
                 ..issue("1", "MT-1", "In Progress")
