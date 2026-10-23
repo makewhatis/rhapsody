@@ -38,6 +38,7 @@ use std::time::Duration;
 use chrono::{DateTime, SecondsFormat, Utc};
 use rhapsody_core::Issue;
 
+use crate::comms::CommsBackend;
 use crate::ghsummons::{SummonHit, SummonSource};
 
 /// Bounds the `gh` exec per enrichment call. 15s is well under the 30s poll interval; a
@@ -323,7 +324,7 @@ impl DaemonPrLinks {
 
     /// This ticket's daemon-recorded pull requests in `owner`/`repo`, ascending; empty when there
     /// are none.
-    fn numbers_for(&self, owner: &str, repo: &str, identifier: &str) -> &[i64] {
+    pub(crate) fn numbers_for(&self, owner: &str, repo: &str, identifier: &str) -> &[i64] {
         self.by_ticket
             .get(&(
                 owner.to_ascii_lowercase(),
@@ -349,6 +350,11 @@ impl DaemonPrLinks {
 /// consulted in addition to the tracker's `linked_prs` because on a repository the tracker's GitHub
 /// integration is not connected to, `linked_prs` is empty and no write can fill it. Pass
 /// `&DaemonPrLinks::default()` for the tracker-only behaviour. See [`DaemonPrLinks`].
+///
+/// STUDIO-1503: the walk now lives in the communication seam's GitHub backend
+/// ([`crate::comms::GitHubComms`]), which folds every detection through the one
+/// [`crate::comms::merge_inbound`] chokepoint shared with the Linear backend. This wrapper keeps the
+/// ported name and signature (and therefore byte-identical behaviour) for the existing callers.
 pub fn apply_github_summons(
     mut issues: Vec<Issue>,
     by_pr: &HashMap<i64, SummonHit>,
@@ -356,176 +362,12 @@ pub fn apply_github_summons(
     repo: &str,
     links: &DaemonPrLinks,
 ) -> SummonApply {
-    if by_pr.is_empty() {
-        return SummonApply {
-            issues,
-            unlinked: Vec::new(),
-        };
-    }
-    // STUDIO-574 observability: every drop below is a `continue` with no trace, so a hit that never
-    // reaches an issue is invisible. Count each drop REASON and emit one line per call, so
-    // "hits found, none applied" is distinguishable from "no hits" — and says WHY.
-    let issue_count = issues.len();
-    let (mut linked, mut other_repo, mut merged, mut no_hit, mut matched, mut advanced) =
-        (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
-    // STUDIO-882: how many pull requests the DAEMON's own record contributed that the tracker did
-    // not. On an unconnected repository this is the whole of `linked_prs_total`'s missing count, and
-    // reading `linked_prs_total=0 daemon_links=1 matched=1` is how an operator tells "the tracker
-    // still classifies nothing, and it no longer matters" from "the fix is not running".
-    let mut daemon_linked = 0usize;
-    // The pull requests the hits are ON, named on every drop report so the warning can point at
-    // the comment somebody actually wrote. Sorted for a stable line across polls.
-    let mut hit_prs: Vec<i64> = by_pr.keys().copied().collect();
-    hit_prs.sort_unstable();
-    let mut unlinked: Vec<UnlinkedSummons> = Vec::new();
-    for iss in issues.iter_mut() {
-        // Clone the PR refs out so the loop can mutate the issue's summon fields without aliasing the
-        // `linked_prs` borrow (Go iterates a slice field while assigning sibling fields — legal in Go,
-        // not in Rust). The list is small (an issue's linked PRs).
-        let prs = iss.linked_prs.clone().unwrap_or_default();
-        linked += prs.len();
-        // Per-issue tally of the repo guard, so a ticket whose linked PRs ALL live outside the polled
-        // repo can be named below — that ticket can never be re-engaged by a GitHub summons, and it
-        // is otherwise completely silent.
-        let mut iss_other_repo = 0usize;
-        // The distinct repos those PRs DO live in — the operator needs the repo to point the project
-        // at, not just the count. Only grows for a foreign PR, which is the rare case.
-        let mut iss_pr_repos: Vec<String> = Vec::new();
-        // Whether this issue has ANY pull request a summons on this repo could have reached — an
-        // unmerged one, in the polled repo. STUDIO-875: when it stays false the hits had nowhere to
-        // land on this ticket, and that is a misconfiguration rather than a quiet no-op.
-        let mut iss_reachable = false;
-        for pr in &prs {
-            // Skip PRs from a different repo — `by_pr` only holds data for owner/repo, so a matching PR
-            // number from another repo would falsely advance `latest_summon_at` and trigger a spurious
-            // dispatch. GitHub owner/repo are case-insensitive, so compare case-folded (the configured
-            // repo URL and the Linear attachment URL can legitimately differ in casing).
-            if !pr.owner.eq_ignore_ascii_case(owner) || !pr.repo.eq_ignore_ascii_case(repo) {
-                other_repo += 1;
-                iss_other_repo += 1;
-                let name = format!("{}/{}", pr.owner, pr.repo);
-                if !iss_pr_repos.contains(&name) {
-                    iss_pr_repos.push(name);
-                }
-                continue;
-            }
-            if pr.merged {
-                merged += 1;
-                continue;
-            }
-            iss_reachable = true;
-            let Some(hit) = by_pr.get(&pr.number) else {
-                no_hit += 1;
-                continue;
-            };
-            matched += 1;
-            if iss.latest_summon_at.is_none_or(|current| hit.at > current) {
-                advanced += 1;
-                iss.latest_summon_at = Some(hit.at);
-                iss.latest_summon_body = hit.body.clone();
-                // Author rides with time/body (STUDIO-1502): a GitHub comment always comes from the
-                // operator's one account and carries no author, so a GitHub hit that SUPERSEDES an
-                // older Linear comment must CLEAR that comment's author rather than inherit it —
-                // otherwise the operator's instruction is seeded attributed to the earlier Linear
-                // author (the STUDIO-1502 review's B3).
-                iss.latest_summon_author = String::new();
-                tracing::info!(issue_identifier = %iss.identifier, pr = pr.number, at = %hit.at, "github-summons: advanced latest_summon_at from PR comment");
-            }
-        }
-        // STUDIO-882: the same walk over the pull requests the DAEMON recorded for this ticket in
-        // this repository, for the ones the tracker did not already supply. Separate from the loop
-        // above rather than folded into it so the ported walk stays byte-identical to Go's, and
-        // because the two sources answer different questions: that one asks what the tracker
-        // believes, this one asks what this daemon did.
-        //
-        // No repo guard and no merged check are needed here and their absence is not an oversight:
-        // the index is keyed BY repository, and it is built from live watch rows, so a foreign or a
-        // merged pull request is not in it to begin with. See [`DaemonPrLinks`].
-        for number in links.numbers_for(owner, repo, &iss.identifier) {
-            if prs.iter().any(|pr| {
-                pr.number == *number
-                    && pr.owner.eq_ignore_ascii_case(owner)
-                    && pr.repo.eq_ignore_ascii_case(repo)
-            }) {
-                // The tracker already offered this one, so the loop above has ruled on it — and
-                // its ruling stands, including when that ruling was `merged`. Deliberate: where
-                // the tracker knows a pull request at all its `merged` comes from a CONNECTED
-                // integration and is fresher than a watch row that a sweep has not yet retired, and
-                // the conservative error (not advancing a summons on a merged pull request) is the
-                // safe one. On the unconnected repositories this index exists for, the tracker
-                // offers nothing, so the two can never disagree there.
-                continue;
-            }
-            daemon_linked += 1;
-            iss_reachable = true;
-            let Some(hit) = by_pr.get(number) else {
-                no_hit += 1;
-                continue;
-            };
-            matched += 1;
-            if iss.latest_summon_at.is_none_or(|current| hit.at > current) {
-                advanced += 1;
-                iss.latest_summon_at = Some(hit.at);
-                iss.latest_summon_body = hit.body.clone();
-                // Same as the tracker-linked loop above: clear the author with the body, because a
-                // GitHub comment supplies none (STUDIO-1502 B3).
-                iss.latest_summon_author = String::new();
-                tracing::info!(issue_identifier = %iss.identifier, pr = number, at = %hit.at, "github-summons: advanced latest_summon_at from PR comment (daemon-recorded link)");
-            }
-        }
-        // Every linked PR on this issue lives outside the repo we polled, so no summons on any of
-        // them can EVER reach this ticket — a routing fault (the ticket's project points at a
-        // different repo than its PRs), not a quiet no-op. INFO because it is the one drop reason an
-        // operator must act on, and it cannot fire for a correctly-routed ticket.
-        //
-        // `!iss_reachable` (STUDIO-882) so a ticket the daemon's own links DID reach is not also
-        // accused of pointing at the wrong repository. It changes nothing for a tracker-only
-        // ticket: if every tracker link is foreign then nothing set `iss_reachable` in the loop
-        // above, and only a daemon link in the POLLED repo can have set it since.
-        let all_in_another_repo =
-            iss_other_repo > 0 && iss_other_repo == prs.len() && !iss_reachable;
-        if all_in_another_repo {
-            tracing::info!(
-                issue_identifier = %iss.identifier,
-                polled_repo = %format!("{owner}/{repo}"),
-                pr_repos = %iss_pr_repos.join(", "),
-                linked_prs = prs.len(),
-                "github-summons: issue's linked PRs are all in another repo; summons on them can never re-engage it"
-            );
-        }
-        // STUDIO-875: this repo produced summons hits and this ticket has no pull request in it
-        // that one could have reached. Reported rather than logged here, because whether it is
-        // WORTH saying depends on state this pure function does not have — see
-        // [`report_unlinked_summons`].
-        //
-        // NOT reported when STUDIO-574's line above already named this ticket: that one says the
-        // ticket's links are in another repository and names which, which is both truer and more
-        // actionable than "it has no linked pull request". Two lines about one ticket, one of them
-        // wrong, is worse than the single accurate line.
-        if !iss_reachable && !all_in_another_repo {
-            unlinked.push(UnlinkedSummons {
-                identifier: iss.identifier.clone(),
-                state: iss.state.clone(),
-                repo_prs: hit_prs.clone(),
-            });
-        }
-    }
-    // One line per apply pass: `hits > 0` with `matched == 0` is exactly the STUDIO-574 signature,
-    // and the drop-reason counters say which link broke (no linked PRs at all / wrong repo / already
-    // merged / no summons on that PR number).
-    tracing::debug!(
-        repo = %format!("{owner}/{repo}"),
-        hits = by_pr.len(),
-        issues = issue_count,
-        linked_prs_total = linked,
-        daemon_links = daemon_linked,
-        skipped_other_repo = other_repo,
-        skipped_merged = merged,
-        skipped_no_hit = no_hit,
-        matched,
-        advanced,
-        "github-summons: applied PR summons"
-    );
+    // STUDIO-1503: the walk lives in the communication seam's GitHub backend
+    // ([`crate::comms::GitHubComms::admit`]), which folds every detection through the ONE
+    // `comms::merge_inbound` chokepoint. This wrapper keeps the ported name and signature for the
+    // existing callers (the legacy poll path, the multi-project apply pass, and their tests).
+    let backend = crate::comms::GitHubComms::new(by_pr, owner, repo, links);
+    let unlinked = backend.admit(&mut issues);
     SummonApply { issues, unlinked }
 }
 

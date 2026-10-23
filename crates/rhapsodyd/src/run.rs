@@ -1443,6 +1443,18 @@ where
         })
         .unwrap_or_default();
     let limit_channels = notify_channels.clone();
+    // The inbound communication backends this daemon resolves (STUDIO-1503), logged once at boot so
+    // "which surfaces can re-engage this daemon" is answerable from the log without reading
+    // WORKFLOW.md. A recognized-but-unimplemented name (buzz/slack) degrades with a warning here,
+    // exactly as `codex` does on the harness axis; dispatch is unaffected.
+    if let Some(cfg) = resolved.as_ref() {
+        let registry = rhapsody_orchestrator::comms::CommsRegistry::from_config(cfg);
+        tracing::info!(
+            active = ?registry.active,
+            "comms: resolved inbound communication backends"
+        );
+        registry.warn_degraded();
+    }
     let limit_report_ctx = shutdown.wait();
     let lead_report_task = o.lead_reports.clone().map(|reports| {
         let ctx = shutdown.wait();

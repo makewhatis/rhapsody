@@ -155,6 +155,20 @@ pub(crate) fn base_issue() -> Issue {
     issue("1", "MT-1", "In Progress")
 }
 
+/// A resolved [`Config`] whose `comms.backends` is exactly `backends` — for the communication-seam
+/// tests (STUDIO-1503). `tracker.kind: linear` keeps the surrounding config ordinary.
+pub(crate) fn config_with_comms_backends(backends: &[&str]) -> Config {
+    let list: String = backends.iter().map(|b| format!("    - {b}\n")).collect();
+    let front = format!("tracker:\n  kind: linear\ncomms:\n  backends:\n{list}");
+    let config: YamlMap = serde_yaml_ng::from_str(&front).expect("front matter parses");
+    let def = Definition {
+        config,
+        prompt_template: String::new(),
+    };
+    let decoded = decode(&def).expect("decode");
+    resolve(decoded, "/tmp/wf").expect("resolve")
+}
+
 /// Builds a blocker reference with the given (optional) identifier + state. Mirrors the
 /// `core.BlockerRef{Identifier: …, State: …}` literals in `dispatch_test.go`.
 pub(crate) fn blocker(ident: Option<&str>, state: Option<&str>) -> BlockerRef {

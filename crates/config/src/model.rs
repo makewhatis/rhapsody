@@ -519,6 +519,75 @@ impl Notify {
     }
 }
 
+/// The inbound `comms:` backends the daemon polls for summons (STUDIO-1503). Rhapsody-only: the
+/// frozen Go reference has no such block, and an installation that never writes it inherits the
+/// sources the rest of its config already implies — so it is byte-identical to one built before the
+/// key existed. See [`crate::comms`] for the recognized/implemented split, the identity each backend
+/// can express, and the graceful-degradation rule.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Comms {
+    /// Explicit backend names (STUDIO-1503): entries of
+    /// [`COMMS_BACKEND_NAMES`](crate::comms::COMMS_BACKEND_NAMES). Empty ⇒ INHERIT the sources the
+    /// rest of the config implies (GitHub when `tracker.github_summons` is on, Linear for a Linear
+    /// tracker) — the same "empty means inherit" rule a profile's `harness:` follows.
+    pub backends: Vec<String>,
+}
+
+impl Comms {
+    /// Resolves the inbound communication backends and where each came from (STUDIO-1503) — the
+    /// `harness:` / `memory.backend` resolution.
+    ///
+    /// An explicit, non-empty `comms.backends` wins, in the order written. Otherwise the sources the
+    /// rest of the config already implies are inherited: the GitHub summons enrichment when
+    /// `github_on`, and the tracker's own comment query when `linear_on`. When neither holds, the
+    /// single default `none` is returned, so introspection always has a definite value to render.
+    ///
+    /// The resolved names are the operator-facing answer to "which surfaces can re-engage this
+    /// daemon"; the origin says whether they chose it or inherited it. It does NOT decide whether a
+    /// name can actually be run — a recognized-but-unimplemented name is still resolved here, and
+    /// the composition root degrades it with a warning.
+    pub fn resolve_backends(
+        &self,
+        github_on: bool,
+        linear_on: bool,
+    ) -> Vec<crate::comms::ResolvedComms> {
+        use crate::comms::{CommsOrigin, ResolvedComms};
+        let explicit: Vec<ResolvedComms> = self
+            .backends
+            .iter()
+            .map(|b| b.trim())
+            .filter(|b| !b.is_empty())
+            .map(|b| ResolvedComms {
+                backend: b.to_string(),
+                origin: CommsOrigin::Explicit,
+            })
+            .collect();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        let mut derived = Vec::new();
+        if github_on {
+            derived.push(ResolvedComms {
+                backend: "github".into(),
+                origin: CommsOrigin::Derived("tracker.github_summons"),
+            });
+        }
+        if linear_on {
+            derived.push(ResolvedComms {
+                backend: "linear".into(),
+                origin: CommsOrigin::Derived("tracker.kind"),
+            });
+        }
+        if derived.is_empty() {
+            derived.push(ResolvedComms {
+                backend: "none".into(),
+                origin: CommsOrigin::Default,
+            });
+        }
+        derived
+    }
+}
+
 /// The typed runtime view of a workflow (Go `Config`, upstream §4.1.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
@@ -570,12 +639,31 @@ pub struct Config {
     /// Rhapsody-only; every channel defaults off, so an install that never writes `notify:` is
     /// byte-identical to one built before the key existed.
     pub notify: Notify,
+    /// The inbound communication backends the daemon polls for summons (STUDIO-1503). Rhapsody-only;
+    /// empty inherits the sources the rest of the config implies, so an install that never writes
+    /// `comms:` is byte-identical to one built before the key existed. The separate one-way notify
+    /// axis is [`Config::notify`].
+    pub comms: Comms,
     /// Operator-defined provider metadata (STUDIO-984). Rhapsody-only; EMPTY (the default, and every
     /// install that never writes a `providers:` block) is byte-identical to today. Ordered by id so
     /// the effective view, encode, and the reload revision are deterministic. The key is the
     /// canonical provider id, which is also [`ProviderDefinition::id`]. No value here can carry a
     /// secret — see [`crate::providers`].
     pub providers: BTreeMap<String, ProviderDefinition>,
+}
+
+impl Config {
+    /// The inbound communication backends this config resolves to, and where each came from
+    /// (STUDIO-1503) — the daemon's own answer to "which surfaces can re-engage this daemon",
+    /// consumed by `rhapsody_orchestrator::comms` (which resolves and degrades them) and
+    /// `rhapsodyd teams show` (which renders them). The GitHub source is inherited when
+    /// `tracker.github_summons` is on; the tracker's own comment query is inherited for a Linear
+    /// tracker.
+    pub fn resolve_comms(&self) -> Vec<crate::comms::ResolvedComms> {
+        let linear_on = self.tracker.kind.trim().eq_ignore_ascii_case("linear");
+        self.comms
+            .resolve_backends(self.tracker.github_summons, linear_on)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -622,6 +710,10 @@ pub(crate) struct Raw {
     /// `Option` so `encode` can emit the block only when some channel is configured, keeping an
     /// unconfigured workflow byte-identical on the round-trip.
     pub notify: Option<RawNotify>,
+    /// `comms:` front-matter block (STUDIO-1503). Rhapsody-only: absent ⇒ empty ⇒ inherit. An
+    /// `Option` so `encode` can emit the block only when it is configured, keeping an unconfigured
+    /// workflow byte-identical on the round-trip.
+    pub comms: Option<RawComms>,
     /// `providers:` front-matter block (STUDIO-984). Rhapsody-only: absent ⇒ empty ⇒ no providers.
     pub providers: BTreeMap<String, RawProviderDefinition>,
 }
@@ -637,6 +729,14 @@ pub(crate) struct RawNotify {
     pub macos: Option<bool>,
     pub webhook: String,
     pub ntfy: String,
+}
+
+/// Raw `comms:` block (STUDIO-1503). `backends` is a list so several backends can run at once —
+/// GitHub and Linear already both do. Absent ⇒ empty ⇒ inherit.
+#[derive(Debug, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub(crate) struct RawComms {
+    pub backends: Vec<String>,
 }
 
 /// Raw `budgets.<provider>` entry. `daily_tokens` is `Option` so an absent value is distinguishable
