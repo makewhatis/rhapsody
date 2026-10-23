@@ -10,8 +10,9 @@ docker build -t rhapsody-investigate:rust-1.97.0-node-22.16.0-v1 docker/investig
 
 For a credential-free build, supply `docker --config <empty-owned-directory> --host <local-unix-socket>`.
 The build context is this directory alone. Rust and Node base manifests are pinned by digest;
-installed utility versions are pinned too. Ripgrep permits Debian's architecture-specific binary
-revision of the same source version. The runtime pins the resulting immutable image ID at boot.
+installed utility versions are pinned too, with the Debian revision suffix wildcarded so security
+revisions float to the newest build of the same upstream version. The runtime pins the resulting
+immutable image ID at boot.
 
 ## Runtime contract
 
