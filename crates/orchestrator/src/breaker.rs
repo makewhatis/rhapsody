@@ -497,6 +497,16 @@ pub trait NotifyChannel: Send + Sync {
     fn name(&self) -> &'static str;
 }
 
+/// One generic one-way notification's JSON body posted to a `notify.webhook` (STUDIO-1504). Flat and
+/// stable, and distinct from [`WebhookPayload`] (which carries `event`), so an operator's endpoint
+/// can tell a breaker crossing from a generic notification.
+#[derive(Debug, Serialize)]
+pub struct WebhookNotice<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    pub link: &'a str,
+}
+
 /// A `notify.webhook` URL: POST a JSON body.
 pub struct WebhookChannel {
     url: String,
@@ -520,6 +530,22 @@ impl NotifyChannel for WebhookChannel {
             .client
             .post(&self.url)
             .json(&payload)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("webhook returned HTTP {}", res.status()))
+        }
+    }
+    /// A generic one-way notification (STUDIO-1504), so a webhook-only install still receives the
+    /// four human-warranting events rather than an "unsupported" error per trigger.
+    async fn send_notice(&self, title: &str, body: &str, link: &str) -> Result<(), String> {
+        let res = self
+            .client
+            .post(&self.url)
+            .json(&WebhookNotice { title, body, link })
             .send()
             .await
             .map_err(|e| e.to_string())?;

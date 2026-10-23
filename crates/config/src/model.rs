@@ -483,9 +483,8 @@ impl Notify {
     ///
     /// The resolved name is the operator-facing answer to "which backend is this daemon actually
     /// notifying through"; the origin says whether they chose it or inherited it. It does NOT decide
-    /// which channels are built — that is
-    /// [`rhapsody_orchestrator::notify::channels_from_config`], which preserves the legacy additive
-    /// behaviour when no explicit backend is named.
+    /// which channels are built — that is `rhapsody_orchestrator::notify::channels_from_config`,
+    /// which preserves the legacy additive behaviour when no explicit backend is named.
     pub fn resolve_backend(&self) -> crate::notify::ResolvedNotify {
         use crate::notify::{NotifyOrigin, ResolvedNotify};
         let explicit = self.backend.trim();

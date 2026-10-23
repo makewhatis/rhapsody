@@ -650,6 +650,49 @@ mod tests {
         assert!(hint.contains("Linear"), "{hint}");
     }
 
+    // The generic delivery path reaches a webhook (generic JSON) and the macOS cell independently —
+    // a webhook-only install must not get an "unsupported" error per trigger.
+    #[tokio::test]
+    async fn perform_notify_reaches_webhook_and_macos_independently() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/notice", listener.local_addr().unwrap());
+        let request = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = vec![0; 4096];
+            let len = socket.read(&mut bytes).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(bytes[..len].to_vec()).unwrap()
+        });
+        let state = Arc::new(NotificationsState::default());
+        let channels: Vec<Arc<dyn NotifyChannel>> = vec![
+            Arc::new(WebhookChannel::new(url)),
+            Arc::new(MacosChannel::new(state.clone())),
+        ];
+        let notification = Notification {
+            kind: NotifyKind::AdviceUnapplied,
+            ticket: "STUDIO-9".into(),
+            title: NotifyKind::AdviceUnapplied.title("STUDIO-9"),
+            body: "body".into(),
+            link: "https://example.test".into(),
+            dedup_key: "notify:advice-unapplied:x".into(),
+        };
+        perform_notify(&notification, &channels).await;
+
+        let wire = request.await.unwrap();
+        assert!(wire.contains("\"title\""), "{wire}");
+        assert!(wire.contains("STUDIO-9"), "{wire}");
+        assert_eq!(
+            state.pending().len(),
+            1,
+            "a webhook channel never suppresses the macOS push"
+        );
+    }
+
     #[test]
     fn titles_name_the_ticket() {
         for kind in [
