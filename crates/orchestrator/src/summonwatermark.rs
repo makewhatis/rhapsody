@@ -128,7 +128,10 @@ impl Orchestrator {
     /// Time and body only: the watermark row carries no author (STUDIO-1502's
     /// [`Issue::latest_summon_author`] is not a column on the frozen `rhapsody_summon_watermark`
     /// table), so a restored summons names no author. That is the aged-out edge; a Linear comment
-    /// inside the candidate fetch's comment window keeps its author.
+    /// inside the candidate fetch's comment window keeps its author. The author is CLEARED with the
+    /// body rather than left standing, because it belongs to the comment being REPLACED: a restored
+    /// newer summons that inherited the older live observation's author would name the wrong writer
+    /// (the STUDIO-1502 review's B3).
     fn restore_summon(&self, iss: &mut Issue, w: SummonWatermark) {
         let Ok(at) = DateTime::parse_from_rfc3339(&w.at) else {
             tracing::warn!(
@@ -145,6 +148,7 @@ impl Orchestrator {
         );
         iss.latest_summon_at = Some(at.with_timezone(&chrono::Utc));
         iss.latest_summon_body = w.body;
+        iss.latest_summon_author = String::new();
     }
 }
 
@@ -276,6 +280,36 @@ mod tests {
                 .map(|w| w.at),
             Some("2026-09-13T04:33:00Z".into()),
             "and the watermark itself must not move backwards either"
+        );
+    }
+
+    // STUDIO-1502 review B3: a restored summons REPLACES the candidate's older live observation, and
+    // the author must be cleared with the body — the watermark row has no author column, so inheriting
+    // the older comment's author would name the wrong writer.
+    //
+    // MUTATION: leave `latest_summon_author` standing (the round-1 defect) and this reds with
+    // "Agent Ada".
+    #[test]
+    fn a_restored_summons_clears_the_older_live_author() {
+        let o = orch_with_store();
+        o.store()
+            .record_summon_watermark(SummonWatermark {
+                identifier: "A-1".into(),
+                at: "2026-09-13T04:33:00Z".into(),
+                body: "newer, restored".into(),
+            })
+            .expect("seed");
+        let mut iss = issue("1", "A-1", "Todo");
+        iss.latest_summon_at = Some(at(29));
+        iss.latest_summon_body = "older, live".into();
+        iss.latest_summon_author = "Agent Ada".into();
+
+        o.restore_summon_watermarks(std::iter::once(&mut iss));
+
+        assert_eq!(iss.latest_summon_body, "newer, restored");
+        assert_eq!(
+            iss.latest_summon_author, "",
+            "the restored comment names no author, and the replaced one's must not be inherited"
         );
     }
 

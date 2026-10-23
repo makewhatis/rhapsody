@@ -1383,9 +1383,10 @@ impl Orchestrator {
             // O6 `message.rs`).
             self.deliver_mid_run_summons_tagged(&tagged);
             // STUDIO-1502: a summons (a Linear issue comment, or a GitHub PR comment) re-engages a
-            // ticket the daemon PARKED for a human, before selection skips it as `subject_parked`.
-            // The same step runs on the legacy ladder below — two ladders, two seams.
-            self.reengage_parked_on_summons(tagged.iter().map(|t| &t.iss));
+            // ticket the daemon PARKED for a human — before selection skips it as `subject_parked` —
+            // and seeds the comment into whichever run answers it. The same step runs on the legacy
+            // ladder below — two ladders, two seams.
+            self.reengage_on_summons(tagged.iter().map(|t| &t.iss));
             // Teams memory re-grounding (STUDIO-645, T4): snapshot what the poller just observed
             // so a recall rendered during THIS tick's dispatch can attach a ticket's current state
             // without asking the tracker anything (§5.2). In-memory, and a no-op with Teams off.
@@ -1539,9 +1540,9 @@ impl Orchestrator {
         self.record_chatgpt_queue(issues.iter().map(|issue| (issue, "")), true);
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
-        // The legacy ladder's half of STUDIO-1502 — a summons re-engages a parked ticket before
-        // selection skips it (the multi-project ladder above is the other half).
-        self.reengage_parked_on_summons(issues.iter());
+        // The legacy ladder's half of STUDIO-1502 — a summons re-engages a parked ticket and seeds
+        // the comment before selection runs (the multi-project ladder above is the other half).
+        self.reengage_on_summons(issues.iter());
         self.record_issue_states(issues.iter());
         self.refresh_waiting_retry_issues(issues.iter());
         let retry_identifiers: std::collections::HashSet<_> = self
