@@ -655,9 +655,10 @@ pub struct Config {
 impl Config {
     /// The inbound communication backends this config resolves to, and where each came from
     /// (STUDIO-1503) — the daemon's own answer to "which surfaces can re-engage this daemon",
-    /// consumed by `rhapsody_orchestrator::comms` (which runs them) and `rhapsodyd teams show`
-    /// (which renders them). The GitHub source is inherited when `tracker.github_summons` is on; the
-    /// tracker's own comment query is inherited for a Linear tracker.
+    /// consumed by `rhapsody_orchestrator::comms` (which resolves and degrades them) and
+    /// `rhapsodyd teams show` (which renders them). The GitHub source is inherited when
+    /// `tracker.github_summons` is on; the tracker's own comment query is inherited for a Linear
+    /// tracker.
     pub fn resolve_comms(&self) -> Vec<crate::comms::ResolvedComms> {
         let linear_on = self.tracker.kind.trim().eq_ignore_ascii_case("linear");
         self.comms

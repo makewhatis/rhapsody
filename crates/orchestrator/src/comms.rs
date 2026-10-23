@@ -351,12 +351,12 @@ impl CommsBackend for LinearComms {
 
 /// The resolved, build-checked set of communication backends for one config (STUDIO-1503).
 ///
-/// `active` names the backends this build will run; `degraded` holds every resolved name that is
-/// recognized-but-unimplemented (or unknown), each of which is warned about and skipped rather than
-/// failing a dispatch — the `codex` behaviour on the harness axis.
+/// `active` names the implemented backends this build can run; `degraded` holds every resolved name
+/// that is recognized-but-unimplemented (or unknown), each of which is warned about and skipped
+/// rather than failing a dispatch — the `codex` behaviour on the harness axis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommsRegistry {
-    /// The implemented backend names this build will run, in resolution order.
+    /// The implemented backend names this build can run, in resolution order.
     pub active: Vec<&'static str>,
     /// Recognized-but-unimplemented (or unknown) names that were skipped, with their origin.
     pub degraded: Vec<ResolvedComms>,
@@ -383,7 +383,7 @@ impl CommsRegistry {
         Self { active, degraded }
     }
 
-    /// Whether this build will run `name`.
+    /// Whether this build can run `name`.
     pub fn is_active(&self, name: &str) -> bool {
         self.active.contains(&name)
     }
