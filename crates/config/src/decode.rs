@@ -17,7 +17,7 @@ use rhapsody_core::normalize_state;
 use serde_yaml_ng::Value;
 
 use crate::model::{
-    Agent, Claude, ClaudeOverride, Codex, Config, DEFAULT_OTEL_ENDPOINT,
+    Agent, Claude, ClaudeOverride, Codex, Comms, Config, DEFAULT_OTEL_ENDPOINT,
     DEFAULT_PR_STATE_INTERVAL_MS, Hooks, Logging, Mcp, Notify, Opencode, Otel, Polling, Project,
     ProviderBudget, Raw, RawBrokerLimits, RawClaudeOverride, RawProject, RawProviderDefinition,
     Server, Storage, Tracker, Workspace,
@@ -327,6 +327,21 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         },
         None => Notify::default(),
     };
+    // Inbound communication backends (STUDIO-1503). Rhapsody-only and inheriting when absent: an
+    // empty list is the default, so a workflow that never writes `comms:` decodes byte-identically
+    // to before. Entries are trimmed and blanks dropped, so a stray `- ""` cannot resolve to a
+    // backend the daemon would then warn about.
+    let comms = match r.comms {
+        Some(c) => Comms {
+            backends: c
+                .backends
+                .into_iter()
+                .map(|b| b.trim().to_string())
+                .filter(|b| !b.is_empty())
+                .collect(),
+        },
+        None => Comms::default(),
+    };
     // Global provider definitions (STUDIO-984). Rhapsody-only and purely additive: an absent
     // `providers:` block decodes to an empty map, so a config that never writes one is byte-identical
     // to a daemon built before this existed. The map key is the provider id and is copied onto the
@@ -372,6 +387,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         prices: r.prices.into_iter().collect(),
         limits,
         notify,
+        comms,
         providers,
     })
 }
@@ -1245,6 +1261,65 @@ mod tests {
         let r = none.notify.resolve_backend();
         assert_eq!(r.backend, "none");
         assert_eq!(r.origin, NotifyOrigin::Default);
+    }
+
+    // STUDIO-1503: the `comms:` block decodes verbatim, and an absent one leaves the empty INHERIT
+    // default — so a workflow that never writes it decodes byte-identically to before.
+    #[test]
+    fn decode_comms_defaults_empty_and_parses() {
+        let unset = decode_yaml("tracker:\n  kind: linear\n", "body");
+        assert!(unset.comms.backends.is_empty());
+
+        let c = decode_yaml("comms:\n  backends:\n    - github\n    - linear\n", "body");
+        assert_eq!(c.comms.backends, vec!["github", "linear"]);
+    }
+
+    // Blank entries are dropped, so a stray `- ""` cannot resolve to a backend the daemon would
+    // then warn about.
+    #[test]
+    fn decode_comms_drops_blank_entries() {
+        let c = decode_yaml(
+            "comms:\n  backends:\n    - github\n    - \"  \"\n    - linear\n",
+            "body",
+        );
+        assert_eq!(c.comms.backends, vec!["github", "linear"]);
+    }
+
+    // STUDIO-1503: an explicit `comms.backends` wins in order; otherwise the sources the rest of
+    // the config implies are inherited (github from `tracker.github_summons`, linear from
+    // `tracker.kind`), and neither derives the default `none`.
+    #[test]
+    fn comms_backends_resolve_with_origin() {
+        use crate::comms::CommsOrigin;
+
+        let explicit = decode_yaml(
+            "tracker:\n  kind: linear\n  github_summons: true\ncomms:\n  backends:\n    - buzz\n",
+            "body",
+        );
+        let r = explicit.resolve_comms();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].backend, "buzz");
+        assert_eq!(r[0].origin, CommsOrigin::Explicit);
+        assert!(r[0].is_recognized() && !r[0].is_implemented());
+
+        let both = decode_yaml("tracker:\n  kind: linear\n  github_summons: true\n", "body");
+        let r = both.resolve_comms();
+        let names: Vec<&str> = r.iter().map(|x| x.backend.as_str()).collect();
+        assert_eq!(names, vec!["github", "linear"]);
+        assert_eq!(r[0].origin, CommsOrigin::Derived("tracker.github_summons"));
+        assert_eq!(r[1].origin, CommsOrigin::Derived("tracker.kind"));
+
+        let linear_only = decode_yaml("tracker:\n  kind: linear\n", "body");
+        let r = linear_only.resolve_comms();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].backend, "linear");
+        assert_eq!(r[0].origin, CommsOrigin::Derived("tracker.kind"));
+
+        let neither = decode_yaml("tracker:\n  kind: file\n", "body");
+        let r = neither.resolve_comms();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].backend, "none");
+        assert_eq!(r[0].origin, CommsOrigin::Default);
     }
 
     // Mirrors Go `TestDecodeOtelDefaults`.

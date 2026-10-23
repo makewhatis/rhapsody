@@ -11,6 +11,7 @@
 //! validated) [`Config`].
 
 pub mod capabilities;
+pub mod comms;
 pub mod decode;
 pub mod effective_json;
 pub mod encode;
@@ -35,12 +36,17 @@ pub mod validate;
 pub mod warnings;
 pub mod workflow;
 
+pub use comms::{
+    COMMS_BACKEND_NAMES, CommsIdentity, CommsOrigin, IMPLEMENTED_COMMS_BACKENDS,
+    IdentityRepresentation, ResolvedComms, comms_backend_identity, comms_backend_is_implemented,
+    comms_backend_is_recognized,
+};
 pub use decode::{ConfigError, decode};
 pub use encode::{encode, go_duration_string};
 pub use harness::HARNESS_NAMES;
 pub use limits::Limits;
 pub use model::{
-    Agent, CLAIM_MODE_ASSIGNEE, CLAIM_MODE_POOL, Claude, ClaudeOverride, Codex, Config,
+    Agent, CLAIM_MODE_ASSIGNEE, CLAIM_MODE_POOL, Claude, ClaudeOverride, Codex, Comms, Config,
     DEFAULT_DEP_MODE_PROMPT_FILE, DEFAULT_OTEL_ENDPOINT, DEPENDENCY_MODE_DAG,
     DEPENDENCY_MODE_DISABLED, DEPENDENCY_MODE_GRAPHITE, Hooks, Logging, Mcp, Notify, Opencode,
     Otel, Polling, Price, Project, ProviderBudget, Server, Storage, Tracker, WORKSPACE_MODE_CLONE,

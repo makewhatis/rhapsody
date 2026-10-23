@@ -27,7 +27,7 @@ use serde_yaml_ng::{Mapping, Value};
 
 use crate::decode::ConfigError;
 use crate::model::{
-    Config, Project, Raw, RawBrokerLimits, RawClaudeOverride, RawCredentialRef, RawHooks,
+    Config, Project, Raw, RawBrokerLimits, RawClaudeOverride, RawComms, RawCredentialRef, RawHooks,
     RawNotify, RawProject, RawProviderBudget, RawProviderDefinition,
 };
 use crate::workflow::Definition;
@@ -244,6 +244,20 @@ fn raw_from_config(c: &Config) -> Raw {
             macos: c.notify.macos.then_some(true),
             webhook: c.notify.webhook.clone(),
             ntfy: c.notify.ntfy.clone(),
+        });
+    }
+    // STUDIO-1503 (Rhapsody-only): emit the `comms:` block only when a backend is named, so a
+    // workflow that never writes it round-trips byte-identically (the empty list inherits).
+    let comms_backends: Vec<String> = c
+        .comms
+        .backends
+        .iter()
+        .map(|b| b.trim().to_string())
+        .filter(|b| !b.is_empty())
+        .collect();
+    if !comms_backends.is_empty() {
+        r.comms = Some(RawComms {
+            backends: comms_backends,
         });
     }
     // STUDIO-984 (Rhapsody-only): a configured provider round-trips; an empty map prunes away,
@@ -740,6 +754,29 @@ mod tests {
         let c4 = re_encode_decode(&c3);
         assert_eq!(c4.notify, c3.notify);
         assert_eq!(c4.notify.backend, "none");
+    }
+
+    // STUDIO-1503: an explicit `comms:` block survives an encode/decode round trip, and an absent
+    // one stays absent (the empty list is the inherit default, so it must not be frozen into the
+    // file).
+    #[test]
+    fn an_explicit_comms_block_survives_a_round_trip() {
+        let c1 = decode_map(
+            "tracker:\n  kind: linear\ncomms:\n  backends:\n    - github\n    - linear\n",
+            "body",
+        );
+        let c2 = re_encode_decode(&c1);
+        assert_eq!(c2.comms, c1.comms, "the comms block must round-trip");
+        assert_eq!(c2.comms.backends, vec!["github", "linear"]);
+
+        let unset = decode_map("tracker:\n  kind: linear\n", "body");
+        let def = encode(&unset).expect("encode");
+        let raw = serde_yaml_ng::to_string(&def.config).expect("serialize");
+        assert!(
+            !raw.contains("comms"),
+            "an unconfigured comms block must not be emitted: {raw}"
+        );
+        assert!(re_encode_decode(&unset).comms.backends.is_empty());
     }
 
     // STUDIO-974 review (jimmy): the console's Save path (`httpapi::config_view::apply_typed_config`)
