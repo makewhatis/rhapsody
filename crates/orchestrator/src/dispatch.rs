@@ -704,6 +704,10 @@ impl Orchestrator {
                 issue_identifier = %iss.identifier,
                 "skipping dispatch: held for a human (rhapsody:human); only a person can do this ticket"
             );
+            // STUDIO-1504: the first time a held ticket becomes a candidate, push it to the
+            // operator — once per ticket, never per tick. The ledger above already deduped the
+            // per-process half; the durable half survives a restart.
+            self.notify_human_hold(&iss.identifier);
         }
     }
 
@@ -1394,6 +1398,34 @@ mod tests {
             !o.review_reopen_eligible(&summoned(Some(vec!["rhapsody:human".into()])), &none),
             "a human ticket is never reopened"
         );
+    }
+
+    // STUDIO-1504: a ticket held by the `rhapsody:human` refusal is one of the four events that
+    // pushes to the operator — once per ticket, the first time it becomes a candidate.
+    #[test]
+    fn a_human_hold_enqueues_one_notification() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let mut eff = empty_effective(Arc::new(rhapsody_tracker::fake::Fake::new()));
+        eff.cfg.notify.macos = true;
+        o.eff = Some(eff);
+        o.set_store(Arc::new(
+            rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("store"),
+        ));
+        let mut rx = o.open_notify_channel();
+        let iss = Issue {
+            identifier: "STUDIO-2".into(),
+            title: "held".into(),
+            ..Default::default()
+        };
+
+        o.note_human_hold(&iss, "rhapsody");
+        let n = rx.try_recv().expect("one notification");
+        assert_eq!(n.kind, crate::notify::NotifyKind::HumanHold);
+        assert!(n.body.contains("STUDIO-2"), "{}", n.body);
+
+        // A repeat of the same hold is not news, so it does not page again.
+        o.note_human_hold(&iss, "rhapsody");
+        assert!(rx.try_recv().is_err(), "once per ticket, never per tick");
     }
 
     // STUDIO-988 review round 5 (alice A): a zero-turn `refused` row must not count as "the last run

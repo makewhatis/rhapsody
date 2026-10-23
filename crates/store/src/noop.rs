@@ -114,6 +114,9 @@ impl Store for Noop {
     fn notices_enabled(&self) -> bool {
         false
     }
+    fn durable_dedup_enabled(&self) -> bool {
+        false
+    }
     fn observe_notices(&self, _rows: &[Notice], _at: &str) -> Result<(), StoreError> {
         Ok(())
     }

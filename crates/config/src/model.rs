@@ -454,11 +454,19 @@ pub struct Price {
     pub cache_write: f64,
 }
 
-/// The `notify:` channels the runaway-loop breaker escalates to (STUDIO-1026). Rhapsody-only: the
-/// frozen Go reference has no such block, and an installation that sets none is byte-identical to
-/// one built before it existed (every channel is off by default).
+/// The one-way `notify:` channels the daemon pushes to (STUDIO-1026, extended by STUDIO-1504).
+/// Rhapsody-only: the frozen Go reference has no such block, and an installation that sets none is
+/// byte-identical to one built before it existed (every channel is off by default).
+///
+/// STUDIO-1504 adds [`Notify::backend`], a named backend resolved by [`Notify::resolve_backend`] —
+/// see [`crate::notify`] for the recognized/implemented split and the graceful-degradation rule.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Notify {
+    /// An explicit named backend (STUDIO-1504): one of
+    /// [`NOTIFY_BACKEND_NAMES`](crate::notify::NOTIFY_BACKEND_NAMES), or empty ⇒ inherit the legacy
+    /// channel keys below. Rhapsody-only, and empty by default, so a workflow that never writes it
+    /// is byte-identical to one built before the key existed.
+    pub backend: String,
     /// Whether the DESKTOP app should raise a native notification. Fed by a `notifications` key on
     /// `/api/v1/state`, present only while a crossing is pending — the desktop polls that surface.
     pub macos: bool,
@@ -466,6 +474,50 @@ pub struct Notify {
     pub webhook: String,
     /// An ntfy topic (or full `https://ntfy.sh/<topic>` URL) to push to. Empty ⇒ off.
     pub ntfy: String,
+}
+
+impl Notify {
+    /// Resolves the notification backend and where it came from (STUDIO-1504) — the `harness:` /
+    /// `memory.backend` resolution: an explicit `notify.backend` wins, else the legacy channel keys
+    /// are inherited (ntfy, then macOS, then webhook), else the default `none`.
+    ///
+    /// The resolved name is the operator-facing answer to "which backend is this daemon actually
+    /// notifying through"; the origin says whether they chose it or inherited it. It does NOT decide
+    /// which channels are built — that is
+    /// [`rhapsody_orchestrator::notify::channels_from_config`], which preserves the legacy additive
+    /// behaviour when no explicit backend is named.
+    pub fn resolve_backend(&self) -> crate::notify::ResolvedNotify {
+        use crate::notify::{NotifyOrigin, ResolvedNotify};
+        let explicit = self.backend.trim();
+        if !explicit.is_empty() {
+            return ResolvedNotify {
+                backend: explicit.to_string(),
+                origin: NotifyOrigin::Explicit,
+            };
+        }
+        if !self.ntfy.trim().is_empty() {
+            return ResolvedNotify {
+                backend: "ntfy".into(),
+                origin: NotifyOrigin::Derived("notify.ntfy"),
+            };
+        }
+        if self.macos {
+            return ResolvedNotify {
+                backend: "macos".into(),
+                origin: NotifyOrigin::Derived("notify.macos"),
+            };
+        }
+        if !self.webhook.trim().is_empty() {
+            return ResolvedNotify {
+                backend: "webhook".into(),
+                origin: NotifyOrigin::Derived("notify.webhook"),
+            };
+        }
+        ResolvedNotify {
+            backend: "none".into(),
+            origin: NotifyOrigin::Default,
+        }
+    }
 }
 
 /// The typed runtime view of a workflow (Go `Config`, upstream §4.1.3).
@@ -580,6 +632,9 @@ pub(crate) struct Raw {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawNotify {
+    /// `notify.backend` (STUDIO-1504). `Option` so an absent value is distinguishable from an
+    /// explicit empty string (both mean "inherit the legacy keys").
+    pub backend: Option<String>,
     pub macos: Option<bool>,
     pub webhook: String,
     pub ntfy: String,

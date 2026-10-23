@@ -1866,6 +1866,10 @@ impl Orchestrator {
                         d.rounds,
                         d.reason.trim()
                     );
+                    // STUDIO-1504: an unapplied `advise` recommendation is one of the four events
+                    // that warrants a human — by definition nothing else will act on it. The other
+                    // divergence kinds above and below are silent (the never-send list).
+                    self.notify_divergence(d);
                     continue;
                 }
                 // STUDIO-967: the author's newest run was stopped at its per-run token ceiling, so
@@ -4293,6 +4297,41 @@ mod store_tests {
             rendered["review_divergence"][0]["reason"], found[0].reason,
             "the row carries the reason so the console can render it"
         );
+    }
+
+    /// **STUDIO-1504.** An unapplied `advise` recommendation is one of the four events that pushes
+    /// to the operator, because by definition nothing else will act on it. The sweep enqueues
+    /// exactly one notification, deduped per `(pull request, head)`.
+    #[test]
+    fn an_unapplied_advice_enqueues_one_notification() {
+        use crate::reviewadjudicate::{Adjudication, AdjudicationLedger};
+
+        let o = &mut orch(false, "2026-10-17T19:00:00Z");
+        o.eff.as_mut().expect("eff").cfg.notify.macos = true;
+        let mut rx = o.open_notify_channel();
+        reviewed_row(o, "alice", "STUDIO-170");
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        let ledger = Arc::new(AdjudicationLedger::default());
+        ledger.record(
+            &pr,
+            Adjudication::Advice {
+                kind: "ROUTE_TO_AUTHOR".to_string(),
+                head: HEAD.to_string(),
+                rounds: 3,
+                findings: Vec::new(),
+                reason: "the demonstrated B1 ownership gap warrants an author fix".to_string(),
+            },
+        );
+        o.adjudication_ledger = Some(ledger);
+
+        o.reconcile_review_divergence();
+        let n = rx.try_recv().expect("one notification");
+        assert_eq!(n.kind, crate::notify::NotifyKind::AdviceUnapplied);
+        assert!(n.body.contains("STUDIO-170"), "{}", n.body);
+        assert!(n.body.contains("Linear"), "{}", n.body);
+
+        o.reconcile_review_divergence();
+        assert!(rx.try_recv().is_err(), "deduped per (PR, head)");
     }
 
     /// **The convergence guard (STUDIO-1330).** An advice whose rows have since ALL approved is
