@@ -1616,24 +1616,28 @@ mod tests {
         );
     }
 
-    // STUDIO-1497: a ticket parked with a NON-blocked hold (a lead escalation, a breaker hold) is
-    // not this report's business — only the "blocked" kind means "no pull request, needs a human".
+    // STUDIO-1497: a ticket parked with a NON-no-PR hold is not this report's business. In
+    // particular the lead's `"blocked"` hold — parked for a lead-detected blocked question whether
+    // or not the run opened a pull request — must NOT be reported as "no pull request", which is
+    // why the declination parks the distinct `BLOCKED_NO_PR_KIND` instead.
     #[test]
     fn the_sweep_does_not_report_a_non_blocked_hold() {
-        let mut o = orch(teams_with(false, ReviewMode::Ticketless, &[]));
-        o.store()
-            .park_subject(&rhapsody_store::SubjectHold {
-                subject: "STUDIO-1497".into(),
-                kind: "escalation".into(),
-                need: "the manager escalated".into(),
-                ..Default::default()
-            })
-            .expect("park");
-        let iss = active("STUDIO-1497");
-        o.reconcile_blocked_no_pr(std::iter::once((&iss, Some(0))), true);
-        assert!(
-            o.warnings.merged_for("rhapsody").is_empty(),
-            "an escalation is not a blocked no-PR ticket"
-        );
+        for kind in ["escalation", "blocked"] {
+            let mut o = orch(teams_with(false, ReviewMode::Ticketless, &[]));
+            o.store()
+                .park_subject(&rhapsody_store::SubjectHold {
+                    subject: "STUDIO-1497".into(),
+                    kind: kind.into(),
+                    need: "the manager escalated".into(),
+                    ..Default::default()
+                })
+                .expect("park");
+            let iss = active("STUDIO-1497");
+            o.reconcile_blocked_no_pr(std::iter::once((&iss, Some(0))), true);
+            assert!(
+                o.warnings.merged_for("rhapsody").is_empty(),
+                "a {kind} hold is not a blocked no-PR ticket"
+            );
+        }
     }
 }
