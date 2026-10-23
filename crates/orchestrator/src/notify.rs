@@ -362,10 +362,10 @@ impl Orchestrator {
     /// Fires the notification for a run that ended blocked with no pull request (STUDIO-1497,
     /// STUDIO-1504). Deduped per hold id, so one blocked episode pages once and a later re-park
     /// pages again.
-    pub(crate) fn notify_blocked_no_pr(&self, ticket: &str, hold_id: i64, need: &str) -> bool {
+    pub(crate) fn notify_blocked_no_pr(&self, ticket: &str, hold_id: i64) -> bool {
         let body = format!(
             "**{ticket}** — a run ended blocked with no pull request, so there is nothing to review \
-             and nothing will move it on its own.\n{need}\n\n{answer}",
+             and nothing will move it on its own.\n\n{answer}",
             answer = answer_hint(ticket),
         );
         self.request_notify(
@@ -578,8 +578,8 @@ mod tests {
         assert!(o.notify_divergence(&divergence(DivergenceKind::AdviceUnapplied)));
         assert!(!o.notify_divergence(&divergence(DivergenceKind::AdviceUnapplied)));
 
-        assert!(o.notify_blocked_no_pr("STUDIO-1", 7, "the run ended with no pull request"));
-        assert!(!o.notify_blocked_no_pr("STUDIO-1", 7, "the run ended with no pull request"));
+        assert!(o.notify_blocked_no_pr("STUDIO-1", 7));
+        assert!(!o.notify_blocked_no_pr("STUDIO-1", 7));
 
         assert!(o.notify_human_hold("STUDIO-2"));
         assert!(!o.notify_human_hold("STUDIO-2"));
@@ -607,20 +607,20 @@ mod tests {
 
         let mut first = orch_with(Arc::clone(&store), enabled());
         let mut rx = first.open_notify_channel();
-        assert!(first.notify_blocked_no_pr("STUDIO-9", 3, "need"));
+        assert!(first.notify_blocked_no_pr("STUDIO-9", 3));
         assert_eq!(rx.try_recv().expect("sent").kind, NotifyKind::BlockedNoPr);
 
         // A "restart": fresh in-memory state, same store.
         let mut second = orch_with(Arc::clone(&store), enabled());
         let mut rx2 = second.open_notify_channel();
         assert!(
-            !second.notify_blocked_no_pr("STUDIO-9", 3, "need"),
+            !second.notify_blocked_no_pr("STUDIO-9", 3),
             "a trip already notified must not be re-sent after a restart"
         );
         assert!(rx2.try_recv().is_err());
 
         // A new hold episode is a new occurrence.
-        assert!(second.notify_blocked_no_pr("STUDIO-9", 4, "need"));
+        assert!(second.notify_blocked_no_pr("STUDIO-9", 4));
         assert_eq!(rx2.try_recv().expect("sent").kind, NotifyKind::BlockedNoPr);
     }
 

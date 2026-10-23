@@ -325,7 +325,7 @@ impl Orchestrator {
                 .record_blocked_no_pr(&group, &identifier, &why);
             // STUDIO-1504: a run blocked with no pull request has no reply surface and nothing will
             // move it — one of the four events that warrants a human. Deduped per hold id.
-            self.notify_blocked_no_pr(&identifier, hold_id, &why);
+            self.notify_blocked_no_pr(&identifier, hold_id);
         }
     }
 
