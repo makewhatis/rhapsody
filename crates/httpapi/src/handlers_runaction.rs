@@ -30,6 +30,12 @@ struct RunActionJson {
     moved_to: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     move_error: String,
+    /// Set only when a handoff DECLINED to park the ticket because the run opened no pull request
+    /// (STUDIO-1497). The ticket stays in its dispatchable state and is parked for a human, so the
+    /// agent must NOT fall back to a manual Linear move into review. Omitted on every other outcome,
+    /// so the stop/resume bodies and a landed handoff are unchanged.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    declined_no_pr: String,
 }
 
 /// Parse `{id}` as a positive run id, or return `Err(404 envelope)` on a bad/zero id (run id 0 is
@@ -96,6 +102,7 @@ pub(crate) async fn handle_run_stop(
                 identifier: res.identifier,
                 moved_to: res.moved_to,
                 move_error: res.move_err,
+                declined_no_pr: String::new(),
             },
         ),
     }
@@ -176,6 +183,7 @@ pub(crate) async fn handle_run_resume(
             identifier: res.identifier,
             moved_to: res.moved_to,
             move_error: res.move_err,
+            declined_no_pr: String::new(),
         },
     )
 }
@@ -235,12 +243,29 @@ pub(crate) async fn handle_run_handoff(
             res.move_err,
             None,
         ),
+        // A handoff that produced NO pull request is not a review handoff (STUDIO-1497): the ticket is
+        // left in its dispatchable state and parked for a human, so the move did not happen. This is a
+        // 200 — NOT an error — deliberately: an error would send the agent to its Linear-MCP fallback
+        // and re-create the exact stall (a ticket parked in review with nothing to review) this
+        // ticket closes. `declined_no_pr` carries the reason the agent reads.
+        Ok(res) if res.declined_no_pr => write_json(
+            StatusCode::OK,
+            &RunActionJson {
+                identifier: res.identifier,
+                moved_to: String::new(),
+                move_error: String::new(),
+                declined_no_pr: "the run opened no pull request, so this is not a review handoff — \
+                                 the ticket was left in its dispatchable state and parked for a human"
+                    .to_string(),
+            },
+        ),
         Ok(res) => write_json(
             StatusCode::OK,
             &RunActionJson {
                 identifier: res.identifier,
                 moved_to: res.moved_to,
                 move_error: String::new(),
+                declined_no_pr: String::new(),
             },
         ),
     }
@@ -546,6 +571,36 @@ mod tests {
             provider.handoff_run_id(),
             7,
             "handoff_run called with the parsed run id"
+        );
+    }
+
+    // STUDIO-1497: a handoff that DECLINED because the run opened no pull request is a 200 carrying
+    // `declined_no_pr` — NOT an error, which would send the agent to its Linear-MCP fallback and
+    // re-create the stall (a ticket parked in review with nothing to review). `moved_to` is absent.
+    #[tokio::test]
+    async fn handoff_declined_no_pr_is_a_200_with_the_reason() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()).with_handoff_result(
+            HandoffResult {
+                identifier: "INF-9".into(),
+                declined_no_pr: true,
+                ..Default::default()
+            },
+        ));
+        let base = spawn(provider).await;
+        let resp = do_action(
+            &format!("{base}/api/v1/runs/7/handoff"),
+            reqwest::Method::POST,
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "a declination is not an error");
+        let body = body_json(resp).await;
+        assert_eq!(body["identifier"], "INF-9");
+        assert!(body.get("moved_to").is_none(), "nothing was moved: {body}");
+        assert!(
+            body["declined_no_pr"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "the reason the agent reads is present: {body}"
         );
     }
 

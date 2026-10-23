@@ -261,9 +261,10 @@ impl Orchestrator {
     /// advisory on `GET /api/v1/projects` ([`crate::warnings::WarningsState`]). It runs on the
     /// control task from the poll's own candidate set, so it costs no tracker call; the blocked fact
     /// comes from the durable subject hold the declined handoff parked
-    /// ([`Orchestrator::handle_handoff_declined`]), not from a re-derivation — and a `blocked` hold
-    /// exists only for a handoff that produced nothing to review, so "blocked" here already means
-    /// "no pull request".
+    /// ([`Orchestrator::handle_handoff_declined`]), which carries the dedicated
+    /// [`BLOCKED_NO_PR_KIND`](crate::leaditems::BLOCKED_NO_PR_KIND) — NOT the lead's `"blocked"`,
+    /// which a lead-detected blocked question also parks whether or not the run opened a pull
+    /// request.
     ///
     /// **Once per ticket per occurrence, not per poll.** The advisory is keyed by ticket, so
     /// re-observing the same blocked ticket on the next tick refreshes its line rather than adding
@@ -292,7 +293,7 @@ impl Orchestrator {
             let Ok(Some(hold)) = self.store().subject_hold(&iss.identifier) else {
                 continue;
             };
-            if hold.kind != "blocked" {
+            if hold.kind != crate::leaditems::BLOCKED_NO_PR_KIND {
                 continue;
             }
             let why = if hold.need.trim().is_empty() {
@@ -1537,7 +1538,7 @@ mod tests {
         o.store()
             .park_subject(&rhapsody_store::SubjectHold {
                 subject: identifier.to_string(),
-                kind: "blocked".into(),
+                kind: crate::leaditems::BLOCKED_NO_PR_KIND.into(),
                 need: "the run ended with no pull request".into(),
                 ..Default::default()
             })

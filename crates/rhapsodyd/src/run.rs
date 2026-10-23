@@ -687,6 +687,21 @@ where
     ))
         as Arc<dyn rhapsody_orchestrator::ghsummons::ManagerGhSource>);
 
+    // The handoff's open-pull-request decision (STUDIO-1497): one off-loop `gh` read that answers
+    // whether a run's branch has an OPEN pull request before the handoff parks its ticket in review.
+    // Built UNCONDITIONALLY for `diff_deps`' reason — it writes nothing and decides only the
+    // daemon's own local advisory — and handed to the `ControlHandle` by `o.control()` below, so the
+    // control task stays network-free. The summon token is `GH::new`'s only construction input and
+    // the open-PR query does not use it, so a daemon with no readable workflow still asks.
+    o.pr_source = Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+        &resolved
+            .as_ref()
+            .map(|c| c.tracker.summon_token.clone())
+            .unwrap_or_default(),
+        None,
+    ))
+        as Arc<dyn rhapsody_orchestrator::ghsummons::OpenPrSource>);
+
     let (lead_report_tx, lead_report_rx) = tokio::sync::mpsc::unbounded_channel();
     if teams_cfg.enabled && teams_cfg.manager.lead.enabled && durable_store {
         o.lead_reports = Some(Arc::new(rhapsody_orchestrator::leadreport::LeadReports {

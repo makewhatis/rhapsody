@@ -511,6 +511,18 @@ pub struct Orchestrator {
     /// the HTTP request's own task, takes no claim and needs no control round-trip. Not gated on
     /// Teams — a read writes nothing and decides nothing.
     pub manager_gh_deps: Option<std::sync::Arc<dyn crate::ghsummons::ManagerGhSource>>,
+    /// The off-loop `gh` seam the daemon-mediated handoff asks whether a run's branch has an OPEN
+    /// pull request before it parks the ticket in review (STUDIO-1497). Snapshotted onto the
+    /// [`ControlHandle`](crate::ControlHandle) exactly as [`Self::diff_deps`] is, and for the same
+    /// reason: the lookup BLOCKS on `gh`, so it runs on the HTTP request's own task, and the
+    /// control task stays network-free. `None` ⇒ the handoff cannot ask, so it treats the answer as
+    /// UNKNOWN and parks exactly as a daemon built before this ticket — the fail-open direction that
+    /// keeps an installation without GitHub byte-identical.
+    ///
+    /// Not gated on Teams, for [`Self::diff_deps`]'s reason: the decision it feeds writes nothing
+    /// beyond the daemon's own local advisory, and a ticket with no pull request is exactly the
+    /// stall the ticket exists to close whatever Teams is configured to do.
+    pub pr_source: Option<std::sync::Arc<dyn crate::ghsummons::OpenPrSource>>,
     /// The Rhapsody Teams **room** the dispatch path catches up from (STUDIO-650, T5; design
     /// record §0.5, §0.11.4). `None` whenever there is no room to read: Teams off, or no on-disk
     /// runtime home to anchor `~/.rhapsody/teams/room/` to.
@@ -1234,6 +1246,7 @@ impl Orchestrator {
             merge_deps: None,
             diff_deps: None,
             manager_gh_deps: None,
+            pr_source: None,
             teams_room: None,
             teams_cursors: None,
             issue_states: HashMap::new(),
