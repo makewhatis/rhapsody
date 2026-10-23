@@ -254,6 +254,74 @@ impl Orchestrator {
         }
     }
 
+    /// Reports every ticket this daemon has left BLOCKED with no pull request (STUDIO-1497).
+    ///
+    /// The report half of the ticket: a run that ended blocked with no pull request is a stall a
+    /// human has to resolve, and it must be visible where stalls already are — the per-project
+    /// advisory on `GET /api/v1/projects` ([`crate::warnings::WarningsState`]). It runs on the
+    /// control task from the poll's own candidate set, so it costs no tracker call; the blocked fact
+    /// comes from the durable subject hold the declined handoff parked
+    /// ([`Orchestrator::handle_handoff_declined`]), not from a re-derivation — and a `blocked` hold
+    /// exists only for a handoff that produced nothing to review, so "blocked" here already means
+    /// "no pull request".
+    ///
+    /// **Once per ticket per occurrence, not per poll.** The advisory is keyed by ticket, so
+    /// re-observing the same blocked ticket on the next tick refreshes its line rather than adding
+    /// one; it is retired the moment the hold goes away (a pull request appeared, or a material
+    /// change released the park).
+    ///
+    /// `read_the_board` gates the RETIREMENT, not the report: a pass that could not read every
+    /// enabled project's board is not evidence that a condition resolved, so it never clears an
+    /// advisory — the same fail-closed direction `poll_all_projects`' partial answer takes
+    /// everywhere else.
+    ///
+    /// A no-op on a daemon with no blocked holds — the common case — so the default installation
+    /// files nothing.
+    pub(crate) fn reconcile_blocked_no_pr<'a>(
+        &mut self,
+        candidates: impl Iterator<Item = (&'a Issue, Option<usize>)>,
+        read_the_board: bool,
+    ) {
+        let mut live: Vec<(String, String, String)> = Vec::new();
+        for (iss, proj) in candidates {
+            if iss.identifier.is_empty() {
+                continue;
+            }
+            // A store that cannot be read answers `Err`, which is skipped rather than reported:
+            // this is a report, and an unreadable hold is not evidence of a blocked ticket.
+            let Ok(Some(hold)) = self.store().subject_hold(&iss.identifier) else {
+                continue;
+            };
+            if hold.kind != "blocked" {
+                continue;
+            }
+            let why = if hold.need.trim().is_empty() {
+                "the run ended with no pull request".to_string()
+            } else {
+                hold.need.clone()
+            };
+            live.push((self.adopt_group(proj), iss.identifier.clone(), why));
+        }
+        // Retire recorded advisories whose hold is gone (or whose ticket left the board), FIRST, so
+        // a ticket recorded in this same sweep is never immediately cleared by a stale entry. Only a
+        // pass that read the whole board may retire anything.
+        if read_the_board {
+            let live_keys: HashSet<(String, String)> = live
+                .iter()
+                .map(|(group, id, _)| (group.clone(), id.clone()))
+                .collect();
+            for (group, identifier) in self.warnings.blocked_no_pr_entries() {
+                if !live_keys.contains(&(group.clone(), identifier.clone())) {
+                    self.warnings.clear_blocked_no_pr(&group, &identifier);
+                }
+            }
+        }
+        for (group, identifier, why) in live {
+            self.warnings
+                .record_blocked_no_pr(&group, &identifier, &why);
+        }
+    }
+
     /// What one candidate is. Every gate here is a comparison over data already in memory or an
     /// indexed local store read; the expensive question — "does this branch have an open pull
     /// request, and which number is it" — is deliberately NOT asked, because it is a `gh` round
@@ -1452,5 +1520,119 @@ mod tests {
         let out = sweep(&mut o, &issues, Instant::now());
 
         assert_eq!(out.planned.len(), MAX_REVIEW_ADOPTIONS_PER_TICK);
+    }
+
+    /// An ACTIVE candidate — the state the declined handoff leaves the ticket in (STUDIO-1497).
+    fn active(identifier: &str) -> Issue {
+        Issue {
+            id: format!("iss-{identifier}"),
+            identifier: identifier.to_string(),
+            team_id: "team-1".to_string(),
+            state: "Todo".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn park_blocked(o: &Orchestrator, identifier: &str) {
+        o.store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: identifier.to_string(),
+                kind: "blocked".into(),
+                need: "the run ended with no pull request".into(),
+                ..Default::default()
+            })
+            .expect("park the blocked hold");
+    }
+
+    // STUDIO-1497 acceptance: the reconciliation sweep reports a ticket left BLOCKED with no pull
+    // request, and the report appears in the per-project advisory.
+    #[test]
+    fn the_sweep_reports_a_blocked_ticket_with_no_pull_request() {
+        let mut o = orch(teams_with(false, ReviewMode::Ticketless, &[]));
+        park_blocked(&o, "STUDIO-1497");
+        let iss = active("STUDIO-1497");
+        o.reconcile_blocked_no_pr(std::iter::once((&iss, Some(0))), true);
+
+        let warnings = o.warnings.merged_for("rhapsody");
+        assert!(
+            warnings
+                .iter()
+                .any(|w| w.contains("STUDIO-1497") && w.contains("blocked with no pull request")),
+            "the blocked, pull-request-less ticket is on the advisory: {warnings:?}"
+        );
+    }
+
+    // STUDIO-1497 acceptance: the report fires once per occurrence, not once per poll — two sweeps
+    // over the same still-blocked ticket leave ONE line — and it is retired once the hold is gone.
+    #[test]
+    fn the_blocked_no_pr_report_fires_once_per_occurrence_not_per_poll() {
+        let mut o = orch(teams_with(false, ReviewMode::Ticketless, &[]));
+        park_blocked(&o, "STUDIO-1497");
+        let iss = active("STUDIO-1497");
+        let lines = |o: &Orchestrator| {
+            o.warnings
+                .merged_for("rhapsody")
+                .into_iter()
+                .filter(|w| w.contains("STUDIO-1497"))
+                .count()
+        };
+
+        o.reconcile_blocked_no_pr(std::iter::once((&iss, Some(0))), true);
+        o.reconcile_blocked_no_pr(std::iter::once((&iss, Some(0))), true);
+        assert_eq!(
+            lines(&o),
+            1,
+            "one occurrence is one line, however many sweeps see it"
+        );
+
+        // The ticket left the board (or the hold was released): the advisory is retired.
+        o.reconcile_blocked_no_pr(std::iter::empty(), true);
+        assert_eq!(lines(&o), 0, "a resolved condition retires the line");
+    }
+
+    // STUDIO-1497: a pass that could not read the whole board never RETIRES an advisory — a partial
+    // answer is not evidence that the condition resolved.
+    #[test]
+    fn a_partial_board_read_never_retires_the_blocked_no_pr_advisory() {
+        let mut o = orch(teams_with(false, ReviewMode::Ticketless, &[]));
+        park_blocked(&o, "STUDIO-1497");
+        let iss = active("STUDIO-1497");
+        o.reconcile_blocked_no_pr(std::iter::once((&iss, Some(0))), true);
+        assert!(
+            o.warnings
+                .merged_for("rhapsody")
+                .iter()
+                .any(|w| w.contains("STUDIO-1497"))
+        );
+        // The fetch failed, so this pass saw no candidates: it must clear nothing.
+        o.reconcile_blocked_no_pr(std::iter::empty(), false);
+        assert!(
+            o.warnings
+                .merged_for("rhapsody")
+                .iter()
+                .any(|w| w.contains("STUDIO-1497")),
+            "a partial board read retires nothing"
+        );
+    }
+
+    // STUDIO-1497: a ticket parked with a NON-blocked hold (a lead escalation, a breaker hold) is
+    // not this report's business — only the "blocked" kind means "no pull request, needs a human".
+    #[test]
+    fn the_sweep_does_not_report_a_non_blocked_hold() {
+        let mut o = orch(teams_with(false, ReviewMode::Ticketless, &[]));
+        o.store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "STUDIO-1497".into(),
+                kind: "escalation".into(),
+                need: "the manager escalated".into(),
+                ..Default::default()
+            })
+            .expect("park");
+        let iss = active("STUDIO-1497");
+        o.reconcile_blocked_no_pr(std::iter::once((&iss, Some(0))), true);
+        assert!(
+            o.warnings.merged_for("rhapsody").is_empty(),
+            "an escalation is not a blocked no-PR ticket"
+        );
     }
 }
