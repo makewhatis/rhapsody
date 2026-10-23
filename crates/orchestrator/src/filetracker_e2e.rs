@@ -53,6 +53,12 @@ struct FIssue {
     state: &'static str,
     team_id: &'static str,
     latest_summon_at: &'static str,
+    /// The body of that summons comment — what the Linear adapter's `normalize_issue` carries in
+    /// `latest_summon_body` (INF-448). `""` omits it.
+    latest_summon_body: &'static str,
+    /// The author of that summons comment (STUDIO-1502) — what the Linear adapter carries from the
+    /// comment's `user { name }`. `""` omits it.
+    latest_summon_author: &'static str,
 }
 
 /// Resolves the committed fake-claude stub to an absolute path (Go `fakeClaudeBin`, `scripts/fake-claude`;
@@ -98,6 +104,12 @@ fn write_tracker_file(path: &str, issues: &[FIssue]) {
             }
             if !i.latest_summon_at.is_empty() {
                 m.insert("latest_summon_at".into(), i.latest_summon_at.into());
+            }
+            if !i.latest_summon_body.is_empty() {
+                m.insert("latest_summon_body".into(), i.latest_summon_body.into());
+            }
+            if !i.latest_summon_author.is_empty() {
+                m.insert("latest_summon_author".into(), i.latest_summon_author.into());
             }
             serde_json::Value::Object(m)
         })
@@ -317,6 +329,8 @@ async fn file_tracker_limits_flow_from_runner_to_accounts_and_release_without_st
             state: "Todo",
             team_id: "",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     let mut ft = build_file_tracker_orch(&src, "");
@@ -384,6 +398,8 @@ async fn file_tracker_opencode_wall_flow_uses_actual_api_auth_and_releases_on_fa
             state: "Todo",
             team_id: "",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     let script = dir.child("wall.sh");
@@ -451,6 +467,8 @@ async fn file_tracker_silent_opencode_run_binds_account_while_active() {
             state: "Todo",
             team_id: "",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     let script = dir.child("silent.sh");
@@ -525,6 +543,8 @@ async fn file_tracker_e2e_dispatch_continued_redispatch() {
             state: "Todo",
             team_id: "team-1",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     let mut ft = build_file_tracker_orch(&src, "FAKE_CLAUDE_SLEEP_S=0"); // finish instantly
@@ -591,6 +611,8 @@ async fn file_tracker_e2e_terminal_teardown() {
             state: "Todo",
             team_id: "team-1",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     // Go's own knob: the stub sleeps forever, so ONLY reconcile's teardown can end this run — and a
@@ -618,6 +640,8 @@ async fn file_tracker_e2e_terminal_teardown() {
             state: "Done",
             team_id: "team-1",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     ft.o.on_tick().await;
@@ -670,6 +694,8 @@ async fn file_tracker_e2e_review_reopen_promotes_and_reengages() {
             state: "In Progress",
             team_id: "team-1",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     let mut ft = build_file_tracker_orch(&src, "FAKE_CLAUDE_SLEEP_S=0");
@@ -698,6 +724,8 @@ async fn file_tracker_e2e_review_reopen_promotes_and_reengages() {
             state: "In Review",
             team_id: "team-1",
             latest_summon_at: "2099-01-01T00:00:00Z",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
 
@@ -735,6 +763,116 @@ async fn file_tracker_e2e_review_reopen_promotes_and_reengages() {
     teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
 }
 
+/// STUDIO-1502 acceptance #1: a summons carried by a LINEAR issue comment re-engages a ticket the
+/// daemon parked for a human, on a ticket with NO pull request.
+///
+/// The tracker is the file tracker, whose `latest_summon_at` is exactly what the Linear adapter's
+/// `normalize_issue` produces from an issue comment containing the summon token — so this drives the
+/// Linear-comment source end to end through the real control pass.
+///
+/// Before the fix this cannot work: `select_dispatch_*` skips every candidate carrying a durable
+/// subject hold (`subject_parked`), and both `pr_suppressed` and `review_reopen_eligible` refuse a
+/// parked subject — so a parked ticket is unreachable by ANY summons, Linear or GitHub. The explicit
+/// operator HTTP message on an ended run already releases the hold (`message.rs::handle_run_message`);
+/// a Linear comment must do the same, and its body must reach the fresh run.
+#[tokio::test(flavor = "multi_thread")]
+async fn file_tracker_e2e_linear_comment_summons_reengages_a_parked_no_pr_ticket() {
+    let dir = TempDir::new();
+    let src = dir.child("issues.json");
+    write_tracker_file(
+        &src,
+        &[FIssue {
+            id: "i1",
+            identifier: "SMK-1",
+            title: "Smoke",
+            state: "In Progress",
+            team_id: "team-1",
+            latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
+        }],
+    );
+    let mut ft = build_file_tracker_orch(&src, "FAKE_CLAUDE_SLEEP_S=0");
+
+    // A first run so the ticket has a run window (a summons must beat its END to count).
+    ft.o.on_tick().await;
+    assert!(
+        pump(&mut ft.o, &mut ft.rx, Duration::from_secs(10), |o| o
+            .running
+            .is_empty()
+            && count_runs(o) >= 1)
+        .await,
+        "prior run did not complete"
+    );
+
+    // A no-PR handoff parks a durable `blocked_no_pr` subject hold and leaves the ticket
+    // dispatchable-but-parked (STUDIO-1497) — the stall a human has no way to answer.
+    let hold = ft
+        .store
+        .park_subject(&rhapsody_store::SubjectHold {
+            subject: "SMK-1".into(),
+            kind: crate::leaditems::BLOCKED_NO_PR_KIND.into(),
+            ..Default::default()
+        })
+        .expect("park the blocked hold");
+    assert!(hold > 0, "the hold must be open");
+    assert!(
+        ft.o.subject_parked("SMK-1", "author"),
+        "the parked ticket refuses the author's dispatch"
+    );
+    // Consume the pending continuation retry (the claim is released for a parked subject).
+    ft.o.on_retry(EvRetry {
+        issue_id: "i1".to_string(),
+    })
+    .await;
+
+    let runs_before = count_runs(&ft.o);
+    // The human replies on the Linear issue with the summon token; `normalize_issue` turns that
+    // comment into `latest_summon_at`/`latest_summon_body`, which the file tracker seeds directly.
+    write_tracker_file(
+        &src,
+        &[FIssue {
+            id: "i1",
+            identifier: "SMK-1",
+            title: "Smoke",
+            state: "In Progress",
+            team_id: "team-1",
+            latest_summon_at: "2099-01-01T00:00:00Z",
+            latest_summon_body: "@symphony the schema gate is waived, continue",
+            latest_summon_author: "david",
+        }],
+    );
+
+    ft.o.on_tick().await;
+    assert!(
+        pump(
+            &mut ft.o,
+            &mut ft.rx,
+            Duration::from_secs(10),
+            |o| count_runs(o) > runs_before
+        )
+        .await,
+        "a Linear-comment summons must re-engage the parked ticket"
+    );
+    assert!(
+        !ft.o.subject_parked("SMK-1", "author"),
+        "the summons released the park"
+    );
+    // The comment body — attributed to its author — reached the fresh run's operator mailbox (the
+    // reopening-summons seed).
+    let seeded =
+        ft.o.running
+            .values()
+            .flat_map(|re| ft.store.list_run_messages(re.run_id).unwrap_or_default())
+            .any(|m| m.body.contains("the schema gate is waived") && m.body.contains("david"));
+    assert!(
+        seeded,
+        "the summon comment body, attributed to its author, must be seeded into the re-engaged run's context"
+    );
+
+    teardown(&mut ft.o, &mut ft.rx, &ft.signal).await;
+}
+
 /// (4) STUDIO-840, Rhapsody-only: a Stop against a live run must leave NO agent process behind.
 ///
 /// The chain has four links — `handle_stop_run` fires the run's cancellation, `spawn_worker`'s select
@@ -756,6 +894,8 @@ async fn file_tracker_e2e_stop_leaves_no_agent_process() {
             state: "Todo",
             team_id: "team-1",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     // Sleeps forever: nothing but a kill can end this run, so a passing assertion cannot be the stub
@@ -846,6 +986,8 @@ async fn file_tracker_e2e_stop_leaves_no_tool_child_that_escaped_the_group() {
             state: "Todo",
             team_id: "team-1",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     // Both knobs: hang so nothing but a kill can end the run, and escape so the run owns a process
@@ -960,6 +1102,8 @@ async fn file_tracker_e2e_drain_finishes_the_run_and_leaves_no_agent_process() {
             state: "Todo",
             team_id: "team-1",
             latest_summon_at: "",
+            latest_summon_body: "",
+            latest_summon_author: "",
         }],
     );
     // Escape (so the run owns a process outside the daemon's group) and a turn slow enough that the

@@ -1818,6 +1818,35 @@ mod tests {
         );
     }
 
+    /// STUDIO-1502 acceptance #2: a ticket that carries BOTH a Linear-comment summons and a GitHub
+    /// PR-comment summons is re-engaged ONCE, not twice. The two sources feed the one
+    /// `latest_summon_at` (max-only — the tracker's `normalize_issue` and `apply_github_summons`
+    /// both only ever advance it), so the reopen ladder sees one instruction and yields one entry.
+    /// The linked PR is present because that is exactly the ticket the GitHub path can reach.
+    #[test]
+    fn a_ticket_with_both_summons_sources_is_reopened_once() {
+        let o = orch_for_reopen("A-1");
+        let mut iss = summoned_review_issue(false);
+        iss.linked_pr = true;
+        iss.linked_prs = Some(vec![rhapsody_core::LinkedPRRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 7,
+            merged: false,
+        }]);
+
+        let (active, reopen, _) = o.select_dispatch_with_reopens(vec![iss]);
+        assert!(
+            active.is_empty(),
+            "a review-state ticket is never dispatched as fresh active work"
+        );
+        assert_eq!(
+            reopen.len(),
+            1,
+            "one instruction from two sources must produce exactly one reopen"
+        );
+    }
+
     /// The multi-project reopen ladder needs its own gate: two ladders, two call sites.
     #[test]
     fn the_multi_project_ladder_does_not_reopen_a_human_ticket() {

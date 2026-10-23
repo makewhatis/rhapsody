@@ -1382,6 +1382,10 @@ impl Orchestrator {
             // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448,
             // O6 `message.rs`).
             self.deliver_mid_run_summons_tagged(&tagged);
+            // STUDIO-1502: a summons (a Linear issue comment, or a GitHub PR comment) re-engages a
+            // ticket the daemon PARKED for a human, before selection skips it as `subject_parked`.
+            // The same step runs on the legacy ladder below — two ladders, two seams.
+            self.reengage_parked_on_summons(tagged.iter().map(|t| &t.iss));
             // Teams memory re-grounding (STUDIO-645, T4): snapshot what the poller just observed
             // so a recall rendered during THIS tick's dispatch can attach a ticket's current state
             // without asking the tracker anything (§5.2). In-memory, and a no-op with Teams off.
@@ -1535,6 +1539,9 @@ impl Orchestrator {
         self.record_chatgpt_queue(issues.iter().map(|issue| (issue, "")), true);
         // Route mid-run summons into live runs BEFORE select drops the running issues (INF-448, O6).
         self.deliver_mid_run_summons(&issues);
+        // The legacy ladder's half of STUDIO-1502 — a summons re-engages a parked ticket before
+        // selection skips it (the multi-project ladder above is the other half).
+        self.reengage_parked_on_summons(issues.iter());
         self.record_issue_states(issues.iter());
         self.refresh_waiting_retry_issues(issues.iter());
         let retry_identifiers: std::collections::HashSet<_> = self
@@ -1964,7 +1971,7 @@ impl Orchestrator {
             iss.state = promote_state;
             if let Some(at) = iss.latest_summon_at {
                 self.pending_reopen_summons
-                    .insert(iss.id.clone(), (at, iss.latest_summon_body.clone()));
+                    .insert(iss.id.clone(), (at, crate::message::summon_seed_text(&iss)));
             }
             self.dispatch_or_prepare(iss, None, route, String::new());
             return;
@@ -1978,7 +1985,7 @@ impl Orchestrator {
         // run is live.
         let summon = iss
             .latest_summon_at
-            .map(|at| (at, iss.latest_summon_body.clone()));
+            .map(|at| (at, crate::message::summon_seed_text(&iss)));
         let id = iss.id.clone();
         let target = crate::prepare::PreparedTarget::Ticket {
             issue: iss,

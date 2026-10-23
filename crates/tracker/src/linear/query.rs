@@ -46,6 +46,14 @@ const BACKLOG_MID: &str = r#") {
 /// Shared tail of `queryCandidates` and `queryBacklogCandidates` — the full issue node selection.
 /// Both queries select the identical fields (the PR-aware dispatch guard + blocker edges + branch
 /// + team), so the tail is one constant. Begins with the ` }` that closes the filter object.
+///
+/// **One Rhapsody-only field rides on the comments selection (STUDIO-1502).** The ported Go text
+/// asks for `comments(first: 50) { nodes { createdAt body } }`; the port additionally selects
+/// `user { name }`, so the newest summons comment's AUTHOR can be carried onto the issue and named
+/// in a re-engaged run's context (an instruction from the operator and a note from an agent carry
+/// different weight). Additive: Linear accepts the extra selection, the field is decoded tolerantly
+/// (a `null` user is "no author"), and nothing the port consumes from Go changes. Documented in the
+/// README's Divergences.
 const FULL_NODE_TAIL: &str = r#" }
   ) {
     nodes {
@@ -65,7 +73,7 @@ const FULL_NODE_TAIL: &str = r#" }
       labels { nodes { name } }
       inverseRelations { nodes { type issue { id identifier state { name } } } }
       attachments(first: 100) { nodes { sourceType metadata } }
-      comments(first: 50) { nodes { createdAt body } }
+      comments(first: 50) { nodes { createdAt body user { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -467,7 +475,7 @@ query Candidates($projectSlug: String!, $states: [String!], $first: Int!, $after
       labels { nodes { name } }
       inverseRelations { nodes { type issue { id identifier state { name } } } }
       attachments(first: 100) { nodes { sourceType metadata } }
-      comments(first: 50) { nodes { createdAt body } }
+      comments(first: 50) { nodes { createdAt body user { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -497,7 +505,7 @@ query Candidates($projectSlug: String!, $states: [String!], $first: Int!, $after
       labels { nodes { name } }
       inverseRelations { nodes { type issue { id identifier state { name } } } }
       attachments(first: 100) { nodes { sourceType metadata } }
-      comments(first: 50) { nodes { createdAt body } }
+      comments(first: 50) { nodes { createdAt body user { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -527,7 +535,7 @@ query Candidates($projectSlug: String!, $states: [String!], $first: Int!, $after
       labels { nodes { name } }
       inverseRelations { nodes { type issue { id identifier state { name } } } }
       attachments(first: 100) { nodes { sourceType metadata } }
-      comments(first: 50) { nodes { createdAt body } }
+      comments(first: 50) { nodes { createdAt body user { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -557,7 +565,7 @@ query Candidates($projectSlug: String!, $states: [String!], $first: Int!, $after
       labels { nodes { name } }
       inverseRelations { nodes { type issue { id identifier state { name } } } }
       attachments(first: 100) { nodes { sourceType metadata } }
-      comments(first: 50) { nodes { createdAt body } }
+      comments(first: 50) { nodes { createdAt body user { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -587,7 +595,7 @@ query BacklogCandidates($projectSlug: String!, $first: Int!, $after: String, $as
       labels { nodes { name } }
       inverseRelations { nodes { type issue { id identifier state { name } } } }
       attachments(first: 100) { nodes { sourceType metadata } }
-      comments(first: 50) { nodes { createdAt body } }
+      comments(first: 50) { nodes { createdAt body user { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }
@@ -617,7 +625,7 @@ query BacklogCandidates($projectSlug: String!, $first: Int!, $after: String, $as
       labels { nodes { name } }
       inverseRelations { nodes { type issue { id identifier state { name } } } }
       attachments(first: 100) { nodes { sourceType metadata } }
-      comments(first: 50) { nodes { createdAt body } }
+      comments(first: 50) { nodes { createdAt body user { name } } }
     }
     pageInfo { hasNextPage endCursor }
   }

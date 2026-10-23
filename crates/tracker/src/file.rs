@@ -403,6 +403,15 @@ struct IssueJson {
         skip_serializing_if = "String::is_empty"
     )]
     latest_summon_body: String,
+    /// The newest summons comment's author (STUDIO-1502, Rhapsody-only — additive, so a file the Go
+    /// daemon wrote still decodes with an empty author). The Linear adapter carries the same value
+    /// from the comment's `user { name }`.
+    #[serde(
+        default,
+        deserialize_with = "null_to_default",
+        skip_serializing_if = "String::is_empty"
+    )]
+    latest_summon_author: String,
     #[serde(
         default,
         deserialize_with = "null_to_default",
@@ -476,6 +485,7 @@ fn to_core_issue(j: &IssueJson) -> Issue {
         linked_prs: None,
         latest_summon_at: utc(j.latest_summon_at),
         latest_summon_body: j.latest_summon_body.clone(),
+        latest_summon_author: j.latest_summon_author.clone(),
         milestone_id: j.milestone_id.clone(),
         milestone_name: j.milestone_name.clone(),
         assignee_id: j.assignee_id.clone(),
@@ -984,6 +994,7 @@ impl crate::Tracker for Tracker {
             latest_pr_activity_at: None,
             latest_summon_at: None,
             latest_summon_body: String::new(),
+            latest_summon_author: String::new(),
             milestone_id: String::new(),
             milestone_name: String::new(),
             assignee_id: spec.assignee_id.clone(),

@@ -120,6 +120,20 @@ struct RawComment {
     created_at: String,
     #[serde(deserialize_with = "super::decode::null_to_empty")]
     body: String,
+    /// The comment's author. Rhapsody-only (STUDIO-1502): the newest summons comment's author is
+    /// carried onto the issue so a re-engaged run can say who wrote the instruction. A GitHub PR
+    /// comment never reaches this path, so it never contributes one. `Option` because Linear can
+    /// answer `user: null` (a deleted account), which must decode as "no author" rather than failing
+    /// the whole issue — the STUDIO-406 null-tolerance rule.
+    user: Option<RawCommentUser>,
+}
+
+/// The `user { name }` sub-selection on a Linear comment (STUDIO-1502).
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct RawCommentUser {
+    #[serde(deserialize_with = "super::decode::null_to_empty")]
+    name: String,
 }
 
 /// Linear's GraphQL issue shape (normalize.go's `rawIssue`). Fields absent from a response fall
@@ -175,7 +189,8 @@ impl Client {
     /// `normalizeIssue`). Labels are lowercased; only `type == "blocks"` relations become
     /// [`BlockedBy`](rhapsody_core::Issue::blocked_by) edges (empty nodes skipped); linked GitHub
     /// PRs (open OR merged) set `linked_pr`/`linked_prs`/`latest_pr_activity_at`; and the newest
-    /// comment whose body contains the summon token sets `latest_summon_at`/`latest_summon_body`.
+    /// comment whose body contains the summon token sets `latest_summon_at`/`latest_summon_body`
+    /// (plus `latest_summon_author`, the Rhapsody-only STUDIO-1502 addition).
     pub fn normalize_issue(&self, r: RawIssue) -> Issue {
         let mut iss = Issue {
             id: r.id,
@@ -261,6 +276,8 @@ impl Client {
                 {
                     iss.latest_summon_at = Some(t);
                     iss.latest_summon_body = cm.body; // body of the SAME (newest) summons (INF-448)
+                    // ...and that same comment's author (STUDIO-1502).
+                    iss.latest_summon_author = cm.user.map(|u| u.name).unwrap_or_default();
                 }
             }
         }
@@ -614,6 +631,48 @@ mod tests {
         assert_eq!(
             iss2.latest_summon_body, "",
             "no summons → LatestSummonBody must be empty"
+        );
+    }
+
+    // STUDIO-1502: the newest summons comment's AUTHOR rides along with its time and body, so a
+    // re-engaged run can say who wrote the instruction. An older tokened comment's author must NOT
+    // win, and a comment with no `user` (or a `null` name) yields an empty author rather than
+    // failing the decode.
+    #[test]
+    fn normalize_captures_the_newest_summon_author() {
+        let raw = r#"{
+          "id": "u", "identifier": "MT-13", "title": "t", "state": { "name": "In Progress" },
+          "labels": { "nodes": [] }, "inverseRelations": { "nodes": [] },
+          "comments": { "nodes": [
+            { "createdAt": "2026-06-03T10:00:00.000Z", "body": "@symphony old ask", "user": { "name": "Ada" } },
+            { "createdAt": "2026-06-03T14:00:00.000Z", "body": "@symphony please fix the MTU", "user": { "name": "David" } },
+            { "createdAt": "2026-06-03T15:00:00.000Z", "body": "chatter, no token", "user": { "name": "Bot" } }
+          ] }
+        }"#;
+        let iss = norm_client("").normalize_issue(parse(raw));
+        assert_eq!(
+            iss.latest_summon_author, "David",
+            "the author of the SAME newest summons comment"
+        );
+
+        // No summons → no author. And a comment whose `user` is null decodes empty (Go's
+        // encoding/json null tolerance), never failing the page.
+        let none = norm_client("").normalize_issue(parse(
+            r#"{"id":"u","identifier":"MT-14","title":"t","state":{"name":"Todo"}}"#,
+        ));
+        assert_eq!(none.latest_summon_author, "");
+        let null_author = norm_client("").normalize_issue(parse(
+            r#"{"id":"u","identifier":"MT-15","title":"t","state":{"name":"Todo"},
+                "comments":{"nodes":[{"createdAt":"2026-06-03T14:00:00Z","body":"@symphony go","user":null}]}}"#,
+        ));
+        assert_eq!(
+            null_author.latest_summon_author, "",
+            "a null user decodes empty rather than failing"
+        );
+        assert_eq!(
+            null_author.latest_summon_at,
+            Some(Utc.with_ymd_and_hms(2026, 6, 3, 14, 0, 0).unwrap()),
+            "the summons itself is still detected"
         );
     }
 
