@@ -1647,12 +1647,14 @@ mod tests {
     }
 
     // Mirrors Go `file.TestSummonBodyDecodes`: latest_summon_body maps onto
-    // core.Issue.LatestSummonBody; absent → empty (INF-448).
+    // core.Issue.LatestSummonBody; absent → empty (INF-448). `latest_summon_author` is the
+    // STUDIO-1502 addition and follows the same rule.
     #[tokio::test]
     async fn summon_body_decodes() {
         let src = r#"{ "issues": [
           { "id": "T", "identifier": "T", "title": "t", "state": "In Progress",
-            "latest_summon_at": "2026-06-17T12:00:00Z", "latest_summon_body": "@symphony fix the MTU" },
+            "latest_summon_at": "2026-06-17T12:00:00Z", "latest_summon_body": "@symphony fix the MTU",
+            "latest_summon_author": "david" },
           { "id": "U", "identifier": "U", "title": "t", "state": "Todo" } ] }"#;
         let (tr, _src) = new_tracker(src);
         let got = tr.fetch_candidate_issues().await.expect("no error");
@@ -1661,9 +1663,14 @@ mod tests {
             got[0].latest_summon_body, "@symphony fix the MTU",
             "LatestSummonBody"
         );
+        assert_eq!(got[0].latest_summon_author, "david", "LatestSummonAuthor");
         assert_eq!(
             got[1].latest_summon_body, "",
             "absent latest_summon_body must decode empty"
+        );
+        assert_eq!(
+            got[1].latest_summon_author, "",
+            "absent latest_summon_author must decode empty"
         );
     }
 

@@ -124,6 +124,11 @@ impl Orchestrator {
     /// Puts a remembered summons back on a candidate whose live view has lost it (or never had
     /// it). An unparseable stored timestamp leaves the candidate untouched — the same tolerance
     /// `last_run_window` applies to a stored run start it cannot read.
+    ///
+    /// Time and body only: the watermark row carries no author (STUDIO-1502's
+    /// [`Issue::latest_summon_author`] is not a column on the frozen `rhapsody_summon_watermark`
+    /// table), so a restored summons names no author. That is the aged-out edge; a Linear comment
+    /// inside the candidate fetch's comment window keeps its author.
     fn restore_summon(&self, iss: &mut Issue, w: SummonWatermark) {
         let Ok(at) = DateTime::parse_from_rfc3339(&w.at) else {
             tracing::warn!(

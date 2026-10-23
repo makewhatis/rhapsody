@@ -1880,6 +1880,12 @@ always comes from the operator's one account and carries no author, so it seeds 
 extra GraphQL selection is additive (Linear accepts it, the field decodes tolerantly — a `null` user is
 "no author"), and nothing the port otherwise consumes from the Go query changes.
 
+One limit is deliberate: the author is **not** persisted in `rhapsody_summon_watermark` (whose columns
+are a frozen parity surface — `identifier`, `summon_at`, `summon_body`). A summons the STUDIO-885
+watermark RESTORES because the live poll no longer covers it therefore carries its body but no author.
+A Linear comment normally sits inside the candidate fetch's 50-comment window, so that is the aged-out
+edge, not the common path; the restored *summons* (its time and body) survives a restart as before.
+
 ### A schema table with no Go counterpart — `rhapsody_review_watch` (STUDIO-711)
 
 The ticketless PR-review subsystem (design STUDIO-703) watches each introduced pull request and
