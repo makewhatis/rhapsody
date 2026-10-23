@@ -1847,6 +1847,46 @@ Nothing else moves: the reopen *gate* (INF-448) is untouched, the turn-1 prompt 
 (no template change), only the newest summons is delivered (the same contract as mid-run), and no
 config field, endpoint or golden is added or changed.
 
+### A named communication-adapter seam for inbound summons (STUDIO-1503)
+
+Rhapsody already does pluggable backends twice (`harness:`, `memory.backend`), and inbound
+communication is the third axis of the same kind. After STUDIO-1502 two concrete implementations of
+one shape exist — **GitHub** (the `gh`-exec poll of unmerged linked pull-request comments) and
+**Linear** (the tracker's own candidate query, which folds a tokened issue comment onto
+`Issue.latest_summon_*` inside `normalize_issue`) — and this lifts the interface out of them rather
+than guessing at it.
+
+A new Rhapsody-only `comms:` block names the inbound backends:
+
+```yaml
+comms:
+  backends: [github, linear]
+```
+
+Absent ⇒ **inherit** the sources the rest of the config implies (`github` when
+`tracker.github_summons` is on, `linear` for a Linear tracker), the same "empty means inherit" rule a
+profile's `harness:` follows — so an install that never writes the key is byte-identical to one
+built before it. The recognized names are `none`, `github`, `linear`, `buzz`, `slack`; this build
+implements the first three, and a recognized-but-unimplemented name (`buzz`, `slack`) degrades with
+a warning rather than failing a dispatch — exactly the `codex` behaviour on the harness axis.
+`rhapsodyd teams show` renders the resolved backends with their origin
+(`comms: github [textual] (tracker.github_summons), …`), and the daemon logs them once at boot.
+
+The variation point between backends is **how an agent's identity is represented**, declared per
+backend rather than assumed: GitHub and Linear both post through one shared account, so a name they
+report is a textual CLAIM and never a verified identity; `buzz` (5/5) holds a keypair per agent, so
+its attribution is proven at the transport. Rhapsody's own identity model stays authoritative — a
+backend's weaker attribution never becomes the source of truth for who did what.
+
+This is a **refactor**: it changes when a run reopens for no configuration. Both backends fold their
+detections through ONE chokepoint (`comms::merge_inbound`), which carries STUDIO-1502's cross-source
+max-only rule (a strictly-newer timestamp replaces time, body and author together; an equal one
+replaces nothing; a source that cannot name the sender CLEARS an older one's author). Every existing
+**refusal** — `rhapsody:human`, non-terminal blockers, the concurrency caps — stays where it already
+was, in `select`/`dispatch`, for every backend in one place rather than per backend. The transports
+keep their own legacy gates in this slice, so the `comms:` block is resolution, introspection and
+graceful degradation rather than a second way to enable or disable a transport.
+
 ### A summons re-engages a ticket and names a Linear comment's author (STUDIO-1502)
 
 A ticket has exactly one inbound channel: a summons (an `@symphony`/`@rhapsody` comment). Two gaps

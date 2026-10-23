@@ -38,6 +38,7 @@ pub mod backoff;
 pub mod breaker;
 pub mod budget;
 pub mod claim;
+pub mod comms;
 pub mod concurrency;
 // `loop` is a reserved word; the file mirrors Go `loop.go` while the module is `control_loop`.
 #[path = "loop.rs"]

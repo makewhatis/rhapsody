@@ -246,15 +246,69 @@ fn show(
         Some(cfg) if teams.enabled => render_effective(cfg, &teams, identity, &resolved),
         _ => String::new(),
     };
+    // The resolved inbound communication backends (STUDIO-1503) — global, and rendered whether or not
+    // Teams is enabled: inbound summons is a daemon-wide surface, not a Teams feature.
+    let comms = render_comms(cfg);
+    let globals = ShowGlobals {
+        backend,
+        rejection: &render_rejection_for(teams_path, &rejected),
+        effective: &effective,
+        comms: &comms,
+    };
     Ok(render_show(
         identity.map(|i| i.name.as_str()),
         &resolved,
         review,
         &room,
-        backend,
-        &render_rejection_for(teams_path, &rejected),
-        &effective,
+        globals,
     ))
+}
+
+/// The daemon-global lines `render_show` splices into the report, gathered so the renderer's
+/// signature stays readable: the configured `agent.backend` (the harness field's inherit branch), the
+/// rejected-config banner, the effective-selection block, and the resolved communication backends
+/// (STUDIO-1503). Every one is a `String` the caller already built; this only groups them.
+struct ShowGlobals<'a> {
+    backend: &'a str,
+    rejection: &'a str,
+    effective: &'a str,
+    comms: &'a str,
+}
+
+/// The daemon's resolved inbound communication backends and where each came from (STUDIO-1503) —
+/// the `harness:`-precedent introspection, rendered beside the resolved harness. Global (not
+/// per-identity), so every `teams show` answers "which surfaces can re-engage this daemon".
+///
+/// Each entry is `<name> [<identity>] (<origin>)`, with a mark when this build cannot run it —
+/// the same graceful-degradation signal `codex` gets on the harness axis. Empty when no config
+/// resolved (there is nothing to report).
+fn render_comms(cfg: Option<&Config>) -> String {
+    let Some(cfg) = cfg else {
+        return String::new();
+    };
+    let resolved = cfg.resolve_comms();
+    let parts: Vec<String> = resolved
+        .iter()
+        .map(|r| {
+            let ident = match r.identity() {
+                Some(i) => format!(" [{}]", i.representation.as_str()),
+                None => String::new(),
+            };
+            let mark = if !r.is_recognized() {
+                ", unknown name"
+            } else if !r.is_implemented() {
+                ", not implemented in this build"
+            } else {
+                ""
+            };
+            format!(
+                "{r_name}{ident} ({origin}{mark})",
+                r_name = r.backend,
+                origin = r.origin.as_str()
+            )
+        })
+        .collect();
+    format!("comms:         {}\n", parts.join(", "))
 }
 
 /// The banner a rejected `teams.yaml` gets, above everything else `show` prints
@@ -400,10 +454,14 @@ fn render_show(
     r: &ResolvedProfile,
     review: Option<&Review>,
     room: &str,
-    backend: &str,
-    rejection: &str,
-    effective: &str,
+    g: ShowGlobals<'_>,
 ) -> String {
+    let ShowGlobals {
+        backend,
+        rejection,
+        effective,
+        comms,
+    } = g;
     let mut out = String::new();
     // First, so it is the line an operator reads before anything else. Empty on
     // every accepted config, which keeps an ordinary `show` byte-identical to
@@ -443,6 +501,10 @@ fn render_show(
         "harness:       {}\n",
         harness_field(&r.harness, r.provenance.harness, backend)
     ));
+    // The resolved inbound communication backends and their origins (STUDIO-1503), beside the
+    // harness for the same reason: it is a resolved global an operator must be able to see without
+    // reading WORKFLOW.md.
+    out.push_str(comms);
     // The provider this profile names, with the same base/overlay origin every sibling field
     // carries (STUDIO-993, P12). It sits between `harness` and `model` because it is the middle
     // field of the tuple: empty means "inherit the daemon's config" exactly as they do. What a run
@@ -986,6 +1048,45 @@ mod tests {
             !profiles_dir.exists(),
             "show must not create {}",
             profiles_dir.display()
+        );
+    }
+
+    /// STUDIO-1503: `teams show` renders the resolved inbound communication backends and their
+    /// origins, and marks a recognized-but-unimplemented name the way `codex` is marked on the
+    /// harness axis.
+    #[test]
+    fn show_reports_the_resolved_comms_backends_with_their_origin() {
+        let dir = TempDir::new();
+        let wf = dir.child("WORKFLOW.md");
+        std::fs::write(
+            &wf,
+            format!(
+                "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\n  github_summons: true\ncomms:\n  backends:\n    - github\n    - buzz\nstorage:\n  path: {}/rhapsody.db\n---\nDo {{{{ issue.identifier }}}}.\n",
+                dir.path.display()
+            ),
+        )
+        .expect("write WORKFLOW.md");
+        let out = run(&["show", "swe"], &wf.to_string_lossy()).expect("show swe");
+        assert!(
+            out.contains("comms:         github [textual] (comms.backends)"),
+            "out = {out}"
+        );
+        assert!(
+            out.contains("buzz [cryptographic] (comms.backends, not implemented in this build)"),
+            "out = {out}"
+        );
+    }
+
+    /// The inherited case: with no `comms:` block, `show` reports the sources the rest of the config
+    /// implies — a Linear tracker's own comment query.
+    #[test]
+    fn show_reports_inherited_comms_backends() {
+        let dir = TempDir::new();
+        let (env, _) = hermetic(&dir);
+        let out = run(&["show", "swe"], &env[0]).expect("show swe");
+        assert!(
+            out.contains("comms:         linear [textual] (tracker.kind)"),
+            "out = {out}"
         );
     }
 

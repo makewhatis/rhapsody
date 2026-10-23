@@ -1839,9 +1839,20 @@ mod tests {
             number: 7,
             merged: false,
         }]);
-        // Source 1 — Linear: the tracker normalized a tokened issue comment onto the issue.
+        // Source 1 — Linear: the tracker normalized a tokened issue comment onto the issue. Since
+        // STUDIO-1503 it is re-admitted through the communication seam's Linear backend, so both
+        // sources meet at the ONE `comms::merge_inbound` chokepoint.
         iss.latest_summon_author = "Agent Ada".into();
         iss.latest_summon_body = "@symphony from Linear".into();
+        {
+            use crate::comms::CommsBackend;
+            let mut one = vec![iss];
+            assert!(
+                crate::comms::LinearComms.admit(&mut one).is_empty(),
+                "the Linear backend reports no drop"
+            );
+            iss = one.into_iter().next().expect("one issue");
+        }
         // Source 2 — GitHub: the enrichment advances the SAME field (max-only) with a newer PR
         // comment, fed through the real apply path.
         let github_at = iss.latest_summon_at.expect("Linear summons") + ChronoDuration::hours(1);
