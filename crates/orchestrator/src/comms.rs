@@ -77,16 +77,26 @@ pub struct Detected {
 
 /// **The one chokepoint** every backend folds its detections through (STUDIO-1503).
 ///
+/// `declared` is the CALLING backend's [`CommsBackend::identity`]. It is enforced here, not merely
+/// trusted: a backend whose identity reports `surfaces_author: false` (GitHub) has its `author`
+/// dropped, so a backend offering only textual — or no — attribution can never silently claim a
+/// sender it cannot see. A caller must not assume more than the declaration admits, and this is where
+/// that is made true rather than merely documented.
+///
 /// Applies the 1502 cross-source rule: `latest_summon_at` is MAX-only, and the body, the author and
 /// the time always describe the SAME message — a strictly-newer detection replaces all three
-/// together; an equal-or-older one replaces nothing. A detection whose `author` is `None` (a backend
-/// that cannot name the sender) CLEARS the author rather than inheriting the previous message's,
-/// which is the STUDIO-1502 B3 rule applied once, for every backend.
+/// together; an equal-or-older one replaces nothing. A detection whose (admitted) author is `None`
+/// CLEARS the author rather than inheriting the previous message's, which is the STUDIO-1502 B3 rule
+/// applied once, for every backend.
 ///
 /// Returns how many candidates advanced (the tests' seam; production ignores it). A detection naming
 /// an id not in `issues` is ignored — a backend may report a candidate the caller has already
 /// dropped, and that is not an error.
-pub fn merge_inbound(issues: &mut [Issue], detected: &[Detected]) -> usize {
+pub fn merge_inbound(
+    issues: &mut [Issue],
+    declared: CommsIdentity,
+    detected: &[Detected],
+) -> usize {
     let mut advanced = 0;
     for d in detected {
         let Some(iss) = issues.iter_mut().find(|i| i.id == d.issue_id) else {
@@ -95,7 +105,13 @@ pub fn merge_inbound(issues: &mut [Issue], detected: &[Detected]) -> usize {
         if iss.latest_summon_at.is_none_or(|current| d.at > current) {
             iss.latest_summon_at = Some(d.at);
             iss.latest_summon_body = d.body.clone();
-            iss.latest_summon_author = d.author.clone().unwrap_or_default();
+            // The declaration is the guard: a backend that cannot name the sender contributes no
+            // author, whatever its detection carries.
+            iss.latest_summon_author = if declared.surfaces_author {
+                d.author.clone().unwrap_or_default()
+            } else {
+                String::new()
+            };
             advanced += 1;
         }
     }
@@ -215,6 +231,7 @@ impl CommsBackend for GitHubComms<'_> {
                     let issue_id = iss.id.clone();
                     merge_inbound(
                         std::slice::from_mut(iss),
+                        GITHUB_IDENTITY,
                         &[Detected {
                             issue_id,
                             at: hit.at,
@@ -246,6 +263,7 @@ impl CommsBackend for GitHubComms<'_> {
                     let issue_id = iss.id.clone();
                     merge_inbound(
                         std::slice::from_mut(iss),
+                        GITHUB_IDENTITY,
                         &[Detected {
                             issue_id,
                             at: hit.at,
@@ -326,7 +344,7 @@ impl CommsBackend for LinearComms {
                 })
             })
             .collect();
-        merge_inbound(issues, &detected);
+        merge_inbound(issues, LINEAR_IDENTITY, &detected);
         Vec::new()
     }
 }
@@ -430,6 +448,7 @@ mod tests {
         // Older and equal both lose.
         let n = merge_inbound(
             &mut issues,
+            LINEAR_IDENTITY,
             &[
                 Detected {
                     issue_id: "A-1".into(),
@@ -452,6 +471,7 @@ mod tests {
         // Newer wins, and body/author ride together.
         let n = merge_inbound(
             &mut issues,
+            LINEAR_IDENTITY,
             &[Detected {
                 issue_id: "A-1".into(),
                 at: at(200),
@@ -466,8 +486,9 @@ mod tests {
     }
 
     /// **A backend that cannot surface an author does not silently claim one** (acceptance #3).
-    /// GitHub declares `surfaces_author: false`, so its detection carries `author: None`, and the
-    /// chokepoint CLEARS the older source's author rather than inheriting it (STUDIO-1502 B3).
+    /// GitHub declares `surfaces_author: false`, so the chokepoint DROPS any author its detection
+    /// carries — the declaration is enforced, not merely trusted — and clears the older source's
+    /// author rather than inheriting it (STUDIO-1502 B3).
     #[test]
     fn a_textual_backend_that_cannot_surface_an_author_does_not_claim_more() {
         assert_eq!(
@@ -491,17 +512,19 @@ mod tests {
         assert_eq!(LinearComms.identity(), LINEAR_IDENTITY);
         assert!(CommsBackend::identity(&LinearComms).surfaces_author);
 
-        // A GitHub detection must not inherit a Linear author it cannot see.
+        // A GitHub detection must not inherit a Linear author it cannot see, even if a detection
+        // were to smuggle one in: the declaration is what the chokepoint enforces.
         let mut issues = vec![issue("A-1")];
         issues[0].latest_summon_at = Some(at(10));
         issues[0].latest_summon_author = "Agent Ada".to_string();
         merge_inbound(
             &mut issues,
+            GITHUB_IDENTITY,
             &[Detected {
                 issue_id: "A-1".into(),
                 at: at(20),
                 body: "from the PR".into(),
-                author: None,
+                author: Some("Mallory".into()),
             }],
         );
         assert_eq!(
@@ -541,6 +564,7 @@ mod tests {
         // The Linear backend re-admits its own (older) observation and changes nothing.
         let n = merge_inbound(
             &mut issues,
+            LINEAR_IDENTITY,
             &[Detected {
                 issue_id: "A-1".into(),
                 at: at(100),
@@ -636,6 +660,7 @@ mod tests {
         issues[0].state = "Todo".to_string();
         let n = merge_inbound(
             &mut issues,
+            GITHUB_IDENTITY,
             &[Detected {
                 issue_id: "A-1".into(),
                 at: at(10),
