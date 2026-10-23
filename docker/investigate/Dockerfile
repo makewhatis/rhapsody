@@ -1,10 +1,12 @@
 # STUDIO-1135: only this image runs untrusted investigation commands. Base digests and toolchain
-# versions are pinned; rebuilding after a package disappears is an explicit operator action.
+# versions are pinned. Installed packages pin their upstream version but wildcard the Debian
+# revision suffix, so security revisions float to the newest build; moving to a new UPSTREAM
+# version is an explicit operator action.
 FROM node:22.16.0-bookworm-slim@sha256:048ed02c5fd52e86fda6fbd2f6a76cf0d4492fd6c6fee9e2c463ed5108da0e34 AS node
 FROM rust:1.97.0-slim-bookworm@sha256:6d220bf85c74e842a79da63997af8d2e74455c0b8847d8bb3a5888572334991d AS tools
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    git=1:2.39.5-0+deb12u3 ripgrep='13.0.0-4*' jq=1.6-2.1+deb12u2 \
-    curl=7.88.1-10+deb12u15 pkg-config=1.8.1-1 libssl-dev=3.0.22-1~deb12u1 \
+    git='1:2.39.5-0+deb12u*' ripgrep='13.0.0-4*' jq='1.6-2.1+deb12u*' \
+    curl='7.88.1-10+deb12u*' pkg-config='1.8.1-1*' libssl-dev='3.0.22-1~deb12u*' \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /opt/rust /repo /cache /scratch \
     && cp -a /usr/local/rustup/toolchains/*/. /opt/rust/ \
