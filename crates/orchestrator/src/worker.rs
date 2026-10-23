@@ -151,6 +151,11 @@ pub struct WorkerDeclaration {
     pub verdict_text: Option<String>,
     /// A ticket run's decision request, detected off-loop only when the tech lead is enabled.
     pub blocked_question: Option<String>,
+    /// The handoff auto-park DECLINED to move the ticket into the review state because the run
+    /// opened no pull request (STUDIO-1497). `false` on every path that did not reach the decision.
+    /// The control task turns this into a durable blocked hold and the "blocked, no pull request"
+    /// advisory, so the ticket is not re-dispatched into the same wall.
+    pub handoff_declined_no_pr: bool,
 }
 
 /// Sent on continuation turns instead of re-rendering the full task prompt, which is already in the
@@ -304,6 +309,24 @@ pub struct WorkerDeps {
     /// prompt is rendered, on the worker's own off-loop task: a hung `gh` parks this one run and
     /// nothing else.
     pub review_delta: Option<std::sync::Arc<dyn crate::ghsummons::ReviewDeltaSource>>,
+    /// Resolves whether this run's branch has an OPEN pull request, for the handoff auto-park's
+    /// state decision (STUDIO-1497). A run that declares a HANDOFF but opened no pull request must
+    /// NOT be parked in the review state — the review state means "there is something to review",
+    /// and a ticketless review is edge-triggered on a head that only exists when a pull request
+    /// does. `None` (every construction that skips the stamp, and every test that does not exercise
+    /// the decision) means UNKNOWN, which the auto-park treats as "park as before" — so the
+    /// behavior is unchanged wherever the daemon cannot ask GitHub.
+    ///
+    /// The lookup runs on the worker's own off-loop task, so a slow `gh` parks this one run and
+    /// nothing else. It is the same [`OpenPrSource`](crate::ghsummons::OpenPrSource) the ticketless
+    /// review path uses, asked the run's own branch — the source of truth the Linear attachment was
+    /// only ever a cache of.
+    pub run_pr_source: Option<std::sync::Arc<dyn crate::ghsummons::OpenPrSource>>,
+    /// The GitHub `owner/repo` the run's branch lives in, parsed at dispatch from
+    /// [`Self::repo_url`] (STUDIO-1497). Stamped alongside [`Self::run_pr_source`], and `None`
+    /// whenever `repo_url` names no GitHub repository — so the auto-park's lookup is simply not
+    /// attempted, which is the same "unknown ⇒ park as before" direction as a missing source.
+    pub run_pr_repo: Option<(String, String)>,
     /// The daemon-wide "stop starting new work" flag (STUDIO-880), cloned from the orchestrator at
     /// dispatch. [`Self::run_turns`] consults it at each TURN BOUNDARY: an armed drain ends the loop
     /// NORMALLY rather than starting another turn, so the run is classified `continued` and keeps
@@ -628,6 +651,7 @@ async fn run_manager_attempt(
             // hand: the decision's dismissals name finding revisions only the daemon knows.
             verdict_text: Some(result_text),
             blocked_question: None,
+            handoff_declined_no_pr: false,
         },
         loop_err,
     )
@@ -1349,6 +1373,18 @@ pub async fn run_agent_attempt(
     } else {
         None
     };
+    // STUDIO-1497: did the handoff auto-park DECLINE because the run opened no pull request? The
+    // ticket is still ACTIVE after a declared handoff, so either the auto-park declined (no PR) or
+    // its review-state move failed. Re-asking GitHub distinguishes them, and only an authoritative
+    // "no open PR" is the declination — a failed move must keep retrying the park as before. The
+    // extra lookup is taken only on this rare path (a declared handoff that left the ticket active).
+    let handoff_declined_no_pr = deps.review.is_none()
+        && deps.manager.is_none()
+        && deps.review_handoff_state.is_some()
+        && !issue.team_id.is_empty()
+        && has_handoff_marker(&result_text)
+        && deps.active_states.contains(&normalize_state(&final_state))
+        && deps.run_has_open_pull_request(&issue.identifier).await == Some(false);
     (
         final_state,
         WorkerDeclaration {
@@ -1356,6 +1392,7 @@ pub async fn run_agent_attempt(
             review_verdict,
             verdict_text: deps.review.as_ref().map(|_| result_text),
             blocked_question,
+            handoff_declined_no_pr,
         },
         loop_err,
     )
@@ -1481,6 +1518,40 @@ impl WorkerDeps {
                     error = %e,
                     "handoff auto-park: the ticket's current state could not be read; the guard \
                      cannot refuse on it, so the park proceeds"
+                );
+                None
+            }
+        }
+    }
+
+    /// Whether this run's branch has an OPEN pull request (STUDIO-1497), asked of the off-loop
+    /// [`OpenPrSource`](crate::ghsummons::OpenPrSource) the dispatch stamped.
+    ///
+    /// `Some(true)` — GitHub answered with an open pull request for the run's own branch;
+    /// `Some(false)` — GitHub answered that there is none; `None` — UNKNOWN: no source was
+    /// stamped, the repository binding names no GitHub `owner/repo`, or the lookup itself failed.
+    /// Only `Some(false)` is authoritative enough to change the handoff's state decision; every
+    /// other answer keeps the pre-ticket behavior, so a daemon that cannot ask GitHub is unchanged.
+    ///
+    /// The branch is the frozen `symphony/<key>` naming contract the worktree was created on
+    /// (`rhapsody_workspace::Manager::ensure_*`), which is what makes this check possible at all:
+    /// the Linear attachment (`Issue::linked_prs`) is absent on an unconnected repository AND stale
+    /// for a pull request the run itself opened during the final turn, so it cannot answer.
+    async fn run_has_open_pull_request(&self, identifier: &str) -> Option<bool> {
+        let source = self.run_pr_source.as_ref()?;
+        let (owner, repo) = self.run_pr_repo.as_ref()?;
+        let branch = format!("symphony/{}", workspace::sanitize_key(identifier));
+        match source.open_pr_for_branch(owner, repo, &branch).await {
+            Ok(Some(_)) => Some(true),
+            Ok(None) => Some(false),
+            Err(e) => {
+                tracing::warn!(
+                    issue_identifier = %identifier,
+                    owner = %owner,
+                    repo = %repo,
+                    error = %e,
+                    "handoff auto-park: could not ask GitHub whether the run opened a pull \
+                     request; the park proceeds as before"
                 );
                 None
             }
@@ -1764,6 +1835,30 @@ impl WorkerDeps {
                     // this value, and a stale `In Progress` would schedule the very continuation
                     // retry this guard exists to prevent.
                     return (fresh, last_result, None);
+                }
+                // STUDIO-1497: a handoff that produced no pull request is not a review handoff.
+                // Ask GitHub whether this run's branch has an OPEN pull request; an authoritative
+                // "no" declines the park, so the ticket stays in its dispatchable state instead of
+                // parking in review with nothing to review. That state is a permanent stall: the
+                // ticketless review is edge-triggered on a head that only exists when a pull
+                // request does, and `In Review` is non-terminal so `dispatch::eligible` refuses
+                // every dependent of the ticket forever. Unknown (no source, unparseable repo, or
+                // a failed lookup) parks as before, so a daemon that cannot ask GitHub is unchanged.
+                if self.run_has_open_pull_request(&issue.identifier).await == Some(false) {
+                    tracing::info!(
+                        issue_identifier = %issue.identifier,
+                        review_state = %state,
+                        "handoff auto-park: not moving {} to {} — the run opened no pull request, \
+                         so this is not a review handoff",
+                        issue.identifier,
+                        state
+                    );
+                    // End the loop, exactly as a successful park does: the agent declared it is
+                    // done, so further turns are pointless. `run_agent_attempt` re-derives this
+                    // declination from the still-active final state and the worker reports it, so
+                    // the control task parks the durable blocked hold that keeps the ticket from
+                    // being re-dispatched into the same wall.
+                    return (issue.state.clone(), last_result, None);
                 }
                 match self
                     .tracker
@@ -2068,6 +2163,8 @@ fi
             review_done_state: None,
             review: None,
             review_delta: None,
+            run_pr_source: None,
+            run_pr_repo: None,
             manager: None,
             manager_root: String::new(),
             manager_test_credential: Some("fake-manager-access".into()),
@@ -4473,6 +4570,159 @@ exit 1
         assert_eq!(moves[0].team_id, "team-1");
         assert_eq!(moves[0].state_name, "in review");
         assert_eq!(last, "in review", "returned state reflects the park");
+    }
+
+    /// An [`OpenPrSource`](crate::ghsummons::OpenPrSource) that always answers the same open pull
+    /// request — or, with `None`, an authoritative "no pull request".
+    struct StubPr(Option<&'static str>);
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::OpenPrSource for StubPr {
+        async fn open_pr_for_branch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+        ) -> crate::ghsummons::OpenPrResult {
+            Ok(self.0.map(|url| crate::ghsummons::OpenPr {
+                url: url.to_string(),
+                head_sha: String::new(),
+            }))
+        }
+    }
+
+    /// An [`OpenPrSource`](crate::ghsummons::OpenPrSource) whose lookup FAILS — the unknown case,
+    /// which must park exactly as before this ticket.
+    struct BrokenPr;
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::OpenPrSource for BrokenPr {
+        async fn open_pr_for_branch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+        ) -> crate::ghsummons::OpenPrResult {
+            Err("gh: could not reach api.github.com".into())
+        }
+    }
+
+    /// The deps for a declaring-handoff ticket run with the park armed and a PR source stamped, over
+    /// the given scripted turns. The [`TempDir`] guard is returned so the CALLER binds it for the
+    /// test's lifetime — dropping it here would delete the workspace root out from under the run,
+    /// which then recreates it and leaks it (the `check-tmp-leaks` guard).
+    fn handoff_deps(
+        turns: Vec<agentfake::TurnScript>,
+        source: Option<Arc<dyn crate::ghsummons::OpenPrSource>>,
+    ) -> (WorkerDeps, Arc<trackerfake::Fake>, TempDir) {
+        let ag = fake_agent(turns);
+        let mut tr = trackerfake::Fake::new();
+        tr.states_by_ids_func = Some(Box::new(|_ids: &[String]| {
+            Ok(vec![issue("1", "MT-1", "In Progress")]) // never leaves active on its own
+        }));
+        let tr = Arc::new(tr);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag, tr.clone() as Arc<dyn Tracker>, "do it", 20);
+        d.review_handoff_state = Some("in review".to_string());
+        // The coordinate the lookup asks about. Kept off `repo_url` so the test does not have to
+        // provision a real workspace from a GitHub remote; production stamps both from the same URL.
+        d.run_pr_repo = Some(("o".to_string(), "r".to_string()));
+        d.run_pr_source = source;
+        (d, tr, root)
+    }
+
+    fn declaring_turn() -> agentfake::TurnScript {
+        agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: "all done\nHANDOFF: in-review".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    // STUDIO-1497 acceptance: a run that ends having opened NO pull request must not park its
+    // ticket in the review state. The ticket is left in its dispatchable state, so a dependent of
+    // it is not wedged behind a review state nothing can ever leave.
+    //
+    // MUTATION: restore the unconditional park (drop the `run_has_open_pull_request` guard in
+    // `run_turns`) and this reds — the ticket lands in `in review`.
+    #[tokio::test]
+    async fn a_handoff_that_opened_no_pull_request_does_not_park_in_review() {
+        let (mut d, tr, _root) = handoff_deps(vec![declaring_turn()], Some(Arc::new(StubPr(None))));
+        let iss = Issue {
+            team_id: "team-1".to_string(),
+            ..issue("1", "MT-1", "In Progress")
+        };
+        let (last, declared, err) =
+            run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+        assert!(declared.declared_handoff, "the agent declared a handoff");
+        assert!(
+            declared.handoff_declined_no_pr,
+            "the park declined because the run opened no pull request"
+        );
+        assert!(
+            tr.move_calls().is_empty(),
+            "the ticket is NOT parked in review: {:?}",
+            tr.move_calls()
+        );
+        assert_eq!(
+            last, "In Progress",
+            "the ticket is left dispatchable, not parked in review"
+        );
+    }
+
+    // STUDIO-1497 acceptance, the regression that matters most: a run that DID open a pull request
+    // parks exactly as before.
+    #[tokio::test]
+    async fn a_handoff_with_a_pull_request_parks_exactly_as_before() {
+        let (mut d, tr, _root) = handoff_deps(
+            vec![declaring_turn()],
+            Some(Arc::new(StubPr(Some("https://github.com/o/r/pull/7")))),
+        );
+        let iss = Issue {
+            team_id: "team-1".to_string(),
+            ..issue("1", "MT-1", "In Progress")
+        };
+        let (last, declared, err) =
+            run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+        assert!(declared.declared_handoff);
+        assert!(
+            !declared.handoff_declined_no_pr,
+            "a run with a pull request is an ordinary review handoff"
+        );
+        let moves = tr.move_calls();
+        assert_eq!(moves.len(), 1, "exactly one park move");
+        assert_eq!(moves[0].state_name, "in review");
+        assert_eq!(last, "in review", "returned state reflects the park");
+    }
+
+    // STUDIO-1497: an UNKNOWN answer (the lookup failed, or no source is stamped) parks as before,
+    // so a daemon that cannot ask GitHub is unchanged.
+    #[tokio::test]
+    async fn an_unknown_pull_request_answer_parks_as_before() {
+        for source in [
+            Some(Arc::new(BrokenPr) as Arc<dyn crate::ghsummons::OpenPrSource>),
+            None,
+        ] {
+            let (mut d, tr, _root) = handoff_deps(vec![declaring_turn()], source);
+            let iss = Issue {
+                team_id: "team-1".to_string(),
+                ..issue("1", "MT-1", "In Progress")
+            };
+            let (last, declared, err) =
+                run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
+            assert!(err.is_none(), "expected normal exit, got {err:?}");
+            assert!(
+                !declared.handoff_declined_no_pr,
+                "unknown is not a declination"
+            );
+            assert_eq!(tr.move_calls().len(), 1, "unknown parks as before");
+            assert_eq!(last, "in review");
+        }
     }
 
     #[tokio::test]

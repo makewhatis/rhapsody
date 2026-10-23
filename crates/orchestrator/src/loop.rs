@@ -243,6 +243,14 @@ pub enum Event {
     },
     /// The adoption task positively found no open PR for a ticket parked in review.
     ReviewMissingPr(crate::reviewintro::ReviewIntroRequest),
+    /// A ticket worker's handoff auto-park DECLINED to move the ticket into the review state
+    /// because the run opened no pull request (STUDIO-1497). Sent before its exit, like
+    /// [`Event::LeadBlockedHandoff`], so the control task can park the durable blocked hold while
+    /// the running entry is still live.
+    HandoffDeclined {
+        issue_id: String,
+        started_at: chrono::DateTime<chrono::Utc>,
+    },
     /// One agent event folded into the running entry (Go `evAgentUpdate`).
     AgentUpdate(AgentUpdate),
     /// Nonsecret auth classification, frozen against the dispatch-time engine and run generation.
@@ -696,6 +704,11 @@ fn worker_deps_for(
         // Review-only (STUDIO-959): `spawn_worker` stamps the `gh` reads a delta round needs, and
         // `None` keeps every non-review run — and every delta-less review — byte-identical.
         review_delta: None,
+        // Per-dispatch (STUDIO-1497): `spawn_worker` stamps the open-PR source and coordinate the
+        // handoff auto-park's state decision asks. `None` here keeps a construction that skips the
+        // stamp — and every test — treating the answer as unknown and parking as before.
+        run_pr_source: None,
+        run_pr_repo: None,
         // The review state a declared HANDOFF parks the ticket in (TRA-240). review_states is a
         // normalized set; MoveIssueState resolves case-insensitively, so the normalized name is fine.
         // `None` when the feature is off ⇒ Go-identical ticket-state-only loop termination.
@@ -861,6 +874,10 @@ impl Orchestrator {
                 question,
             } => self.handle_lead_blocked(&issue_id, started_at, question),
             Event::ReviewMissingPr(req) => self.handle_lead_missing_pr(&req),
+            Event::HandoffDeclined {
+                issue_id,
+                started_at,
+            } => self.handle_handoff_declined(&issue_id, started_at),
             Event::BrokerUsage {
                 issue_id,
                 run_id,
@@ -1396,6 +1413,11 @@ impl Orchestrator {
                 tagged.iter().map(|t| (&t.iss, t.proj)),
                 std::time::Instant::now(),
             );
+            // STUDIO-1497: report every ticket left BLOCKED with no pull request, on the
+            // per-project advisory. The same snapshot again — a blocked ticket is an ordinary
+            // active candidate, and the blocked fact comes from the durable subject hold the
+            // declined handoff parked, so this costs no tracker call and no `gh`.
+            self.reconcile_blocked_no_pr(tagged.iter().map(|t| (&t.iss, t.proj)), read_the_board);
             // STUDIO-988: an issue that dropped out of this tick's candidate set must not keep a
             // preparation reservation / resolver task / slot — but ONLY when the board was actually
             // READ. `poll_all_projects` `continue`s past a project whose fetch FAILED and reports it
@@ -2316,6 +2338,21 @@ impl Orchestrator {
             ))
                 as std::sync::Arc<dyn crate::ghsummons::ReviewDeltaSource>);
         }
+        // The handoff auto-park's state decision (STUDIO-1497): a run that opened no pull request
+        // is not a review handoff, so the auto-park must ask whether this run's branch has an OPEN
+        // pull request before it parks the ticket. Ticket runs only — a review or manager run's
+        // `pr:`/`lead:` key resolves to no tracker ticket, so the auto-park is already inert for
+        // them and the probe would be dead weight. The summon token is `GH::new`'s only
+        // construction input and the open-PR query does not use it, so a daemon with no readable
+        // workflow still gets a working seam.
+        if deps.review.is_none() && deps.manager.is_none() {
+            deps.run_pr_source = Some(std::sync::Arc::new(crate::ghsummons::GH::new(
+                &eff.cfg.tracker.summon_token,
+                None,
+            ))
+                as std::sync::Arc<dyn crate::ghsummons::OpenPrSource>);
+            deps.run_pr_repo = crate::ghsummons::parse_repo(&deps.repo_url);
+        }
         deps.stack_context = stack_context;
         deps.capabilities_section = capabilities_section;
         deps.teammate_section = teammate_section;
@@ -2503,6 +2540,15 @@ impl Orchestrator {
                     issue_id: issue_id.clone(),
                     started_at,
                     question,
+                });
+            }
+            // STUDIO-1497: the auto-park declined because the run opened no pull request. Report
+            // it BEFORE the exit, while the running entry is still live, so the control task can
+            // park the durable blocked hold from the run's own snapshot.
+            if declared.handoff_declined_no_pr {
+                let _ = events_exit.send(Event::HandoffDeclined {
+                    issue_id: issue_id.clone(),
+                    started_at,
                 });
             }
             let exit = EvWorkerExit {

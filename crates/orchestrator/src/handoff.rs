@@ -57,6 +57,12 @@ pub struct HandoffResult {
     /// quorum / ticketless introduction, which ride on a move this handoff did not make, do not
     /// fire.
     pub already_done: bool,
+    /// Set when the handoff REFUSED to move the ticket because the run's branch has no OPEN pull
+    /// request (STUDIO-1497). The ticket is left in its dispatchable state and parked for a human,
+    /// so the agent must NOT fall back to a manual Linear move into review — the very stall this
+    /// ticket closes. Only an authoritative "no open PR" sets this; an unknown answer (no source, an
+    /// unparseable repository, or a failed lookup) parks exactly as before.
+    pub declined_no_pr: bool,
 }
 
 /// The control-task reply for `evHandoffRun`: whether a live run was found + the issue/team the
@@ -77,6 +83,18 @@ pub struct HandoffPlan {
     /// The run's owning project's terminal-state set, NORMALIZED (the form the tracker's state
     /// names are compared in), so the off-loop guard can classify a freshly-read ticket state.
     pub terminal_states: Vec<String>,
+    /// The GitHub `owner/repo` the run's branch lives in, for the open-pull-request decision
+    /// (STUDIO-1497). Parsed on the control task from the run's own repository binding exactly as
+    /// [`plan_review_intro`](Orchestrator::plan_review_intro) parses it — the trusted origin, never
+    /// anything an agent typed. `None` when the run resolves to no GitHub `owner/repo` (or is a
+    /// synthetic review/manager key), in which case the decision is UNKNOWN and the handoff parks
+    /// as before.
+    pub pr_repo: Option<(String, String)>,
+    /// The instant the run being handed off STARTED, carried so the declination the off-loop
+    /// [`handoff_run`](ControlHandle::handoff_run) reports is attributed to this exact attempt — the
+    /// same guard [`handle_handoff_declined`](Orchestrator::handle_handoff_declined) applies to the
+    /// worker's own report.
+    pub started_at: chrono::DateTime<chrono::Utc>,
     /// The review-quorum fan-out to fire once the review-state move SUCCEEDS (STUDIO-659, T7;
     /// design record `~/.rhapsody/docs/STUDIO-572-rhapsody-teams.md`, §0.12). `None` whenever the
     /// quorum does not fire — which is every handoff on an installation that has not opted in, and
@@ -199,6 +217,23 @@ impl Orchestrator {
         // The terminal/merged guard's inputs (STUDIO-1007), resolved per the run's owning project
         // exactly as the review state above is. `done_state` empty ⇒ the guard is inert.
         let (done_state, terminal_states) = self.handoff_done_guard(&re.project_slug);
+        // The open-pull-request decision's coordinate (STUDIO-1497): the run's OWN repository
+        // binding, parsed here on the control task so the off-loop handoff only has to ask. A
+        // synthetic review/manager key resolves to no tracker ticket and is skipped — the handoff
+        // move for one is already refused.
+        let pr_repo = if crate::review::is_non_tracker_key(&re.issue.id) {
+            None
+        } else {
+            let repo_url = if re.project_repo.is_empty() {
+                self.eff
+                    .as_ref()
+                    .map(|eff| eff.cfg.repo.clone())
+                    .unwrap_or_default()
+            } else {
+                re.project_repo.clone()
+            };
+            crate::ghsummons::parse_repo(&repo_url)
+        };
         HandoffPlan {
             found: true,
             issue_id: id.clone(),
@@ -207,6 +242,8 @@ impl Orchestrator {
             review_state: self.review_handoff_state(&re.project_slug),
             done_state,
             terminal_states,
+            pr_repo,
+            started_at: re.started_at,
             // §0.12's trigger: "a teammate's handoff with a linked PR". This is that moment, and it
             // is the moment the daemon EXECUTES rather than merely infers, which is why the design
             // chose it over "PR opened" (the PR exists mid-run, long before it is reviewable) or
@@ -393,6 +430,36 @@ impl ControlHandle {
                 ..Default::default()
             });
         }
+        // STUDIO-1497: a handoff that produced no pull request is not a review handoff. The review
+        // state means "there is something to review", and a ticket parked there with nothing to
+        // review can never leave it — the ticketless review is edge-triggered on a head that only
+        // exists when a pull request does. An authoritative "no open PR" therefore declines the
+        // move, leaves the ticket in its dispatchable state, and reports the declination so the
+        // control task parks the durable blocked hold and the project advisory. Unknown (no source,
+        // an unparseable repository, or a failed lookup) parks exactly as before.
+        if self.handoff_declines_without_pr(&plan).await {
+            tracing::info!(
+                issue_identifier = %plan.identifier,
+                review_state = %plan.review_state,
+                "handoff: not moving {} to {} — the run opened no pull request, so this is not a \
+                 review handoff",
+                plan.identifier,
+                plan.review_state
+            );
+            // Report the declination to the control task BEFORE returning: the run is still live, so
+            // the handler can park the durable blocked hold from the run's own snapshot — the same
+            // event the worker's auto-park emits on its own declination path. Best-effort, like the
+            // other sends here: a gone loop costs a hold, not the agent's terminal action.
+            let _ = self.events.send(Event::HandoffDeclined {
+                issue_id: plan.issue_id.clone(),
+                started_at: plan.started_at,
+            });
+            return Ok(HandoffResult {
+                identifier: plan.identifier,
+                declined_no_pr: true,
+                ..Default::default()
+            });
+        }
         let mut res = HandoffResult {
             identifier: plan.identifier,
             ..Default::default()
@@ -503,6 +570,46 @@ impl ControlHandle {
                 .copied()
                 .unwrap_or(250);
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        }
+    }
+
+    /// The open-pull-request decision for `plan` (STUDIO-1497): `true` when the run's branch has
+    /// authoritatively NO open pull request, so the handoff must NOT park the ticket in review.
+    ///
+    /// The branch is the frozen `symphony/<key>` naming contract the run's worktree was created on
+    /// (`rhapsody_workspace::sanitize_key`), which is what makes the decision possible: the Linear
+    /// attachment (`Issue::linked_prs`) is absent on an unconnected repository AND stale for a pull
+    /// request the run itself opened during the final turn, so it cannot answer.
+    ///
+    /// **Fail open.** `false` (the handoff proceeds) for every answer but an authoritative "none":
+    /// no `pr_source` stamped, no `owner/repo` on the plan, or a lookup that FAILED — so a daemon
+    /// that cannot ask GitHub behaves exactly as a daemon built before this ticket. Only the third
+    /// case is worth a warning.
+    async fn handoff_declines_without_pr(&self, plan: &HandoffPlan) -> bool {
+        let Some(source) = self.pr_source.as_ref() else {
+            return false;
+        };
+        let Some((owner, repo)) = plan.pr_repo.as_ref() else {
+            return false;
+        };
+        let branch = format!(
+            "symphony/{}",
+            rhapsody_workspace::sanitize_key(&plan.identifier)
+        );
+        match source.open_pr_for_branch(owner, repo, &branch).await {
+            Ok(Some(_)) => false,
+            Ok(None) => true,
+            Err(e) => {
+                tracing::warn!(
+                    issue_identifier = %plan.identifier,
+                    owner = %owner,
+                    repo = %repo,
+                    error = %e,
+                    "handoff: could not ask GitHub whether the run opened a pull request; the \
+                     park proceeds as before"
+                );
+                false
+            }
         }
     }
 
@@ -1471,6 +1578,91 @@ mod tests {
         );
     }
 
+    // STUDIO-1497 acceptance on the LIVE path: the agent's own `symphony_handoff` call — the path
+    // the evidenced STUDIO-1486 incident took, and the one the auto-park only backstops — must NOT
+    // park a ticket whose run opened no pull request. The ticket is left in its dispatchable state
+    // and a durable blocked hold is parked for a human, so it is neither stranded in a review state
+    // nothing can leave nor re-dispatched into the same wall.
+    //
+    // MUTATION: drop the `handoff_declines_without_pr` guard from `handoff_run` and this reds — the
+    // ticket lands in `In Review` with no pull request.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_without_a_pull_request_is_not_parked_in_review() {
+        let tr = Arc::new(Fake::new());
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        o.pr_source = Some(Arc::new(NoPr) as Arc<dyn crate::ghsummons::OpenPrSource>);
+        let parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        if let Some(re) = o.running.get_mut(&id) {
+            re.project_repo = "git@github.com:o/r.git".to_string();
+        }
+        let store = Arc::clone(&o.store);
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(res.declined_no_pr, "the handoff declined: {res:?}");
+        assert!(res.moved_to.is_empty(), "no review move was made: {res:?}");
+        assert!(
+            tr.move_calls().is_empty(),
+            "a no-pull-request ticket is never parked in review: {:?}",
+            tr.move_calls()
+        );
+
+        // The declination is reported to the control task, which parks the durable blocked hold.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let hold = loop {
+            if let Some(hold) = store.subject_hold("MT-1").expect("read") {
+                break hold;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the blocked hold was never parked for the human"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(hold.kind, crate::leaditems::BLOCKED_NO_PR_KIND);
+
+        env.signal.cancel();
+        let _ = task.await;
+    }
+
+    // STUDIO-1497, the regression that matters most, on the LIVE `symphony_handoff` path: a run that
+    // DID open a pull request parks exactly as before. The only new work is one off-loop `gh` lookup.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_with_a_pull_request_still_parks() {
+        let tr = Arc::new(Fake::new());
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        o.pr_source = Some(Arc::new(OnePr("https://github.com/o/r/pull/7"))
+            as Arc<dyn crate::ghsummons::OpenPrSource>);
+        let parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        if let Some(re) = o.running.get_mut(&id) {
+            re.project_repo = "git@github.com:o/r.git".to_string();
+        }
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert!(
+            !res.declined_no_pr,
+            "a run with a pull request is an ordinary review handoff: {res:?}"
+        );
+        assert_eq!(res.moved_to, "In Review", "the handoff is unchanged");
+        assert_eq!(tr.move_calls().len(), 1, "exactly one park move");
+
+        env.signal.cancel();
+        let _ = task.await;
+    }
+
     // An unknown run id ⇒ not_running, and the tracker is never called.
     #[tokio::test(flavor = "multi_thread")]
     async fn handoff_unknown_run_is_not_running() {
@@ -1797,6 +1989,22 @@ mod tests {
                 url: self.0.to_string(),
                 head_sha: String::new(),
             }))
+        }
+    }
+
+    /// An [`OpenPrSource`](crate::ghsummons::OpenPrSource) that answers an authoritative "no open
+    /// pull request" — the state a blocked, pull-request-less handoff is in (STUDIO-1497).
+    struct NoPr;
+
+    #[async_trait::async_trait]
+    impl crate::ghsummons::OpenPrSource for NoPr {
+        async fn open_pr_for_branch(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _branch: &str,
+        ) -> crate::ghsummons::OpenPrResult {
+            Ok(None)
         }
     }
 

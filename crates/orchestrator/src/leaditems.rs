@@ -7,6 +7,18 @@ pub use rhapsody_store::{LeadItem, LeadTrigger};
 use crate::orchestrator::Orchestrator;
 use crate::reviewreconcile::{Divergence, DivergenceKind};
 
+/// The subject-hold `kind` a declined no-pull-request handoff parks (STUDIO-1497).
+///
+/// Distinct from the lead's `"blocked"` hold deliberately: [`handle_lead_blocked`] parks `"blocked"`
+/// for a lead-detected blocked question whether or not the run opened a pull request, so the
+/// reconciliation sweep cannot read `"blocked"` as "no pull request" without mislabeling a
+/// lead-blocked ticket that HAS one. This kind is the one the sweep reports.
+///
+/// [`subject_parked`](Orchestrator::subject_parked) treats it exactly like `"blocked"`: it refuses
+/// the author's re-dispatch (the default arm) while still admitting a first review (the `"review"`
+/// arm, which names this kind beside `"blocked"`).
+pub(crate) const BLOCKED_NO_PR_KIND: &str = "blocked_no_pr";
+
 #[derive(Default, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ParkSnapshot {
     description: Option<String>,
@@ -455,7 +467,7 @@ impl Orchestrator {
         match self.store().subject_hold(subject) {
             Ok(Some(hold)) => match work {
                 "lead" => hold.kind == "escalation",
-                "review" => hold.kind != "blocked",
+                "review" => hold.kind != "blocked" && hold.kind != BLOCKED_NO_PR_KIND,
                 _ => true,
             },
             Ok(None) => false,
@@ -816,6 +828,71 @@ impl Orchestrator {
                 Ok(_) => {}
                 Err(error) => tracing::warn!(%error, "blocked ending could not be parked"),
             }
+        }
+    }
+
+    /// Parks the durable "blocked" subject hold for a run whose handoff auto-park DECLINED because
+    /// it opened no pull request (STUDIO-1497).
+    ///
+    /// **Not gated on the tech lead**, unlike [`Self::handle_lead_blocked`] beside it: a blocked
+    /// handoff that produced nothing to review is a human's to resolve whatever the lead is
+    /// configured to do, and the hold is what keeps the ticket from being re-dispatched into the
+    /// same wall. It is the "explicitly blocked" half of the ticket; the hold's release on a
+    /// material change ([`Self::observe_parked_issue_in_project`]) is the "re-dispatchable once the
+    /// blocker clears" half.
+    ///
+    /// The `kind` is [`BLOCKED_NO_PR_KIND`] — distinct from the lead's `"blocked"`, so the
+    /// reconciliation sweep can report it as "blocked with no pull request" without mislabeling a
+    /// lead-blocked ticket that has one — but `subject_parked` treats it exactly like `"blocked"`:
+    /// the author's re-dispatch is refused while a first review is still admitted.
+    pub(crate) fn handle_handoff_declined(
+        &self,
+        issue_id: &str,
+        started_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let Some(re) = self.running.get(issue_id) else {
+            return;
+        };
+        if re.started_at != started_at
+            || re.review.is_some()
+            || crate::managerrun::is_manager_key(&re.issue.id)
+        {
+            return;
+        }
+        let project = self
+            .eff
+            .as_ref()
+            .and_then(|eff| eff.projects.iter().position(|p| p.slug == re.project_slug));
+        self.observe_parked_issue_in_project(&re.issue, project);
+        if self.park_state_is_terminal(&re.issue.state, project) {
+            return;
+        }
+        let need = "the run ended with no pull request".to_string();
+        let snapshot = park_snapshot(self.store(), &re.issue, None, true).and_then(|text| {
+            let mut snapshot: ParkSnapshot =
+                serde_json::from_str(&text).map_err(|e| e.to_string())?;
+            for (pr, observed) in &self.review_observed_head {
+                let key = pr.to_string().to_ascii_lowercase();
+                if snapshot.heads.contains_key(&key) && !observed.head.is_empty() {
+                    snapshot.heads.insert(key, observed.head.clone());
+                }
+            }
+            serde_json::to_string(&snapshot).map_err(|e| e.to_string())
+        });
+        match snapshot.and_then(|snapshot| {
+            self.store()
+                .park_subject(&rhapsody_store::SubjectHold {
+                    subject: re.issue.identifier.clone(),
+                    kind: BLOCKED_NO_PR_KIND.into(),
+                    need,
+                    at: rhapsody_store::format_summon_at(chrono::Utc::now()),
+                    snapshot,
+                    ..Default::default()
+                })
+                .map_err(|e| e.to_string())
+        }) {
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, "blocked no-PR handoff could not be parked"),
         }
     }
 
@@ -1438,6 +1515,115 @@ mod tests {
             matches!(&items[0].trigger, LeadTrigger::BlockedHandoff { ticket, question } if ticket == "STUDIO-1123" && question == "authorize the Event representation?")
         );
         assert!(o.human_holds.labelled_and_primed().0.is_empty());
+    }
+
+    // STUDIO-1497: a handoff auto-park that DECLINED because the run opened no pull request parks
+    // a durable "blocked" subject hold — and it does so with the tech lead OFF as well, because a
+    // blocked handoff that produced nothing to review is a human's to resolve whatever the lead is
+    // configured to do. The hold refuses the author's re-dispatch, so the ticket is not run into the
+    // same wall every poll; it is what the reconciliation sweep reports on the advisory.
+    #[tokio::test]
+    async fn a_declined_handoff_parks_a_blocked_hold_without_the_lead() {
+        for lead in [false, true] {
+            let mut o = orch(lead);
+            let re = crate::testsupport::running_entry(
+                crate::testsupport::issue("u-1497", "STUDIO-1497", "In Progress"),
+                "",
+                "",
+            );
+            let at = re.started_at;
+            o.running.insert("u-1497".into(), re);
+            // A stale attempt is ignored, exactly as the lead's blocked transport ignores one.
+            o.handle_handoff_declined("u-1497", at + chrono::Duration::seconds(1));
+            assert!(
+                o.store()
+                    .subject_hold("STUDIO-1497")
+                    .expect("read")
+                    .is_none(),
+                "lead={lead}: a stale attempt parks nothing"
+            );
+            o.handle_handoff_declined("u-1497", at);
+            let hold = o.store().subject_hold("STUDIO-1497").expect("read");
+            assert!(hold.is_some(), "lead={lead}: the blocked hold is parked");
+            assert_eq!(hold.expect("hold").kind, BLOCKED_NO_PR_KIND);
+            assert!(
+                o.subject_parked("STUDIO-1497", "author"),
+                "lead={lead}: the author's re-dispatch is refused"
+            );
+            assert!(
+                o.store().load_lead_items().expect("items").is_empty(),
+                "lead={lead}: no lead judgment is queued by this path"
+            );
+        }
+    }
+
+    // STUDIO-1497 acceptance (second half): a ticket left blocked-with-no-PR is EXPLICITLY blocked —
+    // the author's re-dispatch is refused, so it is not run into the same wall every poll — and it
+    // is released the moment its blocker clears. Because the fix leaves it in a DISPATCHABLE state
+    // rather than a review state nothing can leave, the daemon can run it again, so a downstream
+    // ticket that lists it as a blocker is not refused indefinitely.
+    #[test]
+    fn a_blocked_no_pr_ticket_is_released_and_its_dependent_can_follow() {
+        let mut o = orch(false);
+        let mut origin = crate::testsupport::issue("u-1497", "STUDIO-1497", "In Progress");
+        origin.description = Some("blocked at an interface gate".into());
+        let re = crate::testsupport::running_entry(origin.clone(), "", "");
+        let at = re.started_at;
+        o.running.insert("u-1497".into(), re);
+        o.handle_handoff_declined("u-1497", at);
+
+        // Explicitly blocked: the author is refused, so the ticket is not re-dispatched into the
+        // same wall — and it is left DISPATCHABLE, never parked in a review state nothing can leave.
+        assert!(o.subject_parked("STUDIO-1497", "author"));
+        let gate = crate::testsupport::GateData::standard();
+        assert!(
+            crate::dispatch::eligible(
+                &origin,
+                &crate::testsupport::no_ids(),
+                &crate::testsupport::no_ids(),
+                &gate.gate(),
+            ),
+            "the ticket is left dispatchable, not parked in review"
+        );
+
+        // The operator resolves the blocker (a material change), releasing the hold.
+        let mut unblocked = origin.clone();
+        unblocked.description = Some("blocker cleared".into());
+        o.observe_parked_issue(&unblocked);
+        assert!(
+            !o.subject_parked("STUDIO-1497", "author"),
+            "a material change releases the hold, so the ticket is re-dispatchable"
+        );
+
+        // A downstream ticket that lists it as a blocker follows the origin's state: refused while
+        // the origin is non-terminal, admitted once it reaches Done.
+        let mut dependent = crate::testsupport::issue("d-1", "STUDIO-1498", "Todo");
+        dependent.blocked_by = Some(vec![crate::testsupport::blocker(
+            Some("STUDIO-1497"),
+            Some("In Progress"),
+        )]);
+        assert!(
+            !crate::dispatch::eligible(
+                &dependent,
+                &crate::testsupport::no_ids(),
+                &crate::testsupport::no_ids(),
+                &gate.gate(),
+            ),
+            "a dependent of a non-terminal blocker is refused — correctly"
+        );
+        dependent.blocked_by = Some(vec![crate::testsupport::blocker(
+            Some("STUDIO-1497"),
+            Some("Done"),
+        )]);
+        assert!(
+            crate::dispatch::eligible(
+                &dependent,
+                &crate::testsupport::no_ids(),
+                &crate::testsupport::no_ids(),
+                &gate.gate(),
+            ),
+            "once the origin is Done the dependent is admitted — the stall is not permanent"
+        );
     }
 
     #[test]

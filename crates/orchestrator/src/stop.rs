@@ -193,6 +193,14 @@ pub struct ControlHandle {
     /// access and the manager's pull-request reads have no answer to give.
     pub(crate) manager_gh: Option<std::sync::Arc<dyn crate::ghsummons::ManagerGhSource>>,
 
+    /// The off-loop `gh` seam the daemon-mediated handoff asks whether the run's branch has an OPEN
+    /// pull request before it parks the ticket in review (STUDIO-1497), snapshotted from
+    /// [`Orchestrator::pr_source`](crate::orchestrator::Orchestrator::pr_source). It lives on the
+    /// handle for [`Self::diff`]'s reason — every call BLOCKS on `gh`, so it runs on the request's
+    /// own task — and `None` means the handoff cannot ask GitHub, so it treats the answer as UNKNOWN
+    /// and parks exactly as before this ticket.
+    pub(crate) pr_source: Option<std::sync::Arc<dyn crate::ghsummons::OpenPrSource>>,
+
     /// The SAME off-loop investigation runtime as the orchestrator (STUDIO-1135). Only live
     /// manager run ids are bound; requests never carry a caller-selected repository or host path.
     pub(crate) investigate: Option<std::sync::Arc<crate::investigate::Investigations>>,
@@ -236,6 +244,7 @@ impl crate::orchestrator::Orchestrator {
             merge: self.merge_deps.as_ref().map(std::sync::Arc::clone),
             diff: self.diff_deps.as_ref().map(std::sync::Arc::clone),
             manager_gh: self.manager_gh_deps.as_ref().map(std::sync::Arc::clone),
+            pr_source: self.pr_source.as_ref().map(std::sync::Arc::clone),
             investigate: self.investigate.clone(),
             lead_reports: self.lead_reports.clone(),
             manager_selftest: self.manager_selftest.clone(),

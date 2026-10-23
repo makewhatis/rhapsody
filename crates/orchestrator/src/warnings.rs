@@ -74,6 +74,13 @@ pub(crate) const LOST_REVIEW_WARN_CAP: usize = 5;
 /// installation-wide fault rather than an incident.
 pub(crate) const ORPHANED_REVIEW_WARN_CAP: usize = 5;
 
+/// How many blocked, pull-request-less tickets one project's advisory names (STUDIO-1497).
+///
+/// [`ORPHANED_REVIEW_WARN_CAP`]'s value and its keyed-by-TICKET shape — a ticket re-observed on
+/// the next sweep refreshes its line rather than adding one — so the cap bounds how many DISTINCT
+/// tickets are named, and five of those is already an installation-wide fault.
+pub(crate) const BLOCKED_NO_PR_WARN_CAP: usize = 5;
+
 /// The per-project snapshot the warning resolver works from, captured on the control task (from
 /// `eff.projects`) BEFORE the async resolver runs, so the resolver never reads loop-owned state
 /// off-loop. Mirrors Go `projectWarnInput`.
@@ -162,7 +169,23 @@ struct WarningMaps {
     /// [`clear_orphaned_review`](WarningsState::clear_orphaned_review), called with that ticket's
     /// own identifier.
     orphaned: HashMap<String, OrphanedReviews>,
+    /// Producer 7 (STUDIO-1497) — the tickets whose run ended with NO pull request and was left
+    /// blocked for a human, per project group. Recorded by the control task's reconciliation sweep
+    /// from the durable blocked subject holds, so it carries no generation guard for `fetch`'s
+    /// reason. **Keyed by TICKET**, exactly as `orphaned` above: the sweep re-observes the same
+    /// blocked ticket every tick, so a list would grow one entry per tick. One ticket is one line.
+    ///
+    /// **Cleared when the hold goes away** (the ticket's pull request appears, or a material change
+    /// releases the park), unlike `orphaned` and `lost_review`: this one describes a live condition
+    /// whose resolution the sweep can see, so it is retired rather than left standing forever.
+    blocked_no_pr: HashMap<String, BlockedNoPr>,
 }
+
+/// One project group's blocked, pull-request-less tickets: the tickets, oldest-first, and why each
+/// needs a human. [`OrphanedReviews`]' shape and its reason (order is load-bearing for the cap and
+/// for deterministic rendering), with a different producer.
+#[derive(Debug, Clone, Default)]
+struct BlockedNoPr(Vec<(String, String)>);
 
 /// One project group's orphaned reviews: the tickets, oldest-first, and why each is unrepairable.
 ///
@@ -362,6 +385,46 @@ impl WarningsState {
         }
     }
 
+    /// Records a ticket whose run ended blocked with NO pull request and was left for a human
+    /// (STUDIO-1497). Called from the control task's reconciliation sweep, once per ticket per
+    /// occurrence: re-recording the SAME ticket refreshes its line rather than adding one, so a
+    /// sweep every poll tick neither grows the advisory nor churns its order.
+    ///
+    /// A LOCAL surface, like every producer here: the ticket is blocked precisely because an agent
+    /// could not proceed, and a comment on the ticket is a write a daemon with no tracker access
+    /// cannot make.
+    pub(crate) fn record_blocked_no_pr(&self, group: &str, identifier: &str, why: &str) {
+        let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
+        let e = m.blocked_no_pr.entry(group.to_string()).or_default();
+        match e.0.iter_mut().find(|(id, _)| id == identifier) {
+            Some(entry) => entry.1 = why.to_string(),
+            None => e.0.push((identifier.to_string(), why.to_string())),
+        }
+        while e.0.len() > BLOCKED_NO_PR_WARN_CAP {
+            e.0.remove(0);
+        }
+    }
+
+    /// Retires a blocked-no-pull-request advisory once its condition is gone — the ticket has a
+    /// pull request, or a material change released the blocked hold. Called with the ticket's own
+    /// identifier by the sweep that re-derives the live set each tick.
+    pub(crate) fn clear_blocked_no_pr(&self, group: &str, identifier: &str) {
+        let mut m = self.maps.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = m.blocked_no_pr.get_mut(group) {
+            e.0.retain(|(id, _)| id != identifier);
+        }
+    }
+
+    /// Every `(group, identifier)` the blocked-no-pr advisory currently names — the sweep's input
+    /// for retiring the ones whose condition has resolved.
+    pub(crate) fn blocked_no_pr_entries(&self) -> Vec<(String, String)> {
+        let m = self.maps.read().unwrap_or_else(|e| e.into_inner());
+        m.blocked_no_pr
+            .iter()
+            .flat_map(|(group, e)| e.0.iter().map(move |(id, _)| (group.clone(), id.clone())))
+            .collect()
+    }
+
     /// The merged warnings for a group (empty when none): missing-prompt-file flags first, then the
     /// unmatched-slug advisories, then the fetch-failure warning (STUDIO-406), then the
     /// enrichment-deferred warning (STUDIO-811), then the lost review fan-outs (STUDIO-822;
@@ -417,6 +480,19 @@ impl WarningsState {
         for (identifier, why) in m.orphaned.get(group).into_iter().flat_map(|o| o.0.iter()) {
             out.push(format!(
                 "the pull request for {identifier} is parked in a review state with no reviewer and cannot be adopted — {why}. Nothing will assign one, so it is unreviewed however the merge gate reads; introduce it by hand or fix the cause"
+            ));
+        }
+        // Appended after the orphaned reviews, for the same golden-ordering reason (STUDIO-1497).
+        // One line per blocked ticket: the identifier is the actionable content, and the run
+        // produced nothing to review, so a human has to clear the blocker before the ticket moves.
+        for (identifier, why) in m
+            .blocked_no_pr
+            .get(group)
+            .into_iter()
+            .flat_map(|b| b.0.iter())
+        {
+            out.push(format!(
+                "the run for {identifier} ended blocked with no pull request — {why}. Nothing can progress it and nothing downstream of it will run until a human resolves the blocker, then re-summon or re-open the ticket"
             ));
         }
         out
