@@ -90,6 +90,19 @@ pub struct Issue {
     /// conveys the actual instruction (INF-448). Never used for eligibility — only for the
     /// delivered message text.
     pub latest_summon_body: String,
+    /// `latest_summon_author` is the display name of the author of the newest summons comment
+    /// (the SAME comment whose time is `latest_summon_at`), empty when the source cannot surface
+    /// one. Rhapsody-only (STUDIO-1502): a Linear issue comment can be written by a human or by an
+    /// agent, and an instruction from the operator and a note from an agent carry different weight,
+    /// so the run's context names the author. A GitHub PR comment always comes from the operator's
+    /// one account and leaves this empty — never used for eligibility, only for the seeded message.
+    ///
+    /// **Not persisted in the summons watermark** (which stores the identifier, time and body only,
+    /// and whose table is a frozen parity surface). So a summons RESTORED by the daemon's
+    /// `restore_summon_watermarks` — one the live poll no longer covers — carries its body but no
+    /// author. A Linear comment is normally inside the candidate fetch's comment window, so this is
+    /// the aged-out edge, not the common path.
+    pub latest_summon_author: String,
 
     /// `milestone_id` / `milestone_name` are the Linear project milestone the issue belongs to
     /// (both empty when the issue has no milestone). Populated by the tracker for

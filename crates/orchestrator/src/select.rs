@@ -1818,6 +1818,70 @@ mod tests {
         );
     }
 
+    /// STUDIO-1502 acceptance #2: a ticket that carries BOTH a Linear-comment summons and a GitHub
+    /// PR-comment summons is re-engaged ONCE, not twice. The two sources feed the one
+    /// `latest_summon_at` (max-only — the tracker's `normalize_issue` and `apply_github_summons`
+    /// both only ever advance it), so the reopen ladder sees one instruction and yields one entry.
+    /// The linked PR is present because that is exactly the ticket the GitHub path can reach.
+    ///
+    /// Both observations are fed through their REAL source shapes here rather than as one
+    /// pre-merged issue: the Linear half arrives as the tracker would leave it (time, body, author),
+    /// and the GitHub half is applied by the real enrichment, so this pins the dedup at the seam the
+    /// two sources actually meet.
+    #[test]
+    fn a_ticket_with_both_summons_sources_is_reopened_once() {
+        let o = orch_for_reopen("A-1");
+        let mut iss = summoned_review_issue(false);
+        iss.linked_pr = true;
+        iss.linked_prs = Some(vec![rhapsody_core::LinkedPRRef {
+            owner: "o".into(),
+            repo: "r".into(),
+            number: 7,
+            merged: false,
+        }]);
+        // Source 1 — Linear: the tracker normalized a tokened issue comment onto the issue.
+        iss.latest_summon_author = "Agent Ada".into();
+        iss.latest_summon_body = "@symphony from Linear".into();
+        // Source 2 — GitHub: the enrichment advances the SAME field (max-only) with a newer PR
+        // comment, fed through the real apply path.
+        let github_at = iss.latest_summon_at.expect("Linear summons") + ChronoDuration::hours(1);
+        let by_pr = HashMap::from([(
+            7,
+            crate::ghsummons::SummonHit {
+                at: github_at,
+                body: "@symphony from the PR".into(),
+            },
+        )]);
+        let applied = crate::ghenrich::apply_github_summons(
+            vec![iss],
+            &by_pr,
+            "o",
+            "r",
+            &crate::ghenrich::DaemonPrLinks::default(),
+        );
+        let iss = applied.issues.into_iter().next().expect("one issue");
+        assert_eq!(
+            iss.latest_summon_at,
+            Some(github_at),
+            "the newer GitHub comment wins the one watermark"
+        );
+        assert_eq!(
+            iss.latest_summon_author, "",
+            "and the GitHub comment, which supplies no author, clears the Linear one"
+        );
+
+        let (active, reopen, _) = o.select_dispatch_with_reopens(vec![iss]);
+        assert!(
+            active.is_empty(),
+            "a review-state ticket is never dispatched as fresh active work"
+        );
+        assert_eq!(
+            reopen.len(),
+            1,
+            "one instruction from two sources must produce exactly one reopen"
+        );
+    }
+
     /// The multi-project reopen ladder needs its own gate: two ladders, two call sites.
     #[test]
     fn the_multi_project_ladder_does_not_reopen_a_human_ticket() {

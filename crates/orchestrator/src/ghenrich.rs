@@ -423,6 +423,12 @@ pub fn apply_github_summons(
                 advanced += 1;
                 iss.latest_summon_at = Some(hit.at);
                 iss.latest_summon_body = hit.body.clone();
+                // Author rides with time/body (STUDIO-1502): a GitHub comment always comes from the
+                // operator's one account and carries no author, so a GitHub hit that SUPERSEDES an
+                // older Linear comment must CLEAR that comment's author rather than inherit it —
+                // otherwise the operator's instruction is seeded attributed to the earlier Linear
+                // author (the STUDIO-1502 review's B3).
+                iss.latest_summon_author = String::new();
                 tracing::info!(issue_identifier = %iss.identifier, pr = pr.number, at = %hit.at, "github-summons: advanced latest_summon_at from PR comment");
             }
         }
@@ -461,6 +467,9 @@ pub fn apply_github_summons(
                 advanced += 1;
                 iss.latest_summon_at = Some(hit.at);
                 iss.latest_summon_body = hit.body.clone();
+                // Same as the tracker-linked loop above: clear the author with the body, because a
+                // GitHub comment supplies none (STUDIO-1502 B3).
+                iss.latest_summon_author = String::new();
                 tracing::info!(issue_identifier = %iss.identifier, pr = number, at = %hit.at, "github-summons: advanced latest_summon_at from PR comment (daemon-recorded link)");
             }
         }
@@ -671,6 +680,42 @@ mod tests {
             got.issues[0].latest_summon_at,
             Some(existing),
             "want unchanged (max only)"
+        );
+    }
+
+    /// STUDIO-1502 review B3: a GitHub hit that SUPERSEDES an older Linear comment must CLEAR that
+    /// comment's author. A GitHub comment always comes from the operator's one account and supplies
+    /// no author, so inheriting the earlier Linear author would seed the operator's instruction
+    /// attributed to an agent — defeating the distinction the attribution exists for.
+    //
+    // MUTATION: replace time/body only (the round-1 defect) and this reds with author "Agent Ada".
+    #[test]
+    fn a_github_summons_clears_an_older_linear_author() {
+        let older = utc(2026, 6, 25, 16, 0, 0);
+        let newer = utc(2026, 6, 25, 18, 0, 0);
+        let issues = vec![Issue {
+            identifier: "AIE-1".into(),
+            latest_summon_at: Some(older),
+            latest_summon_body: "@symphony old Linear ask".into(),
+            latest_summon_author: "Agent Ada".into(),
+            linked_prs: Some(vec![linked("o", "r", 101, false)]),
+            ..Default::default()
+        }];
+        let by_pr = HashMap::from([(
+            101,
+            SummonHit {
+                at: newer,
+                body: "@symphony deploy it".into(),
+            },
+        )]);
+
+        let got = apply_github_summons(issues, &by_pr, "o", "r", &DaemonPrLinks::default());
+
+        assert_eq!(got.issues[0].latest_summon_at, Some(newer));
+        assert_eq!(got.issues[0].latest_summon_body, "@symphony deploy it");
+        assert_eq!(
+            got.issues[0].latest_summon_author, "",
+            "a GitHub comment supplies no author; the older Linear author must not be inherited"
         );
     }
 

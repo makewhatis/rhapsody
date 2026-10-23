@@ -1847,6 +1847,66 @@ Nothing else moves: the reopen *gate* (INF-448) is untouched, the turn-1 prompt 
 (no template change), only the newest summons is delivered (the same contract as mid-run), and no
 config field, endpoint or golden is added or changed.
 
+### A summons re-engages a ticket and names a Linear comment's author (STUDIO-1502)
+
+A ticket has exactly one inbound channel: a summons (an `@symphony`/`@rhapsody` comment). Two gaps
+made it unable to reach the run that should answer it.
+
+**A parked ticket was unreachable.** `selectDispatch` skips every candidate carrying a durable subject
+hold, and both `prSuppressed` and `reviewReopenEligible` refuse a parked subject — so the hold a no-PR
+handoff leaves (`blocked_no_pr`, STUDIO-1497), a breaker hold, or a lead escalation made the ticket
+unreachable by any reply, Linear or GitHub. On 2026-10-22 four no-pull-request tickets sat for hours
+with nowhere to answer them.
+
+**The comment itself did not reach the next run.** The mid-run router delivers only a summons newer
+than a LIVE run's start, so a summons that arrived after a run ended and re-engaged the NEXT one had no
+route into that run's mailbox; STUDIO-649 closed that for the review-reopen ladder alone.
+
+Both are closed by one reconciliation, run on every poll tick for every candidate: a summons
+**strictly newer than the end of the daemon's last author run** on the ticket is fresh and undelivered
+— the same run-window rule the reopen ladder uses and the same rule `prSuppressed` lifts suppression
+by, so a spent summons (created inside the run's own window) never counts (the STUDIO-1443 rule) and a
+ticket the daemon has never worked is never grabbed. A fresh summons releases any durable park (the
+same release an explicit operator HTTP message on an ended run already performs) and seeds the comment
+into whichever run answers it — the active ladder or the review reopen — through
+`pending_reopen_summons`. Re-reading the newest summons each tick, rather than only at the release, is
+what makes the seed survive a capacity wait (a correction supersedes the instruction it replaced) and a
+restart between the release and the dispatch (the STUDIO-885 watermark restores the summons, and the
+seed is re-derived from it). A `rhapsody:human` ticket is skipped outright: the label is a deliberate
+hold and a summons must not become a way around it. The non-terminal-blocker gate and the concurrency
+caps are downstream and still apply.
+
+The release is **source-agnostic** — a GitHub PR comment and a Linear issue comment both feed the one
+`latest_summon_at`, so a Linear comment cannot become a way around a gate a PR comment respects. The
+two sources advance that field **max-only**, and the concrete ordering rule is:
+
+* A **strictly newer** timestamp wins, and REPLACES time, body and author together — so a source that
+  cannot supply an author CLEARS one an older comment supplied rather than inheriting it.
+* An **equal** timestamp replaces nothing. The GitHub path's guard is `hit.at > current`, so an
+  equal-time GitHub hit leaves the live Linear observation — and its author — standing; the tracker
+  path's guard is the same strict `t > cur`. Two sources agreeing on one instant are one instruction,
+  and the ticket is re-engaged once.
+
+Two additive, Rhapsody-only fields support the attribution:
+
+| Surface | Go Symphony v0.4.0 | Rhapsody |
+| --- | --- | --- |
+| candidate query's comments selection | `{ createdAt body }` | `{ createdAt body user { name } }` |
+| `Issue.latest_summon_author` | — | the newest summons comment's author (empty when the source cannot say) |
+
+The author is named in the seeded context (`<author> (Linear comment): <body>`); a GitHub PR comment
+always comes from the operator's one account and carries no author, so it seeds the body verbatim. The
+extra GraphQL selection is additive (Linear accepts it, the field decodes tolerantly — a `null` user is
+"no author"), and nothing the port otherwise consumes from the Go query changes.
+
+One limit is deliberate: the author is **not** persisted in `rhapsody_summon_watermark` (whose columns
+are a frozen parity surface — `identifier`, `summon_at`, `summon_body`). A summons the STUDIO-885
+watermark RESTORES because the live poll no longer covers it therefore carries its body but no author —
+the restore CLEARS any author the candidate was carrying, because that author belonged to the comment
+being replaced. A Linear comment normally sits inside the candidate fetch's 50-comment window, so that
+is the aged-out edge, not the common path; the restored *summons* (its time and body) survives a
+restart as before.
+
 ### A schema table with no Go counterpart — `rhapsody_review_watch` (STUDIO-711)
 
 The ticketless PR-review subsystem (design STUDIO-703) watches each introduced pull request and

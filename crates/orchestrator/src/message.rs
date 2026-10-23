@@ -24,6 +24,13 @@
 //! test skips it forever and the fresh run never saw the reviewer's instructions. The reopen dispatch
 //! path seeds that run's mailbox with the same body, through the same admission path.
 //!
+//! [`Orchestrator::reengage_on_summons`] (STUDIO-1502, also Rhapsody-only) closes the third: a
+//! summons reaches a ticket that the ordinary ladders cannot. It lifts a durable PARK a human used
+//! to answer — selection skips a `subject_parked` candidate outright, so before this such a ticket
+//! was unreachable by ANY reply — and, source-agnostically, seeds the comment's body into whichever
+//! run answers it, so a summons that arrives after a run ended is not dropped by the mid-run
+//! router's "newer than the run start" test.
+//!
 //! Deviations from the Go source, all behavior-preserving:
 //!   * Go's per-run mailbox is a field on the `runningEntry` (`chan string`); a Rust
 //!     [`tokio::sync::mpsc`] channel splits into a non-`Clone`/non-`Sync` receiver + a sender, so the
@@ -59,6 +66,24 @@ pub(crate) const OPERATOR_MAILBOX_CAP: usize = 16;
 /// IS live and the newest comments are what it must re-read.
 const MID_RUN_SUMMON_FALLBACK: &str =
     "a human summoned you mid-run — re-read this ticket's newest comments for updated instructions";
+
+/// The text a summons seeds into a run: the comment's own words, prefixed with WHO wrote it when the
+/// source can say (STUDIO-1502). A GitHub PR comment always comes from the operator's one account and
+/// carries no author, so this returns the body verbatim; a Linear issue comment names its author,
+/// because an instruction from the operator and a note from an agent carry different weight. An
+/// empty body keeps the generic fallback nudge (INF-448).
+pub(crate) fn summon_seed_text(iss: &Issue) -> String {
+    if iss.latest_summon_body.is_empty() {
+        return MID_RUN_SUMMON_FALLBACK.to_string();
+    }
+    if iss.latest_summon_author.is_empty() {
+        return iss.latest_summon_body.clone();
+    }
+    format!(
+        "{} (Linear comment): {}",
+        iss.latest_summon_author, iss.latest_summon_body
+    )
+}
 
 /// A live run's operator-message mailbox: the bounded `tx` the control task delivers to and the `rx`
 /// the worker drains. Keyed by issue id in [`Orchestrator::mailboxes`]. O7's real spawn takes `rx`
@@ -373,11 +398,7 @@ impl Orchestrator {
                 continue; // already delivered this (or a newer) summons to this run
             }
             let (run_id, identifier) = (re.run_id, re.issue.identifier.clone());
-            let body = if iss.latest_summon_body.is_empty() {
-                MID_RUN_SUMMON_FALLBACK.to_string()
-            } else {
-                iss.latest_summon_body.clone()
-            };
+            let body = summon_seed_text(iss);
             // Re-borrow the entry for the admission (both borrows shared: `re` from `running`, `&self`
             // for the method), then advance the watermark only on a successful admit.
             let admitted = match self.running.get(&iss.id) {
@@ -392,6 +413,135 @@ impl Orchestrator {
             } else {
                 tracing::info!(issue_identifier = %identifier, run_id, "mid-run summons deferred: operator mailbox full; will retry next tick");
             }
+        }
+    }
+
+    /// Re-engages a ticket a summons reached, and carries the comment into the run that answers it.
+    ///
+    /// STUDIO-1502. A summons is the one inbound channel a ticket has. Two gaps made it unreachable:
+    ///
+    /// * **A PARKED ticket could not be reached at all.** `select_dispatch_*` skips every candidate
+    ///   carrying a durable subject hold, and both `pr_suppressed` and `review_reopen_eligible` refuse
+    ///   a parked subject — so a ticket the daemon parked for a human (the `blocked_no_pr` hold a no-PR
+    ///   handoff leaves, STUDIO-1497; a breaker hold; a lead escalation) was unreachable by ANY reply,
+    ///   Linear or GitHub. That is the stall STUDIO-1502 closes: on 2026-10-22 four no-PR tickets sat
+    ///   for hours with nowhere to answer them. An explicit operator HTTP message on an ended run
+    ///   already releases the hold ([`Orchestrator::handle_run_message`]); this is the same release,
+    ///   driven by a summons instead of a run id.
+    /// * **The comment's body was not carried onto the run that answered it.** The mid-run router
+    ///   ([`Orchestrator::deliver_mid_run_summons`]) reaches only a summons newer than a LIVE run's
+    ///   start, so a summons that arrives after a run ended and re-engages the NEXT one had no route
+    ///   into that run's mailbox. STUDIO-649 solved it for the review-reopen ladder alone, through
+    ///   `pending_reopen_summons`.
+    ///
+    /// So this reconciles ONE thing for every candidate: a summons strictly newer than the END of the
+    /// daemon's last author run on the ticket is FRESH and undelivered — the same rule the reopen
+    /// ladder uses ([`Orchestrator::review_reopen_eligible`]) and the same rule `pr_suppressed` lifts
+    /// suppression by. A spent summons (created inside the run's own window) never counts
+    /// (STUDIO-1443), and a ticket the daemon has never worked has no window and is not grabbed. A
+    /// fresh summons then (1) releases any durable park, so selection stops skipping the ticket, and
+    /// (2) is seeded into `pending_reopen_summons`, so whichever ladder dispatches the ticket next —
+    /// the active one or the review reopen — the fresh run's operator mailbox carries the comment
+    /// (INF-448 / STUDIO-649).
+    ///
+    /// Running every tick rather than only at the release is what makes the seed survive the two
+    /// windows the review found (STUDIO-1502 B1/B2):
+    ///
+    /// * **A capacity wait.** The release is durable but the seed is loop state, and selection can
+    ///   refuse to spend a slot for several ticks. Re-reading the NEWEST admissible summons each tick
+    ///   means a correction supersedes the instruction it replaced instead of the first one being
+    ///   frozen into the eventual run.
+    /// * **A daemon restart between the release and the dispatch.** The STUDIO-885 watermark restores
+    ///   the summons onto the candidate, and this re-derives the seed from it — so the promise is kept
+    ///   from the durable facts, not from an in-memory map the restart dropped.
+    ///
+    /// A seed already standing at a NEWER time is left alone, so the operator's explicit resume note —
+    /// which [`Orchestrator::handle_seed_resume_note`] stamps with `now` — is never overwritten by an
+    /// older summons.
+    ///
+    /// The release deliberately does NOT grant the durable resume
+    /// ([`Store::release_subject_episode_without_resume`](rhapsody_store::Store::release_subject_episode_without_resume)):
+    /// the fresh summons is itself the admission, and the reopen ladder / `pr_suppressed` re-check the
+    /// run window. Granting the resume would let the RELEASE, rather than the summons, be the
+    /// authority — the STUDIO-1443 defect.
+    ///
+    /// A `rhapsody:human` ticket is skipped outright: the label is a deliberate hold and a summons
+    /// must not become a way around it (STUDIO-949). Every other refusal is untouched — the
+    /// non-terminal blocker gate ([`eligible`](crate::dispatch::eligible)) and the concurrency caps
+    /// are downstream of this and still apply.
+    ///
+    /// It is source-agnostic on purpose: a GitHub PR comment and a Linear issue comment both feed the
+    /// one `latest_summon_at`, so a Linear comment cannot become a way around a gate a PR comment
+    /// respects (STUDIO-1502).
+    pub(crate) fn reengage_on_summons<'a>(&mut self, issues: impl IntoIterator<Item = &'a Issue>) {
+        for iss in issues {
+            if iss.identifier.is_empty() || iss.id.is_empty() {
+                continue;
+            }
+            let Some(summon_at) = iss.latest_summon_at else {
+                continue;
+            };
+            if crate::teams::is_human(iss) {
+                continue; // a deliberate human hold: a summons must not release it
+            }
+            // Only a summons strictly newer than the last author run's END is fresh/undelivered. A
+            // still-live run (no end) can never be beaten — its summons reaches it through the
+            // mid-run router; a ticket the daemon has never worked has no window.
+            let fresh = self
+                .last_run_window(&iss.identifier)
+                .is_some_and(|w| w.ended_at.is_some_and(|end| summon_at > end));
+            if !fresh {
+                continue;
+            }
+            // A seed already standing at a newer (or equal) time wins. The operator's explicit
+            // resume note is stamped with `now`, so this keeps it from being replaced by an older
+            // summons — and skips the park release below for the same reason (the operator's
+            // resume, not this summons, is the authority there).
+            if self
+                .pending_reopen_summons
+                .get(&iss.id)
+                .is_some_and(|(at, _)| *at >= summon_at)
+            {
+                continue;
+            }
+            // Lift a durable park so selection no longer skips the ticket. Only a parked ticket has
+            // one; the release is source-agnostic, so a Linear comment cannot become a way around a
+            // gate a PR comment respects.
+            match self.store().subject_hold(&iss.identifier) {
+                Ok(Some(hold)) => {
+                    match self.store().release_subject_episode_without_resume(
+                        hold.id,
+                        &hold.kind,
+                        "a summons answered the park",
+                    ) {
+                        Ok(true) => {
+                            tracing::info!(
+                                issue_identifier = %iss.identifier,
+                                hold_id = hold.id,
+                                hold_kind = %hold.kind,
+                                summon_at = %summon_at,
+                                "a summons released the park; the author is re-engaged with the comment as context"
+                            );
+                        }
+                        // `false` = the episode was already released / its kind moved on (a stale
+                        // observation); the ticket is unparked either way, so still seed below.
+                        Ok(false) => {}
+                        Err(error) => {
+                            tracing::warn!(issue_identifier = %iss.identifier, hold_id = hold.id, %error,
+                                "a summons could not release the park; leaving it parked");
+                            continue;
+                        }
+                    }
+                }
+                Ok(None) => {} // nothing parked: the ordinary ladders handle the dispatch
+                Err(error) => {
+                    tracing::warn!(issue_identifier = %iss.identifier, %error,
+                        "subject hold unreadable while applying a summons; leaving it parked");
+                    continue;
+                }
+            }
+            self.pending_reopen_summons
+                .insert(iss.id.clone(), (summon_at, summon_seed_text(iss)));
         }
     }
 
@@ -483,26 +633,32 @@ mod tests {
     use crate::agentupdate::AgentUpdate;
     use crate::orchestrator::Orchestrator;
     use crate::retry::EvWorkerExit;
-    use crate::testsupport::{empty_effective, issue, set_of, utc};
+    use crate::testsupport::{empty_effective, issue, seed_run, set_of, utc};
 
-    /// An orchestrator on a fresh in-memory store with a minimal eff (so `dispatch_issue`'s
-    /// `persist_start_run` stamps a real run id). Returns the store so a test can read back the
-    /// persisted `run_messages` rows. Mirrors the store-backed setup Go's `orchWithStore` /
-    /// `newStopHarness` build (minus the O7 control loop this port drives directly).
-    fn message_orch() -> (Orchestrator, Arc<dyn Store + Send + Sync>) {
-        let st: Arc<dyn Store + Send + Sync> =
-            Arc::new(Sqlite::open(StorePath::InMemory).expect("open store"));
+    /// An orchestrator over a GIVEN store with a minimal eff (so `dispatch_issue`'s
+    /// `persist_start_run` stamps a real run id). Used to simulate a daemon restart: two
+    /// orchestrators over the SAME store share only what the store durably holds.
+    fn orch_over(store: Arc<dyn Store + Send + Sync>) -> Orchestrator {
         let mut eff = empty_effective(Arc::new(Fake::new()));
         eff.active_states = set_of(&["todo", "in progress"]);
         eff.terminal_states = set_of(&["done"]);
         eff.max_concurrent = 10;
         let mut o = Orchestrator::new("WORKFLOW.md");
         o.eff = Some(eff);
-        o.set_store(Arc::clone(&st));
+        o.set_store(store);
         // Inject a no-op spawn so dispatch doesn't launch the real worker (which would drain this
         // run's mailbox receiver) — these tests assert on the mailbox admission path, not the worker.
         o.spawn = Some(Box::new(|_iss, _attempt, _re| {}));
-        (o, st)
+        o
+    }
+
+    /// An orchestrator on a fresh in-memory store. Returns the store so a test can read back the
+    /// persisted `run_messages` rows. Mirrors the store-backed setup Go's `orchWithStore` /
+    /// `newStopHarness` build (minus the O7 control loop this port drives directly).
+    fn message_orch() -> (Orchestrator, Arc<dyn Store + Send + Sync>) {
+        let st: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open store"));
+        (orch_over(Arc::clone(&st)), st)
     }
 
     #[test]
@@ -538,6 +694,351 @@ mod tests {
         assert_eq!(
             store.summon_watermark("TEST-1").unwrap().unwrap().body,
             "The acceptance requirement is corrected"
+        );
+    }
+
+    /// A parked ticket (`blocked_no_pr` — the hold a no-PR handoff leaves, STUDIO-1497) whose last
+    /// author run ENDED before the summons: the summons releases the park and seeds its body, so the
+    /// next dispatch carries the comment. This is STUDIO-1502 acceptance #1 at the unit level; the
+    /// file-tracker e2e drives the same path through the real control pass.
+    #[test]
+    fn a_summons_releases_a_parked_ticket_and_seeds_its_body() {
+        let (mut o, store) = message_orch();
+        let ended = utc(2026, 6, 3, 12, 0, 0);
+        seed_run(store.as_ref(), "ID-1", "MT-1", ended);
+        store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "MT-1".into(),
+                kind: crate::leaditems::BLOCKED_NO_PR_KIND.into(),
+                ..Default::default()
+            })
+            .expect("park");
+        let iss = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            team_id: "team-1".into(),
+            latest_summon_at: Some(ended + Duration::hours(1)),
+            latest_summon_body: "@rhapsody the schema gate is waived".into(),
+            latest_summon_author: "david".into(),
+            ..Default::default()
+        };
+
+        o.reengage_on_summons(std::iter::once(&iss));
+
+        assert!(
+            store.subject_hold("MT-1").expect("read").is_none(),
+            "a fresh summons releases the park"
+        );
+        assert_eq!(
+            o.pending_reopen_summons.get("ID-1"),
+            Some(&(
+                ended + Duration::hours(1),
+                "david (Linear comment): @rhapsody the schema gate is waived".to_string()
+            )),
+            "the comment body is seeded for the next dispatch, attributed to its author"
+        );
+    }
+
+    /// A GitHub PR comment carries no author (every agent posts from the operator's one account), so
+    /// the seeded text is the body verbatim; a body-less summons keeps the generic fallback.
+    #[test]
+    fn the_seeded_summons_text_attributes_a_linear_author_but_not_a_github_comment() {
+        let mut iss = Issue {
+            latest_summon_body: "@symphony please retry".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            summon_seed_text(&iss),
+            "@symphony please retry",
+            "no author (a GitHub PR comment) → the body verbatim"
+        );
+        iss.latest_summon_author = "david".into();
+        assert_eq!(
+            summon_seed_text(&iss),
+            "david (Linear comment): @symphony please retry",
+            "a Linear author is named in the run's context"
+        );
+        let empty = Issue::default();
+        assert_eq!(
+            summon_seed_text(&empty),
+            MID_RUN_SUMMON_FALLBACK,
+            "a body-less summons keeps the fallback nudge"
+        );
+    }
+
+    /// A SPENT summons — one created inside the last author run's window — must NOT release a park
+    /// (STUDIO-1443: releasing on a stale summons re-engaged an approved branch).
+    //
+    // MUTATION: drop the `summon_at > end` comparison (release on any summons) and this reds.
+    #[test]
+    fn a_spent_summons_does_not_release_a_park() {
+        let (mut o, store) = message_orch();
+        let ended = utc(2026, 6, 3, 12, 0, 0);
+        seed_run(store.as_ref(), "ID-1", "MT-1", ended);
+        store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "MT-1".into(),
+                kind: crate::leaditems::BLOCKED_NO_PR_KIND.into(),
+                ..Default::default()
+            })
+            .expect("park");
+        let iss = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            team_id: "team-1".into(),
+            // Created while the run was live (the window is [ended-1m, ended]).
+            latest_summon_at: Some(ended - Duration::seconds(30)),
+            latest_summon_body: "@rhapsody I fixed it".into(),
+            ..Default::default()
+        };
+
+        o.reengage_on_summons(std::iter::once(&iss));
+
+        assert!(
+            store.subject_hold("MT-1").expect("read").is_some(),
+            "a spent summons must leave the park standing"
+        );
+        assert!(o.pending_reopen_summons.is_empty());
+    }
+
+    /// A `rhapsody:human` ticket is a deliberate hold: a summons must not become a way around it
+    /// (STUDIO-949 / STUDIO-1502 acceptance #3).
+    #[test]
+    fn a_human_ticket_is_not_released_by_a_summons() {
+        let (mut o, store) = message_orch();
+        let ended = utc(2026, 6, 3, 12, 0, 0);
+        seed_run(store.as_ref(), "ID-1", "MT-1", ended);
+        store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "MT-1".into(),
+                kind: "breaker".into(),
+                ..Default::default()
+            })
+            .expect("park");
+        let iss = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            team_id: "team-1".into(),
+            labels: Some(vec!["rhapsody:human".into()]),
+            latest_summon_at: Some(ended + Duration::hours(1)),
+            latest_summon_body: "@rhapsody go".into(),
+            ..Default::default()
+        };
+
+        o.reengage_on_summons(std::iter::once(&iss));
+
+        assert!(
+            store.subject_hold("MT-1").expect("read").is_some(),
+            "the deliberate human hold stands"
+        );
+        assert!(o.pending_reopen_summons.is_empty());
+    }
+
+    /// A comment WITHOUT a summons changes nothing (STUDIO-1502 acceptance #4).
+    #[test]
+    fn a_comment_without_a_summons_changes_nothing() {
+        let (mut o, store) = message_orch();
+        let ended = utc(2026, 6, 3, 12, 0, 0);
+        seed_run(store.as_ref(), "ID-1", "MT-1", ended);
+        store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "MT-1".into(),
+                kind: crate::leaditems::BLOCKED_NO_PR_KIND.into(),
+                ..Default::default()
+            })
+            .expect("park");
+        let iss = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            team_id: "team-1".into(),
+            latest_summon_at: None, // plain discussion, no token
+            ..Default::default()
+        };
+
+        o.reengage_on_summons(std::iter::once(&iss));
+
+        assert!(store.subject_hold("MT-1").expect("read").is_some());
+        assert!(o.pending_reopen_summons.is_empty());
+    }
+
+    /// A ticket the daemon has never worked has no run window, so a summons does not grab it — the
+    /// same convergence the reopen ladder applies.
+    #[test]
+    fn a_parked_ticket_the_daemon_never_worked_is_not_grabbed() {
+        let (mut o, store) = message_orch();
+        store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "MT-1".into(),
+                kind: crate::leaditems::BLOCKED_NO_PR_KIND.into(),
+                ..Default::default()
+            })
+            .expect("park");
+        let iss = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            team_id: "team-1".into(),
+            latest_summon_at: Some(utc(2030, 1, 1, 0, 0, 0)),
+            latest_summon_body: "@rhapsody hello".into(),
+            ..Default::default()
+        };
+
+        o.reengage_on_summons(std::iter::once(&iss));
+
+        assert!(store.subject_hold("MT-1").expect("read").is_some());
+        assert!(o.pending_reopen_summons.is_empty());
+    }
+
+    /// A fresh summons on a ticket that is NOT parked still seeds the next run's context. The
+    /// summons reached a run only through `deliver_mid_run_summons`, which needs it newer than a LIVE
+    /// run's start — so a summons that arrives after a run ended and re-engages the next one (an
+    /// active-state continuation, or a `pr_suppressed` ticket the summons unsuppressed) had no route
+    /// into that run's mailbox before this. This is the STUDIO-1502 promise applied source-agnostically.
+    #[test]
+    fn a_fresh_summons_on_an_unparked_ticket_is_seeded_for_the_next_run() {
+        let (mut o, store) = message_orch();
+        let ended = utc(2026, 6, 3, 12, 0, 0);
+        seed_run(store.as_ref(), "ID-1", "MT-1", ended);
+        let iss = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            team_id: "team-1".into(),
+            latest_summon_at: Some(ended + Duration::hours(1)),
+            latest_summon_body: "@rhapsody continue".into(),
+            ..Default::default()
+        };
+
+        o.reengage_on_summons(std::iter::once(&iss));
+
+        assert_eq!(
+            o.pending_reopen_summons
+                .get("ID-1")
+                .map(|(_, b)| b.as_str()),
+            Some("@rhapsody continue"),
+            "an undelivered summons must seed the run that answers it"
+        );
+    }
+
+    /// STUDIO-1502 review B1: while a released park WAITS for a slot, each tick must re-read the
+    /// NEWEST admissible summons. The release is durable but the seed is loop state, and selection can
+    /// refuse to spend a slot for several ticks — freezing the first instruction would deliver it
+    /// instead of the correction that superseded it.
+    //
+    // MUTATION: seed only at the release (the round-1 defect) and the second assertion reds with
+    // "deploy version one".
+    #[test]
+    fn a_waiting_park_takes_the_newest_instruction() {
+        let (mut o, store) = message_orch();
+        let ended = utc(2026, 6, 3, 12, 0, 0);
+        seed_run(store.as_ref(), "ID-1", "MT-1", ended);
+        store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "MT-1".into(),
+                kind: crate::leaditems::BLOCKED_NO_PR_KIND.into(),
+                ..Default::default()
+            })
+            .expect("park");
+
+        let mut iss = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            team_id: "team-1".into(),
+            latest_summon_at: Some(ended + Duration::hours(1)),
+            latest_summon_body: "deploy version one".into(),
+            ..Default::default()
+        };
+        o.reengage_on_summons(std::iter::once(&iss));
+        assert!(
+            store.subject_hold("MT-1").expect("read").is_none(),
+            "the fresh summons releases the park"
+        );
+        assert_eq!(
+            o.pending_reopen_summons.get("ID-1").unwrap().1,
+            "deploy version one"
+        );
+
+        // Capacity is exhausted, so the ticket is not dispatched this tick; the human posts a
+        // correction. The next tick must take the CORRECTION, not the frozen first instruction.
+        iss.latest_summon_at = Some(ended + Duration::hours(2));
+        iss.latest_summon_body = "deploy version two".into();
+        o.reengage_on_summons(std::iter::once(&iss));
+        assert_eq!(
+            o.pending_reopen_summons.get("ID-1").unwrap().1,
+            "deploy version two",
+            "a newer correction must supersede the instruction it replaced"
+        );
+    }
+
+    /// STUDIO-1502 review B2: the release is durable but its context seed is loop state, so a restart
+    /// between the release and the dispatch used to lose the comment — the hold was gone (nothing to
+    /// release), the watermark restored the summons onto the candidate, and ordinary active dispatch
+    /// does not seed it. Re-deriving the seed from the restored candidate keeps the promise.
+    //
+    // MUTATION: seed only when a hold is released (the round-1 defect) and this reds with an empty
+    // mailbox.
+    #[test]
+    fn a_restart_between_unparking_and_dispatch_keeps_the_instruction() {
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open store"));
+        let ended = utc(2026, 6, 3, 12, 0, 0);
+        seed_run(store.as_ref(), "ID-1", "MT-1", ended);
+        store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: "MT-1".into(),
+                kind: crate::leaditems::BLOCKED_NO_PR_KIND.into(),
+                ..Default::default()
+            })
+            .expect("park");
+
+        // Before the restart: the poll observes the summons, which remembers it in the watermark and
+        // releases the park.
+        let mut before = orch_over(Arc::clone(&store));
+        let mut iss = Issue {
+            id: "ID-1".into(),
+            identifier: "MT-1".into(),
+            state: "In Progress".into(),
+            team_id: "team-1".into(),
+            latest_summon_at: Some(ended + Duration::hours(1)),
+            latest_summon_body: "deploy version one".into(),
+            latest_summon_author: "david".into(),
+            ..Default::default()
+        };
+        before.restore_summon_watermarks(std::iter::once(&mut iss));
+        before.reengage_on_summons(std::iter::once(&iss));
+        assert!(
+            store.subject_hold("MT-1").expect("read").is_none(),
+            "the fresh summons releases the park"
+        );
+
+        // The restart: a fresh orchestrator over the SAME store, whose poll no longer sees the
+        // comment at all. The watermark is the only durable memory of it.
+        let mut after = orch_over(Arc::clone(&store));
+        let mut iss_after = issue("ID-1", "MT-1", "In Progress");
+        after.restore_summon_watermarks(std::iter::once(&mut iss_after));
+        assert_eq!(
+            iss_after.latest_summon_at,
+            Some(ended + Duration::hours(1)),
+            "the watermark must restore the summons the poll no longer sees"
+        );
+        after.reengage_on_summons(std::iter::once(&iss_after));
+        assert!(
+            after.pending_reopen_summons.contains_key("ID-1"),
+            "the restored summons must seed the next run"
+        );
+
+        after.dispatch_issue(iss_after, None, None, String::new());
+        let seeded = after
+            .mailbox_try_recv("ID-1")
+            .expect("the restored comment must reach the fresh run");
+        assert!(
+            seeded.contains("deploy version one"),
+            "payload = {seeded:?}, want the restored comment"
         );
     }
 
