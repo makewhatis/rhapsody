@@ -428,7 +428,7 @@ impl Orchestrator {
     /// driven by a summons (a Linear issue comment, or a GitHub PR comment) instead of a run id.
     ///
     /// The gate is the SAME rule the reopen ladder uses
-    /// ([`Orchestrator::review_reopen_eligible`](crate::dispatch)): a summons strictly newer than the
+    /// ([`Orchestrator::review_reopen_eligible`]): a summons strictly newer than the
     /// END of the daemon's last author run on the ticket. A spent summons must NOT release a park
     /// (STUDIO-1443 — releasing on a stale summons re-engaged an approved branch), and a ticket the
     /// daemon has never worked has no window and is not grabbed.

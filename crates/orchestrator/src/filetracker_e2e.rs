@@ -858,13 +858,17 @@ async fn file_tracker_e2e_linear_comment_summons_reengages_a_parked_no_pr_ticket
         !ft.o.subject_parked("SMK-1", "author"),
         "the summons released the park"
     );
-    // The comment body — attributed to its author — reached the fresh run's operator mailbox (the
-    // reopening-summons seed).
-    let seeded =
-        ft.o.running
-            .values()
-            .flat_map(|re| ft.store.list_run_messages(re.run_id).unwrap_or_default())
-            .any(|m| m.body.contains("the schema gate is waived") && m.body.contains("david"));
+    // The comment body — attributed to its author — reached the re-engaged run's operator mailbox
+    // (the reopening-summons seed). Read it back from the STORE rather than from `running`: the
+    // worker may already have ended (the stub exits immediately), and the persisted row survives
+    // that, so the assertion is not a race against the run's lifetime.
+    let seeded = ft
+        .store
+        .list_runs(RunFilter::default())
+        .expect("list runs")
+        .into_iter()
+        .flat_map(|r| ft.store.list_run_messages(r.id).unwrap_or_default())
+        .any(|m| m.body.contains("the schema gate is waived") && m.body.contains("david"));
     assert!(
         seeded,
         "the summon comment body, attributed to its author, must be seeded into the re-engaged run's context"
