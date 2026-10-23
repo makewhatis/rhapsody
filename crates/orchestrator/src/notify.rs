@@ -14,17 +14,19 @@
 //!
 //! # What is sent, and what is not
 //!
-//! [`NotifyKind`] is a CLOSED enum, so widening what reaches a phone requires editing it and shows
-//! in a diff. Only four events warrant a human:
+//! Four events warrant a human. [`NotifyKind`] is a CLOSED enum covering three of them, so widening
+//! what reaches a phone requires editing it and shows in a diff:
 //!
-//! * [`NotifyKind::Escalation`] — a manager escalation that names a human (sent by the breaker's
-//!   own path, [`crate::breaker`], which already carries the room line).
 //! * [`NotifyKind::AdviceUnapplied`] — an `advise`-mode recommendation the daemon deliberately did
 //!   not apply, so nothing else will act on it.
 //! * [`NotifyKind::BlockedNoPr`] — a run that ended blocked with no pull request (STUDIO-1497): it
 //!   has no reply surface and nothing will move it.
 //! * [`NotifyKind::HumanHold`] — a ticket held by the `rhapsody:human` refusal, the first time it
 //!   becomes a candidate (once per ticket, never per tick).
+//!
+//! The fourth, a manager **escalation** that names a human, is delivered by the breaker's own path
+//! ([`crate::breaker`]) because that path already carries the room line the escalation owns; routing
+//! it here too would page twice. [`divergence_notify_kind`] records the split in one place.
 //!
 //! Never sent: review rounds, rebases, CI churn, routine dispatch, or anything that resolves
 //! itself. A notifier that cries wolf gets muted, and a muted notifier is worse than none.
@@ -60,11 +62,11 @@ use rhapsody_config::notify::NotifyOrigin;
 /// the durable ledger still suppresses a repeat across a restart wherever storage is on.
 const NOTIFY_SENT_CAPACITY: usize = 256;
 
-/// The one-way notification kinds this daemon sends (STUDIO-1504). Closed on purpose.
+/// The one-way notification kinds this seam delivers (STUDIO-1504). Closed on purpose; a manager
+/// escalation is the fourth human-warranting event and is delivered by [`crate::breaker`] instead
+/// (see [`divergence_notify_kind`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NotifyKind {
-    /// A manager escalation that names a human.
-    Escalation,
     /// An `advise`-mode recommendation that was NOT applied.
     AdviceUnapplied,
     /// A run that ended blocked with no pull request.
@@ -77,7 +79,6 @@ impl NotifyKind {
     /// The stable token used in the dedup key and the logs. Stable because an operator greps it.
     pub fn as_str(self) -> &'static str {
         match self {
-            NotifyKind::Escalation => "escalation",
             NotifyKind::AdviceUnapplied => "advice-unapplied",
             NotifyKind::BlockedNoPr => "blocked-no-pr",
             NotifyKind::HumanHold => "human-hold",
@@ -87,7 +88,6 @@ impl NotifyKind {
     /// The notification title, always naming the ticket.
     pub fn title(self, ticket: &str) -> String {
         match self {
-            NotifyKind::Escalation => format!("Escalation: {ticket}"),
             NotifyKind::AdviceUnapplied => format!("Advice not applied: {ticket}"),
             NotifyKind::BlockedNoPr => format!("Blocked, no pull request: {ticket}"),
             NotifyKind::HumanHold => format!("Held for a human: {ticket}"),
@@ -696,7 +696,6 @@ mod tests {
     #[test]
     fn titles_name_the_ticket() {
         for kind in [
-            NotifyKind::Escalation,
             NotifyKind::AdviceUnapplied,
             NotifyKind::BlockedNoPr,
             NotifyKind::HumanHold,
