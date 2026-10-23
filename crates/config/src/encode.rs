@@ -232,8 +232,15 @@ fn raw_from_config(c: &Config) -> Raw {
         .collect();
     // STUDIO-1026 (Rhapsody-only): emit the `notify:` block only when some channel is configured, so
     // a workflow that never writes it round-trips byte-identically (every channel defaults off).
-    if c.notify.macos || !c.notify.webhook.is_empty() || !c.notify.ntfy.is_empty() {
+    // STUDIO-1504 adds an explicit `backend:` to that test: a backend named with no legacy key set
+    // still has to survive the round-trip.
+    if !c.notify.backend.trim().is_empty()
+        || c.notify.macos
+        || !c.notify.webhook.is_empty()
+        || !c.notify.ntfy.is_empty()
+    {
         r.notify = Some(RawNotify {
+            backend: (!c.notify.backend.trim().is_empty()).then(|| c.notify.backend.clone()),
             macos: c.notify.macos.then_some(true),
             webhook: c.notify.webhook.clone(),
             ntfy: c.notify.ntfy.clone(),
@@ -711,6 +718,28 @@ mod tests {
         assert_eq!(c2.opencode.auto_approve, Some(true), "absent ⇒ enabled");
         // Stable under a second trip: Encode/Decode must be a fixed point here.
         assert_eq!(re_encode_decode(&c2).opencode, c2.opencode);
+    }
+
+    // STUDIO-1504: an explicit `notify.backend` survives an encode/decode round trip even with no
+    // legacy channel key set — otherwise the console's config editor would silently drop it.
+    #[test]
+    fn an_explicit_notify_backend_survives_a_round_trip() {
+        let c1 = decode_map(
+            "tracker:\n  kind: linear\nnotify:\n  backend: ntfy\n  ntfy: rhapsody-alerts\n",
+            "body",
+        );
+        let c2 = re_encode_decode(&c1);
+        assert_eq!(c2.notify, c1.notify, "the notify block must round-trip");
+        assert_eq!(c2.notify.backend, "ntfy");
+
+        // A backend named with no legacy key still round-trips (the block is emitted for it).
+        let c3 = decode_map(
+            "tracker:\n  kind: linear\nnotify:\n  backend: none\n",
+            "body",
+        );
+        let c4 = re_encode_decode(&c3);
+        assert_eq!(c4.notify, c3.notify);
+        assert_eq!(c4.notify.backend, "none");
     }
 
     // STUDIO-974 review (jimmy): the console's Save path (`httpapi::config_view::apply_typed_config`)

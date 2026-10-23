@@ -21,6 +21,7 @@ pub mod limits;
 pub mod manager;
 pub mod memory;
 pub mod model;
+pub mod notify;
 pub mod profiles;
 pub mod projects;
 pub mod prompt;
@@ -44,6 +45,10 @@ pub use model::{
     DEPENDENCY_MODE_DISABLED, DEPENDENCY_MODE_GRAPHITE, Hooks, Logging, Mcp, Notify, Opencode,
     Otel, Polling, Price, Project, ProviderBudget, Server, Storage, Tracker, WORKSPACE_MODE_CLONE,
     WORKSPACE_MODE_WORKTREE, Workspace,
+};
+pub use notify::{
+    IMPLEMENTED_NOTIFY_BACKENDS, NOTIFY_BACKEND_NAMES, NotifyOrigin, ResolvedNotify,
+    notify_backend_is_implemented, notify_backend_is_recognized,
 };
 pub use projects::{EffectiveConfig, ResolvedProject, effective_for, resolve_projects};
 pub use provider_edit::{

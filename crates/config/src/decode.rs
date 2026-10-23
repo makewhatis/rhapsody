@@ -320,6 +320,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     // zero default, so a workflow that never writes `notify:` decodes byte-identically to before.
     let notify = match r.notify {
         Some(n) => Notify {
+            backend: n.backend.unwrap_or_default(),
             macos: n.macos.unwrap_or(false),
             webhook: n.webhook,
             ntfy: n.ntfy,
@@ -1200,6 +1201,50 @@ mod tests {
     fn decode_notify_explicit_empty_is_off() {
         let c = decode_yaml("notify: {}\n", "body");
         assert_eq!(c.notify, Notify::default());
+    }
+
+    // STUDIO-1504: `notify.backend` decodes verbatim, and an absent one leaves the empty inherit
+    // state that the legacy keys resolve from.
+    #[test]
+    fn decode_notify_backend_parses_and_defaults_empty() {
+        let unset = decode_yaml("tracker:\n  kind: linear\n", "body");
+        assert_eq!(unset.notify.backend, "");
+
+        let c = decode_yaml(
+            "notify:\n  backend: ntfy\n  ntfy: rhapsody-alerts\n",
+            "body",
+        );
+        assert_eq!(c.notify.backend, "ntfy");
+        assert_eq!(c.notify.ntfy, "rhapsody-alerts");
+    }
+
+    // STUDIO-1504: the named backend resolves explicitly, inherits from the legacy keys in a fixed
+    // order, and defaults to `none` — the introspection value plus its origin.
+    #[test]
+    fn notify_backend_resolves_with_origin() {
+        use crate::notify::NotifyOrigin;
+
+        let explicit = decode_yaml("notify:\n  backend: macos\n  ntfy: topic\n", "body");
+        let r = explicit.notify.resolve_backend();
+        assert_eq!(r.backend, "macos");
+        assert_eq!(r.origin, NotifyOrigin::Explicit);
+        assert!(r.is_implemented() && r.is_recognized());
+
+        let ntfy = decode_yaml("notify:\n  macos: true\n  ntfy: topic\n", "body");
+        let r = ntfy.notify.resolve_backend();
+        assert_eq!(r.backend, "ntfy", "ntfy is the first inherited key");
+        assert_eq!(r.origin, NotifyOrigin::Derived("notify.ntfy"));
+
+        let macos = decode_yaml("notify:\n  macos: true\n", "body");
+        assert_eq!(macos.notify.resolve_backend().backend, "macos");
+
+        let webhook = decode_yaml("notify:\n  webhook: https://example.test/hook\n", "body");
+        assert_eq!(webhook.notify.resolve_backend().backend, "webhook");
+
+        let none = decode_yaml("notify: {}\n", "body");
+        let r = none.notify.resolve_backend();
+        assert_eq!(r.backend, "none");
+        assert_eq!(r.origin, NotifyOrigin::Default);
     }
 
     // Mirrors Go `TestDecodeOtelDefaults`.

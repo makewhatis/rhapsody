@@ -1828,6 +1828,9 @@ impl Store for Sqlite {
     fn notices_enabled(&self) -> bool {
         true
     }
+    fn durable_dedup_enabled(&self) -> bool {
+        true
+    }
     fn observe_notices(&self, rows: &[Notice], at: &str) -> Result<(), StoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;

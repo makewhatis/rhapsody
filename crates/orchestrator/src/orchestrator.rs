@@ -667,6 +667,19 @@ pub struct Orchestrator {
     /// [`crate::breaker::Orchestrator::reconcile_breaker`] (and the escalation notify), both on the
     /// control task.
     pub(crate) breaker_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::breaker::BreakerPlan>>,
+    /// The one-way notification task's off-loop inbox (STUDIO-1504). `None` whenever no task was
+    /// spawned, in which case a trigger still reserves its dedup marker but nothing is delivered —
+    /// the same stance [`Self::breaker_tx`] takes. Its only sender is
+    /// [`crate::notify::Orchestrator::request_notify`], on the control task.
+    pub(crate) notify_tx: Option<tokio::sync::mpsc::UnboundedSender<crate::notify::Notification>>,
+    /// The per-process once-per-occurrence dedup for the notification triggers (STUDIO-1504),
+    /// keyed `notify:<kind>:<occurrence>`. The durable restart half lives in the store.
+    ///
+    /// A `Mutex` because the `rhapsody:human` trigger reaches it from `&self` (the selection pass
+    /// is `&self` by design, as [`crate::dispatch::HumanHoldLedger`] is). It is taken for one set
+    /// operation and never held across an `.await`, and — unlike that ledger — it is touched ONLY
+    /// by the control task, so it is not a cross-task seam.
+    pub(crate) notify_sent: std::sync::Mutex<HashSet<String>>,
     /// Escalation notify dedupe (STUDIO-1026), keyed `pr@head`. Loop-confined; a restart re-notifies
     /// at worst once, which the module docs state.
     pub(crate) escalation_notified: HashSet<String>,
@@ -1265,6 +1278,8 @@ impl Orchestrator {
             human_holds: Arc::new(crate::dispatch::HumanHoldLedger::default()),
             budget_ledger: Arc::new(crate::budget::BudgetLedger::default()),
             breaker_tx: None,
+            notify_tx: None,
+            notify_sent: std::sync::Mutex::new(HashSet::new()),
             escalation_notified: HashSet::new(),
             notifications: Arc::new(crate::breaker::NotificationsState::default()),
             completed: HashSet::new(),
