@@ -337,4 +337,39 @@ mod tests {
         assert_eq!(iss.latest_summon_at, Some(at(29)));
         assert_eq!(o.store().summon_watermark("A-1").expect("read"), None);
     }
+
+    // STUDIO-1502 acceptance #5, made explicit for the LINEAR source: a summons reaches the
+    // candidate through the TRACKER (the Linear adapter's `normalize_issue`), not through the
+    // GitHub enrichment, and it must survive a daemon restart exactly as the GitHub one does. The
+    // store is the durable party here — a fresh Orchestrator over the SAME store, whose poll no
+    // longer sees the comment (it has aged out), gets the remembered summons back.
+    #[test]
+    fn a_linear_comment_summons_survives_a_restart() {
+        let store: Arc<dyn rhapsody_store::Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("open in-memory store"));
+
+        // Before the restart: the poll observed the Linear comment (the tracker set
+        // `latest_summon_at`/`latest_summon_body`), and the watermark remembered it.
+        let mut before = Orchestrator::new("WORKFLOW.md");
+        before.store = Arc::clone(&store);
+        let mut iss = issue("1", "A-1", "Todo");
+        iss.latest_summon_at = Some(at(29));
+        iss.latest_summon_body = "@symphony have another look".into();
+        before.restore_summon_watermarks(std::iter::once(&mut iss));
+
+        // After the restart: a fresh orchestrator over the same store, and a poll that no longer
+        // sees the comment at all.
+        let mut after = Orchestrator::new("WORKFLOW.md");
+        after.store = Arc::clone(&store);
+        let mut iss_after = issue("1", "A-1", "Todo");
+
+        after.restore_summon_watermarks(std::iter::once(&mut iss_after));
+
+        assert_eq!(
+            iss_after.latest_summon_at,
+            Some(at(29)),
+            "the Linear-sourced summons must survive the restart"
+        );
+        assert_eq!(iss_after.latest_summon_body, "@symphony have another look");
+    }
 }
