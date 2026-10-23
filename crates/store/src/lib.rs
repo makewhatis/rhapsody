@@ -260,6 +260,13 @@ pub trait Store {
     fn notices_enabled(&self) -> bool {
         false
     }
+    /// Whether this store keeps DURABLE once-per-key dedup state — the `rhapsody_lead_reporting`
+    /// ledger. `Sqlite` returns `true`; `Noop` (and the trait default) `false`, because nothing
+    /// persists, so a caller that needs per-occurrence dedup must fall back to an in-memory
+    /// once-set. Used by the notification dedup (STUDIO-1504).
+    fn durable_dedup_enabled(&self) -> bool {
+        false
+    }
     /// Observe a complete, successful notice snapshot, resolving absent transient episodes.
     /// Existing observations never reset read state. Off stores retain the no-op contract.
     fn observe_notices(&self, _rows: &[Notice], _at: &str) -> Result<(), StoreError> {

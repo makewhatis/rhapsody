@@ -574,6 +574,13 @@ where
     // notifications. Spawned on exactly the introduction's condition: a round can only exist where
     // one was introduced, so a non-ticketless daemon has nothing to bound.
     let breaker_rx = spawn_review_intro(&teams_cfg).then(|| o.open_breaker_channel());
+    // --- one-way operator notifications (STUDIO-1504) ---
+    //
+    // The off-loop task the four human-warranting events hand a push to (a manager escalation, an
+    // unapplied `advise` recommendation, a run blocked with no pull request, a `rhapsody:human`
+    // hold). Opened unconditionally like the limit-report channel beside it: the triggers gate on a
+    // backend being configured, and a daemon with none simply never sends.
+    let notify_rx = o.open_notify_channel();
     let limit_report_rx = o.open_limit_report_channel();
     // --- ticketless review watcher (STUDIO-721, slice 5; design record §14.1, §14.4) ---
     //
@@ -1421,20 +1428,21 @@ where
     // must park this task and nothing else. The control task already DECIDED the crossing and
     // persisted it; this task only performs the consequences.
     let breaker_notifications = o.notifications_state();
-    let mut limit_channels: Vec<Arc<dyn rhapsody_orchestrator::breaker::NotifyChannel>> =
-        Vec::new();
-    if let Some(cfg) = resolved.as_ref() {
-        if cfg.notify.macos {
-            limit_channels.push(Arc::new(rhapsody_orchestrator::breaker::MacosChannel::new(
+    // One resolution of the notification backend for every consumer (STUDIO-1504): the account
+    // report, the breaker, and the generic notify task all share the same `Vec<Arc<..>>`, so they
+    // cannot disagree about which backend is in use. `channels_from_config` logs the resolved
+    // backend and its origin once, and degrades a recognized-but-unimplemented name with a warning
+    // rather than failing anything.
+    let notify_channels: Vec<Arc<dyn rhapsody_orchestrator::breaker::NotifyChannel>> = resolved
+        .as_ref()
+        .map(|cfg| {
+            rhapsody_orchestrator::notify::channels_from_config(
+                &cfg.notify,
                 breaker_notifications.clone(),
-            )));
-        }
-        if !cfg.notify.ntfy.trim().is_empty() {
-            limit_channels.push(Arc::new(rhapsody_orchestrator::breaker::NtfyChannel::new(
-                cfg.notify.ntfy.trim().into(),
-            )));
-        }
-    }
+            )
+        })
+        .unwrap_or_default();
+    let limit_channels = notify_channels.clone();
     let limit_report_ctx = shutdown.wait();
     let lead_report_task = o.lead_reports.clone().map(|reports| {
         let ctx = shutdown.wait();
@@ -1472,26 +1480,7 @@ where
     let breaker_task = breaker_rx.map(|rx| {
         let breaker_ctx = shutdown.wait();
         let hold_handle = handle.clone();
-        let mut channels: Vec<Arc<dyn rhapsody_orchestrator::breaker::NotifyChannel>> = Vec::new();
-        if let Some(cfg) = resolved.as_ref() {
-            if cfg.notify.macos {
-                channels.push(Arc::new(rhapsody_orchestrator::breaker::MacosChannel::new(
-                    breaker_notifications.clone(),
-                )));
-            }
-            let webhook = cfg.notify.webhook.trim();
-            if !webhook.is_empty() {
-                channels.push(Arc::new(
-                    rhapsody_orchestrator::breaker::WebhookChannel::new(webhook.to_string()),
-                ));
-            }
-            let ntfy = cfg.notify.ntfy.trim();
-            if !ntfy.is_empty() {
-                channels.push(Arc::new(rhapsody_orchestrator::breaker::NtfyChannel::new(
-                    ntfy.to_string(),
-                )));
-            }
-        }
+        let channels = notify_channels.clone();
         let deps = rhapsody_orchestrator::breaker::BreakerDeps {
             // Read lazily per crossing, exactly as the quorum reads its tracker per request: the
             // handle is built before the first reload, so the trackers arrive later.
@@ -1507,6 +1496,19 @@ where
             rhapsody_orchestrator::breaker::run_breaker_task(breaker_ctx, deps, rx).await;
         })
     });
+
+    // The one-way notification task (STUDIO-1504). It owns every configured backend and the HTTP
+    // that reaching one costs — off the control task, so a hung webhook or a slow ntfy push parks
+    // this task and nothing else. Spawned unconditionally: with no backend configured it idles.
+    let notify_task = {
+        let notify_ctx = shutdown.wait();
+        let deps = rhapsody_orchestrator::notify::NotifyDeps {
+            channels: notify_channels,
+        };
+        tokio::spawn(async move {
+            rhapsody_orchestrator::notify::run_notify_task(notify_ctx, deps, notify_rx).await;
+        })
+    };
 
     // The auto-merge ledger (STUDIO-874), built HERE — beside `triage_seam` above and for the same
     // reason — so the SAME `Arc` can go to two consumers: the off-loop `AutoMergeDeps` below, which
@@ -1831,6 +1833,9 @@ where
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, t).await;
     }
     let _ = tokio::time::timeout(SHUTDOWN_DRAIN, limit_report_task).await;
+    // The notification task is cancelled by the same signal and checks it on both sides of its
+    // receive, so the wait is bounded by whatever HTTP push is already in flight.
+    let _ = tokio::time::timeout(SHUTDOWN_DRAIN, notify_task).await;
     if let Some(task) = lead_report_task {
         let _ = tokio::time::timeout(SHUTDOWN_DRAIN, task).await;
     }

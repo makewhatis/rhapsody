@@ -283,7 +283,7 @@ impl Orchestrator {
         candidates: impl Iterator<Item = (&'a Issue, Option<usize>)>,
         read_the_board: bool,
     ) {
-        let mut live: Vec<(String, String, String)> = Vec::new();
+        let mut live: Vec<(String, String, String, i64)> = Vec::new();
         for (iss, proj) in candidates {
             if iss.identifier.is_empty() {
                 continue;
@@ -301,7 +301,10 @@ impl Orchestrator {
             } else {
                 hold.need.clone()
             };
-            live.push((self.adopt_group(proj), iss.identifier.clone(), why));
+            // The hold id scopes the notification's dedup to this episode (STUDIO-1504): a
+            // re-parked ticket is a new hold with a new id, so it pages again; the same hold does
+            // not.
+            live.push((self.adopt_group(proj), iss.identifier.clone(), why, hold.id));
         }
         // Retire recorded advisories whose hold is gone (or whose ticket left the board), FIRST, so
         // a ticket recorded in this same sweep is never immediately cleared by a stale entry. Only a
@@ -309,7 +312,7 @@ impl Orchestrator {
         if read_the_board {
             let live_keys: HashSet<(String, String)> = live
                 .iter()
-                .map(|(group, id, _)| (group.clone(), id.clone()))
+                .map(|(group, id, _, _)| (group.clone(), id.clone()))
                 .collect();
             for (group, identifier) in self.warnings.blocked_no_pr_entries() {
                 if !live_keys.contains(&(group.clone(), identifier.clone())) {
@@ -317,9 +320,12 @@ impl Orchestrator {
                 }
             }
         }
-        for (group, identifier, why) in live {
+        for (group, identifier, why, hold_id) in live {
             self.warnings
                 .record_blocked_no_pr(&group, &identifier, &why);
+            // STUDIO-1504: a run blocked with no pull request has no reply surface and nothing will
+            // move it — one of the four events that warrants a human. Deduped per hold id.
+            self.notify_blocked_no_pr(&identifier, hold_id);
         }
     }
 
@@ -1589,6 +1595,26 @@ mod tests {
         // The ticket left the board (or the hold was released): the advisory is retired.
         o.reconcile_blocked_no_pr(std::iter::empty(), true);
         assert_eq!(lines(&o), 0, "a resolved condition retires the line");
+    }
+
+    // STUDIO-1504: a run blocked with no pull request is one of the four events that pushes to the
+    // operator — it has no reply surface and nothing will move it. One notification per hold
+    // episode, not per sweep.
+    #[test]
+    fn a_blocked_no_pr_ticket_enqueues_one_notification_per_hold() {
+        let mut o = orch(teams_with(false, ReviewMode::Ticketless, &[]));
+        o.eff.as_mut().expect("eff").cfg.notify.macos = true;
+        let mut rx = o.open_notify_channel();
+        park_blocked(&o, "STUDIO-1497");
+        let iss = active("STUDIO-1497");
+
+        o.reconcile_blocked_no_pr(std::iter::once((&iss, Some(0))), true);
+        let n = rx.try_recv().expect("one notification");
+        assert_eq!(n.kind, crate::notify::NotifyKind::BlockedNoPr);
+        assert!(n.body.contains("STUDIO-1497"), "{}", n.body);
+
+        o.reconcile_blocked_no_pr(std::iter::once((&iss, Some(0))), true);
+        assert!(rx.try_recv().is_err(), "once per occurrence, not per sweep");
     }
 
     // STUDIO-1497: a pass that could not read the whole board never RETIRES an advisory — a partial

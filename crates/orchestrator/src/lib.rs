@@ -77,6 +77,7 @@ pub mod managerselftest_opencode;
 pub mod managerwake;
 pub mod mergeconsole;
 pub mod message;
+pub mod notify;
 pub mod obslog;
 pub mod orchestrator;
 pub mod persist;

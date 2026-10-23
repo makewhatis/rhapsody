@@ -258,6 +258,11 @@ pub fn crossing_body(plan: &BreakerPlan) -> String {
     if plan.kinds.contains(&CrossingKind::Escalation) && !plan.reason.is_empty() {
         body.push_str(&format!("Manager: {}", plan.reason));
     }
+    // STUDIO-1504: an escalation is one of the four events that warrants a human, so it says what
+    // to do — the decision wanted and where to answer — before the pull-request link.
+    if plan.kinds.contains(&CrossingKind::Escalation) {
+        body.push_str(&format!("\n{}", crate::notify::answer_hint(&plan.ticket)));
+    }
     body.push_str(&format!("\n{}", plan.pr_url()));
     body
 }
@@ -474,6 +479,12 @@ pub trait NotifyChannel: Send + Sync {
     async fn send_lead(&self, title: &str, body: &str, _link: &str) -> Result<(), String> {
         self.send_account(title, body).await
     }
+    /// Delivers one generic one-way notification (STUDIO-1504): a title, a body and an optional
+    /// link. Defaults to [`Self::send_lead`], whose shape is already exactly this — a channel that
+    /// has a richer lead format overrides it rather than gaining a second method.
+    async fn send_notice(&self, title: &str, body: &str, link: &str) -> Result<(), String> {
+        self.send_lead(title, body, link).await
+    }
     /// Account-level reporting shares the transport, without pretending an account is a PR.
     async fn send_account(&self, _title: &str, _body: &str) -> Result<(), String> {
         Err("account notifications unsupported on this channel".into())
@@ -484,6 +495,16 @@ pub trait NotifyChannel: Send + Sync {
 
     /// The channel's name, for the log line.
     fn name(&self) -> &'static str;
+}
+
+/// One generic one-way notification's JSON body posted to a `notify.webhook` (STUDIO-1504). Flat and
+/// stable, and distinct from [`WebhookPayload`] (which carries `event`), so an operator's endpoint
+/// can tell a breaker crossing from a generic notification.
+#[derive(Debug, Serialize)]
+pub struct WebhookNotice<'a> {
+    pub title: &'a str,
+    pub body: &'a str,
+    pub link: &'a str,
 }
 
 /// A `notify.webhook` URL: POST a JSON body.
@@ -509,6 +530,22 @@ impl NotifyChannel for WebhookChannel {
             .client
             .post(&self.url)
             .json(&payload)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+        if res.status().is_success() {
+            Ok(())
+        } else {
+            Err(format!("webhook returned HTTP {}", res.status()))
+        }
+    }
+    /// A generic one-way notification (STUDIO-1504), so a webhook-only install still receives the
+    /// four human-warranting events rather than an "unsupported" error per trigger.
+    async fn send_notice(&self, title: &str, body: &str, link: &str) -> Result<(), String> {
+        let res = self
+            .client
+            .post(&self.url)
+            .json(&WebhookNotice { title, body, link })
             .send()
             .await
             .map_err(|e| e.to_string())?;
@@ -751,14 +788,11 @@ impl Orchestrator {
     }
 
     /// Whether any `notify:` channel is configured. Escalation notifications are gated on this (and
-    /// on a task existing) so a daemon with no channels does nothing new.
+    /// on a task existing) so a daemon with no channels does nothing new. Delegates to
+    /// [`Orchestrator::notify_backend_configured`] so an explicit `notify.backend` (STUDIO-1504)
+    /// resolves the same way here as in the generic notify seam.
     pub(crate) fn notify_channels_configured(&self) -> bool {
-        self.notify_cfg()
-            .is_some_and(|n| n.macos || !n.webhook.trim().is_empty() || !n.ntfy.trim().is_empty())
-    }
-
-    fn notify_cfg(&self) -> Option<&rhapsody_config::Notify> {
-        self.eff.as_ref().map(|e| &e.cfg.notify)
+        self.notify_backend_configured()
     }
 
     fn round_threshold(&self) -> Option<i64> {
@@ -1092,9 +1126,27 @@ impl Orchestrator {
         if !self.notify_channels_configured() || self.breaker_tx.is_none() {
             return;
         }
-        let key = format!("{}@{}", div.pr, div.adjudicated_head);
-        if !self.escalation_notified.insert(key) {
+        let key = format!("notify:escalation:{}@{}", div.pr, div.adjudicated_head);
+        if !self.escalation_notified.insert(key.clone()) {
             return; // already told them about this head
+        }
+        // STUDIO-1504: the restart half of the dedup. The in-memory set above is pruned when an
+        // escalation recovers (so a recurrence at a NEW head notifies again); this durable ledger
+        // stops a restart from re-sending a trip the operator already saw.
+        if self.store().durable_dedup_enabled() {
+            match self.store().reserve_lead_report(&key, 1) {
+                Ok(true) => {}
+                Ok(false) => return,
+                Err(error) => {
+                    tracing::warn!(
+                        ticket = %div.ticket,
+                        %error,
+                        "breaker: the escalation dedup marker could not be persisted; skipping \
+                         rather than risking a repeat"
+                    );
+                    return;
+                }
+            }
         }
         let Some((owner, repo, number)) = parse_pr(&div.pr) else {
             return;
@@ -1143,7 +1195,7 @@ impl Orchestrator {
         let live: std::collections::HashSet<String> = found
             .iter()
             .filter(|d| d.kind == crate::reviewreconcile::DivergenceKind::ReviewEscalated)
-            .map(|d| format!("{}@{}", d.pr, d.adjudicated_head))
+            .map(|d| format!("notify:escalation:{}@{}", d.pr, d.adjudicated_head))
             .collect();
         self.escalation_notified.retain(|k| live.contains(k));
     }
@@ -2767,6 +2819,12 @@ mod tests {
         assert!(
             sent[0].contains("escalated the review loop"),
             "an escalation needs its own headline: {}",
+            sent[0]
+        );
+        // STUDIO-1504: the escalation says what to do — the decision wanted and where to answer.
+        assert!(
+            sent[0].contains("Linear"),
+            "an escalation must say where to answer: {}",
             sent[0]
         );
     }
