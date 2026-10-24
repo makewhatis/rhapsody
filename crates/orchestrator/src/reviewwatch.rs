@@ -9459,11 +9459,12 @@ mod tests {
         );
         let c = rx.try_recv().expect("the author is summoned");
         assert_eq!(c.reason, crate::reviewnotify::CompletionReason::Conflict);
-        assert_eq!(
-            c.changes.as_ref().expect("a plan").state,
-            "In Progress",
-            "the ticket leaves the review state"
-        );
+        // The watcher's job ends at this queued plan: it names the configured changes state. The
+        // notify sink applies it, and for a parked pull request it REFUSES the immediate move — the
+        // author is re-engaged through the conflict comment's token instead, and the next poll's
+        // `reengage_on_summons` releases the park (pinned in `reviewnotify`'s
+        // `a_parked_conflict_route_back_posts_the_summons_but_refuses_the_move`).
+        assert_eq!(c.changes.as_ref().expect("a plan").state, "In Progress");
     }
 
     /// `rhapsody:human` still wins over the park: a ticket the operator holds by hand is not moved
@@ -9526,6 +9527,55 @@ mod tests {
                 "draft={draft}: the sweep must name the deliberate hold, not the unexplained stall"
             );
             assert_eq!(found[0].ticket, "STUDIO-721", "draft={draft}");
+        }
+    }
+
+    /// STUDIO-1511 review finding B1: the held report is emitted only while adjudication is enabled
+    /// (STUDIO-964's byte-identical acceptance), so the held-row diversion must not swallow a parked
+    /// row on an install where that report can never fire. On an adjudication-OFF install a parked,
+    /// approved pull request must keep the ordinary `ApprovedStillOpen` report — visible after the
+    /// staleness threshold, exactly as before this ticket — rather than disappearing entirely.
+    ///
+    /// MUTATION: make the held-row condition `labelled_hold || parked` (drop the `&& adjudicating`)
+    /// and this reds (`left: 0` — the parked row is diverted into a held path that reports nothing).
+    #[test]
+    fn a_parked_approved_pull_request_stays_visible_without_adjudication() {
+        for draft in [false, true] {
+            let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+            assert!(
+                o.adjudication_threshold().is_none(),
+                "the regression is the adjudication-off configuration"
+            );
+            introduce(&o, approved_row(12, "bob", HEAD_A));
+            // The approval is well past `RECONCILE_STALE_AFTER` (90 minutes), so the ordinary rule
+            // would have reported this before the held-row diversion existed.
+            let now = (o.now)();
+            let started = (now - chrono::Duration::minutes(130)).to_rfc3339();
+            let ended = (now - chrono::Duration::minutes(120)).to_rfc3339();
+            finished_run(&o, "STUDIO-721", &started, &ended);
+            finished_run(&o, &review_key(OWNER, REPO, 12, "bob"), &started, &ended);
+            park_pr(&o, 12);
+
+            let observed = if draft {
+                draft_at(12, HEAD_A)
+            } else {
+                open_at(12, HEAD_A)
+            };
+            o.handle_review_sweep(&[observed]);
+            o.reconcile_review_divergence();
+
+            let found = o.review_divergences();
+            assert_eq!(
+                found.len(),
+                1,
+                "draft={draft}: a parked approved pull request must stay visible with adjudication \
+                 off, not be diverted into a report that never fires: {found:?}"
+            );
+            assert_eq!(
+                found[0].kind,
+                crate::reviewreconcile::DivergenceKind::ApprovedStillOpen,
+                "draft={draft}: without adjudication the ordinary report is what keeps it visible"
+            );
         }
     }
 

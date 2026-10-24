@@ -1514,6 +1514,34 @@ mod tests {
         );
     }
 
+    /// STUDIO-1511 review follow-up: a conflict route-back on a PARKED pull request is TWO-STAGE,
+    /// and this pins the shape the reviewwatch test can only describe as a queued plan. The conflict
+    /// template ignores `suppress_summons` (a conflict is never an approval), so the comment is still
+    /// posted WITH its token and the author is re-engaged through the summons; but the immediate
+    /// tracker move is refused while the park stands. The park is released on the next poll, when
+    /// `reengage_on_summons` sees the fresh summons — not by a move this tick.
+    #[tokio::test]
+    async fn a_parked_conflict_route_back_posts_the_summons_but_refuses_the_move() {
+        let sink = RecordingSink::new(false);
+        let tickets = Arc::new(RecordingTickets {
+            parked: true,
+            ..Default::default()
+        });
+        drain(deps(&sink, &tickets), vec![conflict_completion_moving()]).await;
+
+        let posted = sink.taken();
+        assert_eq!(posted.len(), 1, "the conflict comment is still posted");
+        assert!(
+            summons_author(&posted[0].2, "@symphony"),
+            "and it carries the token, so the author is re-engaged: {}",
+            posted[0].2
+        );
+        assert!(
+            tickets.taken().is_empty(),
+            "but the immediate tracker move is refused while the park stands"
+        );
+    }
+
     /// The conflict body renders the role, never a blank, when the author is unknown — the same
     /// contract `an_unknown_author_is_addressed_by_role` pins for the verdict comments.
     #[test]
