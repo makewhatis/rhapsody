@@ -131,6 +131,7 @@ pub mod teamsmemory;
 pub mod teamspost;
 pub mod teamsprefetch;
 pub mod telemetry_attrs;
+pub mod terminalcleanup;
 pub mod triage;
 pub mod warnings;
 pub mod worker;

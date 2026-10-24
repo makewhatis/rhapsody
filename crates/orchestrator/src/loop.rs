@@ -36,7 +36,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use rhapsody_agent as agent;
 use rhapsody_config::CLAIM_MODE_POOL;
-use rhapsody_core::{Issue, normalize_state};
+use rhapsody_core::Issue;
 use rhapsody_tracker::Tracker;
 use rhapsody_workspace::Manager;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -59,6 +59,9 @@ use crate::retry::{DispatchRoute, EvRetry, EvWorkerExit};
 use crate::select::TaggedIssue;
 use crate::snapshot::{RefreshResult, Snapshot};
 use crate::stop::{ControlHandle, ResumePlan, StopPlan};
+use crate::terminalcleanup::{
+    TERMINAL_CLEANUP_INTERVAL, TerminalCleanupPlan, TerminalCleanupSummary,
+};
 use crate::worker::{WorkerDeps, WorkerError, run_agent_attempt};
 use crate::workspace_gc::WorkspaceGcPlan;
 
@@ -293,6 +296,12 @@ pub enum Event {
     /// A request for the race-free workspace-GC plan (Go `evWorkspaceGC`).
     WorkspaceGc {
         reply: oneshot::Sender<WorkspaceGcPlan>,
+    },
+    /// A request for the race-free terminal-cleanup plan (STUDIO-1520; no Go counterpart). The
+    /// periodic sweep's off-loop driver reads the live scheduling maps + the store through this
+    /// round-trip so a sweep never blocks the control loop.
+    TerminalCleanup {
+        reply: oneshot::Sender<TerminalCleanupPlan>,
     },
     /// The TOCTOU guard: is this worktree path a live running issue RIGHT NOW (Go `evWorkspaceInUse`)?
     WorkspaceInUse {
@@ -769,22 +778,11 @@ fn worker_deps_for(
     deps
 }
 
-/// What one [`Orchestrator::startup_cleanup`] pass did: how many worktrees it found on disk, how
-/// many of those whose ticket came back terminal, and how many it actually removed (STUDIO-1466).
-/// The pass returns it so a test can pin the counts directly, and logs the same numbers as its one
-/// INFO summary line.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StartupCleanupSummary {
-    pub(crate) worktrees: usize,
-    pub(crate) terminal: usize,
-    pub(crate) removed: usize,
-}
-
 impl Orchestrator {
     /// Loads + validates the workflow (failing startup on error), builds the github-summons source,
     /// starts the async event writer, runs boot recovery, performs startup terminal-workspace cleanup,
-    /// watches the workflow for changes, and runs the control loop until `ctx` is cancelled (upstream
-    /// §16.1). Mirrors Go `Run`.
+    /// starts the periodic terminal-workspace sweep (STUDIO-1520), watches the workflow for changes,
+    /// and runs the control loop until `ctx` is cancelled (upstream §16.1). Mirrors Go `Run`.
     pub async fn run(&mut self, ctx: CancelWait) -> Result<(), ReloadError> {
         self.ctx = Some(ctx.clone());
         if let Err(e) = self.reload_from_disk() {
@@ -812,8 +810,16 @@ impl Orchestrator {
         // the README Divergences entry).
         self.publish_snapshot();
         self.startup_cleanup().await;
+        // STUDIO-1520: the startup pass above only sees tickets already terminal at boot. A ticket
+        // that goes terminal AFTER its run ends (the ordinary merge-then-`done_state` case) had no
+        // sweep at all and kept its worktree — and its `target/` — until the next restart. This task
+        // runs the SAME pass on a bounded interval, off the control loop, for as long as the daemon
+        // is up (see the README Divergences entry).
+        let terminal_sweep =
+            self.start_terminal_cleanup_schedule(ctx.clone(), TERMINAL_CLEANUP_INTERVAL);
         let watch = self.start_watch(ctx.clone());
         self.run_loaded(ctx).await;
+        terminal_sweep.abort();
         watch.abort();
         Ok(())
     }
@@ -950,6 +956,9 @@ impl Orchestrator {
             } => self.handle_dispatch_prepared(id, token, *completion).await,
             Event::WorkspaceGc { reply } => {
                 let _ = reply.send(self.build_workspace_gc_plan());
+            }
+            Event::TerminalCleanup { reply } => {
+                let _ = reply.send(self.build_terminal_cleanup_plan(true));
             }
             Event::WorkspaceInUse { mgr, path, reply } => {
                 let _ = reply.send(self.worktree_in_use(mgr.as_deref(), &path));
@@ -2019,7 +2028,7 @@ impl Orchestrator {
 
     /// The opencode state root the retained-session records and directories live under, when an
     /// effective config is loaded. `None` before boot/reload, when there is nothing to sweep.
-    fn opencode_state_root(&self) -> Option<String> {
+    pub(crate) fn opencode_state_root(&self) -> Option<String> {
         self.eff.as_ref().map(|e| e.cfg.opencode.state_root.clone())
     }
 
@@ -2078,149 +2087,19 @@ impl Orchestrator {
     /// project's terminal states; a ticket the tracker does not return, or one in an active state,
     /// is left alone — exactly the reference's "remove only what comes back terminal". Returns the
     /// counts it logs as its one INFO summary line.
-    async fn startup_cleanup(&self) -> StartupCleanupSummary {
-        let started = std::time::Instant::now();
-        let mut summary = StartupCleanupSummary::default();
-        struct Group {
-            tracker: Arc<dyn Tracker>,
-            terminal: std::collections::HashSet<String>,
-            workspace: Arc<Manager>,
-            repo: String,
-            slug: String,
-        }
-        let groups: Vec<Group> = {
-            let Some(eff) = self.eff.as_ref() else {
-                return summary;
-            };
-            if !eff.projects.is_empty() {
-                eff.projects
-                    .iter()
-                    .map(|p| Group {
-                        tracker: Arc::clone(&p.tracker),
-                        terminal: p
-                            .mcfg
-                            .tracker
-                            .terminal_states
-                            .iter()
-                            .map(|s| normalize_state(s))
-                            .collect(),
-                        workspace: Arc::clone(&p.workspace),
-                        repo: p.repo.clone(),
-                        slug: p.slug.clone(),
-                    })
-                    .collect()
-            } else {
-                vec![Group {
-                    tracker: Arc::clone(&eff.tracker),
-                    terminal: eff
-                        .cfg
-                        .tracker
-                        .terminal_states
-                        .iter()
-                        .map(|s| normalize_state(s))
-                        .collect(),
-                    workspace: Arc::clone(&eff.workspace),
-                    repo: String::new(),
-                    slug: String::new(),
-                }]
-            }
-        };
-        for g in groups {
-            // 1. The worktrees that actually exist on disk, one key each.
-            let keys = g.workspace.worktree_keys(&g.repo);
-            summary.worktrees += keys.len();
-            if keys.is_empty() {
-                continue;
-            }
-            // 2. Map each key to its tracker id from the store's `runs` ledger so the state read is
-            //    batched. The ledger records the identifier, not the sanitized directory key, so the
-            //    match is made on the key the worktree path is derived from. A store read that fails
-            //    (or a store that is off) leaves every key unmapped and takes the fallback below.
-            //
-            //    A review/manager/landing worktree is keyed by a synthetic `pr:…`/`lead:…` run key
-            //    that no tracker can resolve, so it is skipped rather than mapped: the reference's
-            //    by-state page never returned it either (no such issue exists), and sending the
-            //    non-UUID key in the batched id read would fail the whole request (STUDIO-831).
-            let mut by_key: HashMap<String, Option<String>> = HashMap::new();
-            match self.store.distinct_issue_ids(&g.slug) {
-                Ok(pairs) => {
-                    for (identifier, id) in pairs {
-                        let mapped = if crate::review::is_non_tracker_key(&identifier) {
-                            None
-                        } else {
-                            Some(id)
-                        };
-                        by_key
-                            .entry(rhapsody_workspace::sanitize_key(&identifier))
-                            .or_insert(mapped);
-                    }
-                }
-                Err(e) => {
-                    tracing::warn!(project_slug = %g.slug, err = %e, "startup terminal cleanup store read failed; falling back to per-identifier reads");
-                }
-            }
-            let mut ids: Vec<String> = Vec::new();
-            let mut unmapped: Vec<String> = Vec::new();
-            for key in &keys {
-                match by_key.get(key) {
-                    Some(Some(id)) => ids.push(id.clone()),
-                    Some(None) => {} // a review/manager/landing worktree: no tracker ticket to consult
-                    None => unmapped.push(key.clone()),
-                }
-            }
-            // 3. One batched state read per project, plus per-identifier reads for the stragglers.
-            let mut issues: Vec<Issue> = Vec::new();
-            let mut batch_ok = true;
-            if !ids.is_empty() {
-                match g.tracker.fetch_issue_states_by_ids(&ids).await {
-                    Ok(v) => issues.extend(v),
-                    Err(e) => {
-                        batch_ok = false;
-                        tracing::warn!(project_slug = %g.slug, err = %e, "startup terminal cleanup fetch failed; continuing");
-                    }
-                }
-            }
-            if batch_ok {
-                for identifier in unmapped {
-                    match g.tracker.fetch_issue_by_identifier(&identifier).await {
-                        Ok(Some(iss)) => issues.push(iss),
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(issue_identifier = %identifier, project_slug = %g.slug, err = %e, "startup terminal cleanup fetch failed; continuing")
-                        }
-                    }
-                }
-            }
-            // 4. Remove only the worktrees whose ticket came back terminal.
-            for iss in issues {
-                if !g.terminal.contains(&normalize_state(&iss.state)) {
-                    continue;
-                }
-                summary.terminal += 1;
-                // A worktree can vanish between the listing above and here; the guard keeps the
-                // removal (a no-op for a missing path) from being counted as a removal.
-                if g.workspace.worktree_exists(&g.repo, &iss.identifier) {
-                    match g
-                        .workspace
-                        .remove_worktree(&g.repo, &g.slug, &iss.identifier)
-                        .await
-                    {
-                        Ok(()) => summary.removed += 1,
-                        Err(e) => {
-                            tracing::warn!(issue_identifier = %iss.identifier, project_slug = %g.slug, err = %e, "startup workspace cleanup failed")
-                        }
-                    }
-                }
-                // The ticket is terminal: its retained opencode session (if any) is dead weight,
-                // in legacy mode a copy of the operator's credential included (STUDIO-1043).
-                self.discard_retained_opencode_session(&iss.identifier);
-            }
-        }
+    ///
+    /// STUDIO-1520: the walk itself lives in [`crate::terminalcleanup::run_terminal_sweep`], shared
+    /// with the periodic pass so the two can never disagree. This startup call runs it once, on the
+    /// control task, before the first tick, with NO protection set — the reference removed terminal
+    /// worktrees at boot unconditionally, and nothing is dispatched yet.
+    async fn startup_cleanup(&self) -> TerminalCleanupSummary {
+        let plan = self.build_terminal_cleanup_plan(false);
+        let summary = crate::terminalcleanup::run_terminal_sweep(&plan).await;
         tracing::info!(
             worktrees = summary.worktrees,
             terminal = summary.terminal,
             removed = summary.removed,
-            elapsed_ms = started.elapsed().as_millis() as u64,
+            elapsed_ms = summary.elapsed_ms,
             "startup terminal cleanup finished"
         );
         summary
@@ -3953,6 +3832,37 @@ mod tests {
             "the snapshot must be published while cleanup is still running, not after it"
         );
         let _ = tokio::time::timeout(Duration::from_secs(10), task).await;
+    }
+
+    // STUDIO-1520: the periodic terminal-workspace sweep's ONLY production seam is the one call in
+    // `run`. Delete it and every behavioural test stays green while the feature is dead — the exact
+    // shape this daemon has shipped twice (STUDIO-822, STUDIO-839). Asserted on source because the
+    // property (a task spawned beside `start_watch` and armed with the bounded interval) is
+    // invisible to the other tests, which drive `run_loaded`/the sweep directly.
+    #[test]
+    fn run_starts_the_periodic_terminal_cleanup_schedule() {
+        let src = include_str!("loop.rs");
+        // Assembled at run time so this test's own text is not an occurrence of what it checks for.
+        let call: String = ["self.", "start_terminal_cleanup_schedule", "("].concat();
+        let start = src
+            .find("pub async fn run(")
+            .expect("run is still a method on this module");
+        let end = start
+            + src[start..]
+                .find("\n    }")
+                .expect("run is still a braced method inside an impl block");
+        let body = &src[start..end];
+
+        assert!(
+            body.contains(call.as_str()),
+            "run no longer starts the periodic terminal-cleanup schedule; without that call the \
+             sweep never runs in production and nothing else would fail (STUDIO-1520)"
+        );
+        assert!(
+            body.contains("TERMINAL_CLEANUP_INTERVAL"),
+            "the periodic sweep must be armed with its bounded interval, not run on every tick \
+             (STUDIO-1520)"
+        );
     }
 
     // --- loop_multi_test.go: onTick's multi-project poll → dedup → dispatch fan-out (O8 e2e) ------

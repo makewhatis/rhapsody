@@ -175,6 +175,27 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### The terminal-workspace cleanup also runs periodically while the daemon is up (STUDIO-1520)
+
+The frozen Go reference removes a terminal ticket's workspace only at startup (`startupCleanup`). A
+ticket that goes terminal AFTER its run ends — the ordinary case, where a pull request merges later
+and `done_state` moves the ticket while no run is live — therefore kept its worktree, and the
+`target/` inside it, until the next restart. On a daemon that is not restarted often that is roughly
+20 GiB per merged Rust ticket: `~/.rhapsody/workspaces` measured 124 GiB on 2026-10-24, 103 GiB of
+it `target/` inside six worktrees whose tickets were already Done.
+
+Rhapsody runs the SAME cleanup on a fixed hourly interval while the daemon is up
+(`terminalcleanup.rs`, `TERMINAL_CLEANUP_INTERVAL`). It is the pass the boot cleanup runs — the same
+per-project terminal states, the same disk-driven walk and `runs`-ledger mapping, the same one
+batched `fetch_issue_states_by_ids` per project (STUDIO-1466) — sharing one implementation, so the
+two can never disagree about what is terminal. The periodic pass additionally never removes a
+worktree that belongs to a live run, a queued retry, or the ticket named by a live review watch row's
+origin. It runs OFF the control loop (a spawned task, with its plan snapshotted through one control
+round-trip, like the workspace GC), so it never blocks a tick, and it logs one INFO summary line per
+sweep (`periodic terminal cleanup finished`, carrying `worktrees`, `terminal`, `removed`,
+`elapsed_ms`). The startup pass, its log line and its removal set are unchanged. No configuration,
+schema, API payload or golden-fixture changes.
+
 ### Boot snapshot is published before startup cleanup (STUDIO-1465)
 
 The frozen Go reference runs `startupCleanup` before `runLoaded`, and its first snapshot is built
