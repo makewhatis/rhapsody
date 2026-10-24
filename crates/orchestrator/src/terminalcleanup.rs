@@ -169,13 +169,13 @@ pub(crate) async fn run_terminal_sweep(plan: &TerminalCleanupPlan) -> TerminalCl
             if !g.terminal.contains(&normalize_state(&iss.state)) {
                 continue;
             }
-            summary.terminal += 1;
             // The key-level skip above already refused a protected worktree before the state read;
             // this re-check is the defensive twin, so a tracker that returned an identifier whose
             // sanitized key is protected can still never be removed.
             if plan.protect.contains(&sanitize_key(&iss.identifier)) {
                 continue;
             }
+            summary.terminal += 1;
             // A worktree can vanish between the listing above and here; the guard keeps the removal
             // (a no-op for a missing path) from being counted as a removal.
             if g.workspace.worktree_exists(&g.repo, &iss.identifier) {
