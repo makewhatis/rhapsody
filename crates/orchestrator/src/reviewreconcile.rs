@@ -1005,15 +1005,24 @@ impl Orchestrator {
         let mut held_order: Vec<PrCoord> = Vec::new();
         let mut held_by_pr: HashMap<PrCoord, HeldPrFacts> = HashMap::new();
         for row in &rows {
-            if let Some(ticket) = origin_ticket(&row.introduced_by)
-                && labelled.contains(&ticket.to_ascii_lowercase())
-            {
-                let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
+            let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
+            let origin = origin_ticket(&row.introduced_by).map(str::to_string);
+            let labelled_hold = origin
+                .as_deref()
+                .is_some_and(|t| labelled.contains(&t.to_ascii_lowercase()));
+            // STUDIO-1511: a PARKED subject is the same class of deliberate hold as the
+            // `rhapsody:human` label, and this sweep must treat it the same way. Without this a
+            // deliberately-held approved pull request read as "nothing to report" for the whole
+            // ninety-minute staleness window (the 2026-10-24 incident: 87 minutes of silence, then
+            // a human noticing by hand). `subject_parked` fails CLOSED on an unreadable store,
+            // exactly as it already answers every other gate.
+            let parked = self.subject_parked(&pr.to_string(), "review");
+            if labelled_hold || parked {
                 let auto_merge = self.review_auto_merge_for_repo(&row.key.owner, &row.key.repo);
                 let entry = held_by_pr.entry(pr.clone()).or_insert_with(|| {
                     held_order.push(pr.clone());
                     HeldPrFacts {
-                        ticket: ticket.to_string(),
+                        ticket: origin.clone().unwrap_or_default(),
                         auto_merge,
                         live_rows: 0,
                         unapproved: 0,
@@ -1029,14 +1038,11 @@ impl Orchestrator {
                 }
                 continue; // a deliberate hold, not this sweep's business
             }
-            let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
             // Per project (STUDIO-927): each pull request reads the override for the project
             // that owns its repo, so one repo can be held back while a sibling still merges.
             // A repo no resolved project owns falls back to the top-level value.
             let auto_merge = self.review_auto_merge_for_repo(&row.key.owner, &row.key.repo);
-            let ticket = origin_ticket(&row.introduced_by)
-                .unwrap_or_default()
-                .to_string();
+            let ticket = origin.unwrap_or_default();
             let facts = RowFacts {
                 reviewer: row.key.reviewer.clone(),
                 status: row.status.clone(),
