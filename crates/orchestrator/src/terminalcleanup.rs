@@ -502,6 +502,57 @@ mod tests {
         );
     }
 
+    // STUDIO-1520 acceptance (2a, production wiring): the LIVE control loop's terminal-cleanup
+    // handler must ask for the protection set. The guard tests below call the plan builder
+    // directly, so they pin the predicate but not the argument the ONE production caller passes;
+    // this one drives `ControlHandle::sweep_terminal_workspaces()` through `run_loaded` with a live
+    // run, so flipping the handler's `protect_live` to `false` — or dropping the running half of
+    // the set — removes the worktree and asks the tracker about it, failing here.
+    //
+    // MUTATION: `crates/orchestrator/src/loop.rs`'s `Event::TerminalCleanup` arm
+    // `build_terminal_cleanup_plan(true)` → `(false)` makes this test red.
+    #[tokio::test]
+    async fn periodic_sweep_leaves_a_live_runs_worktree_through_the_control_loop() {
+        // The sweep logs through the same callsite AC1 asserts on; hold the lock so no parallel test
+        // can cache that callsite as uninterested (TRA-243).
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+        let (mut o, tr, ws, _dir) = orch_for_cleanup(HashMap::from([(
+            "a1".to_string(),
+            issue("a1", "A-1", "Done"),
+        )]));
+        seed_run(&o, "A-1", "a1", "a");
+        let w = ws.create_for_issue("", "A-1").await.expect("create ws");
+        o.running.insert(
+            "a1".into(),
+            running_entry(issue("a1", "A-1", "Done"), "a", "a"),
+        );
+
+        let signal = CancelSignal::new();
+        o.ctx = Some(signal.wait());
+        let handle = o.control();
+        let loop_ctx = signal.wait();
+        let looped = tokio::spawn(async move { o.run_loaded(loop_ctx).await });
+
+        let removed = handle.sweep_terminal_workspaces().await;
+
+        signal.cancel();
+        looped.await.expect("control loop");
+
+        assert_eq!(
+            removed, 0,
+            "the periodic sweep never removes a live run's worktree"
+        );
+        assert!(
+            std::fs::metadata(&w.path).is_ok(),
+            "the live run's worktree survives the sweep without a restart"
+        );
+        assert_eq!(
+            tr.by_id_calls(),
+            0,
+            "the protected worktree is skipped before the state read"
+        );
+    }
+
     // STUDIO-1520 acceptance (2a): a LIVE run's worktree is never removed, even though its ticket
     // comes back terminal. The skip happens before the state read, so the tracker is never asked.
     //
