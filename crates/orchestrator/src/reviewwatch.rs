@@ -3075,9 +3075,96 @@ impl Orchestrator {
             head_patch_id,
             draft,
         } = observed;
+        // The conflict route-back (STUDIO-961) is decided ABOVE the park gate (STUDIO-1511).
+        //
+        // A deliberately-HELD pull request that goes conflicted used to be invisible here: the park
+        // gate below returned before this decision, so nothing handed the conflict back and the
+        // branch sat conflicted until a human noticed (the 2026-10-24 incident: the park line, and
+        // no conflict line, for the whole 87 minutes the ticket sat in review). A conflict is a
+        // statement about whether the branch is in a workable state, not about publication, and
+        // resolving one publishes nothing — so it routes back whether or not the pull request is
+        // parked. STUDIO-949's `rhapsody:human` hold still refuses it, and the park still refuses
+        // the MERGE: the gate below returns before `propose_auto_merge` is ever reached.
+        //
+        // `mine` and the hold sets are computed HERE rather than below the park gate because the
+        // route-back and the ordinary path both read them; they derive from this hand-back's opening
+        // `rows` snapshot, so moving the computation above the gate changes nothing about their
+        // value.
+        let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
+        // The CURRENT-LABEL set (STUDIO-949), lowercased for the case-insensitive comparison against
+        // a row's origin ticket below. This is `labelled()`, not the console's `held()`: the reported
+        // hold excludes a ticket the daemon is running, but this gate must also catch an origin
+        // labelled while its run was still LIVE — the mid-run hold shape. Empty on any daemon with no
+        // hold, which is what keeps the default path paying only a clone of an empty set.
+        //
+        // Read together with the priming latch, under one lock (STUDIO-949 round 13): read
+        // separately, a selection pass landing between the two calls would let a gate hold an
+        // un-primed empty set and then read `primed == true`, treating "nothing has looked" as "no
+        // hold". The pair is now always the pair one pass produced.
+        let (held, ledger_primed) = self.human_holds.labelled_and_primed();
+        // Whether THIS pull request's origin ticket currently wears the `rhapsody:human` label
+        // (STUDIO-949 round 5). Bound HERE, beside the label set it reads, because two gates need
+        // the same answer: the conflict route-back immediately below, and the auto-merge gate at the
+        // tail of this function. Both are decided before their plan is formed, so nothing is handed
+        // across the seam.
+        //
+        // For auto-merge: the round gate below refuses to DISPATCH against a held ticket, but a pull
+        // request whose reviewers had already approved the current head when the label landed would
+        // still clear auto-merge — and the merge then runs `plan_review_done` on the next tick and
+        // moves the ticket to `review.done_state`. Refusing the review round while MERGING the code
+        // and closing the ticket is the daemon finishing work the label says only a person can do,
+        // and the merge is irreversible. Read from the same current-LABEL set as the round gate
+        // (`labelled()`, live runs included).
+        //
+        // MUTATION: delete this gate and `a_held_origin_ticket_holds_back_auto_merge` /
+        // `a_held_origin_ticket_routes_no_conflict_back` red (a plan is proposed).
+        let held_origin = mine.iter().any(|row| {
+            crate::reviewdone::origin_ticket(&row.introduced_by)
+                .is_some_and(|t| held.contains(&t.to_ascii_lowercase()))
+        });
+        // The conflict route-back (STUDIO-961), behind STUDIO-949's two gates.
+        //
+        // BEHIND THE GATES because a route-back moves tracker state AND reopens the author's agent
+        // run through the summon token — precisely the class of action `rhapsody:human` exists to
+        // refuse. A conflict on a human-held ticket is a human's to resolve; the daemon must not
+        // summon an agent back onto it, and moving the ticket out of the review state would undo a
+        // placement a person made. The fail-closed `ledger_primed` half is the auto-merge gate's own
+        // reasoning verbatim: on a daemon held by a bad config, an armed drain or a dead credential
+        // no selection pass ever runs, so an empty label set is "unknown", not "no hold" — and this
+        // sweep runs from the watcher's own task, independent of those gates.
+        //
+        // ABOVE THE PARK GATE (STUDIO-1511) and ABOVE THE ADJUDICATION BLOCK (STUDIO-956). The park
+        // is a deliberate hold on publication, not a statement that the branch is workable; a parked
+        // pull request that goes conflicted still needs its author. And STUDIO-956's four `return`s
+        // precede the tail of this function: at the tail, a pull request that has reached
+        // `review.adjudicate_after_rounds` would never route back on a conflict again — and a `ship`
+        // adjudication of a conflicted head is exactly the nine-hour stall STUDIO-961 was filed for:
+        // the manager decides the FINDINGS question, `propose_auto_merge` hands out a plan, and
+        // GitHub declines the merge every time with nobody handing the branch back. Mergeability is
+        // orthogonal to the review verdict, so its trigger must be too. Placing it here costs
+        // nothing: `mine` is this hand-back's opening snapshot and neither the adjudication block nor
+        // the dispatch loop writes any state this decision reads, so its answer is the same at
+        // either end.
+        //
+        // MUTATION: move this call below the park gate and
+        // `a_parked_conflicted_pull_request_routes_back_to_its_author` reds (nothing routes); move it
+        // to the tail's `else` branch and
+        // `a_conflict_past_the_adjudication_threshold_still_routes_back` reds.
+        if ledger_primed && !held_origin {
+            self.propose_conflict_route_back(&mine, pr, head, merge_state, report);
+        } else if merge_state == MERGE_STATE_DIRTY {
+            tracing::debug!(
+                pr = %pr, ledger_primed, held_origin,
+                "ticketless review: this pull request is conflicted, but its origin ticket is held \
+                 for a human (or no selection pass has read the board yet); the conflict is a \
+                 human's to resolve"
+            );
+        }
+        // The park gate (STUDIO-1441), now BELOW the conflict route-back: it refuses the merge, but
+        // no longer hides a conflict from the author. This is the one gate that can refuse a pull
+        // request every reviewer approved without saying so, so it says so — once per head — before
+        // returning.
         if self.subject_parked(&pr.to_string(), "review") {
-            // STUDIO-1441: this is the one gate that can refuse a pull request every reviewer
-            // approved without saying so. Say so — once per head — before returning.
             self.note_parked_merge_refusal(rows, pr, head);
             report.deferred += 1;
             return;
@@ -3126,7 +3213,6 @@ impl Orchestrator {
         // the rows that happen to exist right now and would let a retired row shrink the budget.
         let reviewers_per_round = self.reviewers_per_round();
 
-        let mine: Vec<&ReviewWatchRow> = rows.iter().filter(|r| row_is(r, pr)).collect();
         // STUDIO-950: this pull request is being re-evaluated NOW, so a hold recorded for it on a
         // PREVIOUS tick is refuted — a round that is dispatchable again, or deferred for another
         // reason, must stop annotating the reconciliation sweep. Any round this tick still defers
@@ -3140,71 +3226,6 @@ impl Orchestrator {
                 r.key.number,
                 &r.key.reviewer,
             ));
-        }
-        // The CURRENT-LABEL set (STUDIO-949), lowercased for the case-insensitive comparison against
-        // a row's origin ticket below. This is `labelled()`, not the console's `held()`: the reported
-        // hold excludes a ticket the daemon is running, but this gate must also catch an origin
-        // labelled while its run was still LIVE — the mid-run hold shape. Empty on any daemon with no
-        // hold, which is what keeps the default path paying only a clone of an empty set.
-        //
-        // Read together with the priming latch, under one lock (STUDIO-949 round 13): read
-        // separately, a selection pass landing between the two calls would let a gate hold an
-        // un-primed empty set and then read `primed == true`, treating "nothing has looked" as "no
-        // hold". The pair is now always the pair one pass produced.
-        let (held, ledger_primed) = self.human_holds.labelled_and_primed();
-        // Whether THIS pull request's origin ticket currently wears the `rhapsody:human` label
-        // (STUDIO-949 round 5). Bound HERE, beside the label set it reads, because two gates need
-        // the same answer: the conflict route-back immediately below, and the auto-merge gate at the
-        // tail of this function. Both are decided before their plan is formed, so nothing is handed
-        // across the seam.
-        //
-        // For auto-merge: the round gate below refuses to DISPATCH against a held ticket, but a pull
-        // request whose reviewers had already approved the current head when the label landed would
-        // still clear auto-merge — and the merge then runs `plan_review_done` on the next tick and
-        // moves the ticket to `review.done_state`. Refusing the review round while MERGING the code
-        // and closing the ticket is the daemon finishing work the label says only a person can do,
-        // and the merge is irreversible. Read from the same current-LABEL set as the round gate
-        // (`labelled()`, live runs included).
-        //
-        // MUTATION: delete this gate and `a_held_origin_ticket_holds_back_auto_merge` /
-        // `a_held_origin_ticket_routes_no_conflict_back` red (a plan is proposed).
-        let held_origin = mine.iter().any(|row| {
-            crate::reviewdone::origin_ticket(&row.introduced_by)
-                .is_some_and(|t| held.contains(&t.to_ascii_lowercase()))
-        });
-        // The conflict route-back (STUDIO-961), behind STUDIO-949's two gates and deliberately ABOVE
-        // the adjudication block rather than at the tail beside `propose_auto_merge`.
-        //
-        // BEHIND THE GATES because a route-back moves tracker state AND reopens the author's agent
-        // run through the summon token — precisely the class of action `rhapsody:human` exists to
-        // refuse. A conflict on a human-held ticket is a human's to resolve; the daemon must not
-        // summon an agent back onto it, and moving the ticket out of the review state would undo a
-        // placement a person made. The fail-closed `ledger_primed` half is the auto-merge gate's own
-        // reasoning verbatim: on a daemon held by a bad config, an armed drain or a dead credential
-        // no selection pass ever runs, so an empty label set is "unknown", not "no hold" — and this
-        // sweep runs from the watcher's own task, independent of those gates.
-        //
-        // ABOVE THE ADJUDICATION BLOCK because STUDIO-956's four `return`s precede the tail of this
-        // function. At the tail, a pull request that has reached `review.adjudicate_after_rounds`
-        // would never route back on a conflict again — and a `ship` adjudication of a conflicted
-        // head is exactly the nine-hour stall STUDIO-961 was filed for: the manager decides the
-        // FINDINGS question, `propose_auto_merge` hands out a plan, and GitHub declines the merge
-        // every time with nobody handing the branch back. Mergeability is orthogonal to the review
-        // verdict, so its trigger must be too. Placing it here costs nothing: `mine` is this
-        // hand-back's opening snapshot and neither the adjudication block nor the dispatch loop
-        // writes any state this decision reads, so its answer is the same at either end.
-        //
-        // MUTATION: move this call to the tail's `else` branch and
-        // `a_conflict_past_the_adjudication_threshold_still_routes_back` reds (nothing routes).
-        if ledger_primed && !held_origin {
-            self.propose_conflict_route_back(&mine, pr, head, merge_state, report);
-        } else if merge_state == MERGE_STATE_DIRTY {
-            tracing::debug!(
-                pr = %pr, ledger_primed, held_origin,
-                "ticketless review: this pull request is conflicted, but its origin ticket is held \
-                 for a human (or no selection pass has read the board yet); the conflict is a \
-                 human's to resolve"
-            );
         }
         // Who currently holds each of this pull request's required reviews, updated AS the loop
         // reassigns. `mine` is this hand-back's opening snapshot, so reading peers off it directly
@@ -9267,6 +9288,295 @@ mod tests {
         assert_eq!(plan.identifier, "STUDIO-721");
         assert_eq!(plan.state, "In Progress");
         assert_eq!(plan.pr, "makewhatis/rhapsody#12");
+    }
+
+    /// [`open_conflicted`], but the pull request is a DRAFT — the deliberate publication hold
+    /// STUDIO-1511 is about.
+    fn draft_conflicted(number: i64, head: &str, merge_state: &str) -> PrObservation {
+        let mut obs = open_conflicted(number, head, merge_state);
+        if let PrLookup::Found(snap) = &mut obs.lookup {
+            snap.is_draft = Some(true);
+        }
+        obs
+    }
+
+    /// Parks the pull request's coordinate with an escalation subject hold — the durable
+    /// "deliberately held" state STUDIO-1511 is about (the operator's own hold, represented by the
+    /// daemon as a `subject_hold`).
+    fn park_pr(o: &Orchestrator, number: i64) {
+        o.store()
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: coord(number).to_string(),
+                kind: "escalation".to_string(),
+                ..rhapsody_store::SubjectHold::default()
+            })
+            .expect("park the pull request's subject");
+    }
+
+    /// Acceptance 1 and 2: a DRAFT conflicted pull request routes back to its author, the ticket
+    /// leaves the review state, and the pull request is STILL a draft afterwards — the hold is a
+    /// statement about publication, not about whether the branch is in a workable state. And
+    /// auto-merge is still refused the same draft, so the fix cannot regress into "drafts merge now".
+    #[test]
+    fn a_draft_conflicted_pull_request_routes_back_and_stays_draft() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+
+        let report = o.handle_review_sweep(&[draft_conflicted(12, HEAD_A, "DIRTY")]);
+
+        assert_eq!(
+            report.routed, 1,
+            "a draft conflicted pull request must route back to its author"
+        );
+        assert!(
+            report.merge.is_empty(),
+            "and auto-merge must not be offered it: {:?}",
+            report.merge
+        );
+        let c = rx.try_recv().expect("the author is summoned");
+        assert_eq!(c.reason, crate::reviewnotify::CompletionReason::Conflict);
+        assert_eq!(c.head_sha, HEAD_A);
+        let plan = c.changes.as_ref().expect("a route-back plan");
+        assert_eq!(
+            plan.state, "In Progress",
+            "the ticket leaves the review state"
+        );
+        // "Still a draft afterwards" is structural, not asserted on a flag: the route-back's whole
+        // effect is a comment and a tracker move — the daemon never calls `gh pr ready`, so the
+        // publication hold is untouched by it.
+    }
+
+    /// Acceptance 3: the once-per-conflicted-head property still holds for DRAFTS. A second tick at
+    /// the same conflicted head must not route back twice.
+    #[test]
+    fn a_draft_conflict_routes_back_once_per_conflicted_head() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+
+        assert_eq!(
+            o.handle_review_sweep(&[draft_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1
+        );
+        for _ in 0..5 {
+            assert_eq!(
+                o.handle_review_sweep(&[draft_conflicted(12, HEAD_A, "DIRTY")])
+                    .routed,
+                0,
+                "a draft conflict that persists across a tick is not a new event"
+            );
+        }
+        // A push moves the head, so a conflict at the NEW head is a new event.
+        assert_eq!(
+            o.handle_review_sweep(&[draft_conflicted(12, HEAD_B, "DIRTY")])
+                .routed,
+            1
+        );
+
+        let mut n = 0;
+        while rx.try_recv().is_ok() {
+            n += 1;
+        }
+        assert_eq!(n, 2, "exactly one route-back per conflicted head");
+    }
+
+    /// Acceptance 4: BASE MOVEMENT counts. The head not moving is exactly what happened in the
+    /// incident — the commit was pushed conflict-free and became conflicted when master advanced —
+    /// so a head that is unchanged while the base advances must still produce one route-back.
+    #[test]
+    fn a_draft_conflict_routes_back_when_the_base_moves_but_the_head_does_not() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+
+        // The head was pushed conflict-free: GitHub answers a settled non-conflict and nothing
+        // routes. `CLEAN` here stands for the pre-advance read at this very head.
+        assert_eq!(
+            o.handle_review_sweep(&[draft_conflicted(12, HEAD_A, "CLEAN")])
+                .routed,
+            0
+        );
+        // Master advanced: the SAME head is now conflicted, and that is a new event.
+        assert_eq!(
+            o.handle_review_sweep(&[draft_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            1,
+            "base movement at an unchanged head must route the conflict back"
+        );
+        assert_eq!(
+            o.handle_review_sweep(&[draft_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0,
+            "and only once"
+        );
+        assert!(rx.try_recv().is_ok());
+    }
+
+    /// Acceptance 6: `rhapsody:human` on the origin ticket still suppresses the route-back for a
+    /// draft exactly as it does for any other pull request.
+    #[test]
+    fn a_held_origin_ticket_routes_no_draft_conflict_back() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        o.human_holds.note_human_label("STUDIO-721");
+
+        assert_eq!(
+            o.handle_review_sweep(&[draft_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0,
+            "a held ticket must not be moved out of review by the daemon"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "and no summons may reopen the author's run on it"
+        );
+    }
+
+    /// STUDIO-1511's defect, and the incident's actual gate: the conflict route-back sat BEHIND
+    /// `service_review_pr`'s park gate, so a DELIBERATELY-HELD pull request that went conflicted
+    /// never reached it. The log shows the park line and no conflict line for 87 minutes, then a
+    /// route-back the instant the human un-parked it. A conflict routes back whether or not the
+    /// pull request is parked — resolving a conflict publishes nothing, and a held branch left
+    /// conflicted is strictly worse than one that is current.
+    ///
+    /// MUTATION: put the conflict route-back back below the park gate and this reds (routed == 0).
+    #[test]
+    fn a_parked_conflicted_pull_request_routes_back_to_its_author() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        park_pr(&o, 12);
+        assert!(o.subject_parked(&coord(12).to_string(), "review"), "parked");
+
+        let report = o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")]);
+
+        assert_eq!(
+            report.routed, 1,
+            "a parked conflicted pull request must still route back"
+        );
+        assert!(
+            report.merge.is_empty(),
+            "and the park must still refuse the merge: {:?}",
+            report.merge
+        );
+        let c = rx.try_recv().expect("the author is summoned");
+        assert_eq!(c.reason, crate::reviewnotify::CompletionReason::Conflict);
+        // The watcher's job ends at this queued plan: it names the configured changes state. The
+        // notify sink applies it, and for a parked pull request it REFUSES the immediate move — the
+        // author is re-engaged through the conflict comment's token instead, and the next poll's
+        // `reengage_on_summons` releases the park (pinned in `reviewnotify`'s
+        // `a_parked_conflict_route_back_posts_the_summons_but_refuses_the_move`).
+        assert_eq!(c.changes.as_ref().expect("a plan").state, "In Progress");
+    }
+
+    /// `rhapsody:human` still wins over the park: a ticket the operator holds by hand is not moved
+    /// by the daemon even when the pull request is also parked.
+    #[test]
+    fn a_parked_conflict_routes_no_held_ticket_back() {
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        park_pr(&o, 12);
+        o.human_holds.note_human_label("STUDIO-721");
+
+        assert_eq!(
+            o.handle_review_sweep(&[open_conflicted(12, HEAD_A, "DIRTY")])
+                .routed,
+            0,
+            "a human-held ticket is never moved by the daemon"
+        );
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Acceptance 5: the divergence sweep reports a review-state ticket whose pull request has no
+    /// live run, no armed review round and no pending merge — the shape that sat invisible for 87
+    /// minutes in the incident. The pull request is DRAFT in one case and not in the other, so the
+    /// "drafts included" half is exercised: the held report is a statement about the deliberate
+    /// hold, and the publication flag does not change it.
+    ///
+    /// MUTATION: drop the `parked` half of the held-row condition in
+    /// `reconcile_review_divergence` and this reds (nothing is reported — the approving run is five
+    /// minutes old, far inside the staleness threshold).
+    #[test]
+    fn the_sweep_reports_a_parked_approved_pull_request_immediately() {
+        for draft in [false, true] {
+            let mut teams = ticketless_automerge(&["alice", "bob"]);
+            teams.review.adjudicate_after_rounds = 3;
+            let (mut o, _d) = orch(teams);
+            introduce(&o, approved_row(12, "bob", HEAD_A));
+            let now = (o.now)();
+            let started = (now - chrono::Duration::minutes(10)).to_rfc3339();
+            let ended = (now - chrono::Duration::minutes(5)).to_rfc3339();
+            finished_run(&o, "STUDIO-721", &started, &ended);
+            finished_run(&o, &review_key(OWNER, REPO, 12, "bob"), &started, &ended);
+            park_pr(&o, 12);
+
+            // The watcher observes the pull request — DRAFT in one case — before the sweep reads the
+            // board, so the fixture carries the publication state the incident had.
+            let observed = if draft {
+                draft_at(12, HEAD_A)
+            } else {
+                open_at(12, HEAD_A)
+            };
+            o.handle_review_sweep(&[observed]);
+
+            o.reconcile_review_divergence();
+
+            let found = o.review_divergences();
+            assert_eq!(found.len(), 1, "draft={draft}: {found:?}");
+            assert_eq!(
+                found[0].kind,
+                crate::reviewreconcile::DivergenceKind::HeldForHuman,
+                "draft={draft}: the sweep must name the deliberate hold, not the unexplained stall"
+            );
+            assert_eq!(found[0].ticket, "STUDIO-721", "draft={draft}");
+        }
+    }
+
+    /// STUDIO-1511 review finding B1: the held report is emitted only while adjudication is enabled
+    /// (STUDIO-964's byte-identical acceptance), so the held-row diversion must not swallow a parked
+    /// row on an install where that report can never fire. On an adjudication-OFF install a parked,
+    /// approved pull request must keep the ordinary `ApprovedStillOpen` report — visible after the
+    /// staleness threshold, exactly as before this ticket — rather than disappearing entirely.
+    ///
+    /// MUTATION: make the held-row condition `labelled_hold || parked` (drop the `&& adjudicating`)
+    /// and this reds (`left: 0` — the parked row is diverted into a held path that reports nothing).
+    #[test]
+    fn a_parked_approved_pull_request_stays_visible_without_adjudication() {
+        for draft in [false, true] {
+            let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+            assert!(
+                o.adjudication_threshold().is_none(),
+                "the regression is the adjudication-off configuration"
+            );
+            introduce(&o, approved_row(12, "bob", HEAD_A));
+            // The approval is well past `RECONCILE_STALE_AFTER` (90 minutes), so the ordinary rule
+            // would have reported this before the held-row diversion existed.
+            let now = (o.now)();
+            let started = (now - chrono::Duration::minutes(130)).to_rfc3339();
+            let ended = (now - chrono::Duration::minutes(120)).to_rfc3339();
+            finished_run(&o, "STUDIO-721", &started, &ended);
+            finished_run(&o, &review_key(OWNER, REPO, 12, "bob"), &started, &ended);
+            park_pr(&o, 12);
+
+            let observed = if draft {
+                draft_at(12, HEAD_A)
+            } else {
+                open_at(12, HEAD_A)
+            };
+            o.handle_review_sweep(&[observed]);
+            o.reconcile_review_divergence();
+
+            let found = o.review_divergences();
+            assert_eq!(
+                found.len(),
+                1,
+                "draft={draft}: a parked approved pull request must stay visible with adjudication \
+                 off, not be diverted into a report that never fires: {found:?}"
+            );
+            assert_eq!(
+                found[0].kind,
+                crate::reviewreconcile::DivergenceKind::ApprovedStillOpen,
+                "draft={draft}: without adjudication the ordinary report is what keeps it visible"
+            );
+        }
     }
 
     /// ⚠️ A conflict on a pull request whose ticket is ALREADY out of review — here, a `reviewed`

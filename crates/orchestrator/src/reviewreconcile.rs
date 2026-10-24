@@ -979,6 +979,13 @@ impl Orchestrator {
         };
         // Read once, before the rows, because the capacity-hold freshness test below needs it.
         let now = (self.now)();
+        // Whether adjudication is enabled (STUDIO-956's `review.adjudicate_after_rounds`), read ONCE
+        // for this sweep. The held-row diversion below and the held report at the tail must agree:
+        // the diversion REPLACES a row's ordinary report with the held one, and the held report is
+        // emitted only while adjudication is enabled (STUDIO-964's byte-identical acceptance).
+        // STUDIO-1511's review found exactly the case where they disagreed — a parked row was
+        // diverted into a held path that then emitted nothing (B1).
+        let adjudicating = self.adjudication_threshold().is_some();
         // The current `rhapsody:human` LABEL set (STUDIO-949), already lowercased for the
         // case-insensitive comparison below. A row whose origin ticket wears the label is a
         // DELIBERATE hold, not a stalled obligation, so it is dropped before the rules can date it —
@@ -1005,15 +1012,34 @@ impl Orchestrator {
         let mut held_order: Vec<PrCoord> = Vec::new();
         let mut held_by_pr: HashMap<PrCoord, HeldPrFacts> = HashMap::new();
         for row in &rows {
-            if let Some(ticket) = origin_ticket(&row.introduced_by)
-                && labelled.contains(&ticket.to_ascii_lowercase())
-            {
-                let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
+            let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
+            let origin = origin_ticket(&row.introduced_by).map(str::to_string);
+            let labelled_hold = origin
+                .as_deref()
+                .is_some_and(|t| labelled.contains(&t.to_ascii_lowercase()));
+            // STUDIO-1511: a PARKED subject is the same class of deliberate hold as the
+            // `rhapsody:human` label, and this sweep treats it the same way — WITH the same
+            // adjudication gate the held report carries (STUDIO-964). Without this a
+            // deliberately-held approved pull request read as "nothing to report" for the whole
+            // ninety-minute staleness window (the 2026-10-24 incident: 87 minutes of silence, then
+            // a human noticing by hand). `subject_parked` fails CLOSED on an unreadable store,
+            // exactly as it already answers every other gate.
+            //
+            // The `&& adjudicating` is load-bearing, not a convenience: the `continue` below drops
+            // the row from the ordinary rules, and the replacement `HeldForHuman` report is emitted
+            // only while adjudication is enabled. On an install with adjudication OFF, diverting a
+            // parked row would therefore leave it with NEITHER report — permanent invisibility on a
+            // supported configuration (STUDIO-1511 review, B1) — where falling through still reports
+            // it as `ApprovedStillOpen` after the staleness threshold, exactly as before this
+            // ticket. The `rhapsody:human` label keeps its unconditional diversion: its silence
+            // without adjudication is STUDIO-964's own accepted behaviour.
+            let parked = self.subject_parked(&pr.to_string(), "review");
+            if labelled_hold || (parked && adjudicating) {
                 let auto_merge = self.review_auto_merge_for_repo(&row.key.owner, &row.key.repo);
                 let entry = held_by_pr.entry(pr.clone()).or_insert_with(|| {
                     held_order.push(pr.clone());
                     HeldPrFacts {
-                        ticket: ticket.to_string(),
+                        ticket: origin.clone().unwrap_or_default(),
                         auto_merge,
                         live_rows: 0,
                         unapproved: 0,
@@ -1029,14 +1055,11 @@ impl Orchestrator {
                 }
                 continue; // a deliberate hold, not this sweep's business
             }
-            let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
             // Per project (STUDIO-927): each pull request reads the override for the project
             // that owns its repo, so one repo can be held back while a sibling still merges.
             // A repo no resolved project owns falls back to the top-level value.
             let auto_merge = self.review_auto_merge_for_repo(&row.key.owner, &row.key.repo);
-            let ticket = origin_ticket(&row.introduced_by)
-                .unwrap_or_default()
-                .to_string();
+            let ticket = origin.unwrap_or_default();
             let facts = RowFacts {
                 reviewer: row.key.reviewer.clone(),
                 status: row.status.clone(),
@@ -1385,7 +1408,9 @@ impl Orchestrator {
         // wait is deliberate. Reported under its own kind so it is never routed to the manager and
         // never pages a second time. Gated on adjudication being enabled, so an install that never
         // set `review.adjudicate_after_rounds` keeps exactly its previous behaviour (acceptance).
-        if self.adjudication_threshold().is_some() {
+        // The SAME `adjudicating` the held-row diversion above reads, so a row is only ever diverted
+        // when this report can replace what the diversion removed (STUDIO-1511 B1).
+        if adjudicating {
             found.extend(held_order.iter().filter_map(|pr| {
                 let held = held_by_pr.get(pr)?;
                 (held.auto_merge && held.live_rows > 0 && held.unapproved == 0).then(|| {
