@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.3.8](https://github.com/makewhatis/rhapsody/compare/v0.3.7...v0.3.8) (2026-10-24)
+
+
+### Features
+
+* **orchestrator:** a pluggable one-way notification backend (STUDIO-1504) ([#380](https://github.com/makewhatis/rhapsody/issues/380)) ([297ebdc](https://github.com/makewhatis/rhapsody/commit/297ebdc25d3db97e9642fd0808eae5053ef743a7))
+* **orchestrator:** re-engage a parked ticket on a summons and attribute a Linear comment (STUDIO-1502) ([#381](https://github.com/makewhatis/rhapsody/issues/381)) ([2be1605](https://github.com/makewhatis/rhapsody/commit/2be1605b5f0a175eb2575e338cace207fbb8fcd4))
+* **orchestrator:** run the terminal-workspace cleanup periodically (STUDIO-1520) ([#384](https://github.com/makewhatis/rhapsody/issues/384)) ([f71a60e](https://github.com/makewhatis/rhapsody/commit/f71a60eb92af590ccfcabe82a4e957440c04243b))
+
+
+### Bug Fixes
+
+* **docker:** float Debian security revisions in the investigate image (STUDIO-1498) ([#377](https://github.com/makewhatis/rhapsody/issues/377)) ([aabff23](https://github.com/makewhatis/rhapsody/commit/aabff2350e709e5254574047a6efec3e3bb90991))
+* **orchestrator:** a handoff with no pull request must not park its ticket in review (STUDIO-1497) ([#379](https://github.com/makewhatis/rhapsody/issues/379)) ([27bddb9](https://github.com/makewhatis/rhapsody/commit/27bddb9b76359cc931df1a59c1fc0379a7893908))
+* **orchestrator:** route a conflicted pull request back even when it is parked or a draft (STUDIO-1511) ([#383](https://github.com/makewhatis/rhapsody/issues/383)) ([4447cce](https://github.com/makewhatis/rhapsody/commit/4447ccecac5d40eabd21f5e53a41c9dc9ee546d5))
+
 ## [0.3.7](https://github.com/makewhatis/rhapsody/compare/v0.3.6...v0.3.7) (2026-10-22)
 
 
