@@ -999,13 +999,25 @@ pub async fn run_agent_attempt(
             }
         }
     }
+    // Manager mode (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3): a manager run has NO
+    // repository, so it takes an entirely separate provisioning path — an empty daemon-owned cwd and
+    // the isolated session posture — and creates no worktree, runs no before_run/after_run hooks and
+    // reads no prompt file. Handled BEFORE the workspace block so no checkout can ever be created for
+    // one. `None` for every other run, leaving this function byte-identical.
+    if let Some(mgr) = deps.manager.clone() {
+        return run_manager_attempt(deps, issue, mgr, messages, on_event, on_transcript).await;
+    }
+    if let Some(landing) = deps.landing.clone() {
+        return run_lander_attempt(deps, issue, landing, messages, on_event, on_transcript).await;
+    }
     // STUDIO-1584: resolve the project's bound 1Password service-account credential OFF the control
     // loop (this worker task), then probe its health with `op whoami`. A rejected credential — or a
     // bound id with no stored token — HOLDS the run with a clear reason, the terminal no-retry
     // [`WorkerError::OnePasswordRefused`], so a bad credential is visible instead of an invisible
     // stall. A healthy credential proceeds; a probe timeout is an infrastructure fault and never
     // holds (mirrors the credential preflight's repeated-timeout rule). The token is applied to the
-    // session below and reaches only the agent subprocess env.
+    // session below and reaches only the agent subprocess env. Manager and landing runs take their
+    // own session paths and are out of scope for this injection.
     let mut onepassword_token: Option<String> = None;
     if let Some(id) = deps.onepassword_id.clone() {
         let read = match deps.onepassword_source.clone() {
@@ -1053,17 +1065,6 @@ pub async fn run_agent_attempt(
             );
         }
         onepassword_token = token;
-    }
-    // Manager mode (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3): a manager run has NO
-    // repository, so it takes an entirely separate provisioning path — an empty daemon-owned cwd and
-    // the isolated session posture — and creates no worktree, runs no before_run/after_run hooks and
-    // reads no prompt file. Handled BEFORE the workspace block so no checkout can ever be created for
-    // one. `None` for every other run, leaving this function byte-identical.
-    if let Some(mgr) = deps.manager.clone() {
-        return run_manager_attempt(deps, issue, mgr, messages, on_event, on_transcript).await;
-    }
-    if let Some(landing) = deps.landing.clone() {
-        return run_lander_attempt(deps, issue, landing, messages, on_event, on_transcript).await;
     }
     // Review mode provisions a DETACHED worktree at the head SHA pinned at dispatch: a review reads
     // one pull request's commit and creates no branch to push (STUDIO-715). Checked first because it
