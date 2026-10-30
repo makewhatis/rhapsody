@@ -7,6 +7,12 @@ use std::sync::Arc;
 pub struct LeadReports {
     pub store: Arc<dyn Store + Send + Sync>,
     pub memory: Option<Arc<dyn OverruleMemory>>,
+    /// 1Password service-account expiry advisories (STUDIO-1584, AC5), published by the control
+    /// task's `onepassword_preflight` and read by [`LeadReports::digest`] so the morning digest warns
+    /// before a bound credential lapses. A short mutex-guarded `Vec<String>` of non-secret sentences
+    /// (each names a credential id and its expiry, never a token); empty on a daemon with no bound
+    /// credential or no readable expiry, which keeps every existing digest byte-identical.
+    pub onepassword_expiring: std::sync::Mutex<Vec<String>>,
 }
 
 /// The host-only T3 retain seam, never a teammate/personal-bank write.
@@ -63,6 +69,18 @@ impl crate::Orchestrator {
 }
 
 impl LeadReports {
+    /// Replace the 1Password expiry advisories (STUDIO-1584). Called from the control task's
+    /// `onepassword_preflight`; the digest reads them on its next tick. Best-effort: a poisoned lock
+    /// is recovered rather than panicking the caller (the workspace's `-D warnings` posture forbids a
+    /// panicking accessor on a non-test path).
+    pub fn set_onepassword_expiring(&self, warnings: Vec<String>) {
+        let mut guard = self
+            .onepassword_expiring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *guard = warnings;
+    }
+
     pub fn resolve(&self, id: i64, note: &str) -> Result<(), String> {
         let note = note.trim();
         if id <= 0
@@ -285,10 +303,23 @@ impl LeadReports {
         {
             return Ok(None);
         }
-        Ok(Some(format!(
+        let mut body = format!(
             "Lead: {} decisions yesterday, {escalations} escalations; {queued} items queued",
             rows.len()
-        )))
+        );
+        // STUDIO-1584 (AC5): warn 14 days before a bound 1Password credential expires, when the
+        // expiry is readable. Empty on a daemon with no bound credential (or an unreadable expiry),
+        // so every existing digest is byte-identical.
+        let expiring = self
+            .onepassword_expiring
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if !expiring.is_empty() {
+            body.push_str("; 1Password: ");
+            body.push_str(&expiring.join("; "));
+        }
+        Ok(Some(body))
     }
     pub fn pages(&self) -> Result<Vec<String>, String> {
         let items = self.store.load_lead_items().map_err(|e| e.to_string())?;
@@ -433,6 +464,7 @@ mod tests {
         LeadReports {
             store: Arc::new(Sqlite::open(StorePath::InMemory).unwrap()),
             memory: None,
+            onepassword_expiring: std::sync::Mutex::new(Vec::new()),
         }
     }
     fn decision(reports: &LeadReports, at: &str, summary: &str) -> i64 {
@@ -537,6 +569,33 @@ mod tests {
             None
         );
     }
+    /// STUDIO-1584 (AC5): a bound 1Password credential within 14 days of expiry is named in the
+    /// morning digest. Empty advisories keep the digest byte-identical.
+    #[test]
+    fn digest_names_a_near_expiry_onepassword_credential() {
+        let r = reports();
+        let time = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap();
+        let plain = r
+            .digest(time("2026-10-08T09:30:00+02:00"), "09:30")
+            .unwrap()
+            .unwrap();
+        assert!(
+            !plain.contains("1Password"),
+            "no advisories must leave the digest unchanged: {plain}"
+        );
+        r.set_onepassword_expiring(vec![
+            "credential studio-infra-readonly expires 2026-10-20T00:00:00Z".to_string(),
+        ]);
+        let body = r
+            .digest(time("2026-10-09T09:30:00+02:00"), "09:30")
+            .unwrap()
+            .unwrap();
+        assert!(
+            body.contains("1Password: credential studio-infra-readonly expires"),
+            "the digest must name the expiring credential: {body}"
+        );
+    }
+
     #[test]
     fn escalation_pages_immediately_with_need() {
         let r = reports();

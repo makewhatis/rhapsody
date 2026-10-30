@@ -481,6 +481,7 @@ mod tests {
                     rhapsody_orchestrator::leadreport::LeadReports {
                         store: Arc::new(Sqlite::open(StorePath::InMemory).unwrap()),
                         memory: None,
+                        onepassword_expiring: std::sync::Mutex::new(Vec::new()),
                     },
                 ))
             } else {
@@ -535,6 +536,7 @@ mod tests {
         let reports = Arc::new(rhapsody_orchestrator::leadreport::LeadReports {
             store: store.clone(),
             memory: None,
+            onepassword_expiring: std::sync::Mutex::new(Vec::new()),
         });
         let url = spawn_router(crate::new_handler(
             Arc::new(FakeProvider::ok(empty_snapshot()).with_lead_reports(reports)),

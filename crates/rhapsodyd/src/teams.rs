@@ -249,11 +249,16 @@ fn show(
     // The resolved inbound communication backends (STUDIO-1503) — global, and rendered whether or not
     // Teams is enabled: inbound summons is a daemon-wide surface, not a Teams feature.
     let comms = render_comms(cfg);
+    // The per-project 1Password service-account bindings (STUDIO-1584): the bound ID only, never the
+    // token value (which lives in the desktop-managed credential store and never reaches this
+    // process). Empty when nothing is bound, so an ordinary `show` is byte-identical.
+    let onepassword = render_onepassword(cfg);
     let globals = ShowGlobals {
         backend,
         rejection: &render_rejection_for(teams_path, &rejected),
         effective: &effective,
         comms: &comms,
+        onepassword: &onepassword,
     };
     Ok(render_show(
         identity.map(|i| i.name.as_str()),
@@ -273,6 +278,29 @@ struct ShowGlobals<'a> {
     rejection: &'a str,
     effective: &'a str,
     comms: &'a str,
+    onepassword: &'a str,
+}
+
+/// The per-project 1Password service-account credential bindings (STUDIO-1584). Renders one line per
+/// project that binds an id — the ID only, NEVER the token value, which is stored in the
+/// desktop-managed system credential store and never reaches the daemon's config or this process.
+/// Empty when no project binds one, so a Teams-off / unbound `show` is byte-identical to before this
+/// section existed.
+fn render_onepassword(cfg: Option<&Config>) -> String {
+    let Some(cfg) = cfg else {
+        return String::new();
+    };
+    let mut out = String::new();
+    for p in &cfg.projects {
+        let Some(id) = p.onepassword.as_deref() else {
+            continue;
+        };
+        let project = p.slugs.first().map(String::as_str).unwrap_or(&p.name);
+        out.push_str(&format!(
+            "onepassword:   {id} (project {project}; value in the desktop credential store)\n"
+        ));
+    }
+    out
 }
 
 /// The daemon's resolved inbound communication backends and where each came from (STUDIO-1503) —
@@ -461,6 +489,7 @@ fn render_show(
         rejection,
         effective,
         comms,
+        onepassword,
     } = g;
     let mut out = String::new();
     // First, so it is the line an operator reads before anything else. Empty on
@@ -513,6 +542,9 @@ fn render_show(
         "provider:      {}\n",
         field(&r.provider, r.provenance.provider)
     ));
+    // The bound 1Password credential IDs (STUDIO-1584). Rendered only when a project binds one, so
+    // an unbound installation's report is unchanged. NEVER the token value.
+    out.push_str(onepassword);
     out.push_str(&format!(
         "model:         {}\n",
         field(&r.model, r.provenance.model)
@@ -1006,6 +1038,34 @@ mod tests {
         .expect("write WORKFLOW.md");
         let env = vec![wf.to_string_lossy().into_owned()];
         (env, dir.path.join("teams").join("profiles"))
+    }
+
+    // STUDIO-1584: `teams show` prints the bound 1Password credential ID per project, never the
+    // value; an unbound project prints nothing (byte-identical to before this section existed).
+    #[test]
+    fn render_onepassword_prints_the_bound_id_and_never_a_value() {
+        let def = rhapsody_config::workflow::parse(
+            "---\ntracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n\
+             projects:\n  - slugs:\n      - studio-infra\n    repo: git@github.com:o/r.git\n    onepassword: studio-infra-readonly\n\
+             \n---\nDo {{{{ issue.identifier }}}}.\n",
+        )
+        .expect("parse");
+        let cfg = rhapsody_config::decode(&def).expect("decode");
+        let cfg = rhapsody_config::resolve(cfg, ".").expect("resolve");
+        let out = render_onepassword(Some(&cfg));
+        assert!(out.contains("studio-infra-readonly"), "{out}");
+        assert!(out.contains("project studio-infra"), "{out}");
+        assert!(!out.contains("ops_"), "must never print a value: {out}");
+
+        // No binding → nothing rendered.
+        let def = rhapsody_config::workflow::parse(
+            "---\ntracker:\n  kind: linear\n  api_key: tok\n  project_slug: proj\n\
+             projects:\n  - slugs:\n      - a\n    repo: git@github.com:o/r.git\n\n---\nDo.\n",
+        )
+        .expect("parse");
+        let cfg = rhapsody_config::decode(&def).expect("decode");
+        let cfg = rhapsody_config::resolve(cfg, ".").expect("resolve");
+        assert_eq!(render_onepassword(Some(&cfg)), "");
     }
 
     fn getenv_for(wf: &str) -> impl Fn(&str) -> String + '_ {

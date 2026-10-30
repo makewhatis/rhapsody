@@ -78,6 +78,10 @@ pub struct EffectiveConfig {
     /// The resolved provider set for this scope (STUDIO-984): the top-level providers overlaid with
     /// this project's own definitions (a project entry with the same id wins). Ordered by id.
     pub providers: std::collections::BTreeMap<String, crate::providers::ProviderDefinition>,
+    /// The resolved per-project 1Password service-account credential id (STUDIO-1584), or `None`
+    /// when the project binds none. There is deliberately no top-level default — the safe default is
+    /// **no token**, so a project that binds nothing gets nothing.
+    pub onepassword: Option<String>,
 }
 
 /// One routing target: a single Linear slug → repo + effective config (Go `ResolvedProject`). A
@@ -195,6 +199,9 @@ fn effective_of(config: &Config, project: Option<&Project>) -> EffectiveConfig {
         claim_mode: config.tracker.claim_mode.clone(),
         // Seed from the top-level provider set; a project's own entries overlay it below.
         providers: config.providers.clone(),
+        // No top-level default: the safe default is no 1Password token, so a project that binds
+        // nothing gets nothing (STUDIO-1584).
+        onepassword: None,
     };
     if let Some(p) = project {
         apply_project_overrides(&mut eff, config, p);
@@ -282,6 +289,11 @@ fn apply_project_overrides(eff: &mut EffectiveConfig, config: &Config, p: &Proje
     // nothing, so a provider-less install stays byte-identical.
     for (id, def) in &p.providers {
         eff.providers.insert(id.clone(), def.clone());
+    }
+    // STUDIO-1584: a project's 1Password binding is presence-based; there is no top-level default,
+    // so an absent project value leaves the effective binding unset.
+    if let Some(id) = &p.onepassword {
+        eff.onepassword = Some(id.clone());
     }
     if let Some(ov) = &p.claude {
         eff.claude = apply_claude_override(config.claude.clone(), ov);

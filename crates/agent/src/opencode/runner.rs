@@ -266,6 +266,7 @@ impl Runner {
             run_id: AtomicI64::new(0),
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
+            onepassword_token: Mutex::new(None),
             poisoned: AtomicBool::new(false),
             adopted,
             last_turn_failed: AtomicBool::new(false),
@@ -485,6 +486,7 @@ impl Runner {
             run_id: AtomicI64::new(0),
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
+            onepassword_token: Mutex::new(None),
             poisoned: AtomicBool::new(false),
             adopted: false,
             last_turn_failed: AtomicBool::new(false),
@@ -652,6 +654,7 @@ impl crate::Runner for Runner {
             run_id: AtomicI64::new(0),
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
+            onepassword_token: Mutex::new(None),
             poisoned: AtomicBool::new(false),
             adopted,
             last_turn_failed: AtomicBool::new(false),
@@ -690,6 +693,11 @@ struct OpencodeSession {
     run_id: AtomicI64,
     review_head: Mutex<String>,
     model_override: Mutex<crate::ModelOverride>,
+    /// The 1Password service-account token for this run (STUDIO-1584), set once by the worker via
+    /// [`Session::set_onepassword_token`] before the first turn; `None` for every project that binds
+    /// no credential. Injected as `OP_SERVICE_ACCOUNT_TOKEN` into the executor child env only —
+    /// never logged, never recorded. Behind a `Mutex` for the same reason `review_head` is.
+    onepassword_token: Mutex<Option<String>>,
     /// Set when a re-probe between turns finds the command changed: the already prepared session is
     /// dropped (its state removed) and every later turn refuses before minting or spawning (`§9.1`).
     poisoned: AtomicBool,
@@ -928,6 +936,16 @@ impl Session for OpencodeSession {
 
     fn set_model_override(&self, over: crate::ModelOverride) {
         *self.locked_model_override() = over;
+    }
+
+    /// Stores the 1Password service-account token for this run (STUDIO-1584), applied to the child
+    /// env by [`crate::onepassword::append_onepassword_env`] every turn. `None` means the project
+    /// binds no credential; biometric unlock is still disabled so an unbound `op` call fails fast.
+    fn set_onepassword_token(&self, token: Option<String>) {
+        *self
+            .onepassword_token
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = token;
     }
 
     /// Releases the session's private state directory. Unlike claude's no-op `stop`, this backend
@@ -1440,6 +1458,18 @@ impl OpencodeSession {
             }
             env
         };
+        // STUDIO-1584: the run's 1Password service-account token (when the project binds one) plus
+        // the always-on biometric-disable variable, applied to EVERY posture (legacy, manager,
+        // brokered) so an `op` call in any of them fails fast instead of prompting. Injected into
+        // the executor child env only; never logged.
+        let mut env = env;
+        {
+            let token = self
+                .onepassword_token
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::onepassword::append_onepassword_env(&mut env, token.as_deref());
+        }
         let control_env_bytes = control.password.len()
             + "OPENCODE_SERVER_PASSWORD=".len()
             + "OPENCODE_SERVER_USERNAME=opencode".len()
@@ -2214,18 +2244,22 @@ mkdir "$XDG_DATA_HOME/opencode/.lock" || exit 1
         let home = Path::new(&env["HOME"]);
         let xdg = Path::new(&env["XDG_DATA_HOME"]).parent().unwrap();
         assert!(home.starts_with(s.state.path()));
-        assert_eq!(
-            env,
-            manager::manager_env(
-                home,
-                xdg,
-                &env["OPENCODE_CONFIG_CONTENT"],
-                "42",
-                &std::env::var("PATH").unwrap_or_default()
-            )
-            .into_iter()
-            .collect()
+        // STUDIO-1584: the 1Password biometric-disable variable is appended to EVERY posture,
+        // including the manager allow-list, so an unbound `op` call fails fast instead of prompting.
+        let mut expected: std::collections::BTreeMap<String, String> = manager::manager_env(
+            home,
+            xdg,
+            &env["OPENCODE_CONFIG_CONTENT"],
+            "42",
+            &std::env::var("PATH").unwrap_or_default(),
+        )
+        .into_iter()
+        .collect();
+        expected.insert(
+            "OP_BIOMETRIC_UNLOCK_ENABLED".to_string(),
+            "false".to_string(),
         );
+        assert_eq!(env, expected);
         let cfg: Value = serde_json::from_str(
             &std::fs::read_to_string(s.root.path().join("posture/config")).unwrap(),
         )
@@ -3302,6 +3336,56 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         );
         assert_eq!(argv[0], "run");
         assert!(argv.contains(&"--dir".to_string()) && argv.contains(&ws));
+    }
+
+    // STUDIO-1584: the 1Password env reaches the opencode executor child too, in the legacy posture.
+    #[tokio::test]
+    async fn the_child_gets_the_onepassword_token_and_biometric_disable() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let dump = scripts.path().join("op-env.txt");
+        let body = format!(
+            "env > \"{d}\"\n\
+             printf '{{\"type\":\"step_finish\",\"sessionID\":\"ses_x\",\"part\":{{\"reason\":\"stop\"}}}}\\n'\n",
+            d = dump.display()
+        );
+        let script = write_script(&scripts, "op-env.sh", &body);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+
+        let mut cfg = Config {
+            command: format!("bash {script}"),
+            workspace_root: root_path(&root),
+            turn_timeout: std::time::Duration::from_secs(30),
+            auth_source: auth.clone(),
+            state_root: state_root.path().to_string_lossy().into_owned(),
+            tracker_api_key: "lin_api_SECRET".to_string(),
+            ..Default::default()
+        };
+        cfg.inject_mcp = false;
+        let runner = Runner::new(cfg);
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1584"), None)
+            .await
+            .expect("session");
+        sess.set_onepassword_token(Some("ops_sentinel_value".to_string()));
+        let (_seen, on_event) = collector();
+        let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
+
+        let text = std::fs::read_to_string(&dump).expect("env dump");
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                .map(str::to_string)
+        };
+        assert_eq!(
+            get("OP_SERVICE_ACCOUNT_TOKEN").as_deref(),
+            Some("ops_sentinel_value")
+        );
+        assert_eq!(get("OP_BIOMETRIC_UNLOCK_ENABLED").as_deref(), Some("false"));
     }
 
     // ⚠️ The env the child actually gets: a PRIVATE XDG_DATA_HOME (never the operator's), the "me"

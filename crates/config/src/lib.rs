@@ -23,6 +23,7 @@ pub mod manager;
 pub mod memory;
 pub mod model;
 pub mod notify;
+pub mod onepassword;
 pub mod profiles;
 pub mod projects;
 pub mod prompt;

@@ -88,6 +88,12 @@ pub struct EvWorkerExit {
     /// so the next tick does not re-dispatch it, and schedules no retry; `err_msg` carries the
     /// typed reason.
     pub refused: bool,
+    /// The 1Password credential hold when the exit is a 1Password refusal (STUDIO-1584): the
+    /// project's bound service-account credential is rejected or absent. `on_worker_exit` records it
+    /// `failed` ONCE, drops the claim, and schedules no retry — the hold is a control-task record
+    /// cleared by a later probe that succeeds, so the ticket is HELD rather than failed until a
+    /// restart. `None` on every other exit.
+    pub onepassword_hold: Option<crate::onepassword::OnePasswordHold>,
     /// True when the exit is the agent's typed AUTH-NEEDED outcome (STUDIO-1118,
     /// `AgentError::AuthNeeded`): the provider rejected the run's native login, and the operator's
     /// current login is the very one it rejected (the runner has already re-seeded and, where the
@@ -96,6 +102,11 @@ pub struct EvWorkerExit {
     /// claim and schedules no retry — the worker has applied the human-needed label, whose
     /// "Human step done → resume" clears both and re-dispatches onto the fresh login.
     pub auth_needed: bool,
+    /// The AC6 advisory when the run's agent output showed a 1Password CLI auth failure
+    /// (STUDIO-1584): a non-secret sentence naming the project (and the bound credential id, when
+    /// one is bound). `on_worker_exit` records it in the reconciliation feed so an unbound project's
+    /// failed `op` call is visible. `None` on every other exit.
+    pub onepassword_auth_failure: Option<String>,
 }
 
 /// The ceiling on an armed retry delay. A real retry is minutes-scale by construction (the 1s
@@ -1207,6 +1218,28 @@ impl Orchestrator {
                 .insert(e.issue_id.clone(), engine.clone());
         }
         self.release_teams_run(&re);
+        // STUDIO-1584 (AC6): record (or clear) this run's in-run 1Password auth-failure advisory, so
+        // an unbound project's failed `op` call is visible in the reconciliation feed. Ticket runs
+        // only — a review or manager run holds no project credential binding.
+        if re.review.is_none() && !crate::managerrun::is_manager_key(&re.issue.id) {
+            match &e.onepassword_auth_failure {
+                Some(advisory) => {
+                    if !re.project_slug.is_empty() {
+                        self.onepassword_inrun_failures
+                            .insert(re.project_slug.clone(), advisory.clone());
+                    }
+                    // AC6 (review B5): the advisory must also reach the RUN's own status, not only
+                    // the project-level sweep feed — that feed is keyed by project and overwritten
+                    // by the project's next run, so the run detail/history would otherwise carry no
+                    // 1Password reason at all. Record it as a timeline row on the run (best-effort:
+                    // a run with no row, i.e. store off, records nothing).
+                    self.record_run_event(&re, "onepassword.auth_failure", advisory);
+                }
+                None => {
+                    self.onepassword_inrun_failures.remove(&re.project_slug);
+                }
+            }
+        }
         // A review run's worktree has no other reclaimer: its `pr:` id reaches no terminal tracker
         // state, so `reconcile`'s TerminateCleanup never fires for it (STUDIO-715, design §14.2).
         if let Some(run) = &re.review {
@@ -1289,6 +1322,32 @@ impl Orchestrator {
             // The next owned sweep applies the verdict alongside operator actions and checks.
             let _ = self.events.send(crate::control_loop::Event::LandingWake);
             self.rearm_tick_for_held_capacity();
+            return;
+        }
+        // A 1Password credential refusal HOLDS the ticket rather than failing it terminally
+        // (STUDIO-1584). Record the hold for the project, record the run `failed` ONCE, and schedule
+        // no retry; the in-memory claim is dropped so the ticket is re-offered, and selection refuses
+        // it while the hold stands. A probe that later succeeds clears the hold (see
+        // `Orchestrator::onepassword_preflight`), releasing the ticket without a daemon restart.
+        if let Some(hold) = e.onepassword_hold.clone() {
+            self.completed.remove(&e.issue_id);
+            self.claimed.remove(&e.issue_id);
+            let reason = hold.reason.clone();
+            tracing::warn!(
+                run_id = re.run_id,
+                issue_id = %e.issue_id,
+                issue_identifier = %re.issue.identifier,
+                project_slug = %re.project_slug,
+                reason = %reason,
+                "holding dispatch: the bound 1Password credential is unusable; recording failed \
+                 once and scheduling no retry until a probe succeeds"
+            );
+            self.persist_end_run(&re, store::OUTCOME_FAILED, &reason);
+            self.persist_complete(&re.issue.identifier);
+            self.persist_totals();
+            // Keyed by the credential id the worker actually used (review B6), NOT the project — a
+            // profile-bound credential must survive a tick where the project binds nothing.
+            self.record_onepassword_hold(hold);
             return;
         }
         // A TYPED CAPABILITY REFUSAL is terminal and NOT retryable (STUDIO-978). The failure branch
@@ -2075,6 +2134,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 
@@ -2119,6 +2180,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 
@@ -2361,6 +2424,8 @@ mod tests {
                 review_verdict: None,
                 verdict_text: None,
                 refused: false,
+                onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: false,
             });
             let runs = store_handle
@@ -2597,6 +2662,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         assert!(
@@ -2612,6 +2679,209 @@ mod tests {
         assert!(
             o.totals.seconds_running > 0.0,
             "runtime should be accumulated"
+        );
+    }
+
+    /// STUDIO-1584 review B4: the 1Password HOLD's production wiring, end to end. A worker exit
+    /// carrying `onepassword_hold` records a hold keyed by the credential id; the dispatch gate
+    /// refuses the ticket while it stands; a healthy `onepassword_preflight` releases it and the gate
+    /// admits again. Removing the exit's `record_onepassword_hold` or the gate's
+    /// `onepassword_hold_for_dispatch` reds this test. NOTE: it calls `onepassword_preflight`
+    /// DIRECTLY, so removing the TICK's call site (`loop.rs`) is NOT pinned here — see the review's
+    /// M4 follow-up. Before this test existed, the review removed all of them and the suite stayed
+    /// green.
+    #[tokio::test]
+    async fn a_worker_exit_hold_refuses_dispatch_until_a_healthy_preflight_releases_it() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let mut proj = empty_resolved_project("studio-infra", Arc::new(Fake::new()));
+        proj.onepassword = Some("studio-infra-readonly".to_string());
+        o.eff.as_mut().unwrap().projects = vec![proj];
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let st = o.running["1"].started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: true,
+            started_at: st,
+            err_msg: "1Password: token rejected".into(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            onepassword_hold: Some(crate::onepassword::OnePasswordHold {
+                id: "studio-infra-readonly".into(),
+                project_slug: "studio-infra".into(),
+                reason: "1Password: token rejected for project studio-infra".into(),
+            }),
+            auth_needed: false,
+            onepassword_auth_failure: None,
+        });
+        assert!(
+            o.onepassword_holds.contains_key("studio-infra-readonly"),
+            "the exit recorded the hold"
+        );
+        assert!(
+            !o.limit_dispatch_ready(&issue("1", "MT-1", "Todo"), "studio-infra"),
+            "a held credential must refuse dispatch"
+        );
+
+        // A healthy probe releases the hold and the gate admits again.
+        let dir = TempDir::new();
+        let script = dir.child("op");
+        std::fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho '{\"user_type\":\"SERVICE_ACCOUNT\"}'\n",
+        )
+        .expect("write fake op");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod");
+        }
+        let mut map = std::collections::HashMap::new();
+        map.insert(
+            "studio-infra-readonly".to_string(),
+            "ops_sentinel".to_string(),
+        );
+        o.onepassword_source = Some(Arc::new(crate::onepassword::MapOnePasswordSource::new(map)));
+        o.onepassword_op_command = script;
+        o.onepassword_preflight().await;
+        assert!(
+            !o.onepassword_holds.contains_key("studio-infra-readonly"),
+            "a healthy probe must release the hold"
+        );
+        assert!(
+            o.limit_dispatch_ready(&issue("1", "MT-1", "Todo"), "studio-infra"),
+            "the released credential admits dispatch again"
+        );
+    }
+
+    /// STUDIO-1584 (AC6, review B5): an exit carrying a 1Password in-run auth-failure advisory
+    /// surfaces it in the reconciliation feed, and a later advisory-free run for the same project
+    /// clears it. This is the wiring the unbound-project case depends on — no dispatch-time hold can
+    /// catch it, because nothing is bound.
+    #[test]
+    fn an_in_run_op_failure_reaches_the_reconciliation_feed_and_clears() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        o.running.get_mut("1").expect("running").project_slug = "kid-coder".to_string();
+        let st = o.running["1"].started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: true,
+            started_at: st,
+            err_msg: "op failed".into(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: Some(
+                "1Password: no service account bound for project kid-coder".into(),
+            ),
+            auth_needed: false,
+        });
+        let feed = o.onepassword_human_feed();
+        assert!(
+            feed.iter().any(|d| d
+                .reason
+                .contains("no service account bound for project kid-coder")),
+            "the in-run failure must reach the reconciliation feed: {feed:?}"
+        );
+
+        // A later run for the same project that shows no failure clears the stale advisory.
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        o.running.get_mut("1").expect("running").project_slug = "kid-coder".to_string();
+        let st2 = o.running["1"].started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: false,
+            started_at: st2,
+            err_msg: String::new(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
+            auth_needed: false,
+        });
+        assert!(
+            o.onepassword_human_feed().is_empty(),
+            "an advisory-free run must clear the stale in-run failure"
+        );
+    }
+
+    /// STUDIO-1584 (AC6, review B5): the in-run 1Password auth-failure advisory must reach the RUN's
+    /// OWN recorded history, not only the project-level reconciliation feed — that feed is keyed by
+    /// project and is overwritten by the project's next run, so the run detail/history for THIS
+    /// ticket would otherwise carry no 1Password reason at all. A ticket run whose exit carries the
+    /// advisory records an `onepassword.auth_failure` timeline row on its own `run_id`; an
+    /// advisory-free exit records none.
+    #[test]
+    fn an_in_run_op_failure_reaches_the_runs_own_history() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(store::Sqlite::open(store::StorePath::InMemory).expect("open"));
+        o.set_store(Arc::clone(&store));
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        o.running.get_mut("1").expect("running").project_slug = "kid-coder".to_string();
+        let run_id = o.running["1"].run_id;
+        assert_ne!(run_id, 0, "the store must have recorded a run row");
+        let started = o.running["1"].started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: true,
+            started_at: started,
+            err_msg: "op failed".into(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: Some(
+                "1Password: no service account bound for project kid-coder".into(),
+            ),
+            auth_needed: false,
+        });
+        let events = store.run_events(run_id).expect("run events");
+        let row = events
+            .iter()
+            .find(|e| e.kind == "onepassword.auth_failure")
+            .expect("the advisory must be recorded on the run itself, not only the sweep feed");
+        assert!(
+            row.text
+                .contains("no service account bound for project kid-coder"),
+            "the run row must carry the reason: {}",
+            row.text
+        );
+
+        // An advisory-free exit for the same ticket records no such row on its own run.
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let run_id2 = o.running["1"].run_id;
+        let started2 = o.running["1"].started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: false,
+            started_at: started2,
+            err_msg: String::new(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
+            auth_needed: false,
+        });
+        let events2 = store.run_events(run_id2).expect("run events");
+        assert!(
+            !events2.iter().any(|e| e.kind == "onepassword.auth_failure"),
+            "an advisory-free run must record no advisory row"
         );
     }
 
@@ -2634,6 +2904,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         assert_eq!(
@@ -2659,6 +2931,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         assert_eq!(
@@ -2683,6 +2957,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         let re = o.retry_attempts.get("1").expect("backoff retry");
@@ -2721,6 +2997,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: true,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 
@@ -2774,6 +3052,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: true,
         });
 
@@ -2881,6 +3161,8 @@ mod tests {
                 review_verdict: None,
                 verdict_text: None,
                 refused: false,
+                onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: true,
             });
         }
@@ -3044,6 +3326,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         assert!(
@@ -3104,6 +3388,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 
@@ -3137,6 +3423,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 
@@ -3167,6 +3455,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 
@@ -3202,6 +3492,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 
@@ -3235,6 +3527,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 

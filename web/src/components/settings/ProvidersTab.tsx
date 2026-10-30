@@ -55,6 +55,7 @@ import {
 import type { UiGlobal } from "@/lib/settings-model";
 import { ProviderCredentialForm } from "./ProviderCredentialForm";
 import { ProviderEditor } from "./ProviderEditor";
+import { OnePasswordSection } from "./OnePasswordSection";
 
 export interface ProvidersTabProps {
   value: UiGlobal;
@@ -283,6 +284,8 @@ export function ProvidersTab({ value, onChange, onDefinitionsChanged }: Provider
         {!bridged && <p style={{ fontSize: 12, color: "var(--tx-3)" }}>{DESKTOP_ONLY_MESSAGE}</p>}
         {bridged && <p style={{ fontSize: 12, color: "var(--tx-3)" }}>{ACTIVE_SESSION_NOTICE}</p>}
       </SectionCard>
+
+      <OnePasswordSection />
 
       <ProviderEditor
         open={editorOpen}

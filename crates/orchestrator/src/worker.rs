@@ -156,6 +156,14 @@ pub struct WorkerDeclaration {
     /// The control task turns this into a durable blocked hold and the "blocked, no pull request"
     /// advisory, so the ticket is not re-dispatched into the same wall.
     pub handoff_declined_no_pr: bool,
+    /// The agent's final output showed a 1Password CLI auth failure (STUDIO-1584, AC6). `None` on
+    /// every run whose output does not, and on every manager run (a manager holds no credential).
+    /// Carries the non-secret AC6 advisory the exit path records in the reconciliation feed, so an
+    /// unbound project's failed `op` call — which no hold can catch, since nothing is bound — is
+    /// visible instead of an unexplained failure. Best-effort: it fires only when the agent reports
+    /// the failure in its final message, which is the one signal available without intercepting the
+    /// CLI.
+    pub onepassword_auth_failure: Option<String>,
 }
 
 /// Sent on continuation turns instead of re-rendering the full task prompt, which is already in the
@@ -200,6 +208,15 @@ pub enum WorkerError {
     /// `Display` is what the run row records and what an operator reads.
     #[error("capability refused: {0}")]
     CapabilityRefused(rhapsody_agent::CapabilityRefusal),
+    /// The project's bound 1Password service-account credential is unusable (STUDIO-1584): rejected
+    /// by 1Password, or bound but absent from the credential store. Raised BEFORE any session is
+    /// started, and handled as a RELEASABLE HOLD — recorded once, no retry, and cleared by a later
+    /// probe that succeeds — so a bad credential holds the ticket with a visible reason instead of
+    /// stalling invisibly or failing terminally until the daemon restarts. The carried
+    /// [`OnePasswordHold`](crate::onepassword::OnePasswordHold) is a non-secret operator sentence
+    /// naming the project plus the last probe's non-secret details.
+    #[error("1password refused: {0}")]
+    OnePasswordRefused(crate::onepassword::OnePasswordHold),
 }
 
 /// The dependencies a single worker attempt needs (Go `WorkerDeps`). The `Arc`-held deps are the
@@ -345,6 +362,17 @@ pub struct WorkerDeps {
     /// harness this build has no runner for. `Some` makes [`run_agent_attempt`] fail immediately
     /// with this reason and start NO session; it is never a fall back to another harness.
     pub harness_refusal: Option<CapabilityRefusal>,
+    /// The project's bound 1Password service-account credential id (STUDIO-1584), or `None` when the
+    /// project binds none. Resolved to a token off the control loop by [`run_agent_attempt`] through
+    /// [`Self::onepassword_source`].
+    pub onepassword_id: Option<String>,
+    /// The daemon's 1Password source (STUDIO-1584). `None` in a bare CLI run or a test, which
+    /// resolves a bound id as absent (no token, no prompt).
+    pub onepassword_source: Option<Arc<dyn crate::onepassword::OnePasswordSource>>,
+    /// The `op` command the health probe runs (STUDIO-1584). Defaults to
+    /// [`crate::onepassword::DEFAULT_OP_COMMAND`]; a test points it at a fake script so the probe
+    /// never shells out to a real `op`.
+    pub onepassword_op_command: String,
     /// The move-only prepared harness spec an accepted brokered preparation produced (PB7,
     /// STUDIO-1002). `None` on every legacy/native-login dispatch — the worker keeps the shared
     /// [`Self::agent`] runner and behaves byte-identically. `Some` makes [`run_agent_attempt`] build
@@ -652,6 +680,7 @@ async fn run_manager_attempt(
             verdict_text: Some(result_text),
             blocked_question: None,
             handoff_declined_no_pr: false,
+            onepassword_auth_failure: None,
         },
         loop_err,
     )
@@ -996,6 +1025,104 @@ pub async fn run_agent_attempt(
     if let Some(landing) = deps.landing.clone() {
         return run_lander_attempt(deps, issue, landing, messages, on_event, on_transcript).await;
     }
+    // STUDIO-1584: resolve the project's bound 1Password service-account credential OFF the control
+    // loop (this worker task), then probe its health with `op whoami`. A rejected credential — or a
+    // bound id with no stored token — HOLDS the run with a clear reason, the terminal no-retry
+    // [`WorkerError::OnePasswordRefused`], so a bad credential is visible instead of an invisible
+    // stall. A healthy credential proceeds; a probe timeout is an infrastructure fault and never
+    // holds (mirrors the credential preflight's repeated-timeout rule). The token is applied to the
+    // session below and reaches only the agent subprocess env. Manager and landing runs take their
+    // own session paths and are out of scope for this injection.
+    let mut onepassword_token: Option<String> = None;
+    if let Some(id) = deps.onepassword_id.clone() {
+        let read = match deps.onepassword_source.clone() {
+            Some(source) => source.read(&id).await,
+            None => crate::onepassword::OnePasswordRead::Absent,
+        };
+        // Resolve FIRST, then probe only what we actually hold. Probing with no token would make
+        // `op whoami` exit non-zero exactly as a rejected token does, which reported a missing
+        // binding as "token rejected" and made the "no service account bound" reason unreachable
+        // (STUDIO-1584 review B5). An absent or unavailable credential is classified directly.
+        let (token, health) = match read {
+            crate::onepassword::OnePasswordRead::Present(token) => {
+                let health = crate::onepassword::probe_whoami(
+                    &deps.onepassword_op_command,
+                    Some(&token),
+                    crate::onepassword::PROBE_TIMEOUT,
+                )
+                .await;
+                (Some(token), health)
+            }
+            crate::onepassword::OnePasswordRead::Absent => {
+                (None, crate::onepassword::OnePasswordHealth::Absent)
+            }
+            crate::onepassword::OnePasswordRead::Unavailable(reason) => {
+                tracing::warn!(
+                    issue_identifier = %issue.identifier,
+                    onepassword_id = %id,
+                    reason = %reason,
+                    "1Password: the bound credential owner is unavailable; treating it as absent"
+                );
+                (None, crate::onepassword::OnePasswordHealth::Absent)
+            }
+        };
+        if let Some(hold) =
+            crate::onepassword::OnePasswordHold::from_health(&id, &deps.project_slug, &health)
+        {
+            tracing::warn!(
+                issue_identifier = %issue.identifier,
+                onepassword_id = %id,
+                reason = %hold.reason,
+                "holding dispatch: the bound 1Password credential is unusable"
+            );
+            return (
+                issue.state.clone(),
+                WorkerDeclaration::default(),
+                Some(WorkerError::OnePasswordRefused(hold)),
+            );
+        }
+        if let crate::onepassword::OnePasswordHealth::Ok {
+            account_type,
+            expires_at,
+            ..
+        } = &health
+        {
+            // Out of scope: writes stay human, so warn when a binding looks like it can write.
+            if crate::onepassword::account_type_looks_writable(account_type) {
+                tracing::warn!(
+                    issue_identifier = %issue.identifier,
+                    onepassword_id = %id,
+                    account_type = %account_type,
+                    "1Password: the bound credential is not a read-only service account; service \
+                     accounts are the read-only design target"
+                );
+            }
+            // Warn 14 days before expiry when the expiry is readable.
+            if let Some(expires_at) = expires_at
+                && let Some(soon) =
+                    crate::onepassword::expiry_within_warning(expires_at, chrono::Utc::now())
+                && soon
+            {
+                tracing::warn!(
+                    issue_identifier = %issue.identifier,
+                    onepassword_id = %id,
+                    expires_at = %expires_at,
+                    "1Password: the bound service-account credential expires within {} days; mint a \
+                     replacement",
+                    crate::onepassword::EXPIRY_WARN_DAYS
+                );
+            }
+        }
+        if matches!(health, crate::onepassword::OnePasswordHealth::Timeout) {
+            tracing::warn!(
+                issue_identifier = %issue.identifier,
+                onepassword_id = %id,
+                "1Password: the health probe timed out; dispatching anyway (infrastructure fault, \
+                 not a credential failure)"
+            );
+        }
+        onepassword_token = token;
+    }
     // Review mode provisions a DETACHED worktree at the head SHA pinned at dispatch: a review reads
     // one pull request's commit and creates no branch to push (STUDIO-715). Checked first because it
     // overrides `workspace_mode` — a review is never a `symphony/<key>` checkout in either shape.
@@ -1287,6 +1414,10 @@ pub async fn run_agent_attempt(
             }
         }
     };
+    // STUDIO-1584: land the resolved 1Password token on the session before its first turn. `None`
+    // (no binding, or no stored token) leaves the session's env with only the biometric-disable
+    // variable, so an unbound `op` call fails fast.
+    sess.set_onepassword_token(onepassword_token.clone());
     if !deps.resume_session.is_empty()
         && let Err(error) = sess.resume_from(&deps.resume_session)
     {
@@ -1385,6 +1516,19 @@ pub async fn run_agent_attempt(
         && has_handoff_marker(&result_text)
         && deps.active_states.contains(&normalize_state(&final_state))
         && deps.run_has_open_pull_request(&issue.identifier).await == Some(false);
+    // STUDIO-1584 (AC6): a run whose agent output shows a 1Password auth failure carries the AC6
+    // advisory to the exit path, so the unbound-project case is visible in the run status and the
+    // reconciliation sweep rather than an unexplained failure. Detected only for a TICKET run (a
+    // review/manager run holds no project binding) and only when the output names the failure.
+    let onepassword_auth_failure = if deps.review.is_none() {
+        crate::onepassword::op_auth_failure_advisory(
+            &deps.project_slug,
+            deps.onepassword_id.as_deref(),
+            &result_text,
+        )
+    } else {
+        None
+    };
     (
         final_state,
         WorkerDeclaration {
@@ -1393,6 +1537,7 @@ pub async fn run_agent_attempt(
             verdict_text: deps.review.as_ref().map(|_| result_text),
             blocked_question,
             handoff_declined_no_pr,
+            onepassword_auth_failure,
         },
         loop_err,
     )
@@ -2176,6 +2321,9 @@ fi
             // honest default for the pre-978 tests, none of which exercises the refusal path.
             mcp_enabled: true,
             harness_refusal: None,
+            onepassword_id: None,
+            onepassword_source: None,
+            onepassword_op_command: crate::onepassword::DEFAULT_OP_COMMAND.to_string(),
             prepared: None,
             broker: None,
             prepared_harness: None,
@@ -2259,6 +2407,8 @@ fi
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         assert!(o.claimed.contains("1"));
@@ -2977,6 +3127,358 @@ exit 1
             Some(412),
             "the dispatch run id must reach the session"
         );
+    }
+
+    // --- STUDIO-1584: 1Password service-account credential wiring ---------------------------------
+
+    /// Writes an executable fake `op` script and returns its path, so the health probe never shells
+    /// out to a real 1Password CLI.
+    fn fake_op_script(root: &TempDir, body: &str) -> String {
+        let path = root.child("op");
+        std::fs::write(&path, body).expect("write fake op");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        path
+    }
+
+    fn map_source(entries: &[(&str, &str)]) -> Arc<dyn crate::onepassword::OnePasswordSource> {
+        let mut map = std::collections::HashMap::new();
+        for (id, token) in entries {
+            map.insert((*id).to_string(), (*token).to_string());
+        }
+        Arc::new(crate::onepassword::MapOnePasswordSource::new(map))
+    }
+
+    /// The mutation the review reproduced — deleting `sess.set_onepassword_token(...)` in the worker
+    /// — left every test green. This pins the run-side half: a bound project's resolved token must
+    /// reach the session the agent child is built from.
+    #[tokio::test]
+    async fn a_bound_project_injects_its_onepassword_token_into_the_run() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let op = fake_op_script(
+            &root,
+            "#!/usr/bin/env bash\necho '{\"type\":\"SERVICE_ACCOUNT\"}'\n",
+        );
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.project_slug = "studio-infra".to_string();
+        d.onepassword_id = Some("studio-infra-readonly".to_string());
+        d.onepassword_source = Some(map_source(&[(
+            "studio-infra-readonly",
+            "ops_sentinel_token",
+        )]));
+        d.onepassword_op_command = op;
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected a normal exit, got {err:?}");
+        assert_eq!(
+            ag.last_onepassword_token().as_deref(),
+            Some("ops_sentinel_token"),
+            "the bound project's token must reach the run's session"
+        );
+    }
+
+    /// The other half of the routing test: a project that binds nothing must inject NO token, even
+    /// when the daemon's source holds other projects' credentials.
+    #[tokio::test]
+    async fn an_unbound_project_injects_no_onepassword_token() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.project_slug = "kid-coder".to_string();
+        // The daemon holds studio-infra's token, but kid-coder binds nothing.
+        d.onepassword_source = Some(map_source(&[(
+            "studio-infra-readonly",
+            "ops_sentinel_token",
+        )]));
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected a normal exit, got {err:?}");
+        assert_eq!(
+            ag.last_onepassword_token(),
+            None,
+            "an unbound project must inject no token"
+        );
+    }
+
+    /// A bound id with no stored token HOLDS the run with the "no service account bound" reason —
+    /// the arm the pre-fix probe made unreachable by probing with no token (review B5). The run must
+    /// start no session.
+    #[tokio::test]
+    async fn an_absent_bound_credential_holds_the_run_with_a_bound_reason() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.project_slug = "studio-infra".to_string();
+        d.onepassword_id = Some("studio-infra-readonly".to_string());
+        d.onepassword_source = Some(map_source(&[]));
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        match err {
+            Some(WorkerError::OnePasswordRefused(hold)) => assert!(
+                hold.reason
+                    .contains("no service account bound for project studio-infra"),
+                "reason = {}",
+                hold.reason
+            ),
+            other => panic!("expected OnePasswordRefused, got {other:?}"),
+        }
+        assert_eq!(
+            ag.start_calls(),
+            0,
+            "a held dispatch must never start a session"
+        );
+    }
+
+    /// A credential the CLI rejects holds the run with a "token rejected" reason, and the token
+    /// value never appears in that reason.
+    #[tokio::test]
+    async fn a_rejected_credential_holds_the_run_without_leaking_the_token() {
+        const SENTINEL: &str = "ops_SENTINEL_REJECTED_VALUE";
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let op = fake_op_script(
+            &root,
+            "#!/usr/bin/env bash\necho '[ERROR] authentication failed' >&2\nexit 1\n",
+        );
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.project_slug = "studio-infra".to_string();
+        d.onepassword_id = Some("studio-infra-readonly".to_string());
+        d.onepassword_source = Some(map_source(&[("studio-infra-readonly", SENTINEL)]));
+        d.onepassword_op_command = op;
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        match err {
+            Some(WorkerError::OnePasswordRefused(hold)) => {
+                assert!(
+                    hold.reason
+                        .contains("token rejected for project studio-infra"),
+                    "reason = {}",
+                    hold.reason
+                );
+                assert!(
+                    !hold.reason.contains(SENTINEL),
+                    "the reason leaked the token: {}",
+                    hold.reason
+                );
+            }
+            other => panic!("expected OnePasswordRefused, got {other:?}"),
+        }
+        assert_eq!(
+            ag.start_calls(),
+            0,
+            "a held dispatch must never start a session"
+        );
+    }
+
+    /// A probe timeout is an infrastructure fault, never a credential failure: the run proceeds
+    /// with the token and does not hold.
+    #[tokio::test]
+    async fn a_probe_timeout_dispatches_rather_than_holding() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        // No such command: `probe_whoami` classifies a spawn failure as Timeout.
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.project_slug = "studio-infra".to_string();
+        d.onepassword_id = Some("studio-infra-readonly".to_string());
+        d.onepassword_source = Some(map_source(&[(
+            "studio-infra-readonly",
+            "ops_sentinel_token",
+        )]));
+        d.onepassword_op_command = root.child("nonexistent-op");
+
+        let (_last, _declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(
+            err.is_none(),
+            "a timeout must not hold the run, got {err:?}"
+        );
+        assert_eq!(
+            ag.last_onepassword_token().as_deref(),
+            Some("ops_sentinel_token"),
+            "the token still reaches the run on a probe timeout"
+        );
+    }
+
+    /// The token value never appears in the run's emitted events — the stream the transcript, the
+    /// run row and the API responses are all built from.
+    #[tokio::test]
+    async fn the_onepassword_token_never_appears_in_the_run_events() {
+        const SENTINEL: &str = "ops_SENTINEL_NEVER_IN_EVENTS";
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, root) = test_workspace(HookScripts::default());
+        let op = fake_op_script(
+            &root,
+            "#!/usr/bin/env bash\necho '{\"type\":\"SERVICE_ACCOUNT\"}'\n",
+        );
+        let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
+        d.project_slug = "studio-infra".to_string();
+        d.onepassword_id = Some("studio-infra-readonly".to_string());
+        d.onepassword_source = Some(map_source(&[("studio-infra-readonly", SENTINEL)]));
+        d.onepassword_op_command = op;
+
+        let events = Mutex::new(Vec::new());
+        let (_last, _declared, err) = run_agent_attempt(
+            &mut d,
+            dispatched(),
+            None,
+            None,
+            &|event| events.lock().unwrap().push(event),
+            None,
+        )
+        .await;
+        assert!(err.is_none(), "expected a normal exit, got {err:?}");
+        let dump = format!("{:?}", events.lock().unwrap());
+        assert!(
+            !dump.contains(SENTINEL),
+            "the token leaked into the run events: {dump}"
+        );
+    }
+
+    /// STUDIO-1584 review B4: the token must never reach the daemon LOG at any level — for a bound
+    /// run and for a rejected-token hold. The event test above covers the run's event stream; this
+    /// covers the `tracing` output the log file is built from, via the testsupport capture. Each
+    /// phase asserts its callsite actually fired (so the capture is not vacuously empty) and that no
+    /// captured event carries the sentinel.
+    #[tokio::test]
+    async fn the_onepassword_token_never_appears_in_the_run_logs() {
+        const SENTINEL: &str = "ops_SENTINEL_NEVER_IN_LOGS";
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
+        let (logs, subscriber) = crate::testsupport::recording_subscriber();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let rejected = "#!/usr/bin/env bash\necho '[ERROR] authentication failed' >&2\nexit 1\n";
+        // A writable-looking account type fires the read-only warn on the healthy path.
+        let writable = "#!/usr/bin/env bash\necho '{\"user_type\":\"INDIVIDUAL\"}'\n";
+
+        // TRA-243: warm the 1Password callsites so this thread's subscriber sees them.
+        {
+            let (ws, root) = test_workspace(HookScripts::default());
+            let mut warm = make_deps(
+                ws,
+                fake_agent(vec![succeeded_turn()]),
+                fake_tracker_by_id(&[("1", "MT-1", "Done")]),
+                "p",
+                20,
+            );
+            warm.project_slug = "studio-infra".into();
+            warm.onepassword_id = Some("studio-infra-readonly".into());
+            warm.onepassword_source = Some(map_source(&[("studio-infra-readonly", SENTINEL)]));
+            warm.onepassword_op_command = fake_op_script(&root, writable);
+            let _ =
+                run_agent_attempt(&mut warm, dispatched(), None, None, &noop_event(), None).await;
+        }
+        tracing::callsite::rebuild_interest_cache();
+        logs.lock().expect("event buffer lock").clear();
+
+        // A bound run: the writable warn fires, and the token never appears in the log.
+        let (ws, root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            ws,
+            fake_agent(vec![succeeded_turn()]),
+            fake_tracker_by_id(&[("1", "MT-1", "Done")]),
+            "p",
+            20,
+        );
+        d.project_slug = "studio-infra".into();
+        d.onepassword_id = Some("studio-infra-readonly".into());
+        d.onepassword_source = Some(map_source(&[("studio-infra-readonly", SENTINEL)]));
+        d.onepassword_op_command = fake_op_script(&root, writable);
+        let (_l, _d, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected a normal exit, got {err:?}");
+        let bound_dump = format!("{:?}", logs.lock().expect("event buffer lock").clone());
+        assert!(
+            bound_dump.contains("1Password"),
+            "the bound-run callsite must have logged: {bound_dump}"
+        );
+        assert!(
+            !bound_dump.contains(SENTINEL),
+            "the token leaked into the logs: {bound_dump}"
+        );
+
+        // A rejected credential: the hold warn fires, still carrying no token.
+        logs.lock().expect("event buffer lock").clear();
+        let (ws, root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(
+            ws,
+            fake_agent(vec![succeeded_turn()]),
+            fake_tracker_by_id(&[("1", "MT-1", "Done")]),
+            "p",
+            20,
+        );
+        d.project_slug = "studio-infra".into();
+        d.onepassword_id = Some("studio-infra-readonly".into());
+        d.onepassword_source = Some(map_source(&[("studio-infra-readonly", SENTINEL)]));
+        d.onepassword_op_command = fake_op_script(&root, rejected);
+        let (_l, _d, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(matches!(err, Some(WorkerError::OnePasswordRefused(_))));
+        let hold_dump = format!("{:?}", logs.lock().expect("event buffer lock").clone());
+        assert!(
+            hold_dump.contains("1Password"),
+            "the hold callsite must have logged: {hold_dump}"
+        );
+        assert!(
+            !hold_dump.contains(SENTINEL),
+            "the token leaked into the logs on the hold path: {hold_dump}"
+        );
+    }
+
+    /// STUDIO-1584 (AC6, review B5): a ticket run whose agent output shows a 1Password auth failure
+    /// carries the AC6 advisory out on its declaration, so the exit path can surface it in the run
+    /// status and the reconciliation sweep. An ordinary result text carries none.
+    #[tokio::test]
+    async fn a_run_whose_output_shows_an_op_auth_failure_carries_the_advisory() {
+        let ag = fake_agent(vec![agentfake::TurnScript {
+            result: TurnResult {
+                status: TURN_SUCCEEDED.to_string(),
+                result_text: "Could not read the token: [ERROR] no active session found for \
+                              account studio49"
+                    .into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        }]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag, tr, "p", 20);
+        d.project_slug = "kid-coder".to_string();
+        let (_last, declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected a normal exit, got {err:?}");
+        assert_eq!(
+            declared.onepassword_auth_failure.as_deref(),
+            Some("1Password: no service account bound for project kid-coder")
+        );
+    }
+
+    /// The other half: an ordinary run's declaration carries NO advisory, so nothing is surfaced for
+    /// a project that never touched 1Password.
+    #[tokio::test]
+    async fn an_ordinary_run_carries_no_op_advisory() {
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = fake_tracker_by_id(&[("1", "MT-1", "Done")]);
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let mut d = make_deps(ws, ag, tr, "p", 20);
+        d.project_slug = "kid-coder".to_string();
+        let (_last, declared, err) =
+            run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+        assert!(err.is_none(), "expected a normal exit, got {err:?}");
+        assert!(declared.onepassword_auth_failure.is_none());
     }
 
     /// STUDIO-978: a harness that cannot reach the daemon's own tools is REFUSED before anything is

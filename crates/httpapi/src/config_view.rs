@@ -431,6 +431,14 @@ fn project_from_json(base: &Config, pj: &ProjectReq) -> Project {
     if let Some(bp) = base_project {
         p.providers = bp.providers.clone();
     }
+    // Per-project 1Password credential bindings (STUDIO-1584) are likewise not surfaced in the typed
+    // `projects[]` view, so carry them forward from the base project exactly as `providers`
+    // (STUDIO-984) and `promote_from_states` (STUDIO-948) are. Without this, a Settings autosave
+    // rebuilds every project from `Project::default()` and silently DELETES each project's
+    // `onepassword:` binding — after which its runs get no token and "Done when" breaks.
+    if let Some(bp) = base_project {
+        p.onepassword = bp.onepassword.clone();
+    }
     // Seed the override from the base project's claude block (preserving unmanaged knobs), then
     // overwrite ONLY the managed knobs from the DTO (a None clears that managed knob).
     let mut ov = base_project

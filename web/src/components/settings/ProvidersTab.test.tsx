@@ -141,7 +141,9 @@ describe("ProvidersTab", () => {
     h.hasProviderBridge.mockReturnValue(false);
     renderTab();
     await waitFor(() => expect(screen.getByText("Connected")).toBeTruthy());
-    expect(screen.getByText(/require the Rhapsody desktop app/i)).toBeTruthy();
+    // Both the provider card and the 1Password section state that credential changes need the
+    // desktop app; either occurrence is the shared copy, so match all.
+    expect(screen.getAllByText(/require the Rhapsody desktop app/i).length).toBeGreaterThan(0);
     for (const name of ["Connect", "Replace key", "Rebind to this endpoint", "Remove", "Test connection"]) {
       expect(screen.queryByRole("button", { name })).toBeNull();
     }

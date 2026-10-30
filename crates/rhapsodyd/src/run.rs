@@ -370,6 +370,14 @@ where
     o.set_preparation_resolver(Arc::new(
         rhapsody_orchestrator::ProviderPreparationResolver::new(prep_source),
     ));
+    // STUDIO-1584: install the 1Password service-account source over the SAME authenticated channel
+    // the provider credentials use. A bare CLI run (no bootstrap frame) has no owner, so the source
+    // resolves every bound id as absent — no token, and biometric unlock is still disabled.
+    if let Some(resolver) = credential_owner_boundary.clone() {
+        o.set_onepassword_source(Arc::new(
+            crate::onepassword::ResolverOnePasswordSource::new(resolver),
+        ));
+    }
     // `durable_store` is false for every fallback — storage off, --no-store, :memory:, AND a
     // failed open. Only the readers that would ACT on an absence use it (the Teams identity-label
     // reconcile, STUDIO-672, and the STUDIO-979 startup refusal above); everything else is
@@ -718,6 +726,7 @@ where
                 .as_ref()
                 .and_then(|m| m.operator_memory())
                 .map(|m| m as Arc<dyn rhapsody_orchestrator::leadreport::OverruleMemory>),
+            onepassword_expiring: std::sync::Mutex::new(Vec::new()),
         }));
         o.lead_report_tx = Some(lead_report_tx);
     }

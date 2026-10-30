@@ -324,6 +324,7 @@ fn collapsible_to_single(c: &Config) -> bool {
         && p.promote_from_states.is_empty()
         && p.claim_mode.is_empty()
         && p.providers.is_empty()
+        && p.onepassword.is_none()
         && p.enabled.is_none()
         && p.landing.is_none()
 }
@@ -457,6 +458,9 @@ fn raw_project_from_project(
                 )
             })
             .collect(),
+        // STUDIO-1584: an id, copied verbatim; `None` prunes to absent so a project that binds
+        // nothing round-trips identically.
+        onepassword: p.onepassword.clone(),
     };
     if let Some(ov) = &p.claude {
         rp.claude = Some(RawClaudeOverride {
@@ -1406,6 +1410,30 @@ mod tests {
         let bare = "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n";
         let c3 = re_encode_decode(&decode_map(bare, "body"));
         assert!(c3.tracker.promote_from_states.is_empty());
+    }
+
+    // STUDIO-1584 (Rhapsody-only, DATA-LOSS class): a per-project `onepassword` binding MUST survive
+    // an Encode->Decode round-trip, or a Settings save would silently drop an operator's credential
+    // binding. A project that binds nothing must materialize no key.
+    #[test]
+    fn onepassword_binding_round_trips_and_absent_materializes_nothing() {
+        let front = concat!(
+            "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n",
+            "  active_states: [Todo]\n  terminal_states: [Done]\n",
+            "repo: \"git@github.com:o/r.git\"\n",
+            "projects:\n",
+            "  - slugs:\n      - a-1\n    onepassword: studio-infra-readonly\n",
+        );
+        let c1 = decode_map(front, "body");
+        let c2 = re_encode_decode(&c1);
+        assert_eq!(
+            c2.projects[0].onepassword.as_deref(),
+            Some("studio-infra-readonly")
+        );
+
+        let bare = "tracker:\n  kind: linear\n  api_key: \"$X\"\n  project_slug: p\n  active_states: [Todo]\n  terminal_states: [Done]\n";
+        let c3 = re_encode_decode(&decode_map(bare, "body"));
+        assert!(c3.projects.iter().all(|p| p.onepassword.is_none()));
     }
 
     // STUDIO-984 (Rhapsody-only, DATA-LOSS class): a provider definition and the normalized

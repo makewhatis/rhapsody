@@ -1666,6 +1666,8 @@ mod tests {
             last_state: String::new(),
             auth_needed: false,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             declared_handoff: false,
             review_verdict: None,
             verdict_text: None,
@@ -1870,6 +1872,8 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         assert!(!o.running.contains_key(key));

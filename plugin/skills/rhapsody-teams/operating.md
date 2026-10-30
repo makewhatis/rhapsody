@@ -181,6 +181,69 @@ daemon nobody drains behaves exactly as before.
 - **`quorum.enabled: true` and `review.mode: ticketless` are mutually exclusive**, and
   validation hard-rejects the pair rather than guessing which one you meant.
 
+## 1Password service accounts
+
+A run that needs a credential shells out to the 1Password CLI (`op read`, `op run`). The daemon
+starts from launchd, not a login shell, so it has no `OP_SERVICE_ACCOUNT_TOKEN`; without one, `op`
+falls back to the **1Password desktop-app integration** and raises a Touch ID prompt that, if
+authorized, grants the operator's **whole account** to the agent. Rhapsody makes that impossible:
+
+- **Every agent run gets `OP_BIOMETRIC_UNLOCK_ENABLED=false`.** An unbound `op` call therefore
+  fails fast with an auth error instead of prompting — a visible failure, never a silent stall.
+- **A project binds a read-only service account by ID, never by value.** `WORKFLOW.md` carries
+  `onepassword: <id>` on a project entry; the token lives in the system credential store (macOS
+  Keychain), managed from the desktop app, and is injected as `OP_SERVICE_ACCOUNT_TOKEN` into that
+  project's agent subprocess env only — never the daemon's env, a run's recorded environment, the
+  transcript, a log, or any API response. A field that carries a token-shaped value in place of an
+  id is refused at config load.
+- **The default is no token.** A project with no `onepassword:` binding gets none.
+
+### Minting a read-only service account
+
+Create it with `op` and pipe the token **straight into the desktop app's Connect flow** — never
+echo it, never paste it into a file or a chat:
+
+```sh
+op service-account create studio-infra-readonly \
+  --vault MyVault:read_items \
+  --expires-in 90d --raw
+```
+
+That prints the token once. Connect it in Rhapsody's desktop app (Settings → Providers / the
+credential store) under the id `studio-infra-readonly`; the value goes into the Keychain and the id
+is what you bind. Read-only (`read_items`) is the design target; a write-scoped account is out of
+scope — if a probe shows write permission, that is a warning, not a supported mode.
+
+### Binding it
+
+```yaml
+projects:
+  - slugs: [studio-infra]
+    repo: git@github.com:acme/studio-infra.git
+    onepassword: studio-infra-readonly
+```
+
+`rhapsodyd teams show <name>` prints the bound credential **id** for each project (never the
+value), so you can confirm a binding without reading the store.
+
+### Health, expiry and holds
+
+Service-account tokens expire (`--expires-in 90d` above). Rhapsody probes every **bound** credential
+(project- and profile-bound alike) with `op whoami` under a hard timeout — the probes run
+concurrently, bounded by that timeout, so a stalled CLI never strands the daemon — and records the
+account type, vaults and an expiry when the CLI reports one. The result is shown per credential in
+Settings → Providers (the Keychain-presence status beside the daemon's own probe sentence), so
+"stored" and "works" are never confused. A run whose bound credential is **rejected or absent is held
+with a clear reason** (`1Password: token rejected for project …` / `no service account bound for
+project …`) rather than failing and retrying forever; the hold is re-probed on a later tick and
+**clears automatically once a probe authenticates**, so re-minting or re-Connecting the credential
+releases the run without a restart. A probe **timeout is an infrastructure fault**, not a credential
+failure, and never holds a run. A probe that authenticates with a non-service-account (potentially
+writable) credential is logged as a warning, and one expiring within 14 days is named in the lead
+morning digest. An `op` auth failure **during** a run (the unbound-project case, which no dispatch
+hold can catch) is surfaced in the reconciliation sweep rather than left as an unexplained failure.
+Mint a replacement a couple of weeks before expiry.
+
 ## When the board looks idle
 
 Check, in order:

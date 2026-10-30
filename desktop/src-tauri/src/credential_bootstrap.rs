@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
-use rhapsody_credential_ipc::domain::{CredentialRef, Revision};
+use rhapsody_credential_ipc::domain::Revision;
 use rhapsody_credential_ipc::owner::CredentialOwner;
 use rhapsody_credential_ipc::session::{ServerSession, Token};
 use rhapsody_credential_ipc::wire::{
@@ -375,8 +375,9 @@ async fn serve_one(
         // the peer sent, even though only an already-authenticated peer reaches this line — AND
         // require the lookup to name exactly one owner for it. A syntactically valid but WRONG
         // account (e.g. a typo, or a client asking for a provider this desktop does not own) must
-        // get a refusal, never another owner's data.
-        if CredentialRef::for_provider(strip_v1(&account)).is_err() {
+        // get a refusal, never another owner's data. STUDIO-1584: `op:v1:<id>` 1Password accounts are
+        // valid here too, not only provider `v1:<id>` accounts.
+        if !rhapsody_credential_ipc::domain::is_valid_credential_account(&account) {
             return;
         }
         let Some(owner) = lookup.owner_for(&account) else {
@@ -414,12 +415,6 @@ async fn serve_one(
         // received must never be reported as daemon-observable (STUDIO-991's sync verdict).
         observations.record(&account, read.revision);
     }
-}
-
-/// `CredentialRef::account()` is `v1:<id>`; recovers `<id>` to re-derive/validate it. Falls back to
-/// the whole string (which will simply fail `for_provider`'s validation) if the prefix is absent.
-fn strip_v1(account: &str) -> &str {
-    account.strip_prefix("v1:").unwrap_or(account)
 }
 
 fn split_state(

@@ -201,6 +201,10 @@ pub struct BuiltinProfile {
     /// The provider for this teammate's runs (STUDIO-985); empty ⇒ inherit. Every built-in ships
     /// empty, so a built-in keeps whatever default login it had.
     pub provider: &'static str,
+    /// A 1Password service-account credential id this teammate's runs bind (STUDIO-1584); empty ⇒
+    /// inherit the project's own `onepassword:` binding. An id, never a token. Every built-in ships
+    /// empty, so a built-in binds nothing of its own.
+    pub onepassword: &'static str,
     /// Names from the BO-11 registry ([`crate::capabilities`]) — referenced
     /// here, resolved by whoever renders them.
     pub capabilities: &'static [&'static str],
@@ -223,6 +227,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &[
             "design-first",
             "test-coverage",
@@ -239,6 +244,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &["code-review", "security-review", "simplify"],
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v1.md"),
@@ -250,6 +256,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &["systematic-debugging", "adversarial-verify"],
         tools: &[],
         body: include_str!("profiles/builtin/sre.v1.md"),
@@ -266,6 +273,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &[
             "design-first",
             "test-coverage",
@@ -282,6 +290,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &["code-review", "security-review", "simplify"],
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v2.md"),
@@ -293,6 +302,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &["systematic-debugging", "adversarial-verify"],
         tools: &[],
         body: include_str!("profiles/builtin/sre.v2.md"),
@@ -308,6 +318,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &["code-review", "security-review", "simplify"],
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v3.md"),
@@ -324,6 +335,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &[
             "design-first",
             "test-coverage",
@@ -340,6 +352,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &["code-review", "security-review", "simplify"],
         tools: &[],
         body: include_str!("profiles/builtin/reviewer.v4.md"),
@@ -356,6 +369,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "",
         provider: "",
+        onepassword: "",
         capabilities: &["code-review", "adversarial-verify"],
         tools: &[],
         body: include_str!("profiles/builtin/manager.v1.md"),
@@ -368,6 +382,7 @@ const BUILTINS: &[BuiltinProfile] = &[
         effort: "",
         harness: "claude",
         provider: "",
+        onepassword: "",
         capabilities: &[],
         tools: &["Read", "Glob", "Grep", "WebFetch", "WebSearch"],
         body: include_str!("profiles/builtin/lander.v1.md"),
@@ -429,6 +444,8 @@ struct RawProfile {
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
+    onepassword: Option<String>,
+    #[serde(default)]
     capabilities: Option<Vec<String>>,
     #[serde(default)]
     tools: Option<Vec<String>>,
@@ -443,6 +460,9 @@ pub struct ProfileFile {
     pub effort: String,
     pub harness: String,
     pub provider: String,
+    /// A 1Password service-account credential id this teammate's runs bind (STUDIO-1584); empty ⇒
+    /// inherit the project's own `onepassword:` binding. An id, never a token.
+    pub onepassword: String,
     pub capabilities: Vec<String>,
     /// Parsed, explicitly unused (§0.11.7).
     pub tools: Vec<String>,
@@ -504,6 +524,7 @@ pub struct Provenance {
     pub effort: Origin,
     pub harness: Origin,
     pub provider: Origin,
+    pub onepassword: Origin,
     pub capabilities: Origin,
     pub tools: Origin,
     pub body: BodyOrigin,
@@ -541,6 +562,11 @@ pub struct ResolvedProfile {
     /// provider names an operator-chosen key, never a credential, and an unresolvable one is the
     /// wrong-provider fallback the design forbids.
     pub provider: String,
+    /// A 1Password service-account credential id this teammate's runs bind (STUDIO-1584); empty ⇒
+    /// inherit the project's own `onepassword:` binding. An id, never a token. A NON-EMPTY value is
+    /// validated with the same canonical parser the project binding uses, so a token pasted where an
+    /// id belongs is refused here too.
+    pub onepassword: String,
     pub capabilities: Vec<String>,
     /// Parsed, explicitly unused (§0.11.7).
     pub tools: Vec<String>,
@@ -578,6 +604,7 @@ fn parse_definition(def: Definition) -> Result<ProfileFile, ProfileError> {
         effort: raw.effort.unwrap_or_default(),
         harness: raw.harness.unwrap_or_default(),
         provider: raw.provider.unwrap_or_default(),
+        onepassword: raw.onepassword.unwrap_or_default(),
         capabilities: raw.capabilities.unwrap_or_default(),
         tools: raw.tools.unwrap_or_default(),
         body: def.prompt_template,
@@ -753,6 +780,18 @@ fn resolve_with(
         crate::routing::validate_routing_fields("", &provider, "")
             .map_err(|reason| ProfileError::Routing(format!("profile {:?}: {reason}", name)))?;
     }
+    // STUDIO-1584: a non-empty profile `onepassword` binding must be a canonical credential id — the
+    // same parser the project binding uses, so a token pasted where an id belongs is refused here
+    // too. Empty inherits the project's own binding.
+    let (onepassword, onepassword_origin) = pick_str(
+        &file.onepassword,
+        base_profile.map_or("", |b| b.onepassword),
+    );
+    if !onepassword.is_empty() {
+        crate::onepassword::canonical_onepassword_id(&onepassword).map_err(|reason| {
+            ProfileError::Routing(format!("profile {:?}: onepassword: {reason}", name))
+        })?;
+    }
     let (capabilities, capabilities_origin) = pick_list(
         &file.capabilities,
         base_profile.map_or(&[][..], |b| b.capabilities),
@@ -766,6 +805,7 @@ fn resolve_with(
         effort,
         harness,
         provider,
+        onepassword,
         capabilities,
         tools,
         prompt,
@@ -781,6 +821,7 @@ fn resolve_with(
             effort: effort_origin,
             harness: harness_origin,
             provider: provider_origin,
+            onepassword: onepassword_origin,
             capabilities: capabilities_origin,
             tools: tools_origin,
             body,
@@ -811,6 +852,7 @@ fn from_builtin(name: &str, base: &'static BuiltinProfile) -> ResolvedProfile {
         effort: base.effort.to_string(),
         harness: base.harness.to_string(),
         provider: base.provider.to_string(),
+        onepassword: base.onepassword.to_string(),
         capabilities: base.capabilities.iter().map(|s| (*s).to_string()).collect(),
         tools: base.tools.iter().map(|s| (*s).to_string()).collect(),
         prompt: base.body.trim().to_string(),
@@ -826,6 +868,7 @@ fn from_builtin(name: &str, base: &'static BuiltinProfile) -> ResolvedProfile {
             effort: str_origin(base.effort),
             harness: str_origin(base.harness),
             provider: str_origin(base.provider),
+            onepassword: str_origin(base.onepassword),
             capabilities: list_origin(base.capabilities),
             tools: list_origin(base.tools),
             body: BodyOrigin::Base,
@@ -1110,6 +1153,7 @@ mod tests {
             effort: "medium",
             harness: "claude",
             provider: "",
+            onepassword: "",
             capabilities: &["code-review"],
             tools: &["read"],
             body: "v1 body",
@@ -1121,6 +1165,7 @@ mod tests {
             effort: "high",
             harness: "opencode",
             provider: "openrouter",
+            onepassword: "",
             capabilities: &["code-review", "test-coverage"],
             tools: &["read", "write"],
             body: "v2 body",
@@ -1538,8 +1583,63 @@ mod tests {
         assert_eq!(r.provenance.harness, Origin::Unset);
     }
 
-    // ── provider (STUDIO-985) ───────────────────────────────────────────────
+    // ── onepassword (STUDIO-1584) ───────────────────────────────────────────
 
+    /// Every SHIPPED built-in binds no 1Password credential, so an installation that never writes
+    /// one is byte-identical to before this field existed.
+    #[test]
+    fn every_shipped_builtin_binds_no_onepassword() {
+        for b in BUILTINS {
+            assert_eq!(
+                b.onepassword, "",
+                "built-in {}@{} ships a 1Password binding",
+                b.name, b.version
+            );
+        }
+    }
+
+    /// An overlay naming a credential id resolves it and records the overlay as its origin; a
+    /// profile that names none inherits (empty).
+    #[test]
+    fn an_overlay_onepassword_binding_resolves_and_records_its_origin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        write_profile(
+            p,
+            "swe",
+            "---\nextends: swe@2\nonepassword: studio-infra-readonly\n---\nBody.\n",
+        );
+        let r = resolve_with(p, "swe", TWO_VERSIONS).expect("resolves");
+        assert_eq!(r.onepassword, "studio-infra-readonly");
+        assert_eq!(r.provenance.onepassword, Origin::Overlay);
+
+        write_profile(p, "swe", "---\nextends: swe@2\n---\nBody.\n");
+        let r = resolve_with(p, "swe", TWO_VERSIONS).expect("resolves");
+        assert_eq!(r.onepassword, "", "no binding means inherit (empty)");
+        assert_eq!(r.provenance.onepassword, Origin::Unset);
+    }
+
+    /// A token pasted where an id belongs is refused here too, by the same canonical parser the
+    /// project binding uses.
+    #[test]
+    fn a_profile_onepassword_binding_refuses_a_token_shaped_value() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path();
+        write_profile(
+            p,
+            "swe",
+            "---\nextends: swe@2\nonepassword: ops_eyJhbGciOiJIUzI1NiJ9\n---\nBody.\n",
+        );
+        let err = resolve_with(p, "swe", TWO_VERSIONS).expect_err("token refused");
+        let msg = format!("{err:?}");
+        assert!(msg.contains("onepassword"), "{msg}");
+        assert!(
+            !msg.contains("ops_eyJhbGciOiJIUzI1NiJ9"),
+            "the refusal leaked the pasted token: {msg}"
+        );
+    }
+
+    // ── provider (STUDIO-985) ───────────────────────────────────────────────
     /// The additive guarantee: every SHIPPED built-in names no provider, so an installation that
     /// never writes one is byte-identical to before this field existed.
     #[test]

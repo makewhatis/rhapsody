@@ -735,6 +735,13 @@ fn worker_deps_for(
         // Per-dispatch: `spawn_worker` stamps a refusal when the routed profile names an
         // unimplemented harness; every other dispatch leaves `None`.
         harness_refusal: None,
+        // Per-project (STUDIO-1584): the bound 1Password credential id, stamped below from the
+        // project's effective config; `None` on the legacy single-project path.
+        onepassword_id: None,
+        // Per-dispatch (STUDIO-1584): `spawn_worker` stamps the daemon's source; every other
+        // construction leaves `None`, which resolves a bound id as absent.
+        onepassword_source: None,
+        onepassword_op_command: crate::onepassword::DEFAULT_OP_COMMAND.to_string(),
         // Per-dispatch and PB7-only: `spawn_worker` stamps the move-only prepared spec and the
         // loop-external broker supervisor for an accepted brokered preparation; every other dispatch
         // leaves both `None`, keeping the legacy path byte-identical.
@@ -758,6 +765,8 @@ fn worker_deps_for(
         deps.review_handoff_state = rp.review_states.iter().next().cloned(); // per-project park state (TRA-240)
         deps.repo_url = rp.repo.clone(); // Phase 3: per-issue repo URL for the worktree workspace
         deps.project_slug = rp.slug.clone(); // surfaced to hooks as SYMPHONY_PROJECT
+        // Per-project 1Password binding (STUDIO-1584): an id, resolved to a token at dispatch.
+        deps.onepassword_id = rp.onepassword.clone();
     }
     // Prompt selection by dependency_mode (INF-318): graphite/dag mode renders the mode-on prompt
     // (`.rhapsody/PROMPT.dep_mod.md` by default, TRA-238); disabled mode leaves `prompt_file`
@@ -1324,6 +1333,10 @@ impl Orchestrator {
         // BO-59/STUDIO-1144: refresh per-context verdicts before selection; only a definite failure
         // holds that credential's work. Timeouts are unknown and never skip the whole tick.
         self.credential_preflight().await;
+        // STUDIO-1584: re-probe any held 1Password credential and release the hold on a healthy
+        // probe, so a bound-but-unusable credential HOLDS its runs rather than failing them until a
+        // daemon restart.
+        self.onepassword_preflight().await;
         // symphony.poll wraps this tick's candidate fetch + dispatch decisions (a short control-loop
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
@@ -2144,6 +2157,19 @@ impl Orchestrator {
     /// the turn's `KillTreeOnDrop` guard (`rhapsody_agent`) SIGKILLs the `claude` process tree, the
     /// stand-in for Go's `exec.CommandContext` + `cmd.Cancel` (STUDIO-840, widened by STUDIO-871). Mirrors Go `spawnWorker`
     /// (telemetry span links are P6).
+    /// The 1Password credential id a teammate's profile binds (STUDIO-1584), or `None` when the
+    /// identity is empty/unknown or the profile names none (inherit the project's own binding).
+    pub(crate) fn profile_onepassword_override(&self, identity: &str) -> Option<String> {
+        if identity.is_empty() {
+            return None;
+        }
+        let teams = self.teams.as_ref()?;
+        let ident = teams.roster.iter().find(|i| i.name == identity)?;
+        let dir = self.teams_profiles_dir.as_ref()?;
+        let profile = rhapsody_config::profiles::resolve(dir, &ident.profile).ok()?;
+        (!profile.onepassword.is_empty()).then(|| profile.onepassword.clone())
+    }
+
     // The signature mirrors Go's flat `spawnWorker(wctx, iss, attempt, projectSlug, stackContext,
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)
     // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit, and
@@ -2198,6 +2224,16 @@ impl Orchestrator {
             .as_ref()
             .and_then(|t| t.review_done_state())
             .map(str::to_string);
+        // The daemon's 1Password source (STUDIO-1584). `None` on a bare CLI run, which resolves the
+        // project's bound id as absent — no token, and biometric unlock is still disabled.
+        deps.onepassword_source = self.onepassword_source.clone();
+        // Per-profile 1Password override (STUDIO-1584): a teammate's profile may bind a different
+        // credential than the project default. Resolved from the same roster + profiles directory
+        // the model/harness overrides come from; empty on every profile that names none, which
+        // leaves the project's own binding in place (so an existing installation is unchanged).
+        if let Some(id) = self.profile_onepassword_override(&model_override.identity) {
+            deps.onepassword_id = Some(id);
+        }
         // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
         // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
         deps.review = review;
@@ -2415,6 +2451,12 @@ impl Orchestrator {
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
             // succeed, and the failure backoff would loop forever.
             let refused = matches!(err, Some(WorkerError::CapabilityRefused(_)));
+            // A 1Password credential refusal is its own terminal-until-released HOLD (STUDIO-1584):
+            // `on_worker_exit` records the hold and schedules no retry, and a later probe clears it.
+            let onepassword_hold = match &err {
+                Some(WorkerError::OnePasswordRefused(hold)) => Some(hold.clone()),
+                _ => None,
+            };
             // The control task holds the shared credential after a typed login rejection.
             let auth_needed = matches!(
                 err,
@@ -2448,7 +2490,12 @@ impl Orchestrator {
                 review_verdict: declared.review_verdict,
                 verdict_text: declared.verdict_text,
                 refused,
+                onepassword_hold,
                 auth_needed,
+                // STUDIO-1584 (AC6): the worker's best-effort 1Password auth-failure advisory, when
+                // its agent output showed one. Carried to `on_worker_exit`, which records it in the
+                // reconciliation feed.
+                onepassword_auth_failure: declared.onepassword_auth_failure,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
         });
@@ -2939,14 +2986,77 @@ mod tests {
 
     use crate::orchestrator::Orchestrator;
     use crate::testsupport::{
-        DispatchedEntries, TempDir, empty_effective, issue, orch_for_retry_multi,
-        proj_with_tracker, record_entries, running_entry, set_of,
+        DispatchedEntries, TempDir, empty_effective, empty_resolved_project, issue,
+        orch_for_retry_multi, proj_with_tracker, record_entries, running_entry, set_of,
     };
     use chrono::TimeZone;
     use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    /// STUDIO-1584: the per-project `onepassword:` binding must reach the worker as the credential
+    /// id, and an unbound project must carry none. The mutation the review reproduced — deleting
+    /// `deps.onepassword_id = rp.onepassword.clone()` — left the whole suite green, so this pins the
+    /// config→dispatch half of the wiring directly.
+    #[test]
+    fn worker_deps_for_stamps_the_projects_bound_onepassword_id() {
+        let eff = empty_effective(Arc::new(Fake::new()));
+        let drain = crate::drain::DrainSignal::new();
+
+        let mut bound = empty_resolved_project("studio-infra", Arc::new(Fake::new()));
+        bound.onepassword = Some("studio-infra-readonly".to_string());
+        let deps = worker_deps_for(&eff, Some(&bound), &drain);
+        assert_eq!(
+            deps.onepassword_id.as_deref(),
+            Some("studio-infra-readonly"),
+            "a bound project's credential id must reach the worker"
+        );
+
+        let unbound = empty_resolved_project("kid-coder", Arc::new(Fake::new()));
+        let deps = worker_deps_for(&eff, Some(&unbound), &drain);
+        assert_eq!(
+            deps.onepassword_id, None,
+            "a project with no binding must carry no credential id"
+        );
+    }
+
+    /// STUDIO-1584: a teammate's profile may override the project's 1Password binding; a profile
+    /// that names none (or an unknown/empty identity) inherits it.
+    #[test]
+    fn a_teammates_profile_onepassword_overrides_the_project_binding() {
+        let dir = TempDir::new();
+        std::fs::write(
+            dir.child("worker.md"),
+            "---\nextends: none\nonepassword: kid-coder-readonly\n---\nWorker\n",
+        )
+        .unwrap();
+        let mut o = Orchestrator::new("not-read.md");
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            roster: vec![rhapsody_config::teams::Identity {
+                name: "alice".into(),
+                profile: "worker".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(&dir.path));
+        assert_eq!(
+            o.profile_onepassword_override("alice").as_deref(),
+            Some("kid-coder-readonly")
+        );
+        assert_eq!(
+            o.profile_onepassword_override("nobody"),
+            None,
+            "an unknown identity inherits"
+        );
+        assert_eq!(
+            o.profile_onepassword_override(""),
+            None,
+            "an empty identity inherits"
+        );
+    }
 
     /// Wires an orchestrator with fakes and a recording spawn that increments a counter and simulates
     /// an immediate clean worker exit (Go `newLoopOrch`), bypassing the disk load (sets `eff` directly).
@@ -2975,6 +3085,8 @@ mod tests {
                 review_verdict: None,
                 verdict_text: None,
                 refused: false,
+                onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: false,
             }));
         }));

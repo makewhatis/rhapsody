@@ -420,6 +420,12 @@ pub struct Project {
     /// top-level [`Config::providers`] entry with the same id, following the existing
     /// decode→validate→effective→encode pipeline. Empty ⇒ the project inherits the global set.
     pub providers: BTreeMap<String, ProviderDefinition>,
+    /// Per-project 1Password service-account credential binding (STUDIO-1584). Rhapsody-only. An
+    /// **id** (never a value) referencing a token stored in the desktop-managed system credential
+    /// store; only this project's runs get `OP_SERVICE_ACCOUNT_TOKEN` in their agent env. `None` ⇒ no
+    /// token for this project (the default). Validated by
+    /// [`crate::onepassword::canonical_onepassword_id`], which refuses a token-shaped value.
+    pub onepassword: Option<String>,
 }
 
 /// One provider's daily token budget (STUDIO-957). Rhapsody-only — the frozen Go reference has no
@@ -994,6 +1000,9 @@ pub(crate) struct RawProject {
     pub enabled: Option<bool>,
     /// STUDIO-984; Rhapsody-only per-project provider definitions. Empty ⇒ inherit the top level.
     pub providers: BTreeMap<String, RawProviderDefinition>,
+    /// STUDIO-1584; Rhapsody-only per-project 1Password service-account credential binding. An id,
+    /// never a value; absent ⇒ no token for this project.
+    pub onepassword: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]

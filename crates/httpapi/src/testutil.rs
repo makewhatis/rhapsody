@@ -1510,6 +1510,7 @@ pub(crate) fn empty_snapshot() -> Snapshot {
         limit_items: Vec::new(),
         limit_jobs: Vec::new(),
         notifications: Vec::new(),
+        onepassword: Vec::new(),
     }
 }
 

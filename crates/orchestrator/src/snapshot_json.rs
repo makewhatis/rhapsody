@@ -260,6 +260,19 @@ pub fn render(s: &Snapshot) -> Value {
             serde_json::to_value(&s.notifications).unwrap_or(Value::Array(Vec::new())),
         );
     }
+    // STUDIO-1584 (AC5): the bound 1Password credentials' last probe status, emitted ONLY when at
+    // least one is recorded — for the `held_for_human` key's reason and under the same guard. It
+    // fills only when a workflow binds an `onepassword:` credential, so a daemon with no binding
+    // serves a payload byte-identical to the Go capture's. Clients read `state.onepassword` to show
+    // the probe result and any hold reason in Settings.
+    if !s.onepassword.is_empty()
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "onepassword".to_string(),
+            serde_json::to_value(&s.onepassword).unwrap_or(Value::Array(Vec::new())),
+        );
+    }
     out
 }
 
@@ -464,6 +477,79 @@ mod tests {
         assert!(
             rendered.get("review_divergence").is_none(),
             "a healthy daemon must serve the Go-identical payload, got: {rendered}"
+        );
+    }
+
+    // STUDIO-1584 (AC5): the same parity guard for the 1Password status key. It only fills when a
+    // workflow binds an `onepassword:` credential, so a daemon with no binding must emit NO
+    // `onepassword` key — otherwise it would be a Rhapsody-only key on every Go-pinned payload.
+    #[test]
+    fn a_daemon_with_no_onepassword_binding_emits_no_onepassword_key() {
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        let now = fixed_now();
+        o.now = Box::new(move || now);
+        let rendered = render(&o.build_snapshot());
+        assert!(
+            rendered.get("onepassword").is_none(),
+            "a daemon with no bound credential must serve the Go-identical payload, got: {rendered}"
+        );
+
+        // And the other half: a recorded probe reaches the surface with the fields Settings needs,
+        // and a held credential carries its hold reason.
+        o.onepassword_status.insert(
+            "studio-infra-readonly".into(),
+            crate::onepassword::OnePasswordStatus {
+                ok: true,
+                account_type: "SERVICE_ACCOUNT".into(),
+                vaults: vec!["Studio49".into()],
+                expires_at: Some("2027-01-01T00:00:00Z".into()),
+                reason: String::new(),
+                checked_at_s: 0,
+            },
+        );
+        o.onepassword_status.insert(
+            "kid-coder-readonly".into(),
+            crate::onepassword::OnePasswordStatus {
+                ok: false,
+                account_type: String::new(),
+                vaults: Vec::new(),
+                expires_at: None,
+                reason: "authentication failed".into(),
+                checked_at_s: 0,
+            },
+        );
+        o.onepassword_holds.insert(
+            "kid-coder-readonly".into(),
+            crate::onepassword::OnePasswordHold {
+                id: "kid-coder-readonly".into(),
+                project_slug: "kid-coder".into(),
+                reason: "1Password: token rejected for project kid-coder (authentication failed)"
+                    .into(),
+            },
+        );
+        let rendered = render(&o.build_snapshot());
+        let rows = rendered["onepassword"]
+            .as_array()
+            .expect("onepassword is an array");
+        assert_eq!(rows.len(), 2);
+        let studio = rows
+            .iter()
+            .find(|r| r["id"] == "studio-infra-readonly")
+            .expect("studio row");
+        assert_eq!(studio["ok"], true);
+        assert_eq!(studio["account_type"], "SERVICE_ACCOUNT");
+        assert_eq!(studio["held"], false);
+        assert!(studio.get("hold_reason").is_none());
+        let kid = rows
+            .iter()
+            .find(|r| r["id"] == "kid-coder-readonly")
+            .expect("kid row");
+        assert_eq!(kid["held"], true);
+        assert!(
+            kid["hold_reason"]
+                .as_str()
+                .is_some_and(|r| r.contains("token rejected")),
+            "{kid}"
         );
     }
 

@@ -109,6 +109,11 @@ struct Recorded {
     /// timeout (STUDIO-1049).
     last_manager_start: Option<crate::manager::ManagerSessionStart>,
     last_resume: Option<String>,
+    /// The 1Password service-account token the most recent session was given via
+    /// [`Session::set_onepassword_token`], or `None` when the caller never called it (STUDIO-1584).
+    /// Recorded so a worker test can assert a project's bound credential actually reaches the run's
+    /// session — the wiring the config→run path must not drop.
+    last_onepassword_token: Option<String>,
     retained_calls: i64,
     fresh_resets: i64,
 }
@@ -174,6 +179,12 @@ impl Fake {
 
     pub fn last_resume(&self) -> Option<String> {
         self.lock().last_resume.clone()
+    }
+
+    /// The 1Password service-account token the most recent session was given via
+    /// [`Session::set_onepassword_token`]; `None` when the caller never called it (STUDIO-1584).
+    pub fn last_onepassword_token(&self) -> Option<String> {
+        self.lock().last_onepassword_token.clone()
     }
 
     pub fn retained_calls(&self) -> i64 {
@@ -363,6 +374,13 @@ impl Session for FakeSession {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .last_model_override = Some(over);
+    }
+
+    fn set_onepassword_token(&self, token: Option<String>) {
+        self.recorded
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .last_onepassword_token = token;
     }
 
     async fn run_turn(

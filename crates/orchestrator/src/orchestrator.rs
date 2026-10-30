@@ -1187,6 +1187,38 @@ pub struct Orchestrator {
     /// refusal rather than any direct-key fallback.
     pub provider_broker: Option<rhapsody_provider_broker::BrokerRegistrar>,
 
+    /// The daemon's 1Password service-account source (STUDIO-1584, Rhapsody-only). `None` by default,
+    /// so a bare CLI run or a test resolves every bound id as `Absent`; the composition root installs
+    /// the real one before `Run`. The source hands a token to a dispatch's agent env and nowhere
+    /// else — never logged, recorded, or returned by an API.
+    pub onepassword_source: Option<Arc<dyn crate::onepassword::OnePasswordSource>>,
+
+    /// The `op` command the 1Password health probe runs (STUDIO-1584). Defaults to
+    /// [`crate::onepassword::DEFAULT_OP_COMMAND`]; a test points it at a fake script.
+    pub onepassword_op_command: String,
+
+    /// The bound 1Password credentials whose service account is currently unusable (STUDIO-1584),
+    /// keyed by credential id with the operator-facing reason. Loop-confined: written by
+    /// `on_worker_exit` (a refusal) and by `onepassword_preflight` (a release), read by the dispatch
+    /// gate. Keyed by credential id, not project, because a teammate's profile can override the
+    /// project's binding (review B6). A run that would resolve to a held credential is refused at
+    /// selection until a probe succeeds and clears it.
+    pub(crate) onepassword_holds:
+        std::collections::BTreeMap<String, crate::onepassword::OnePasswordHold>,
+
+    /// The last health probe of each bound 1Password credential (STUDIO-1584, AC5), keyed by
+    /// credential id. Loop-confined, written only by `onepassword_preflight`, read by the state
+    /// snapshot so Settings can show the probe result (account type/vaults/expiry, or the non-secret
+    /// reason) without reading the log. Never carries a token.
+    pub(crate) onepassword_status:
+        std::collections::BTreeMap<String, crate::onepassword::OnePasswordStatus>,
+
+    /// The last ticket run's in-run 1Password auth-failure advisory per project (STUDIO-1584, AC6),
+    /// keyed by project slug. Written by `on_worker_exit` from the worker's best-effort detection
+    /// (an unbound project's failed `op` call, which no dispatch-time hold can catch), cleared by a
+    /// later run that shows none, and read by `onepassword_human_feed`. Non-secret; never a token.
+    pub(crate) onepassword_inrun_failures: std::collections::BTreeMap<String, String>,
+
     /// The daemon's provider-set reload sink (STUDIO-990, P9, Rhapsody-only). `None` by default, so
     /// the reload path is byte-identical for tests and any embedding with no provider runtime; the
     /// composition root installs the real one before `Run`. See [`crate::providerreload`].
@@ -1386,6 +1418,13 @@ impl Orchestrator {
             // STUDIO-990 (P9): no provider-reload sink by default. The daemon injects the real one
             // before `Run`; tests leave it `None`.
             provider_reload: None,
+            // STUDIO-1584: no 1Password source by default. The desktop-supervised daemon injects the
+            // real one before `Run`; tests leave it `None`, which resolves every bound id as Absent.
+            onepassword_source: None,
+            onepassword_op_command: crate::onepassword::DEFAULT_OP_COMMAND.to_string(),
+            onepassword_holds: std::collections::BTreeMap::new(),
+            onepassword_status: std::collections::BTreeMap::new(),
+            onepassword_inrun_failures: std::collections::BTreeMap::new(),
         }
     }
 
@@ -1417,6 +1456,17 @@ impl Orchestrator {
     /// dispatch (PB7) reads exactly the broker the daemon bound.
     pub fn set_provider_broker(&mut self, registrar: rhapsody_provider_broker::BrokerRegistrar) {
         self.provider_broker = Some(registrar);
+    }
+
+    /// Injects the daemon's 1Password service-account source (STUDIO-1584). The composition root
+    /// calls this once, before [`control`](Orchestrator::control) moves the orchestrator into the
+    /// control task, so a later dispatch can resolve a bound credential id to its token off the
+    /// control loop. Absent (the default) resolves every id as `Absent` — no token, no prompt.
+    pub fn set_onepassword_source(
+        &mut self,
+        source: Arc<dyn crate::onepassword::OnePasswordSource>,
+    ) {
+        self.onepassword_source = Some(source);
     }
 
     /// Installs the orchestrator's lifetime cancellation BEFORE [`Run`](Orchestrator::run) sets it, so

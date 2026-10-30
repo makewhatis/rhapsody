@@ -26,6 +26,7 @@ pub mod harness_version;
 pub mod humanize;
 pub mod lander;
 pub mod manager;
+pub mod onepassword;
 pub mod opencode;
 pub mod proctree;
 pub mod ratelimit;
@@ -298,6 +299,20 @@ pub trait Session: Send + Sync {
     /// (`~/.rhapsody/docs/pluggable-harnesses-design.md` §4.1) and is deliberately NOT done here:
     /// swapping a whole harness needs a different runner, but changing `--model` inside one does not.
     fn set_model_override(&self, _over: ModelOverride) {}
+
+    /// Records the 1Password service-account token for this run (STUDIO-1584), so the backend can
+    /// expose it to the agent child as `OP_SERVICE_ACCOUNT_TOKEN`.
+    ///
+    /// Rhapsody-only, and shaped exactly like [`Session::set_run_id`] and
+    /// [`Session::set_review_head`]: `&self`, called once by the worker after `start_session` and
+    /// before the first turn, defaulted to a no-op so a backend that cannot carry the token ignores
+    /// it. `None` (the default) means the run's project binds no credential — the backend still
+    /// disables 1Password biometric unlock, so an unbound `op` call fails fast with an auth error
+    /// rather than raising a Touch ID prompt that would grant the operator's whole account.
+    ///
+    /// The value is injected into the agent subprocess env only; it must never be logged, recorded in
+    /// a run's environment/transcript, or returned by an API.
+    fn set_onepassword_token(&self, _token: Option<String>) {}
 
     /// Runs one turn with the given prompt, forwarding events to `on_event`. The returned
     /// `(TurnResult, Option<AgentError>)` mirrors Go's `(TurnResult, error)`: a `Some` error means

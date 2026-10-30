@@ -133,6 +133,28 @@ export interface StateResponse {
   // queued, so a daemon with no `notify.macos` serves the Go-identical payload. Read it as
   // `state.notifications ?? []`. `useNotifications` turns each new one into a native notification.
   notifications?: NotificationEntry[];
+  // The bound 1Password service-account credentials' last probe status (STUDIO-1584), or ABSENT when
+  // no workflow binds an `onepassword:` credential. Optional for `drain`'s reason: emitted only when
+  // at least one credential is recorded, so a daemon with no binding serves the Go-identical payload.
+  // Settings reads it as `state.onepassword ?? []` to show the probe result and any hold reason
+  // beside each bound id. Never carries a token.
+  onepassword?: OnePasswordProbe[];
+}
+
+// OnePasswordProbe is one row of /api/v1/state's `onepassword` key (STUDIO-1584): the last `op whoami`
+// probe of one bound credential. `ok` true means the credential authenticated; `account_type`,
+// `vaults` and `expires_at` are what the probe reported (any may be empty when the CLI did not
+// expose it). When `held` is true the credential is currently refusing its project's runs and
+// `hold_reason` carries the daemon's non-secret sentence.
+export interface OnePasswordProbe {
+  id: string;
+  ok: boolean;
+  account_type: string;
+  vaults: string[];
+  expires_at?: string;
+  reason: string;
+  held: boolean;
+  hold_reason?: string;
 }
 
 // NotificationEntry is one row of /api/v1/state's `notifications` key (STUDIO-1026): a crossing the
@@ -1602,6 +1624,9 @@ export interface ProjectConfigDTO {
   prompt?: string;
   /** Per-agent prompt-source-file override. Empty/absent => inherit the global `prompt_file`. */
   prompt_file?: string;
+  /** The bound 1Password service-account credential id (STUDIO-1584), or absent when the project
+   *  binds none. An ID, never the token; the value lives only in the system credential store. */
+  onepassword?: string;
   overrides: ClaudeOverridesDTO;
   effective?: EffectiveConfigDTO;
   /** Display-only hint (emit-only; ignored on POST): true when this project's effective

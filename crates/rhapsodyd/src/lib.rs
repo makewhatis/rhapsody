@@ -27,6 +27,7 @@ pub mod credential_client;
 pub mod doctor;
 pub mod logsource;
 pub mod mcp;
+pub mod onepassword;
 pub mod otel;
 pub mod providerbudget;
 pub mod providers;
