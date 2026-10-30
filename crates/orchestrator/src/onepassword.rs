@@ -338,7 +338,22 @@ impl crate::Orchestrator {
             // token is stored. Nothing to probe.
             return;
         };
-        // Snapshot the (project_slug, credential id) pairs for held projects.
+        // Snapshot the (project_slug, credential id) pairs for held projects. A hold whose project no
+        // longer binds a credential (a reload removed the binding, or the project vanished) is DROPPED
+        // here — otherwise it would block that project's runs forever, since nothing would probe it.
+        let bound_slugs: std::collections::HashSet<String> = self
+            .eff
+            .as_ref()
+            .map(|eff| {
+                eff.projects
+                    .iter()
+                    .filter(|p| p.onepassword.is_some())
+                    .map(|p| p.slug.clone())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.onepassword_holds
+            .retain(|slug, _| bound_slugs.contains(slug));
         let held: Vec<(String, String)> = self
             .eff
             .as_ref()
@@ -689,6 +704,22 @@ mod tests {
         assert!(
             o.onepassword_project_hold("studio-infra").is_some(),
             "with no source there is nothing to probe, so the hold stands"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hold_for_a_project_that_no_longer_binds_is_dropped() {
+        let (mut o, _dir) = orch_holding(
+            "studio-infra-readonly",
+            Some("ops_sentinel"),
+            "#!/usr/bin/env bash\necho '{\"type\":\"SERVICE_ACCOUNT\"}'\n",
+        );
+        // A reload removes the binding: nothing can probe it, so the hold must not linger.
+        o.eff.as_mut().unwrap().projects[0].onepassword = None;
+        o.onepassword_preflight().await;
+        assert!(
+            o.onepassword_project_hold("studio-infra").is_none(),
+            "a hold for a project that no longer binds must be dropped"
         );
     }
 
