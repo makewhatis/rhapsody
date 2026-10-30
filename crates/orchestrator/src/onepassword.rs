@@ -386,7 +386,7 @@ impl crate::Orchestrator {
                 (slug, health)
             });
         }
-        let now = chrono::Utc::now();
+        let now = (self.now)();
         while let Some(result) = tasks.join_next().await {
             let Ok((slug, health)) = result else {
                 continue;
