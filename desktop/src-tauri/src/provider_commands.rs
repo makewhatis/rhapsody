@@ -817,18 +817,37 @@ pub fn production_owner_factory() -> OwnerFactory {
 /// over the P0c channel through exactly the owners the desktop command surface mutates, so the
 /// revisions `ChannelObservations` records and the revisions `commit` compares are the same number
 /// line. See [`ProviderCommandService::owner_for_account`].
+///
+/// STUDIO-1584: `op:v1:<id>` 1Password accounts are routed to the 1Password command service's own
+/// owner cache, so the daemon reads the token through the same owner the Settings surface mutates.
 pub struct ServiceOwnerLookup {
     service: Arc<ProviderCommandService>,
+    onepassword: Option<Arc<crate::onepassword_credential::OnePasswordCommandService>>,
 }
 
 impl ServiceOwnerLookup {
     pub fn new(service: Arc<ProviderCommandService>) -> ServiceOwnerLookup {
-        ServiceOwnerLookup { service }
+        ServiceOwnerLookup {
+            service,
+            onepassword: None,
+        }
+    }
+
+    /// Attach the 1Password command service so `op:v1:*` accounts resolve (STUDIO-1584).
+    pub fn with_onepassword(
+        mut self,
+        onepassword: Arc<crate::onepassword_credential::OnePasswordCommandService>,
+    ) -> ServiceOwnerLookup {
+        self.onepassword = Some(onepassword);
+        self
     }
 }
 
 impl crate::credential_bootstrap::CredentialOwnerLookup for ServiceOwnerLookup {
     fn owner_for(&self, account: &str) -> Option<Arc<dyn CredentialOwner>> {
+        if account.starts_with(rhapsody_credential_ipc::domain::ONEPASSWORD_ACCOUNT_PREFIX) {
+            return self.onepassword.as_ref()?.owner_for_account(account);
+        }
         self.service.owner_for_account(account)
     }
 }

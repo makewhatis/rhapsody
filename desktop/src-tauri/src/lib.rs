@@ -26,6 +26,7 @@ pub mod linearprojects;
 pub mod logbridge;
 pub mod menu;
 pub mod onboarding;
+pub mod onepassword_credential;
 pub mod prefs;
 pub mod provider_commands;
 pub mod provider_credential;

@@ -17,6 +17,9 @@ use rhapsody_desktop::credential_bootstrap::{ChannelObservations, default_socket
 use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome, REASON_OPERATOR};
 use rhapsody_desktop::linearprojects::Project;
 use rhapsody_desktop::logbridge::{LogBridge, LogMsg};
+use rhapsody_desktop::onepassword_credential::{
+    OnePasswordCommandError, OnePasswordCommandService, OnePasswordMutationDto, OnePasswordStatusDto,
+};
 use rhapsody_desktop::provider_commands::{
     DaemonObservation, HttpConnectionTester, MutationResultDto, PreparedCommandDto,
     ProviderCommandError, ProviderCommandService, ProviderOperation, ProviderStatusDto,
@@ -360,6 +363,76 @@ async fn provider_test_connection(
         .map_err(CommandFailure::from)
 }
 
+// ---- STUDIO-1584 1Password service-account credential commands ----------------------------------
+
+/// The desktop-only 1Password credential command state (STUDIO-1584). The SAME service instance is
+/// wired into the supervisor's credential listener, so a token the Settings surface stores is
+/// exactly the token the daemon reads.
+struct OnePasswordCommandState {
+    service: Arc<OnePasswordCommandService>,
+}
+
+impl From<OnePasswordCommandError> for CommandFailure {
+    fn from(error: OnePasswordCommandError) -> CommandFailure {
+        CommandFailure {
+            code: error.code().to_string(),
+            message: error.message(),
+        }
+    }
+}
+
+/// One 1Password credential's non-secret status and the operations its state permits.
+#[tauri::command]
+async fn onepassword_status(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, OnePasswordCommandState>,
+    id: String,
+) -> Result<OnePasswordStatusDto, CommandFailure> {
+    authorize(&window)?;
+    state.service.status(&id).map_err(CommandFailure::from)
+}
+
+/// Connect: store a service-account token for `id` (requires the id to be currently absent).
+#[tauri::command]
+async fn onepassword_connect(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, OnePasswordCommandState>,
+    id: String,
+    token: String,
+) -> Result<OnePasswordMutationDto, CommandFailure> {
+    authorize(&window)?;
+    state
+        .service
+        .connect(&id, token)
+        .map_err(CommandFailure::from)
+}
+
+/// Replace: change only the stored token for `id`.
+#[tauri::command]
+async fn onepassword_replace(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, OnePasswordCommandState>,
+    id: String,
+    token: String,
+) -> Result<OnePasswordMutationDto, CommandFailure> {
+    authorize(&window)?;
+    state
+        .service
+        .replace(&id, token)
+        .map_err(CommandFailure::from)
+}
+
+/// Remove: delete the stored token for `id`.
+#[tauri::command]
+async fn onepassword_remove(
+    window: tauri::WebviewWindow,
+    state: tauri::State<'_, OnePasswordCommandState>,
+    id: String,
+) -> Result<OnePasswordMutationDto, CommandFailure> {
+    authorize(&window)?;
+    state.service.remove(&id).map_err(CommandFailure::from)
+}
+
 /// Start the Logs view's live tail: connect the host to the supervised daemon's SSE log stream and
 /// re-emit each frame over the given IPC `channel` (TRA-252). The packaged app can't tail the stream
 /// through the buffered custom-protocol proxy, so it subscribes to this channel instead of `EventSource`.
@@ -440,6 +513,10 @@ fn run() -> tauri::Result<()> {
             provider_rebind,
             provider_remove,
             provider_test_connection,
+            onepassword_status,
+            onepassword_connect,
+            onepassword_replace,
+            onepassword_remove,
             update::update_check,
             update::update_download,
             update::update_install,
@@ -463,15 +540,25 @@ fn run() -> tauri::Result<()> {
                 application.workflow_path(),
                 Arc::new(HttpConnectionTester::new()),
             );
+            // STUDIO-1584: the 1Password service-account command service, wired into the SAME
+            // credential listener so `op:v1:<id>` accounts the daemon asks for resolve to the
+            // owners this Settings surface mutates.
+            let onepassword = OnePasswordCommandService::new();
             let observations = Arc::new(ChannelObservations::new());
             application.set_credential_bootstrap(supervisor::CredentialBootstrap {
                 socket_dir: default_socket_dir(),
-                lookup: Arc::new(ServiceOwnerLookup::new(service.clone())),
+                lookup: Arc::new(
+                    ServiceOwnerLookup::new(service.clone())
+                        .with_onepassword(onepassword.clone()),
+                ),
                 observations: observations.clone(),
             });
             app.manage(ProviderCommandState {
                 service,
                 observations,
+            });
+            app.manage(OnePasswordCommandState {
+                service: onepassword,
             });
             // Owns the Logs view's host-side log-stream bridge (TRA-252); the start/stop_log_stream
             // commands drive it.

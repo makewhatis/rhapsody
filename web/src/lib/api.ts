@@ -1602,6 +1602,9 @@ export interface ProjectConfigDTO {
   prompt?: string;
   /** Per-agent prompt-source-file override. Empty/absent => inherit the global `prompt_file`. */
   prompt_file?: string;
+  /** The bound 1Password service-account credential id (STUDIO-1584), or absent when the project
+   *  binds none. An ID, never the token; the value lives only in the system credential store. */
+  onepassword?: string;
   overrides: ClaudeOverridesDTO;
   effective?: EffectiveConfigDTO;
   /** Display-only hint (emit-only; ignored on POST): true when this project's effective

@@ -112,6 +112,24 @@ impl ProviderCredentialOwner {
         )
     }
 
+    /// The production owner for a 1Password service-account credential id (STUDIO-1584), backed by
+    /// the real OS Keychain under the separate [`rhapsody_credential_ipc::domain::ONEPASSWORD_SERVICE`]
+    /// namespace. The envelope/CAS machinery is the provider owner's own — only the service
+    /// namespace and the derived `op:v1:<id>` account differ, which is what keeps a 1Password token
+    /// from ever colliding with a provider key.
+    pub fn for_onepassword(
+        id: &str,
+    ) -> Result<ProviderCredentialOwner, rhapsody_credential_ipc::domain::InvalidProviderId> {
+        let credential_ref = CredentialRef::for_onepassword(id)?;
+        Ok(ProviderCredentialOwner::with_keyring(
+            &credential_ref,
+            Arc::new(OsKeyring {
+                service: rhapsody_credential_ipc::domain::ONEPASSWORD_SERVICE.to_string(),
+                account: credential_ref.account().to_string(),
+            }),
+        ))
+    }
+
     fn with_keyring(
         credential_ref: &CredentialRef,
         keyring: Arc<dyn Keyring>,
@@ -152,6 +170,14 @@ impl ProviderCredentialOwner {
         keyring: Arc<dyn Keyring>,
     ) -> ProviderCredentialOwner {
         let credential_ref = CredentialRef::for_provider(provider_id).expect("valid id");
+        ProviderCredentialOwner::with_keyring(&credential_ref, keyring)
+    }
+
+    /// The test-only seam for a 1Password credential (STUDIO-1584): an owner over an injected
+    /// keychain double under the derived `op:v1:<id>` account.
+    #[cfg(test)]
+    pub(crate) fn for_test_onepassword(id: &str, keyring: Arc<dyn Keyring>) -> ProviderCredentialOwner {
+        let credential_ref = CredentialRef::for_onepassword(id).expect("valid id");
         ProviderCredentialOwner::with_keyring(&credential_ref, keyring)
     }
 
