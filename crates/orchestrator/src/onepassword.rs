@@ -298,6 +298,31 @@ impl crate::Orchestrator {
         self.onepassword_holds.get(project_slug)
     }
 
+    /// The reconciliation sweep's feed for held 1Password credentials (STUDIO-1584, AC6): one
+    /// `CredentialInfrastructure` divergence per held project, so an unusable credential shows up in
+    /// `/api/v1/state`'s `review_divergence` and the per-project advisory instead of an unexplained
+    /// stall. Empty on a healthy daemon, which keeps the wire payload — and the golden — unchanged.
+    pub(crate) fn onepassword_human_feed(&self) -> Vec<crate::reviewreconcile::Divergence> {
+        self.onepassword_holds
+            .iter()
+            .map(|(slug, hold)| crate::reviewreconcile::Divergence {
+                pr: format!("1Password credential for project {slug}"),
+                kind: crate::reviewreconcile::DivergenceKind::CredentialInfrastructure,
+                ticket: String::new(),
+                reviewer: String::new(),
+                stale_secs: 0,
+                auto_merge_reason: None,
+                capacity_held: None,
+                capacity_unreadable: None,
+                adjudicated_head: String::new(),
+                current_head: String::new(),
+                rounds: 0,
+                findings: Vec::new(),
+                reason: hold.reason.clone(),
+            })
+            .collect()
+    }
+
     /// Re-probe every held project's bound credential and RELEASE the hold when a probe
     /// authenticates (STUDIO-1584). Mirrors `credential_preflight`: the probes run concurrently as
     /// tasks and the control task awaits the join, so a probe that never returns is bounded by
@@ -665,5 +690,28 @@ mod tests {
             o.onepassword_project_hold("studio-infra").is_some(),
             "with no source there is nothing to probe, so the hold stands"
         );
+    }
+
+    #[test]
+    fn a_hold_appears_in_the_reconciliation_feed() {
+        let (mut o, _dir) = orch_holding(
+            "studio-infra-readonly",
+            Some("ops_sentinel"),
+            "#!/usr/bin/env bash\nexit 0\n",
+        );
+        let feed = o.onepassword_human_feed();
+        assert_eq!(feed.len(), 1, "one divergence per held project");
+        assert!(
+            feed[0].reason.contains("studio-infra"),
+            "the divergence names the project: {}",
+            feed[0].reason
+        );
+        assert!(matches!(
+            feed[0].kind,
+            crate::reviewreconcile::DivergenceKind::CredentialInfrastructure
+        ));
+        // A healthy daemon feeds nothing, keeping the wire payload unchanged.
+        o.onepassword_holds.clear();
+        assert!(o.onepassword_human_feed().is_empty());
     }
 }
