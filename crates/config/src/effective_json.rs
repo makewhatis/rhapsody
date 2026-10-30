@@ -357,6 +357,11 @@ fn build_projects(c: &Config) -> Vec<Value> {
         if !p.capabilities.is_empty() {
             entry.insert("capabilities".into(), str_array(&p.capabilities));
         }
+        // STUDIO-1584: the bound 1Password credential ID (never a value), emitted only when set, so
+        // the console can show which project binds which credential.
+        if let Some(id) = &p.onepassword {
+            entry.insert("onepassword".into(), s(id));
+        }
         entry.insert("enabled".into(), Value::Bool(enabled));
         if !p.active_states.is_empty() {
             entry.insert("active_states".into(), str_array(&p.active_states));
