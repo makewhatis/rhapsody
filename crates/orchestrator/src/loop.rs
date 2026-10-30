@@ -2157,6 +2157,19 @@ impl Orchestrator {
     /// the turn's `KillTreeOnDrop` guard (`rhapsody_agent`) SIGKILLs the `claude` process tree, the
     /// stand-in for Go's `exec.CommandContext` + `cmd.Cancel` (STUDIO-840, widened by STUDIO-871). Mirrors Go `spawnWorker`
     /// (telemetry span links are P6).
+    /// The 1Password credential id a teammate's profile binds (STUDIO-1584), or `None` when the
+    /// identity is empty/unknown or the profile names none (inherit the project's own binding).
+    pub(crate) fn profile_onepassword_override(&self, identity: &str) -> Option<String> {
+        if identity.is_empty() {
+            return None;
+        }
+        let teams = self.teams.as_ref()?;
+        let ident = teams.roster.iter().find(|i| i.name == identity)?;
+        let dir = self.teams_profiles_dir.as_ref()?;
+        let profile = rhapsody_config::profiles::resolve(dir, &ident.profile).ok()?;
+        (!profile.onepassword.is_empty()).then(|| profile.onepassword.clone())
+    }
+
     // The signature mirrors Go's flat `spawnWorker(wctx, iss, attempt, projectSlug, stackContext,
     // startedAt)` arg list; BO-12 threads one more per-dispatch worker input (`capabilities_section`)
     // the same way `stack_context` is threaded, tipping it one over clippy's 7-arg limit, and
@@ -2214,6 +2227,13 @@ impl Orchestrator {
         // The daemon's 1Password source (STUDIO-1584). `None` on a bare CLI run, which resolves the
         // project's bound id as absent — no token, and biometric unlock is still disabled.
         deps.onepassword_source = self.onepassword_source.clone();
+        // Per-profile 1Password override (STUDIO-1584): a teammate's profile may bind a different
+        // credential than the project default. Resolved from the same roster + profiles directory
+        // the model/harness overrides come from; empty on every profile that names none, which
+        // leaves the project's own binding in place (so an existing installation is unchanged).
+        if let Some(id) = self.profile_onepassword_override(&model_override.identity) {
+            deps.onepassword_id = Some(id);
+        }
         // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
         // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
         deps.review = review;
@@ -2994,6 +3014,43 @@ mod tests {
         assert_eq!(
             deps.onepassword_id, None,
             "a project with no binding must carry no credential id"
+        );
+    }
+
+    /// STUDIO-1584: a teammate's profile may override the project's 1Password binding; a profile
+    /// that names none (or an unknown/empty identity) inherits it.
+    #[test]
+    fn a_teammates_profile_onepassword_overrides_the_project_binding() {
+        let dir = TempDir::new();
+        std::fs::write(
+            dir.child("worker.md"),
+            "---\nextends: none\nonepassword: kid-coder-readonly\n---\nWorker\n",
+        )
+        .unwrap();
+        let mut o = Orchestrator::new("not-read.md");
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            roster: vec![rhapsody_config::teams::Identity {
+                name: "alice".into(),
+                profile: "worker".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(&dir.path));
+        assert_eq!(
+            o.profile_onepassword_override("alice").as_deref(),
+            Some("kid-coder-readonly")
+        );
+        assert_eq!(
+            o.profile_onepassword_override("nobody"),
+            None,
+            "an unknown identity inherits"
+        );
+        assert_eq!(
+            o.profile_onepassword_override(""),
+            None,
+            "an empty identity inherits"
         );
     }
 
