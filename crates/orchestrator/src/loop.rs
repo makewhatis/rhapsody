@@ -741,6 +741,7 @@ fn worker_deps_for(
         // Per-dispatch (STUDIO-1584): `spawn_worker` stamps the daemon's source; every other
         // construction leaves `None`, which resolves a bound id as absent.
         onepassword_source: None,
+        onepassword_op_command: crate::onepassword::DEFAULT_OP_COMMAND.to_string(),
         // Per-dispatch and PB7-only: `spawn_worker` stamps the move-only prepared spec and the
         // loop-external broker supervisor for an accepted brokered preparation; every other dispatch
         // leaves both `None`, keeping the legacy path byte-identical.
@@ -2953,14 +2954,40 @@ mod tests {
 
     use crate::orchestrator::Orchestrator;
     use crate::testsupport::{
-        DispatchedEntries, TempDir, empty_effective, issue, orch_for_retry_multi,
-        proj_with_tracker, record_entries, running_entry, set_of,
+        DispatchedEntries, TempDir, empty_effective, empty_resolved_project, issue,
+        orch_for_retry_multi, proj_with_tracker, record_entries, running_entry, set_of,
     };
     use chrono::TimeZone;
     use rhapsody_tracker::TrackerError;
     use rhapsody_tracker::fake::Fake;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+
+    /// STUDIO-1584: the per-project `onepassword:` binding must reach the worker as the credential
+    /// id, and an unbound project must carry none. The mutation the review reproduced — deleting
+    /// `deps.onepassword_id = rp.onepassword.clone()` — left the whole suite green, so this pins the
+    /// config→dispatch half of the wiring directly.
+    #[test]
+    fn worker_deps_for_stamps_the_projects_bound_onepassword_id() {
+        let eff = empty_effective(Arc::new(Fake::new()));
+        let drain = crate::drain::DrainSignal::new();
+
+        let mut bound = empty_resolved_project("studio-infra", Arc::new(Fake::new()));
+        bound.onepassword = Some("studio-infra-readonly".to_string());
+        let deps = worker_deps_for(&eff, Some(&bound), &drain);
+        assert_eq!(
+            deps.onepassword_id.as_deref(),
+            Some("studio-infra-readonly"),
+            "a bound project's credential id must reach the worker"
+        );
+
+        let unbound = empty_resolved_project("kid-coder", Arc::new(Fake::new()));
+        let deps = worker_deps_for(&eff, Some(&unbound), &drain);
+        assert_eq!(
+            deps.onepassword_id, None,
+            "a project with no binding must carry no credential id"
+        );
+    }
 
     /// Wires an orchestrator with fakes and a recording spawn that increments a counter and simulates
     /// an immediate clean worker exit (Go `newLoopOrch`), bypassing the disk load (sets `eff` directly).
