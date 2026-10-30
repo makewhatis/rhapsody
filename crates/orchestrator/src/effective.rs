@@ -100,6 +100,10 @@ pub struct ResolvedProject {
     pub claim_mode: String,
     /// The project's effective claude model (`mcfg.claude.model`). A bounded telemetry label.
     pub model: String,
+    /// The project's bound 1Password service-account credential id (STUDIO-1584), or `None` when the
+    /// project binds none. An id, never a value; resolved to a token off the control loop at
+    /// dispatch.
+    pub onepassword: Option<String>,
 
     /// Mirrors this project's `tracker.github_summons` flag. `gh_owner`/`gh_repo` are parsed once
     /// from `repo` at build time (empty when `repo` is absent or not a GitHub remote). The poll-side
@@ -668,6 +672,7 @@ pub fn build_effective_with_runner(
             promote_from_states: normalize_set(&rp.eff.promote_from_states),
             claim_mode: rp.eff.claim_mode.clone(),
             model: rp.eff.claude.model.clone(),
+            onepassword: rp.eff.onepassword.clone(),
             stall_timeout: stall_timeout_for(&mcfg),
             mcfg,
             agent: project_runner,

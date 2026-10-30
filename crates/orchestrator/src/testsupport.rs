@@ -405,6 +405,7 @@ pub(crate) fn empty_resolved_project(slug: &str, tracker: Arc<dyn Tracker>) -> R
         promote_from_states: HashSet::new(),
         claim_mode: String::new(),
         model: String::new(),
+        onepassword: None,
         github_summons: false,
         gh_owner: String::new(),
         gh_repo: String::new(),

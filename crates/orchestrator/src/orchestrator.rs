@@ -1187,6 +1187,12 @@ pub struct Orchestrator {
     /// refusal rather than any direct-key fallback.
     pub provider_broker: Option<rhapsody_provider_broker::BrokerRegistrar>,
 
+    /// The daemon's 1Password service-account source (STUDIO-1584, Rhapsody-only). `None` by default,
+    /// so a bare CLI run or a test resolves every bound id as `Absent`; the composition root installs
+    /// the real one before `Run`. The source hands a token to a dispatch's agent env and nowhere
+    /// else — never logged, recorded, or returned by an API.
+    pub onepassword_source: Option<Arc<dyn crate::onepassword::OnePasswordSource>>,
+
     /// The daemon's provider-set reload sink (STUDIO-990, P9, Rhapsody-only). `None` by default, so
     /// the reload path is byte-identical for tests and any embedding with no provider runtime; the
     /// composition root installs the real one before `Run`. See [`crate::providerreload`].
@@ -1386,6 +1392,9 @@ impl Orchestrator {
             // STUDIO-990 (P9): no provider-reload sink by default. The daemon injects the real one
             // before `Run`; tests leave it `None`.
             provider_reload: None,
+            // STUDIO-1584: no 1Password source by default. The desktop-supervised daemon injects the
+            // real one before `Run`; tests leave it `None`, which resolves every bound id as Absent.
+            onepassword_source: None,
         }
     }
 
@@ -1417,6 +1426,17 @@ impl Orchestrator {
     /// dispatch (PB7) reads exactly the broker the daemon bound.
     pub fn set_provider_broker(&mut self, registrar: rhapsody_provider_broker::BrokerRegistrar) {
         self.provider_broker = Some(registrar);
+    }
+
+    /// Injects the daemon's 1Password service-account source (STUDIO-1584). The composition root
+    /// calls this once, before [`control`](Orchestrator::control) moves the orchestrator into the
+    /// control task, so a later dispatch can resolve a bound credential id to its token off the
+    /// control loop. Absent (the default) resolves every id as `Absent` — no token, no prompt.
+    pub fn set_onepassword_source(
+        &mut self,
+        source: Arc<dyn crate::onepassword::OnePasswordSource>,
+    ) {
+        self.onepassword_source = Some(source);
     }
 
     /// Installs the orchestrator's lifetime cancellation BEFORE [`Run`](Orchestrator::run) sets it, so

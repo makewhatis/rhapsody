@@ -141,6 +141,7 @@ impl crate::Runner for Runner {
             run_id: AtomicI64::new(0),
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
+            onepassword_token: Mutex::new(None),
             manager_config_dir: None,
             manager_credential: None,
             account_oauth: Mutex::new(None),
@@ -198,6 +199,7 @@ impl Harness for Runner {
             run_id: AtomicI64::new(0),
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
+            onepassword_token: Mutex::new(None),
             manager_config_dir: None,
             manager_credential: None,
             account_oauth: Mutex::new(None),
@@ -276,6 +278,7 @@ impl Harness for Runner {
             run_id: AtomicI64::new(0),
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
+            onepassword_token: Mutex::new(None),
             manager_config_dir: Some(req.config_dir),
             manager_credential: req.model_credential,
             account_oauth: Mutex::new(None),
@@ -334,6 +337,11 @@ struct ClaudeSession {
     /// the relocated credential file). `None` on every non-manager run — and on a manager run whose
     /// operator store had no usable token — leaving that run's env byte-identical.
     manager_credential: Option<String>,
+    /// The 1Password service-account token for this run (STUDIO-1584), set once by the worker via
+    /// [`Session::set_onepassword_token`] before the first turn; `None` for every project that binds
+    /// no credential. Injected as `OP_SERVICE_ACCOUNT_TOKEN` into the agent child env only — never
+    /// logged, never recorded. Behind a `Mutex` for the same reason `review_head` is.
+    onepassword_token: Mutex<Option<String>>,
     /// Nonsecret auth observed from the first system/init; frozen for this run.
     account_oauth: Mutex<Option<bool>>,
     activity_callback: Mutex<Option<crate::ActivityCallback>>,
@@ -532,6 +540,16 @@ impl Session for ClaudeSession {
         *self.locked_model_override() = over;
     }
 
+    /// Stores the 1Password service-account token for this run (STUDIO-1584), applied to the child
+    /// env by [`crate::onepassword::append_onepassword_env`] every turn. `None` means the project
+    /// binds no credential; biometric unlock is still disabled so an unbound `op` call fails fast.
+    fn set_onepassword_token(&self, token: Option<String>) {
+        *self
+            .onepassword_token
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = token;
+    }
+
     async fn stop(&self) -> Result<(), AgentError> {
         Ok(()) // per-turn processes; nothing persistent
     }
@@ -616,6 +634,15 @@ impl Session for ClaudeSession {
         // manager run whose operator store held no token, which leaves that run's env unchanged.
         if let Some(cred) = &self.manager_credential {
             env.push(format!("{}={cred}", crate::manager::MANAGER_CREDENTIAL_ENV));
+        }
+        // STUDIO-1584: the run's 1Password service-account token (when the project binds one) plus
+        // the always-on biometric-disable variable. Injected into the child env only; never logged.
+        {
+            let token = self
+                .onepassword_token
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            crate::onepassword::append_onepassword_env(&mut env, token.as_deref());
         }
         cmd.env_clear();
         for kv in &env {
@@ -2710,6 +2737,64 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"complete-sessi
         assert!(
             !env.contains_key("SYMPHONY_RUN_ID") && !env.contains_key("RHAPSODY_RUN_ID"),
             "an unset run id must emit no run-id env"
+        );
+    }
+
+    /// STUDIO-1584: a project that binds a 1Password credential gets its token in the agent child
+    /// env as `OP_SERVICE_ACCOUNT_TOKEN`, and every run — bound or not — carries
+    /// `OP_BIOMETRIC_UNLOCK_ENABLED=false` so an unbound `op` call fails fast instead of raising a
+    /// Touch ID prompt that would grant the operator's whole account.
+    #[tokio::test]
+    async fn run_turn_injects_the_onepassword_token_and_always_disables_biometric_unlock() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-OP-BOUND");
+        let (_s, script) = env_dump_script();
+        let r = new_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("r5", "MT-OP-BOUND"), None)
+            .await
+            .expect("start session");
+        sess.set_onepassword_token(Some("ops_sentinel_value".to_string()));
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "RunTurn err = {err:?}");
+        let env = read_env_dump(&format!("{ws}/env.dump"));
+        assert_eq!(
+            env.get("OP_SERVICE_ACCOUNT_TOKEN").map(String::as_str),
+            Some("ops_sentinel_value"),
+            "a bound run must carry its token"
+        );
+        assert_eq!(
+            env.get("OP_BIOMETRIC_UNLOCK_ENABLED").map(String::as_str),
+            Some("false"),
+            "biometric unlock must be disabled for every run"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_turn_without_a_token_emits_no_token_but_still_disables_biometric_unlock() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "MT-OP-UNBOUND");
+        let (_s, script) = env_dump_script();
+        let r = new_runner(&script, &root.path());
+        let sess = r
+            .start_session(&ws, issue("r6", "MT-OP-UNBOUND"), None)
+            .await
+            .expect("start session");
+        let (_t, on_event) = type_collector();
+        let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none(), "RunTurn err = {err:?}");
+        let env = read_env_dump(&format!("{ws}/env.dump"));
+        assert!(
+            !env.contains_key("OP_SERVICE_ACCOUNT_TOKEN"),
+            "an unbound run must carry no token"
+        );
+        assert_eq!(
+            env.get("OP_BIOMETRIC_UNLOCK_ENABLED").map(String::as_str),
+            Some("false"),
+            "biometric unlock must be disabled even with no token"
         );
     }
 

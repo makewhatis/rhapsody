@@ -463,6 +463,9 @@ fn decode_project(rp: RawProject) -> Project {
                 (id.clone(), ProviderDefinition { id, ..def })
             })
             .collect(),
+        // Per-project 1Password binding (STUDIO-1584): an id, mapped verbatim. An empty string is
+        // normalized to `None` (unset) so the effective overlay's "presence wins" rule is exact.
+        onepassword: rp.onepassword.filter(|s| !s.is_empty()),
     }
 }
 

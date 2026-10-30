@@ -55,6 +55,7 @@ pub fn render(def: &Definition) -> Value {
     // sol). Every non-provider key is echoed unchanged, so provider-less configs stay byte-identical.
     let mut config = yaml_map_to_json(&def.config);
     sanitize_provider_blocks(&mut config);
+    sanitize_onepassword_bindings(&mut config);
     out.insert("config".to_string(), config);
     out.insert(
         "prompt_body".to_string(),
@@ -615,6 +616,29 @@ fn sanitize_provider_blocks(root: &mut Value) {
             if let Some(Value::Object(providers)) = pmap.get_mut("providers") {
                 sanitize_provider_map(providers);
             }
+        }
+    }
+}
+
+/// Drops every project `onepassword:` binding whose value is not a canonical credential id
+/// (STUDIO-1584). Defense in depth: `validate` already refuses a token-shaped value, but the GET
+/// handler renders the parsed front matter WITHOUT validating it first, so this is the boundary that
+/// keeps a pasted token out of `GET /api/v1/config`. A binding is a scalar id or it is dropped.
+fn sanitize_onepassword_bindings(root: &mut Value) {
+    let Value::Object(map) = root else {
+        return;
+    };
+    let Some(Value::Array(projects)) = map.get_mut("projects") else {
+        return;
+    };
+    for project in projects.iter_mut() {
+        let Value::Object(pmap) = project else {
+            continue;
+        };
+        let keep = matches!(pmap.get("onepassword"), Some(Value::String(id))
+            if crate::onepassword::canonical_onepassword_id(id).is_ok());
+        if !keep {
+            pmap.remove("onepassword");
         }
     }
 }

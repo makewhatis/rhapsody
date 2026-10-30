@@ -200,6 +200,13 @@ pub enum WorkerError {
     /// `Display` is what the run row records and what an operator reads.
     #[error("capability refused: {0}")]
     CapabilityRefused(rhapsody_agent::CapabilityRefusal),
+    /// The project's bound 1Password service-account credential is unusable (STUDIO-1584): rejected
+    /// by 1Password, or bound but absent from the credential store. Raised BEFORE any session is
+    /// started, and handled exactly like [`WorkerError::CapabilityRefused`] — recorded once, NO
+    /// retry — so a bad credential HOLDS the ticket with a visible reason instead of looping or
+    /// stalling invisibly. The string is a non-secret operator sentence naming the project.
+    #[error("1password refused: {0}")]
+    OnePasswordRefused(String),
 }
 
 /// The dependencies a single worker attempt needs (Go `WorkerDeps`). The `Arc`-held deps are the
@@ -345,6 +352,13 @@ pub struct WorkerDeps {
     /// harness this build has no runner for. `Some` makes [`run_agent_attempt`] fail immediately
     /// with this reason and start NO session; it is never a fall back to another harness.
     pub harness_refusal: Option<CapabilityRefusal>,
+    /// The project's bound 1Password service-account credential id (STUDIO-1584), or `None` when the
+    /// project binds none. Resolved to a token off the control loop by [`run_agent_attempt`] through
+    /// [`Self::onepassword_source`].
+    pub onepassword_id: Option<String>,
+    /// The daemon's 1Password source (STUDIO-1584). `None` in a bare CLI run or a test, which
+    /// resolves a bound id as absent (no token, no prompt).
+    pub onepassword_source: Option<Arc<dyn crate::onepassword::OnePasswordSource>>,
     /// The move-only prepared harness spec an accepted brokered preparation produced (PB7,
     /// STUDIO-1002). `None` on every legacy/native-login dispatch — the worker keeps the shared
     /// [`Self::agent`] runner and behaves byte-identically. `Some` makes [`run_agent_attempt`] build
@@ -985,6 +999,61 @@ pub async fn run_agent_attempt(
             }
         }
     }
+    // STUDIO-1584: resolve the project's bound 1Password service-account credential OFF the control
+    // loop (this worker task), then probe its health with `op whoami`. A rejected credential — or a
+    // bound id with no stored token — HOLDS the run with a clear reason, the terminal no-retry
+    // [`WorkerError::OnePasswordRefused`], so a bad credential is visible instead of an invisible
+    // stall. A healthy credential proceeds; a probe timeout is an infrastructure fault and never
+    // holds (mirrors the credential preflight's repeated-timeout rule). The token is applied to the
+    // session below and reaches only the agent subprocess env.
+    let mut onepassword_token: Option<String> = None;
+    if let Some(id) = deps.onepassword_id.clone() {
+        let read = match deps.onepassword_source.clone() {
+            Some(source) => source.read(&id).await,
+            None => crate::onepassword::OnePasswordRead::Absent,
+        };
+        let token = match read {
+            crate::onepassword::OnePasswordRead::Present(token) => Some(token),
+            crate::onepassword::OnePasswordRead::Absent => None,
+            crate::onepassword::OnePasswordRead::Unavailable(reason) => {
+                tracing::warn!(
+                    issue_identifier = %issue.identifier,
+                    onepassword_id = %id,
+                    reason = %reason,
+                    "1Password: the bound credential owner is unavailable; treating it as absent"
+                );
+                None
+            }
+        };
+        let health = crate::onepassword::probe_whoami(
+            crate::onepassword::DEFAULT_OP_COMMAND,
+            token.as_deref(),
+            crate::onepassword::PROBE_TIMEOUT,
+        )
+        .await;
+        if let Some(reason) = crate::onepassword::hold_reason(&deps.project_slug, &health) {
+            tracing::warn!(
+                issue_identifier = %issue.identifier,
+                onepassword_id = %id,
+                reason = %reason,
+                "holding dispatch: the bound 1Password credential is unusable"
+            );
+            return (
+                issue.state.clone(),
+                WorkerDeclaration::default(),
+                Some(WorkerError::OnePasswordRefused(reason)),
+            );
+        }
+        if matches!(health, crate::onepassword::OnePasswordHealth::Timeout) {
+            tracing::warn!(
+                issue_identifier = %issue.identifier,
+                onepassword_id = %id,
+                "1Password: the health probe timed out; dispatching anyway (infrastructure fault, \
+                 not a credential failure)"
+            );
+        }
+        onepassword_token = token;
+    }
     // Manager mode (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3): a manager run has NO
     // repository, so it takes an entirely separate provisioning path — an empty daemon-owned cwd and
     // the isolated session posture — and creates no worktree, runs no before_run/after_run hooks and
@@ -1287,6 +1356,10 @@ pub async fn run_agent_attempt(
             }
         }
     };
+    // STUDIO-1584: land the resolved 1Password token on the session before its first turn. `None`
+    // (no binding, or no stored token) leaves the session's env with only the biometric-disable
+    // variable, so an unbound `op` call fails fast.
+    sess.set_onepassword_token(onepassword_token.clone());
     if !deps.resume_session.is_empty()
         && let Err(error) = sess.resume_from(&deps.resume_session)
     {
@@ -2176,6 +2249,8 @@ fi
             // honest default for the pre-978 tests, none of which exercises the refusal path.
             mcp_enabled: true,
             harness_refusal: None,
+            onepassword_id: None,
+            onepassword_source: None,
             prepared: None,
             broker: None,
             prepared_harness: None,

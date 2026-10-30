@@ -124,6 +124,11 @@ pub enum ValidationError {
     /// The selected provider's model id violates §2.2's transport bounds (STUDIO-984).
     #[error("invalid_provider_model: {0}")]
     InvalidProviderModel(String),
+    /// A project's `onepassword:` binding is not a canonical id — most importantly, it is a
+    /// token-shaped VALUE pasted where an id belongs (STUDIO-1584; Rhapsody-only). Carries an
+    /// actionable reason.
+    #[error("invalid_onepassword: {0}")]
+    InvalidOnePassword(String),
 }
 
 /// Runs the scheduler preflight checks on a resolved config (Go `ValidateDispatch`, upstream §6.3).
@@ -192,7 +197,23 @@ pub fn validate(config: &mut Resolved) -> Result<(), ValidationError> {
             config.agent.backend.clone(),
         ));
     }
+    validate_onepassword(config)?;
     validate_providers(config)?;
+    Ok(())
+}
+
+/// Validates every per-project `onepassword:` binding (STUDIO-1584; Rhapsody-only). Each binding must
+/// be a canonical credential id; a token-shaped value pasted in place of an id is refused with a
+/// message naming the mistake. A no-op when nothing is bound, so a workflow that never writes the
+/// field validates exactly as before.
+fn validate_onepassword(config: &Resolved) -> Result<(), ValidationError> {
+    for (i, p) in config.projects.iter().enumerate() {
+        if let Some(id) = &p.onepassword {
+            crate::onepassword::canonical_onepassword_id(id).map_err(|reason| {
+                ValidationError::InvalidOnePassword(format!("project {i}: onepassword: {reason}"))
+            })?;
+        }
+    }
     Ok(())
 }
 
@@ -728,6 +749,37 @@ mod tests {
         let err = validate(&mut c).unwrap_err();
         assert!(matches!(err, ValidationError::FileTrackerMultiProject));
         assert_eq!(err.to_string(), "file_tracker_multi_project");
+    }
+
+    // STUDIO-1584: a per-project `onepassword:` binding must be a canonical id; a token-shaped value
+    // pasted in place of the id is refused with a message naming the mistake.
+    #[test]
+    fn onepassword_binding_accepts_a_canonical_id_and_refuses_a_token_value() {
+        let mut c = valid();
+        c.projects = vec![Project {
+            repo: "git@github.com:o/r.git".to_string(),
+            slugs: vec!["a".to_string()],
+            onepassword: Some("studio-infra-readonly".to_string()),
+            ..Default::default()
+        }];
+        assert!(validate(&mut c).is_ok(), "a canonical id validates");
+
+        let mut c = valid();
+        c.projects = vec![Project {
+            repo: "git@github.com:o/r.git".to_string(),
+            slugs: vec!["a".to_string()],
+            onepassword: Some("ops_eyJhbGciOiJIUzI1NiJ9".to_string()),
+            ..Default::default()
+        }];
+        let err = validate(&mut c).unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidOnePassword(_)),
+            "a token-shaped value must be refused, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("service-account token"),
+            "the refusal must name the mistake: {err}"
+        );
     }
 
     // Mirrors Go `TestValidateNegativeHandoffDrainGrace`.

@@ -17,6 +17,22 @@ use zeroize::Zeroize;
 /// definition can never resolve to the Linear item even if it names the same account string.
 pub const PROVIDER_SERVICE: &str = "is.makewhat.rhapsody.providers";
 
+/// The Keychain service namespace for 1Password service-account tokens (STUDIO-1584) — a THIRD
+/// namespace, distinct from both Linear's and the provider one, so a 1Password binding can never
+/// resolve to a provider key (or vice versa) even if the account strings looked alike.
+pub const ONEPASSWORD_SERVICE: &str = "is.makewhat.rhapsody.onepassword";
+
+/// The versioned adapter label a 1Password service-account binding carries. It is NOT a provider
+/// protocol — it exists so the shared [`Binding`] type can pin a stored 1Password credential to its
+/// id without widening the provider protocol match (a lease carrying this adapter can never move
+/// into the provider broker).
+pub const ONEPASSWORD_SERVICE_ACCOUNT_V1: &str = "onepassword-service-account-v1";
+
+/// The account-string prefix for a 1Password credential reference (`op:v1:<id>`). The `op:` prefix is
+/// what lets the desktop's single authenticated channel route a read to the 1Password owner rather
+/// than a provider owner, exactly as the `v1:` account prefix distinguishes providers.
+pub const ONEPASSWORD_ACCOUNT_PREFIX: &str = "op:v1:";
+
 /// Identifies which provider credential is being asked for. The account string is derived and
 /// validated (never taken verbatim from YAML) — see [`CredentialRef::for_provider`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -60,9 +76,41 @@ impl CredentialRef {
         })
     }
 
+    /// Derives the versioned account name (`op:v1:<id>`) for a 1Password service-account credential
+    /// (STUDIO-1584). The id shares the provider id's canonical shape (`[a-z][a-z0-9_-]{0,63}`), so a
+    /// config can never point the lookup at an arbitrary account string, and the `op:` prefix keeps
+    /// the two credential kinds' accounts disjoint.
+    pub fn for_onepassword(id: &str) -> Result<CredentialRef, InvalidProviderId> {
+        let valid = !id.is_empty()
+            && id.len() <= 64
+            && id
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
+            && id.as_bytes()[0].is_ascii_lowercase();
+        if !valid {
+            return Err(InvalidProviderId(id.to_string()));
+        }
+        Ok(CredentialRef {
+            account: format!("{ONEPASSWORD_ACCOUNT_PREFIX}{id}"),
+        })
+    }
+
     /// The derived Keychain account string (e.g. `v1:anthropic`). Not a secret — safe to log.
     pub fn account(&self) -> &str {
         &self.account
+    }
+}
+
+/// True when `account` is a syntactically valid credential account the owner may be asked for: either
+/// a provider account (`v1:<id>`) or a 1Password account (`op:v1:<id>`). The single validation gate
+/// the IPC server uses, so a malformed or unknown-kind account is refused before any owner lookup.
+pub fn is_valid_credential_account(account: &str) -> bool {
+    if let Some(id) = account.strip_prefix(ONEPASSWORD_ACCOUNT_PREFIX) {
+        CredentialRef::for_onepassword(id).is_ok()
+    } else if let Some(id) = account.strip_prefix("v1:") {
+        CredentialRef::for_provider(id).is_ok()
+    } else {
+        false
     }
 }
 
@@ -282,6 +330,27 @@ mod tests {
         let r = CredentialRef::for_provider("linear-api-token").expect("syntactically valid slug");
         assert_ne!(r.account(), "linear-api-token");
         assert_eq!(r.account(), "v1:linear-api-token");
+    }
+
+    // STUDIO-1584: a 1Password credential is addressed by `op:v1:<id>`, disjoint from the provider
+    // `v1:<id>` accounts, so the two can never collide in the single owner channel.
+    #[test]
+    fn onepassword_ref_derives_a_disjoint_versioned_account() {
+        let r = CredentialRef::for_onepassword("studio-infra-readonly").expect("valid id");
+        assert_eq!(r.account(), "op:v1:studio-infra-readonly");
+        assert_ne!(r.account(), "v1:studio-infra-readonly");
+        assert!(CredentialRef::for_onepassword("Not An Id").is_err());
+        assert!(CredentialRef::for_onepassword("").is_err());
+    }
+
+    #[test]
+    fn credential_account_validation_accepts_both_kinds_and_refuses_junk() {
+        assert!(is_valid_credential_account("v1:anthropic"));
+        assert!(is_valid_credential_account("op:v1:studio-infra-readonly"));
+        assert!(!is_valid_credential_account("op:v1:Not An Id"));
+        assert!(!is_valid_credential_account("linear-api-token"));
+        assert!(!is_valid_credential_account(""));
+        assert!(!is_valid_credential_account("op:studio-infra"));
     }
 
     #[test]

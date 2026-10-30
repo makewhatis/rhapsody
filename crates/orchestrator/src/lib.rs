@@ -80,6 +80,7 @@ pub mod mergeconsole;
 pub mod message;
 pub mod notify;
 pub mod obslog;
+pub mod onepassword;
 pub mod orchestrator;
 pub mod persist;
 pub mod prconditional;

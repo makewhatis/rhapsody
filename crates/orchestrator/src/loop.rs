@@ -735,6 +735,12 @@ fn worker_deps_for(
         // Per-dispatch: `spawn_worker` stamps a refusal when the routed profile names an
         // unimplemented harness; every other dispatch leaves `None`.
         harness_refusal: None,
+        // Per-project (STUDIO-1584): the bound 1Password credential id, stamped below from the
+        // project's effective config; `None` on the legacy single-project path.
+        onepassword_id: None,
+        // Per-dispatch (STUDIO-1584): `spawn_worker` stamps the daemon's source; every other
+        // construction leaves `None`, which resolves a bound id as absent.
+        onepassword_source: None,
         // Per-dispatch and PB7-only: `spawn_worker` stamps the move-only prepared spec and the
         // loop-external broker supervisor for an accepted brokered preparation; every other dispatch
         // leaves both `None`, keeping the legacy path byte-identical.
@@ -758,6 +764,8 @@ fn worker_deps_for(
         deps.review_handoff_state = rp.review_states.iter().next().cloned(); // per-project park state (TRA-240)
         deps.repo_url = rp.repo.clone(); // Phase 3: per-issue repo URL for the worktree workspace
         deps.project_slug = rp.slug.clone(); // surfaced to hooks as SYMPHONY_PROJECT
+        // Per-project 1Password binding (STUDIO-1584): an id, resolved to a token at dispatch.
+        deps.onepassword_id = rp.onepassword.clone();
     }
     // Prompt selection by dependency_mode (INF-318): graphite/dag mode renders the mode-on prompt
     // (`.rhapsody/PROMPT.dep_mod.md` by default, TRA-238); disabled mode leaves `prompt_file`
@@ -2198,6 +2206,9 @@ impl Orchestrator {
             .as_ref()
             .and_then(|t| t.review_done_state())
             .map(str::to_string);
+        // The daemon's 1Password source (STUDIO-1584). `None` on a bare CLI run, which resolves the
+        // project's bound id as absent — no token, and biometric unlock is still disabled.
+        deps.onepassword_source = self.onepassword_source.clone();
         // Review mode (STUDIO-715): `Some` makes the worker provision a detached worktree at the
         // pinned head instead of a `symphony/<key>` branch. `None` for every ticket dispatch.
         deps.review = review;
@@ -2414,7 +2425,10 @@ impl Orchestrator {
             // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
             // succeed, and the failure backoff would loop forever.
-            let refused = matches!(err, Some(WorkerError::CapabilityRefused(_)));
+            let refused = matches!(
+                err,
+                Some(WorkerError::CapabilityRefused(_)) | Some(WorkerError::OnePasswordRefused(_))
+            );
             // The control task holds the shared credential after a typed login rejection.
             let auth_needed = matches!(
                 err,
