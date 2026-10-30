@@ -1024,9 +1024,23 @@ pub async fn run_agent_attempt(
             Some(source) => source.read(&id).await,
             None => crate::onepassword::OnePasswordRead::Absent,
         };
-        let token = match read {
-            crate::onepassword::OnePasswordRead::Present(token) => Some(token),
-            crate::onepassword::OnePasswordRead::Absent => None,
+        // Resolve FIRST, then probe only what we actually hold. Probing with no token would make
+        // `op whoami` exit non-zero exactly as a rejected token does, which reported a missing
+        // binding as "token rejected" and made the "no service account bound" reason unreachable
+        // (STUDIO-1584 review B5). An absent or unavailable credential is classified directly.
+        let (token, health) = match read {
+            crate::onepassword::OnePasswordRead::Present(token) => {
+                let health = crate::onepassword::probe_whoami(
+                    crate::onepassword::DEFAULT_OP_COMMAND,
+                    Some(&token),
+                    crate::onepassword::PROBE_TIMEOUT,
+                )
+                .await;
+                (Some(token), health)
+            }
+            crate::onepassword::OnePasswordRead::Absent => {
+                (None, crate::onepassword::OnePasswordHealth::Absent)
+            }
             crate::onepassword::OnePasswordRead::Unavailable(reason) => {
                 tracing::warn!(
                     issue_identifier = %issue.identifier,
@@ -1034,15 +1048,9 @@ pub async fn run_agent_attempt(
                     reason = %reason,
                     "1Password: the bound credential owner is unavailable; treating it as absent"
                 );
-                None
+                (None, crate::onepassword::OnePasswordHealth::Absent)
             }
         };
-        let health = crate::onepassword::probe_whoami(
-            crate::onepassword::DEFAULT_OP_COMMAND,
-            token.as_deref(),
-            crate::onepassword::PROBE_TIMEOUT,
-        )
-        .await;
         if let Some(reason) = crate::onepassword::hold_reason(&deps.project_slug, &health) {
             tracing::warn!(
                 issue_identifier = %issue.identifier,

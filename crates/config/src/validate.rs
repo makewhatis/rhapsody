@@ -768,7 +768,7 @@ mod tests {
         c.projects = vec![Project {
             repo: "git@github.com:o/r.git".to_string(),
             slugs: vec!["a".to_string()],
-            onepassword: Some("ops_eyJhbGciOiJIUzI1NiJ9".to_string()),
+            onepassword: Some("ops_SENTINELSECRETVALUE123".to_string()),
             ..Default::default()
         }];
         let err = validate(&mut c).unwrap_err();
@@ -779,6 +779,12 @@ mod tests {
         assert!(
             err.to_string().contains("service-account token"),
             "the refusal must name the mistake: {err}"
+        );
+        // B1 (STUDIO-1584 review): the wrapped, operator-facing error is logged verbatim on every
+        // tick, so it must never carry the rejected value.
+        assert!(
+            !err.to_string().contains("ops_SENTINELSECRETVALUE123"),
+            "the refusal leaked the pasted token: {err}"
         );
     }
 

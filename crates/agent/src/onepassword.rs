@@ -36,10 +36,12 @@ pub const OP_BIOMETRIC_UNLOCK_DISABLED: &str = "false";
 /// operator's own `OP_SERVICE_ACCOUNT_TOKEN` in the daemon env can never leak into a run that binds
 /// nothing (and a bound run's token can never be shadowed by an inherited one).
 pub fn append_onepassword_env(env: &mut Vec<String>, token: Option<&str>) {
-    env.retain(|kv| {
-        !kv.starts_with(OP_BIOMETRIC_UNLOCK_ENABLED_ENV)
-            && !kv.starts_with(OP_SERVICE_ACCOUNT_TOKEN_ENV)
-    });
+    // Match on the full `NAME=` prefix, not a bare `NAME`: a `starts_with("OP_SERVICE_ACCOUNT_TOKEN")`
+    // would also drop an unrelated `OP_SERVICE_ACCOUNT_TOKEN_FILE`-style variable (STUDIO-1584 review
+    // follow-up). The separator is what makes this the exact variable and nothing else.
+    let token_prefix = format!("{OP_SERVICE_ACCOUNT_TOKEN_ENV}=");
+    let biometric_prefix = format!("{OP_BIOMETRIC_UNLOCK_ENABLED_ENV}=");
+    env.retain(|kv| !kv.starts_with(&token_prefix) && !kv.starts_with(&biometric_prefix));
     env.push(format!(
         "{OP_BIOMETRIC_UNLOCK_ENABLED_ENV}={OP_BIOMETRIC_UNLOCK_DISABLED}"
     ));
@@ -102,6 +104,26 @@ mod tests {
         assert!(
             !env.iter()
                 .any(|kv| kv.starts_with("OP_SERVICE_ACCOUNT_TOKEN="))
+        );
+    }
+
+    // The scrub must match the exact variable, not a prefix of it (STUDIO-1584 review follow-up):
+    // an unrelated `OP_SERVICE_ACCOUNT_TOKEN_FILE`-style variable is the operator's own and must
+    // survive.
+    #[test]
+    fn an_unrelated_token_prefixed_variable_is_not_dropped() {
+        let mut env = vec![
+            "OP_SERVICE_ACCOUNT_TOKEN_FILE=/etc/op.token".to_string(),
+            "OP_BIOMETRIC_UNLOCK_ENABLED_EXTRA=keep-me".to_string(),
+        ];
+        append_onepassword_env(&mut env, None);
+        assert!(
+            env.contains(&"OP_SERVICE_ACCOUNT_TOKEN_FILE=/etc/op.token".to_string()),
+            "an unrelated OP_SERVICE_ACCOUNT_TOKEN*-prefixed variable must not be scrubbed"
+        );
+        assert!(
+            env.contains(&"OP_BIOMETRIC_UNLOCK_ENABLED_EXTRA=keep-me".to_string()),
+            "an unrelated OP_BIOMETRIC_UNLOCK_ENABLED*-prefixed variable must not be scrubbed"
         );
     }
 }

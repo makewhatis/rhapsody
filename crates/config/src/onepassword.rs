@@ -31,12 +31,18 @@ pub const ONEPASSWORD_TOKEN_PREFIX: &str = "ops_";
 /// A value that looks like a service-account token is refused with a message naming the mistake, so
 /// the operator learns to store the token in the desktop app and bind only its id. Returns the reason
 /// as a plain string; the caller wraps it in the scope-appropriate validation error.
+/// A refusal NEVER echoes the rejected value (STUDIO-1584 review B1). The whole reason this parser
+/// exists is the mistake of pasting a token where the id belongs, and that refusal is logged at
+/// error level on every tick (`loop.rs`'s dispatch-preflight failure) and at startup — so naming
+/// the value would put the very secret the rule protects into `~/.rhapsody/logs/rhapsodyd.*.log`.
+/// Every message here names the RULE, never the input.
 pub fn canonical_onepassword_id(id: &str) -> Result<(), String> {
     if id.starts_with(ONEPASSWORD_TOKEN_PREFIX) {
-        return Err(format!(
-            "{id:?} looks like a 1Password service-account token, not an id — bind the credential's \
-             id and store the token in the desktop app"
-        ));
+        return Err(
+            "a 1Password credential id must not start with the service-account token prefix \
+             'ops_'; bind the credential's id and store the token in the desktop app"
+                .to_string(),
+        );
     }
     if id.is_empty() {
         return Err("1Password credential id must not be empty".to_string());
@@ -49,18 +55,19 @@ pub fn canonical_onepassword_id(id: &str) -> Result<(), String> {
     let mut chars = id.chars();
     let first = chars.next().unwrap_or('\0');
     if !first.is_ascii_lowercase() {
-        return Err(format!(
-            "1Password credential id {id:?} must start with a lowercase ASCII letter"
-        ));
+        return Err(
+            "a 1Password credential id must start with a lowercase ASCII letter".to_string(),
+        );
     }
     if !id
         .bytes()
         .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_')
     {
-        return Err(format!(
-            "1Password credential id {id:?} may contain only lowercase ASCII letters, digits, '_' \
-             and '-'"
-        ));
+        return Err(
+            "a 1Password credential id may contain only lowercase ASCII letters, digits, '_' and \
+             '-'"
+                .to_string(),
+        );
     }
     Ok(())
 }
@@ -82,6 +89,29 @@ mod tests {
         // The exact mistake the ticket calls out: pasting the value in place of the id.
         let err = canonical_onepassword_id("ops_eyJhbGciOiJIUzI1NiJ9").expect_err("token refused");
         assert!(err.contains("service-account token"), "reason: {err}");
+    }
+
+    // STUDIO-1584 review B1: the refusal must NEVER echo the rejected value. `validate_onepassword`
+    // wraps this reason and the daemon logs it at error level on every tick, so a value echoed here
+    // would be a token written into `~/.rhapsody/logs/rhapsodyd.*.log` on the exact mistake the
+    // refusal exists for. Every branch that could carry an attacker-influenced string is checked.
+    #[test]
+    fn a_refusal_never_echoes_the_rejected_value() {
+        const SENTINEL: &str = "ops_SENTINELSECRETVALUE123";
+        let token_shaped = canonical_onepassword_id(SENTINEL).expect_err("token refused");
+        assert!(
+            !token_shaped.contains(SENTINEL),
+            "the refusal leaked the token: {token_shaped}"
+        );
+
+        // A non-`ops_`-prefixed value that is still not a canonical id (here, a bare secret with
+        // uppercase/underscore characters) must not be echoed either.
+        const OTHER_SENTINEL: &str = "Zz_SUPER_SECRET_VALUE";
+        let other = canonical_onepassword_id(OTHER_SENTINEL).expect_err("non-canonical refused");
+        assert!(
+            !other.contains(OTHER_SENTINEL),
+            "the refusal leaked the value: {other}"
+        );
     }
 
     #[test]
