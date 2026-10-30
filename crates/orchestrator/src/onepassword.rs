@@ -545,6 +545,14 @@ impl crate::Orchestrator {
         if let Some(reports) = &self.lead_reports {
             reports.set_onepassword_expiring(self.onepassword_expiry_advisories());
         }
+        // Prune in-run advisories for projects a reload removed, so a deleted project's stale AC6
+        // advisory cannot linger in the reconciliation feed forever.
+        if let Some(eff) = &self.eff {
+            let slugs: std::collections::HashSet<&str> =
+                eff.projects.iter().map(|p| p.slug.as_str()).collect();
+            self.onepassword_inrun_failures
+                .retain(|slug, _| slugs.contains(slug.as_str()));
+        }
         let Some(source) = self.onepassword_source.clone() else {
             // No desktop channel: a bound id can never resolve, so nothing can be probed and no
             // status can change. A hold can only stand until a token is stored.
