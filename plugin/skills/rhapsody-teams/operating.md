@@ -228,13 +228,16 @@ value), so you can confirm a binding without reading the store.
 
 ### Health, expiry and holds
 
-Service-account tokens expire (`--expires-in 90d` above). Rhapsody probes each bound credential
-off the control loop with `op whoami` under a hard timeout and records the account type, vaults
-and an expiry when the CLI reports one. A run whose bound credential is **rejected or absent is
-held with a clear reason** (`1Password: token rejected for project …` / `no service account bound
-for project …`) rather than failing and retrying forever; re-mint or re-Connect the credential and
-it proceeds. A probe **timeout is an infrastructure fault**, not a credential failure, and never
-holds a run. Mint a replacement a couple of weeks before expiry.
+Service-account tokens expire (`--expires-in 90d` above). Rhapsody probes each **held** credential
+with `op whoami` under a hard timeout (the probes run concurrently, bounded by that timeout, so a
+stalled CLI never strands the daemon) and records the account type, vaults and an expiry when the
+CLI reports one. A run whose bound credential is **rejected or absent is held with a clear reason**
+(`1Password: token rejected for project …` / `no service account bound for project …`) rather than
+failing and retrying forever; the hold is re-probed on a later tick and **clears automatically once
+a probe authenticates**, so re-minting or re-Connecting the credential releases the run without a
+restart. A probe **timeout is an infrastructure fault**, not a credential failure, and never holds a
+run. A probe that authenticates with a non-service-account (potentially writable) credential, or one
+expiring within 14 days, is logged as a warning. Mint a replacement a couple of weeks before expiry.
 
 ## When the board looks idle
 
