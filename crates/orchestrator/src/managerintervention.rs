@@ -2223,6 +2223,7 @@ mod tests {
             verdict_text: Some(result.result_text),
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed,
         });
     }
@@ -3009,6 +3010,7 @@ mod tests {
             verdict_text: text.map(str::to_string),
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         }
     }

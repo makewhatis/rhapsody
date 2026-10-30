@@ -5834,6 +5834,7 @@ mod tests {
                 verdict_text: None,
                 refused: false,
                 onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: false,
             });
             return;
@@ -5863,6 +5864,7 @@ mod tests {
                 verdict_text: None,
                 refused: false,
                 onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: false,
             });
             return;
@@ -5891,6 +5893,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         let now = (o.now)() + chrono::Duration::seconds(30);
@@ -11073,6 +11076,7 @@ mod tests {
                 verdict_text: None,
                 refused: false,
                 onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: false,
             },
         );
@@ -11131,6 +11135,7 @@ mod tests {
                 verdict_text: None,
                 refused: false,
                 onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: false,
             },
         );
@@ -11505,6 +11510,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
     }
@@ -13635,6 +13641,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         let waiting = o.handle_review_sweep(&[open_at(12, HEAD_B)]);

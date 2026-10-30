@@ -695,6 +695,7 @@ mod tests {
         let reports = Arc::new(rhapsody_orchestrator::leadreport::LeadReports {
             store: store.clone(),
             memory: None,
+            onepassword_expiring: std::sync::Mutex::new(Vec::new()),
         });
         let url = spawn_router(crate::new_handler(
             Arc::new(
@@ -935,6 +936,7 @@ mod tests {
             .with_lead_reports(Arc::new(rhapsody_orchestrator::leadreport::LeadReports {
                 store,
                 memory: None,
+                onepassword_expiring: std::sync::Mutex::new(Vec::new()),
             }));
         let rows = observe(&provider, None).await.unwrap();
         assert_eq!(rows.iter().filter(|n| n.kind == "lead_decision").count(), 2);

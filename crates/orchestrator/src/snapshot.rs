@@ -165,6 +165,14 @@ pub struct Snapshot {
     /// configured a macOS channel serves a `/api/v1/state` payload byte-identical to the Go
     /// daemon's, which is what `harness/fixtures/api/state.json` pins.
     pub notifications: Vec<crate::breaker::Notification>,
+    /// The bound 1Password credentials' last probe status (STUDIO-1584, AC5), one row per credential.
+    ///
+    /// Empty is the load-bearing half, exactly as [`Snapshot::review_divergence`]'s is:
+    /// [`crate::snapshot_json::render`] emits the `onepassword` key ONLY when this is non-empty, and
+    /// it only fills when a workflow binds an `onepassword:` credential — so a daemon with no binding
+    /// serves a `/api/v1/state` payload byte-identical to the Go daemon's, which is what
+    /// `harness/fixtures/api/state.json` pins.
+    pub onepassword: Vec<crate::onepassword::OnePasswordStatusRow>,
     /// The armed drain, or `None` when dispatch is not gated (STUDIO-880).
     ///
     /// `None` is the load-bearing half: [`crate::snapshot_json::render`] emits the `drain` key ONLY
@@ -294,6 +302,9 @@ impl Orchestrator {
             // STUDIO-1026: the pending desktop notifications; empty on a daemon with no macOS
             // channel, which keeps the wire payload — and the golden — unchanged.
             notifications: self.notifications.pending(),
+            // STUDIO-1584: the bound 1Password credentials' last probe status; empty on a daemon with
+            // no `onepassword:` binding, which keeps the wire payload — and the golden — unchanged.
+            onepassword: self.onepassword_status_rows(),
             // STUDIO-880: `None` unless a drain is armed, which keeps the wire payload — and the
             // golden — exactly as it was on every daemon that is not draining.
             drain: match self.drain.status() {

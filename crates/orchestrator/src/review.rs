@@ -2684,6 +2684,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         run_id
@@ -2710,6 +2711,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         run_id
@@ -2754,6 +2756,7 @@ mod tests {
                 verdict_text: Some(text.into()),
                 refused: false,
                 onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: false,
             });
             let c = rx.try_recv().expect("completion");
@@ -3629,6 +3632,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 
@@ -3801,6 +3805,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 

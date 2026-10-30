@@ -1588,6 +1588,7 @@ mod tests {
                 verdict_text: None,
                 refused: false,
                 onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: false,
             }))
             .expect("worker-exit send");

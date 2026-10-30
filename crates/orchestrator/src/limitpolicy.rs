@@ -344,7 +344,13 @@ impl Orchestrator {
         let now = (self.now)().timestamp();
         // STUDIO-1584: a held 1Password credential is checked first, so a bound-but-unusable
         // credential refuses dispatch with its own reason rather than falling through the fast path.
-        if let Some(hold) = self.onepassword_project_hold(project) {
+        // The hold is keyed by the credential id the dispatch would resolve — a teammate's profile
+        // can override the project's binding (review B6) — so a hold on a DIFFERENT teammate's
+        // credential never blocks this ticket.
+        let identity = self
+            .planned_identity(issue, &self.teammate_load())
+            .unwrap_or_default();
+        if let Some(hold) = self.onepassword_hold_for_dispatch(&identity, project) {
             self.note_usd_budget_hold(crate::budget::BudgetHeld {
                 subject: issue.identifier.clone(),
                 title: issue.title.clone(),
@@ -466,8 +472,13 @@ impl Orchestrator {
         account: Option<&str>,
     ) -> bool {
         // STUDIO-1584: a held 1Password credential refuses dispatch before any other gate, so a
-        // bound-but-unusable credential never reaches a spawn.
-        if let Some(hold) = self.onepassword_project_hold(&re.project_slug) {
+        // bound-but-unusable credential never reaches a spawn. The id is the one `spawn_worker` will
+        // actually resolve (the routed profile's override, else the project's binding), so a hold on
+        // a different credential never refuses this run (review B6).
+        let onepassword_identity = re.model_override.identity.clone();
+        if let Some(hold) =
+            self.onepassword_hold_for_dispatch(&onepassword_identity, &re.project_slug)
+        {
             let hold_reason = hold.reason.clone();
             let project = re.project_slug.clone();
             let subject = re.issue.identifier.clone();
@@ -2756,6 +2767,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         assert_eq!(
@@ -3112,6 +3124,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         let before = o.retry_attempts["1"].attempt;
@@ -3151,6 +3164,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         clock.store(1200, Ordering::SeqCst);

@@ -14,7 +14,7 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Button, Key, SectionCard, TextInput } from "@/components/ui";
-import { fetchTypedConfig } from "@/lib/api";
+import { fetchState, fetchTypedConfig, type OnePasswordProbe } from "@/lib/api";
 import { DESKTOP_ONLY_MESSAGE } from "@/lib/providers-model";
 import { failureMessage } from "@/lib/provider-credentials";
 import {
@@ -26,6 +26,22 @@ import {
   onePasswordStatus,
   type OnePasswordStatus,
 } from "@/lib/onepassword-credentials";
+
+/** The daemon's own sentence for a bound credential's last probe (STUDIO-1584), or "" when the
+ * daemon has not probed it yet. Read beside the Keychain-presence status so an operator can tell
+ * "stored" from "works", and can see WHY a run is held. */
+function probeLabel(probe: OnePasswordProbe | undefined): string {
+  if (!probe) return "";
+  if (probe.held && probe.hold_reason) return probe.hold_reason;
+  if (probe.ok) {
+    const parts: string[] = [];
+    if (probe.account_type) parts.push(probe.account_type);
+    if (probe.vaults.length > 0) parts.push(`vaults: ${probe.vaults.join(", ")}`);
+    if (probe.expires_at) parts.push(`expires ${probe.expires_at}`);
+    return parts.length > 0 ? `verified — ${parts.join("; ")}` : "verified";
+  }
+  return probe.reason ? `probe failed: ${probe.reason}` : "probe failed";
+}
 
 function statusTone(status: OnePasswordStatus | undefined): string {
   if (!status) return "var(--tx-3)";
@@ -71,6 +87,15 @@ export function OnePasswordSection() {
     enabled: bridged && ids.length > 0,
   });
 
+  // The daemon's own probe result / hold reason for each bound credential (STUDIO-1584). Absent when
+  // no credential is bound, so this is a harmless extra read on a daemon with no binding.
+  const state = useQuery({
+    queryKey: ["onepassword-probes"],
+    queryFn: fetchState,
+    enabled: bridged && ids.length > 0,
+  });
+  const probes = new Map((state.data?.onepassword ?? []).map((p) => [p.id, p]));
+
   return (
     <SectionCard
       title="1Password service accounts"
@@ -91,7 +116,11 @@ export function OnePasswordSection() {
               key={id}
               id={id}
               status={statuses.data?.[id]}
-              onChanged={() => void statuses.refetch()}
+              probe={probes.get(id)}
+              onChanged={() => {
+                void statuses.refetch();
+                void state.refetch();
+              }}
             />
           ))}
         </div>
@@ -103,10 +132,11 @@ export function OnePasswordSection() {
 interface OnePasswordRowProps {
   id: string;
   status: OnePasswordStatus | undefined;
+  probe: OnePasswordProbe | undefined;
   onChanged: () => void;
 }
 
-function OnePasswordRow({ id, status, onChanged }: OnePasswordRowProps) {
+function OnePasswordRow({ id, status, probe, onChanged }: OnePasswordRowProps) {
   const [editing, setEditing] = useState<"none" | "connect" | "replace">("none");
   const [token, setToken] = useState("");
   const [busy, setBusy] = useState(false);
@@ -164,6 +194,16 @@ function OnePasswordRow({ id, status, onChanged }: OnePasswordRowProps) {
         <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
           <code style={{ fontSize: 13 }}>{id}</code>
           <span style={{ fontSize: 12, color: statusTone(status) }}>{statusLabel(status)}</span>
+          {probeLabel(probe) && (
+            <span
+              style={{
+                fontSize: 12,
+                color: probe?.held || (probe && !probe.ok) ? "var(--red)" : "var(--tx-3)",
+              }}
+            >
+              {probeLabel(probe)}
+            </span>
+          )}
         </div>
         <div style={{ display: "flex", gap: 8 }}>
           {status?.can_connect !== false && (

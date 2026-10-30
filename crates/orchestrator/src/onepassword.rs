@@ -13,6 +13,14 @@
 //!   in the agent subprocess env and nowhere else — never logged, recorded, or returned by an API;
 //! * the biometric-disable variable is set on every run (see `rhapsody_agent::onepassword`), so an
 //!   `op` call with no bound token fails fast instead of prompting.
+//!
+//! # Holds are keyed by CREDENTIAL ID, never by project
+//!
+//! A project's binding can be overridden per teammate profile (STUDIO-1584 review B6), so the
+//! credential a run actually uses is not a function of the project alone. A hold is therefore keyed
+//! by the credential id that was used, and the dispatch gate resolves the id the run *would* use
+//! before consulting it. Keying by project released a profile-bound hold on the next tick (preflight
+//! probed the project's own id, which was fine or absent) and re-dispatched the ticket forever.
 
 use std::time::Duration;
 
@@ -26,6 +34,11 @@ pub use rhapsody_agent::onepassword::{
 /// fault. Matches the credential preflight's own hard bound (`preflight::PROBE_TIMEOUT`): a probe
 /// that never returns must not strand a dispatch.
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How long a recorded probe result stays fresh before the preflight re-probes it. Matches
+/// `preflight::PROBE_TTL`: a bound credential is probed off the control loop at most once per
+/// window, so a daemon with several projects does not shell out to `op` on every tick.
+pub const STATUS_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// The default `op` command the probe runs. Overridable so tests can point it at a fake script.
 pub const DEFAULT_OP_COMMAND: &str = "op";
@@ -120,15 +133,17 @@ pub async fn probe_whoami(
 }
 
 /// The account type `op whoami --format=json` reports, read defensively from the shapes the CLI has
-/// used (`type` / `account.type`).
+/// used. `op` 2.x reports `user_type` for a service account, so it is checked first; the older
+/// `type` / `account.type` spellings are kept so a probe against another version still classifies.
 fn whoami_account_type(v: &serde_json::Value) -> String {
-    v.get("type")
+    for key in ["user_type", "type"] {
+        if let Some(t) = v.get(key).and_then(|t| t.as_str()) {
+            return t.to_string();
+        }
+    }
+    v.get("account")
+        .and_then(|a| a.get("type"))
         .and_then(|t| t.as_str())
-        .or_else(|| {
-            v.get("account")
-                .and_then(|a| a.get("type"))
-                .and_then(|t| t.as_str())
-        })
         .unwrap_or("")
         .to_string()
 }
@@ -151,7 +166,9 @@ fn whoami_vaults(v: &serde_json::Value) -> Vec<String> {
 }
 
 /// A token expiry, if `op whoami` exposes one (`expires_at` / `expiresAt`). Service-account tokens
-/// are minted with an expiry but not every CLI version reports it; `None` means "not readable".
+/// are minted with an expiry but not every CLI version reports it; `None` means "not readable". The
+/// ticket's 14-day digest warning is explicitly conditional on the expiry being readable, so an
+/// unreadable one is `None` here and never manufactures a warning.
 fn whoami_expiry(v: &serde_json::Value) -> Option<String> {
     v.get("expires_at")
         .or_else(|| v.get("expiresAt"))
@@ -199,15 +216,16 @@ impl OnePasswordSource for MapOnePasswordSource {
     }
 }
 
-/// The reason a run is held when its bound credential cannot be used. Names the project so the
-/// operator knows which binding to fix, never the token.
-pub fn hold_reason(project_slug: &str, health: &OnePasswordHealth) -> Option<String> {
+/// The reason a run is held when its bound credential cannot be used. Names the binding so the
+/// operator knows which credential to fix, never the token. `label` is the project slug (or the
+/// teammate whose profile overrode the project) — whichever the hold was recorded against.
+pub fn hold_reason(label: &str, health: &OnePasswordHealth) -> Option<String> {
     match health {
         OnePasswordHealth::Rejected(reason) => Some(format!(
-            "1Password: token rejected for project {project_slug} ({reason})"
+            "1Password: token rejected for project {label} ({reason})"
         )),
         OnePasswordHealth::Absent => Some(format!(
-            "1Password: no service account bound for project {project_slug}"
+            "1Password: no service account bound for project {label}"
         )),
         // Ok and Timeout are not credential failures: a timeout is an infrastructure fault that must
         // not strand the run (mirrors the credential preflight's repeated-timeout rule).
@@ -215,40 +233,33 @@ pub fn hold_reason(project_slug: &str, health: &OnePasswordHealth) -> Option<Str
     }
 }
 
-/// A recorded hold on a project whose bound 1Password credential is unusable (STUDIO-1584). Held on
-/// the control task until a probe succeeds (or the credential becomes absent-then-present), so a bad
-/// credential HOLDS the ticket instead of failing it terminally until the daemon restarts. Carries
-/// the last probe's non-secret details so the operator can see WHY without reading the log.
+/// A recorded hold on a credential whose bound service account is unusable (STUDIO-1584). Held on
+/// the control task until a probe succeeds, so a bad credential HOLDS its runs instead of failing
+/// them terminally until the daemon restarts. Keyed by the credential `id` (see the module doc): the
+/// `project_slug` is carried only so the operator-facing reason can name where the binding lives.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OnePasswordHold {
-    /// The operator-facing reason (names the project, never the token).
+    /// The bound credential id whose token was rejected/absent. The map key, never the token.
+    pub id: String,
+    /// The project slug (or teammate name) the binding came from, for the operator-facing reason.
+    pub project_slug: String,
+    /// The operator-facing reason (names the binding, never the token).
     pub reason: String,
-    /// The probe's account type, if it reported one.
-    pub account_type: String,
-    /// The vaults the credential can read, if the probe listed them.
-    pub vaults: Vec<String>,
-    /// The credential's expiry, if the probe exposed one.
-    pub expires_at: Option<String>,
 }
 
 impl OnePasswordHold {
     /// Build a hold from a probe that does not authenticate, or `None` when the health does not
     /// warrant a hold (a healthy credential, or an infrastructure timeout).
-    pub fn from_health(project_slug: &str, health: &OnePasswordHealth) -> Option<OnePasswordHold> {
-        let reason = hold_reason(project_slug, health)?;
-        let (account_type, vaults, expires_at) = match health {
-            OnePasswordHealth::Ok {
-                account_type,
-                vaults,
-                expires_at,
-            } => (account_type.clone(), vaults.clone(), expires_at.clone()),
-            _ => (String::new(), Vec::new(), None),
-        };
+    pub fn from_health(
+        id: &str,
+        label: &str,
+        health: &OnePasswordHealth,
+    ) -> Option<OnePasswordHold> {
+        let reason = hold_reason(label, health)?;
         Some(OnePasswordHold {
+            id: id.to_string(),
+            project_slug: label.to_string(),
             reason,
-            account_type,
-            vaults,
-            expires_at,
         })
     }
 }
@@ -257,6 +268,127 @@ impl std::fmt::Display for OnePasswordHold {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.reason)
     }
+}
+
+/// The last health probe of one bound credential (STUDIO-1584, AC5). Recorded off the control loop by
+/// [`crate::Orchestrator::onepassword_preflight`] so the operator can see WHY a run is held — the
+/// account type, the vault list and the expiry a healthy probe reported, or the non-secret reason a
+/// rejected one did — without reading the daemon log. Never carries a token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnePasswordStatus {
+    /// Whether the last probe authenticated.
+    pub ok: bool,
+    /// The account type `op whoami` reported, if any.
+    pub account_type: String,
+    /// The vaults the credential can read, if the probe listed them.
+    pub vaults: Vec<String>,
+    /// The credential's expiry, if the probe exposed one.
+    pub expires_at: Option<String>,
+    /// A non-secret reason when the probe did not authenticate (empty when `ok`).
+    pub reason: String,
+    /// When the probe ran (unix seconds), for the freshness TTL.
+    pub checked_at_s: i64,
+}
+
+impl OnePasswordStatus {
+    /// Classify one probe result into a recorded status. The details come from a healthy `op whoami`;
+    /// a rejected/absent/timeout probe records only its non-secret reason.
+    pub fn from_health(health: &OnePasswordHealth, now_s: i64) -> OnePasswordStatus {
+        match health {
+            OnePasswordHealth::Ok {
+                account_type,
+                vaults,
+                expires_at,
+            } => OnePasswordStatus {
+                ok: true,
+                account_type: account_type.clone(),
+                vaults: vaults.clone(),
+                expires_at: expires_at.clone(),
+                reason: String::new(),
+                checked_at_s: now_s,
+            },
+            OnePasswordHealth::Rejected(reason) => OnePasswordStatus {
+                ok: false,
+                account_type: String::new(),
+                vaults: Vec::new(),
+                expires_at: None,
+                reason: reason.clone(),
+                checked_at_s: now_s,
+            },
+            OnePasswordHealth::Absent => OnePasswordStatus {
+                ok: false,
+                account_type: String::new(),
+                vaults: Vec::new(),
+                expires_at: None,
+                reason: "no service-account token is stored for this id".to_string(),
+                checked_at_s: now_s,
+            },
+            OnePasswordHealth::Timeout => OnePasswordStatus {
+                ok: false,
+                account_type: String::new(),
+                vaults: Vec::new(),
+                expires_at: None,
+                reason: "the health probe timed out (infrastructure fault)".to_string(),
+                checked_at_s: now_s,
+            },
+        }
+    }
+}
+
+/// One bound credential's status as `/api/v1/state`'s `onepassword` key renders it (STUDIO-1584,
+/// AC5): the last probe's account type/vaults/expiry (or the non-secret reason it failed) plus
+/// whether a hold currently stands. Never carries a token. Emitted only when at least one credential
+/// is bound and has been probed, so a daemon with no `onepassword:` binding serves a `/api/v1/state`
+/// payload byte-identical to the Go daemon's.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct OnePasswordStatusRow {
+    pub id: String,
+    pub ok: bool,
+    pub account_type: String,
+    pub vaults: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<String>,
+    /// The non-secret reason the last probe did not authenticate (empty when `ok`).
+    pub reason: String,
+    /// Whether a hold currently refuses runs bound to this credential.
+    pub held: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_reason: Option<String>,
+}
+
+/// Whether an agent's output shows a 1Password CLI auth failure (STUDIO-1584, AC6). The
+/// biometric-disabled `op` prints a recognizable signature when no service account is bound or its
+/// token was rejected — reproduced against `op` 2.41.0: `[ERROR] … no active session found for
+/// account …`, with no Touch ID prompt. Matching is deliberately conservative (a specific phrase, or
+/// `1password` beside an auth phrase) so ordinary text is never mistaken for a credential failure.
+pub fn op_auth_failure_signature(text: &str) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    if lowered.contains("no active session found") || lowered.contains("no account is signed in") {
+        return true;
+    }
+    lowered.contains("1password")
+        && (lowered.contains("not signed in")
+            || lowered.contains("not currently signed in")
+            || lowered.contains("authentication failed"))
+}
+
+/// The AC6 advisory for a run whose agent output shows a 1Password auth failure. Names the project,
+/// and the bound credential id when one is bound, never a token. `None` when `text` shows no
+/// signature, so the ordinary path adds nothing.
+pub fn op_auth_failure_advisory(
+    project_slug: &str,
+    credential_id: Option<&str>,
+    text: &str,
+) -> Option<String> {
+    if !op_auth_failure_signature(text) {
+        return None;
+    }
+    Some(match credential_id {
+        Some(id) if !id.is_empty() => {
+            format!("1Password: token rejected for project {project_slug} (credential {id})")
+        }
+        _ => format!("1Password: no service account bound for project {project_slug}"),
+    })
 }
 
 /// How many days before a credential's expiry the operator should be warned (STUDIO-1584). Service
@@ -283,94 +415,163 @@ pub fn account_type_looks_writable(account_type: &str) -> bool {
 }
 
 impl crate::Orchestrator {
-    /// Record a hold for `project_slug` (STUDIO-1584). Loop-confined: written by the worker-exit
-    /// path when a dispatch is refused for an unusable credential.
-    pub(crate) fn record_onepassword_hold(&mut self, project_slug: &str, hold: OnePasswordHold) {
-        if project_slug.is_empty() {
+    /// Record a hold for the credential it names (STUDIO-1584). Loop-confined: written by the
+    /// worker-exit path when a dispatch is refused for an unusable credential. Keyed by the
+    /// credential id, so a hold only blocks dispatches that would resolve to the same credential.
+    pub(crate) fn record_onepassword_hold(&mut self, hold: OnePasswordHold) {
+        if hold.id.is_empty() {
             return;
         }
-        self.onepassword_holds
-            .insert(project_slug.to_string(), hold);
+        self.onepassword_holds.insert(hold.id.clone(), hold);
     }
 
-    /// The hold on `project_slug`'s bound credential, if any.
-    pub(crate) fn onepassword_project_hold(&self, project_slug: &str) -> Option<&OnePasswordHold> {
-        self.onepassword_holds.get(project_slug)
+    /// The credential id a dispatch of `issue` in `project_slug` would resolve, mirroring
+    /// `spawn_worker`: a routed teammate's profile `onepassword:` override wins, else the project's
+    /// own binding. `None` when neither binds one (the default — a project gets no token).
+    pub(crate) fn onepassword_id_for_dispatch(
+        &self,
+        identity: &str,
+        project_slug: &str,
+    ) -> Option<String> {
+        if let Some(id) = self.profile_onepassword_override(identity) {
+            return Some(id);
+        }
+        self.eff
+            .as_ref()
+            .and_then(|eff| eff.project_by_slug(project_slug))
+            .and_then(|p| p.onepassword.clone())
+    }
+
+    /// The hold that would refuse a dispatch of `issue` for `identity` in `project_slug`, keyed by
+    /// the credential the run would actually use. `None` when the resolved credential is not held
+    /// (including when nothing is bound, or a DIFFERENT teammate's credential is the held one).
+    pub(crate) fn onepassword_hold_for_dispatch(
+        &self,
+        identity: &str,
+        project_slug: &str,
+    ) -> Option<&OnePasswordHold> {
+        let id = self.onepassword_id_for_dispatch(identity, project_slug)?;
+        self.onepassword_holds.get(&id)
+    }
+
+    /// Every distinct credential id the config binds — each project's `onepassword:` plus each
+    /// roster profile's — paired with a label (the project slug, or the teammate name) for the
+    /// operator-facing reason. Used by the preflight to probe and record each bound credential.
+    pub(crate) fn bound_onepassword_ids(&self) -> Vec<(String, String)> {
+        let mut out: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        if let Some(eff) = &self.eff {
+            for p in &eff.projects {
+                if let Some(id) = &p.onepassword {
+                    out.entry(id.clone()).or_insert_with(|| p.slug.clone());
+                }
+            }
+        }
+        if let (Some(teams), Some(dir)) = (self.teams.as_ref(), self.teams_profiles_dir.as_ref()) {
+            for ident in &teams.roster {
+                if let Ok(profile) = rhapsody_config::profiles::resolve(dir, &ident.profile)
+                    && !profile.onepassword.is_empty()
+                {
+                    out.entry(profile.onepassword.clone())
+                        .or_insert_with(|| ident.name.clone());
+                }
+            }
+        }
+        out.into_iter().collect()
     }
 
     /// The reconciliation sweep's feed for held 1Password credentials (STUDIO-1584, AC6): one
-    /// `CredentialInfrastructure` divergence per held project, so an unusable credential shows up in
-    /// `/api/v1/state`'s `review_divergence` and the per-project advisory instead of an unexplained
-    /// stall. Empty on a healthy daemon, which keeps the wire payload — and the golden — unchanged.
+    /// `CredentialInfrastructure` divergence per held credential, so an unusable credential shows up
+    /// in `/api/v1/state`'s `review_divergence` and the per-project advisory instead of an
+    /// unexplained stall. Empty on a healthy daemon, which keeps the wire payload — and the golden —
+    /// unchanged.
     pub(crate) fn onepassword_human_feed(&self) -> Vec<crate::reviewreconcile::Divergence> {
-        self.onepassword_holds
+        let holds =
+            self.onepassword_holds
+                .values()
+                .map(|hold| crate::reviewreconcile::Divergence {
+                    pr: format!("1Password credential for project {}", hold.project_slug),
+                    kind: crate::reviewreconcile::DivergenceKind::CredentialInfrastructure,
+                    ticket: String::new(),
+                    reviewer: String::new(),
+                    stale_secs: 0,
+                    auto_merge_reason: None,
+                    capacity_held: None,
+                    capacity_unreadable: None,
+                    adjudicated_head: String::new(),
+                    current_head: String::new(),
+                    rounds: 0,
+                    findings: Vec::new(),
+                    reason: hold.reason.clone(),
+                });
+        // AC6: a ticket run whose agent output showed a 1Password auth failure. The unbound-project
+        // case — which no dispatch-time hold can catch, because nothing is bound — lands here, so it
+        // reads as a named credential failure rather than an unexplained one.
+        let in_run = self
+            .onepassword_inrun_failures
             .iter()
-            .map(|(slug, hold)| crate::reviewreconcile::Divergence {
-                pr: format!("1Password credential for project {slug}"),
-                kind: crate::reviewreconcile::DivergenceKind::CredentialInfrastructure,
-                ticket: String::new(),
-                reviewer: String::new(),
-                stale_secs: 0,
-                auto_merge_reason: None,
-                capacity_held: None,
-                capacity_unreadable: None,
-                adjudicated_head: String::new(),
-                current_head: String::new(),
-                rounds: 0,
-                findings: Vec::new(),
-                reason: hold.reason.clone(),
-            })
-            .collect()
+            .map(
+                |(project_slug, reason)| crate::reviewreconcile::Divergence {
+                    pr: format!("1Password credential for project {project_slug}"),
+                    kind: crate::reviewreconcile::DivergenceKind::CredentialInfrastructure,
+                    ticket: String::new(),
+                    reviewer: String::new(),
+                    stale_secs: 0,
+                    auto_merge_reason: None,
+                    capacity_held: None,
+                    capacity_unreadable: None,
+                    adjudicated_head: String::new(),
+                    current_head: String::new(),
+                    rounds: 0,
+                    findings: Vec::new(),
+                    reason: reason.clone(),
+                },
+            );
+        holds.chain(in_run).collect()
     }
 
-    /// Re-probe every held project's bound credential and RELEASE the hold when a probe
+    /// Re-probe every bound credential off the control loop and RELEASE the hold when a probe
     /// authenticates (STUDIO-1584). Mirrors `credential_preflight`: the probes run concurrently as
     /// tasks and the control task awaits the join, so a probe that never returns is bounded by
     /// [`PROBE_TIMEOUT`] rather than stranding the daemon. A timeout is an infrastructure fault and
-    /// keeps the hold; only a healthy `op whoami` releases it. A healthy probe also warns when the
-    /// credential looks writable or is within [`EXPIRY_WARN_DAYS`] of expiry.
+    /// keeps the hold; only a healthy `op whoami` releases it. Each probe result is recorded as a
+    /// [`OnePasswordStatus`] (AC5) so the operator can see the account type, vaults and expiry, or
+    /// the non-secret reason, without reading the log.
+    ///
+    /// A hold whose credential is no longer bound by ANY project or profile is dropped here: nothing
+    /// would ever probe it again, so leaving it would block that credential's runs forever.
     pub(crate) async fn onepassword_preflight(&mut self) {
-        if self.onepassword_holds.is_empty() {
-            return;
+        // Publish the current expiry advisories for the morning digest (AC5) on every pass, so a
+        // credential that drifts inside the warning window is picked up without waiting for a probe.
+        if let Some(reports) = &self.lead_reports {
+            reports.set_onepassword_expiring(self.onepassword_expiry_advisories());
         }
         let Some(source) = self.onepassword_source.clone() else {
-            // No desktop channel: a bound id can never resolve, so the hold can only stand until a
-            // token is stored. Nothing to probe.
+            // No desktop channel: a bound id can never resolve, so nothing can be probed and no
+            // status can change. A hold can only stand until a token is stored.
             return;
         };
-        // Snapshot the (project_slug, credential id) pairs for held projects. A hold whose project no
-        // longer binds a credential (a reload removed the binding, or the project vanished) is DROPPED
-        // here — otherwise it would block that project's runs forever, since nothing would probe it.
-        let bound_slugs: std::collections::HashSet<String> = self
-            .eff
-            .as_ref()
-            .map(|eff| {
-                eff.projects
-                    .iter()
-                    .filter(|p| p.onepassword.is_some())
-                    .map(|p| p.slug.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
+        let bound = self.bound_onepassword_ids();
+        let bound_ids: std::collections::HashSet<String> =
+            bound.iter().map(|(id, _)| id.clone()).collect();
         self.onepassword_holds
-            .retain(|slug, _| bound_slugs.contains(slug));
-        let held: Vec<(String, String)> = self
-            .eff
-            .as_ref()
-            .map(|eff| {
-                eff.projects
-                    .iter()
-                    .filter(|p| self.onepassword_holds.contains_key(&p.slug))
-                    .filter_map(|p| p.onepassword.clone().map(|id| (p.slug.clone(), id)))
-                    .collect()
+            .retain(|id, _| bound_ids.contains(id));
+        self.onepassword_status
+            .retain(|id, _| bound_ids.contains(id));
+        let now_s = (self.now)().timestamp();
+        let due: Vec<(String, String)> = bound
+            .into_iter()
+            .filter(|(id, _)| {
+                self.onepassword_status
+                    .get(id)
+                    .is_none_or(|s| now_s - s.checked_at_s >= STATUS_TTL.as_secs() as i64)
             })
-            .unwrap_or_default();
-        if held.is_empty() {
+            .collect();
+        if due.is_empty() {
             return;
         }
         let command = self.onepassword_op_command.clone();
         let mut tasks = tokio::task::JoinSet::new();
-        for (slug, id) in held {
+        for (id, label) in due {
             let source = source.clone();
             let command = command.clone();
             tasks.spawn(async move {
@@ -383,29 +584,34 @@ impl crate::Orchestrator {
                     Some(t) => probe_whoami(&command, Some(t), PROBE_TIMEOUT).await,
                     None => OnePasswordHealth::Absent,
                 };
-                (slug, health)
+                (id, label, health)
             });
         }
         let now = (self.now)();
         while let Some(result) = tasks.join_next().await {
-            let Ok((slug, health)) = result else {
+            let Ok((id, label, health)) = result else {
                 continue;
             };
+            self.onepassword_status
+                .insert(id.clone(), OnePasswordStatus::from_health(&health, now_s));
             match &health {
                 OnePasswordHealth::Ok {
                     account_type,
                     expires_at,
                     ..
                 } => {
-                    self.onepassword_holds.remove(&slug);
-                    tracing::warn!(
-                        project_slug = %slug,
-                        "1Password: the bound credential recovered; releasing the hold"
-                    );
-                    self.schedule_tick(Duration::ZERO);
+                    if self.onepassword_holds.remove(&id).is_some() {
+                        tracing::warn!(
+                            credential_id = %id,
+                            project_slug = %label,
+                            "1Password: the bound credential recovered; releasing the hold"
+                        );
+                        self.schedule_tick(Duration::ZERO);
+                    }
                     if account_type_looks_writable(account_type) {
                         tracing::warn!(
-                            project_slug = %slug,
+                            credential_id = %id,
+                            project_slug = %label,
                             account_type = %account_type,
                             "1Password: the bound credential is not a read-only service account"
                         );
@@ -414,7 +620,8 @@ impl crate::Orchestrator {
                         && let Some(true) = expiry_within_warning(expires_at, now)
                     {
                         tracing::warn!(
-                            project_slug = %slug,
+                            credential_id = %id,
+                            project_slug = %label,
                             expires_at = %expires_at,
                             "1Password: the bound service-account credential expires within {} \
                              days; mint a replacement",
@@ -424,18 +631,57 @@ impl crate::Orchestrator {
                 }
                 OnePasswordHealth::Timeout => {
                     tracing::warn!(
-                        project_slug = %slug,
+                        credential_id = %id,
+                        project_slug = %label,
                         "1Password: the health probe timed out; keeping the hold (infrastructure \
                          fault, not a credential failure)"
                     );
                 }
                 OnePasswordHealth::Rejected(_) | OnePasswordHealth::Absent => {
-                    if let Some(hold) = OnePasswordHold::from_health(&slug, &health) {
-                        self.onepassword_holds.insert(slug.clone(), hold);
+                    if let Some(hold) = OnePasswordHold::from_health(&id, &label, &health) {
+                        self.onepassword_holds.insert(id.clone(), hold);
                     }
                 }
             }
         }
+    }
+
+    /// The non-secret advisories for bound credentials within [`EXPIRY_WARN_DAYS`] of expiry (or
+    /// already past), one per credential, for the morning digest (STUDIO-1584, AC5). Empty when no
+    /// credential has a readable near expiry — the ticket's warning is conditional on the expiry
+    /// being readable, so an unreadable one is never a warning.
+    pub(crate) fn onepassword_expiry_advisories(&self) -> Vec<String> {
+        let now = (self.now)();
+        self.onepassword_status
+            .iter()
+            .filter_map(|(id, status)| {
+                let expires_at = status.expires_at.as_deref()?;
+                match expiry_within_warning(expires_at, now) {
+                    Some(true) => Some(format!("credential {id} expires {expires_at}")),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    /// The bound credentials' recorded probe status, one row per credential, ordered by id, for
+    /// `/api/v1/state`'s `onepassword` key (STUDIO-1584, AC5). Empty when nothing has been probed —
+    /// a daemon with no `onepassword:` binding — which keeps the wire payload (and the golden)
+    /// unchanged.
+    pub(crate) fn onepassword_status_rows(&self) -> Vec<OnePasswordStatusRow> {
+        self.onepassword_status
+            .iter()
+            .map(|(id, status)| OnePasswordStatusRow {
+                id: id.clone(),
+                ok: status.ok,
+                account_type: status.account_type.clone(),
+                vaults: status.vaults.clone(),
+                expires_at: status.expires_at.clone(),
+                reason: status.reason.clone(),
+                held: self.onepassword_holds.contains_key(id),
+                hold_reason: self.onepassword_holds.get(id).map(|h| h.reason.clone()),
+            })
+            .collect()
     }
 }
 
@@ -475,7 +721,7 @@ mod tests {
         let dir = tmp();
         let script = fake_op(
             &dir,
-            "#!/usr/bin/env bash\necho '{\"type\":\"SERVICE_ACCOUNT\",\"vaults\":[\"Studio49\"],\"expires_at\":\"2027-01-01T00:00:00Z\"}'\n",
+            "#!/usr/bin/env bash\necho '{\"user_type\":\"SERVICE_ACCOUNT\",\"vaults\":[\"Studio49\"],\"expires_at\":\"2027-01-01T00:00:00Z\"}'\n",
         );
         let health = probe_whoami(&script, Some("ops_x"), PROBE_TIMEOUT).await;
         assert_eq!(
@@ -484,6 +730,26 @@ mod tests {
                 account_type: "SERVICE_ACCOUNT".into(),
                 vaults: vec!["Studio49".into()],
                 expires_at: Some("2027-01-01T00:00:00Z".into()),
+            }
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `op` 2.x reports `user_type`; the older `type` spelling must still classify.
+    #[tokio::test]
+    async fn a_whoami_that_reports_the_legacy_type_key_still_classifies() {
+        let dir = tmp();
+        let script = fake_op(
+            &dir,
+            "#!/usr/bin/env bash\necho '{\"type\":\"SERVICE_ACCOUNT\"}'\n",
+        );
+        let health = probe_whoami(&script, Some("ops_x"), PROBE_TIMEOUT).await;
+        assert_eq!(
+            health,
+            OnePasswordHealth::Ok {
+                account_type: "SERVICE_ACCOUNT".into(),
+                vaults: Vec::new(),
+                expires_at: None,
             }
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -590,7 +856,29 @@ mod tests {
         assert!(account_type_looks_writable("BUSINESS"));
     }
 
-    // --- Hold + release (STUDIO-1584 review B3) -------------------------------------------------
+    #[test]
+    fn a_status_records_the_probe_details_or_the_reason() {
+        let ok = OnePasswordStatus::from_health(
+            &OnePasswordHealth::Ok {
+                account_type: "SERVICE_ACCOUNT".into(),
+                vaults: vec!["Studio49".into()],
+                expires_at: Some("2027-01-01T00:00:00Z".into()),
+            },
+            100,
+        );
+        assert!(ok.ok);
+        assert_eq!(ok.account_type, "SERVICE_ACCOUNT");
+        assert_eq!(ok.vaults, vec!["Studio49".to_string()]);
+        assert_eq!(ok.checked_at_s, 100);
+
+        let rejected =
+            OnePasswordStatus::from_health(&OnePasswordHealth::Rejected("bad".into()), 101);
+        assert!(!rejected.ok);
+        assert_eq!(rejected.reason, "bad");
+        assert!(rejected.account_type.is_empty());
+    }
+
+    // --- Hold + release (STUDIO-1584 review B3/B6) ----------------------------------------------
 
     /// An orchestrator with one project bound to `id`, a source holding `token`, and a fake `op`.
     fn orch_holding(
@@ -616,15 +904,11 @@ mod tests {
         let dir = tmp();
         let script = fake_op(&dir, op_body);
         o.onepassword_op_command = script;
-        o.record_onepassword_hold(
-            "studio-infra",
-            OnePasswordHold {
-                reason: "1Password: token rejected for project studio-infra (stale)".into(),
-                account_type: String::new(),
-                vaults: Vec::new(),
-                expires_at: None,
-            },
-        );
+        o.record_onepassword_hold(OnePasswordHold {
+            id: id.to_string(),
+            project_slug: "studio-infra".to_string(),
+            reason: "1Password: token rejected for project studio-infra (stale)".into(),
+        });
         (o, dir)
     }
 
@@ -633,14 +917,21 @@ mod tests {
         let (mut o, dir) = orch_holding(
             "studio-infra-readonly",
             Some("ops_sentinel"),
-            "#!/usr/bin/env bash\necho '{\"type\":\"SERVICE_ACCOUNT\"}'\n",
+            "#!/usr/bin/env bash\necho '{\"user_type\":\"SERVICE_ACCOUNT\"}'\n",
         );
-        assert!(o.onepassword_project_hold("studio-infra").is_some());
+        assert!(o.onepassword_holds.contains_key("studio-infra-readonly"));
         o.onepassword_preflight().await;
         assert!(
-            o.onepassword_project_hold("studio-infra").is_none(),
+            !o.onepassword_holds.contains_key("studio-infra-readonly"),
             "a healthy probe must release the hold"
         );
+        // The probe's details are recorded even though the hold is released (AC5).
+        let status = o
+            .onepassword_status
+            .get("studio-infra-readonly")
+            .expect("a status is recorded");
+        assert!(status.ok);
+        assert_eq!(status.account_type, "SERVICE_ACCOUNT");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -653,7 +944,8 @@ mod tests {
         );
         o.onepassword_preflight().await;
         let hold = o
-            .onepassword_project_hold("studio-infra")
+            .onepassword_holds
+            .get("studio-infra-readonly")
             .expect("a rejected probe keeps the hold");
         assert!(
             hold.reason
@@ -672,7 +964,8 @@ mod tests {
         );
         o.onepassword_preflight().await;
         let hold = o
-            .onepassword_project_hold("studio-infra")
+            .onepassword_holds
+            .get("studio-infra-readonly")
             .expect("an absent credential keeps the hold");
         assert!(hold.reason.contains("no service account bound"), "{hold}");
     }
@@ -687,7 +980,7 @@ mod tests {
         o.onepassword_op_command = "/nonexistent/op-xyz".to_string();
         o.onepassword_preflight().await;
         assert!(
-            o.onepassword_project_hold("studio-infra").is_some(),
+            o.onepassword_holds.contains_key("studio-infra-readonly"),
             "an infrastructure timeout must not release the hold"
         );
     }
@@ -702,25 +995,130 @@ mod tests {
         o.onepassword_source = None;
         o.onepassword_preflight().await;
         assert!(
-            o.onepassword_project_hold("studio-infra").is_some(),
+            o.onepassword_holds.contains_key("studio-infra-readonly"),
             "with no source there is nothing to probe, so the hold stands"
         );
     }
 
     #[tokio::test]
-    async fn a_hold_for_a_project_that_no_longer_binds_is_dropped() {
+    async fn a_hold_for_a_credential_that_is_no_longer_bound_is_dropped() {
         let (mut o, _dir) = orch_holding(
             "studio-infra-readonly",
             Some("ops_sentinel"),
-            "#!/usr/bin/env bash\necho '{\"type\":\"SERVICE_ACCOUNT\"}'\n",
+            "#!/usr/bin/env bash\necho '{\"user_type\":\"SERVICE_ACCOUNT\"}'\n",
         );
         // A reload removes the binding: nothing can probe it, so the hold must not linger.
         o.eff.as_mut().unwrap().projects[0].onepassword = None;
         o.onepassword_preflight().await;
         assert!(
-            o.onepassword_project_hold("studio-infra").is_none(),
-            "a hold for a project that no longer binds must be dropped"
+            !o.onepassword_holds.contains_key("studio-infra-readonly"),
+            "a hold for a credential that is no longer bound must be dropped"
         );
+    }
+
+    /// STUDIO-1584 review B6: a PROFILE-bound credential's hold must survive a preflight tick even
+    /// when the project binds nothing. The old project-keyed preflight probed the project's own id
+    /// (none here), dropped the hold, and the ticket re-dispatched and recorded a failed run every
+    /// poll. The hold is keyed by the credential id, so it is probed directly and only a healthy
+    /// probe releases it.
+    #[tokio::test]
+    async fn a_profile_bound_hold_survives_a_preflight_when_the_project_binds_nothing() {
+        use crate::testsupport::{empty_effective, empty_resolved_project};
+        use rhapsody_config::teams::{Identity, Teams};
+        let profile_dir = tmp();
+        std::fs::write(
+            profile_dir.join("worker.md"),
+            "---\nextends: none\nonepassword: kid-coder-readonly\n---\nWorker\n",
+        )
+        .unwrap();
+        let mut eff = empty_effective(Arc::new(rhapsody_tracker::fake::Fake::new()));
+        let mut proj = empty_resolved_project(
+            "studio-infra",
+            Arc::new(rhapsody_tracker::fake::Fake::new()),
+        );
+        proj.onepassword = None; // the project binds NOTHING
+        eff.projects = vec![proj];
+        let mut o = crate::Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.teams = Some(Teams {
+            enabled: true,
+            roster: vec![Identity {
+                name: "alice".into(),
+                profile: "worker".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        o.teams_profiles_dir = Some(profile_dir.clone());
+
+        // alice's run used the profile-bound credential and was refused.
+        o.record_onepassword_hold(OnePasswordHold {
+            id: "kid-coder-readonly".into(),
+            project_slug: "alice".into(),
+            reason: "1Password: token rejected for project alice".into(),
+        });
+        // The gate resolves alice's override; bob inherits the project's (absent) binding.
+        assert!(
+            o.onepassword_hold_for_dispatch("alice", "studio-infra")
+                .is_some(),
+            "alice's profile-bound credential is held"
+        );
+        assert!(
+            o.onepassword_hold_for_dispatch("bob", "studio-infra")
+                .is_none(),
+            "a hold on alice's credential must not block a teammate whose credential is fine"
+        );
+
+        // A preflight tick probes the HELD id (not the project's), finds it still rejected, keeps it.
+        let op_dir = tmp();
+        let script = fake_op(
+            &op_dir,
+            "#!/usr/bin/env bash\necho '[ERROR] authentication failed' >&2\nexit 1\n",
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("kid-coder-readonly".to_string(), "ops_sentinel".to_string());
+        o.onepassword_source = Some(Arc::new(MapOnePasswordSource::new(map)));
+        o.onepassword_op_command = script;
+        o.onepassword_preflight().await;
+        assert!(
+            o.onepassword_holds.contains_key("kid-coder-readonly"),
+            "the profile-bound hold must survive the preflight (review B6)"
+        );
+        assert!(
+            o.onepassword_hold_for_dispatch("alice", "studio-infra")
+                .is_some(),
+            "the hold still refuses alice's dispatch"
+        );
+        std::fs::remove_dir_all(&profile_dir).ok();
+        std::fs::remove_dir_all(&op_dir).ok();
+    }
+
+    // --- In-run auth-failure advisory (STUDIO-1584 review B5, AC6) ------------------------------
+
+    #[test]
+    fn an_op_auth_signature_is_recognized_and_named_without_a_token() {
+        // The exact shape `op` 2.41.0 prints with biometric unlock disabled and no token.
+        let text = "[ERROR] 2026/10/30 12:00:00 no active session found for account studio49";
+        assert!(op_auth_failure_signature(text));
+        let advisory = op_auth_failure_advisory("kid-coder", None, text).expect("unbound advisory");
+        assert_eq!(
+            advisory,
+            "1Password: no service account bound for project kid-coder"
+        );
+        let bound = op_auth_failure_advisory("studio-infra", Some("studio-infra-readonly"), text)
+            .expect("bound advisory");
+        assert!(
+            bound.contains("token rejected for project studio-infra"),
+            "{bound}"
+        );
+        assert!(!bound.contains("ops_"), "never a token: {bound}");
+    }
+
+    #[test]
+    fn ordinary_text_is_never_a_1password_failure() {
+        assert!(!op_auth_failure_signature("the build succeeded"));
+        assert!(!op_auth_failure_signature("no session found in the cache"));
+        assert!(op_auth_failure_advisory("p", None, "all good").is_none());
     }
 
     #[test]
@@ -731,7 +1129,7 @@ mod tests {
             "#!/usr/bin/env bash\nexit 0\n",
         );
         let feed = o.onepassword_human_feed();
-        assert_eq!(feed.len(), 1, "one divergence per held project");
+        assert_eq!(feed.len(), 1, "one divergence per held credential");
         assert!(
             feed[0].reason.contains("studio-infra"),
             "the divergence names the project: {}",

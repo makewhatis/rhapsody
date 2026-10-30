@@ -1327,6 +1327,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
 
@@ -1385,6 +1386,7 @@ mod tests {
             verdict_text: None,
             refused: false,
             onepassword_hold: None,
+            onepassword_auth_failure: None,
             auth_needed: false,
         });
         // The reopen ladder is the unit under test; drop the dispatch's claim so

@@ -726,6 +726,7 @@ where
                 .as_ref()
                 .and_then(|m| m.operator_memory())
                 .map(|m| m as Arc<dyn rhapsody_orchestrator::leadreport::OverruleMemory>),
+            onepassword_expiring: std::sync::Mutex::new(Vec::new()),
         }));
         o.lead_report_tx = Some(lead_report_tx);
     }

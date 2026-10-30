@@ -2492,6 +2492,10 @@ impl Orchestrator {
                 refused,
                 onepassword_hold,
                 auth_needed,
+                // STUDIO-1584 (AC6): the worker's best-effort 1Password auth-failure advisory, when
+                // its agent output showed one. Carried to `on_worker_exit`, which records it in the
+                // reconciliation feed.
+                onepassword_auth_failure: declared.onepassword_auth_failure,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
         });
@@ -3082,6 +3086,7 @@ mod tests {
                 verdict_text: None,
                 refused: false,
                 onepassword_hold: None,
+                onepassword_auth_failure: None,
                 auth_needed: false,
             }));
         }));

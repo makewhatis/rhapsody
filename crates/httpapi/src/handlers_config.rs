@@ -433,6 +433,36 @@ Default prompt for {{ issue.identifier }}.\n";
         );
     }
 
+    // STUDIO-1584 review follow-up: a Settings autosave must NOT delete a project's `onepassword:`
+    // binding. The typed `projects[]` DTO (`ProjectReq`) has no such field, so `project_from_json`
+    // rebuilds the project from `Project::default()` and — before the fix — silently dropped the
+    // binding, after which the project's runs get no token. It is carried forward from the base
+    // project like `providers` (STUDIO-984) and `promote_from_states` (STUDIO-948).
+    #[tokio::test]
+    async fn config_post_typed_preserves_the_onepassword_binding() {
+        const WF: &str = "---\n\
+tracker:\n  kind: linear\n  api_key: $HOME\n  active_states:\n    - Todo\n  terminal_states:\n    - Done\n\
+repo: git@github.com:o/infra.git\n\
+agent:\n  backend: claude\n\
+projects:\n  - name: Infra Bot\n    slugs:\n      - infra\n    onepassword: studio-infra-readonly\n\
+---\n\
+Default prompt for {{ issue.identifier }}.\n";
+        let wf = TempWorkflow::new(WF);
+        let base = spawn(&wf.path()).await;
+        let got = get_config_ok(&base).await;
+        assert_eq!(
+            got["projects"][0]["onepassword"], "studio-infra-readonly",
+            "precondition: the typed view surfaces the bound id"
+        );
+        let resp = post_config(&base, &got).await;
+        assert_eq!(resp.status(), 200, "POST body={:?}", resp.text().await);
+        let after = get_config_ok(&base).await;
+        assert_eq!(
+            after["projects"][0]["onepassword"], "studio-infra-readonly",
+            "a Settings save must not delete the project's 1Password binding"
+        );
+    }
+
     // Mirrors Go `TestConfigPostTypedRemovesProject`: remove-agent = a POST whose payload omits the
     // entry (no separate delete endpoint).
     #[tokio::test]
