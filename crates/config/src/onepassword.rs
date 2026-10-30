@@ -66,7 +66,7 @@ pub fn canonical_onepassword_id(id: &str) -> Result<(), String> {
         return Err(
             "a 1Password credential id may contain only lowercase ASCII letters, digits, '_' and \
              '-'"
-                .to_string(),
+            .to_string(),
         );
     }
     Ok(())

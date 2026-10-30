@@ -342,7 +342,21 @@ impl Orchestrator {
 
     pub(crate) fn limit_dispatch_ready(&self, issue: &rhapsody_core::Issue, project: &str) -> bool {
         let now = (self.now)().timestamp();
+        // STUDIO-1584: a held 1Password credential is checked first, so a bound-but-unusable
+        // credential refuses dispatch with its own reason rather than falling through the fast path.
+        if let Some(hold) = self.onepassword_project_hold(project) {
+            self.note_usd_budget_hold(crate::budget::BudgetHeld {
+                subject: issue.identifier.clone(),
+                title: issue.title.clone(),
+                project: project.into(),
+                provider: "onepassword".into(),
+                reason: hold.reason.clone(),
+                ..Default::default()
+            });
+            return false;
+        }
         if !self.has_credential_holds()
+            && self.onepassword_holds.is_empty()
             && !self.accounts.snapshot(now).iter().any(|a| {
                 level(&self.accounts, &a.account, &self.limits_config(), now) >= Level::StopNew
             })
@@ -451,6 +465,23 @@ impl Orchestrator {
         supplied: &mut Option<crate::dispatch::DispatchEngine>,
         account: Option<&str>,
     ) -> bool {
+        // STUDIO-1584: a held 1Password credential refuses dispatch before any other gate, so a
+        // bound-but-unusable credential never reaches a spawn.
+        if let Some(hold) = self.onepassword_project_hold(&re.project_slug) {
+            let hold_reason = hold.reason.clone();
+            let project = re.project_slug.clone();
+            let subject = re.issue.identifier.clone();
+            let title = re.issue.title.clone();
+            self.note_usd_budget_hold(crate::budget::BudgetHeld {
+                subject,
+                title,
+                project,
+                provider: "onepassword".into(),
+                reason: hold_reason,
+                ..Default::default()
+            });
+            return false;
+        }
         let pricing = self.run_pricing_for(&re.harness, &re.model_override, &re.project_slug);
         let account = account.unwrap_or(&pricing.account);
         let canary = self.credential_canary_due(re, account);
@@ -2724,6 +2755,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         assert_eq!(
@@ -3079,6 +3111,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         let before = o.retry_attempts["1"].attempt;
@@ -3117,6 +3150,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         clock.store(1200, Ordering::SeqCst);

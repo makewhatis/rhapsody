@@ -1847,6 +1847,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
     }

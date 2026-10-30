@@ -202,11 +202,13 @@ pub enum WorkerError {
     CapabilityRefused(rhapsody_agent::CapabilityRefusal),
     /// The project's bound 1Password service-account credential is unusable (STUDIO-1584): rejected
     /// by 1Password, or bound but absent from the credential store. Raised BEFORE any session is
-    /// started, and handled exactly like [`WorkerError::CapabilityRefused`] — recorded once, NO
-    /// retry — so a bad credential HOLDS the ticket with a visible reason instead of looping or
-    /// stalling invisibly. The string is a non-secret operator sentence naming the project.
+    /// started, and handled as a RELEASABLE HOLD — recorded once, no retry, and cleared by a later
+    /// probe that succeeds — so a bad credential holds the ticket with a visible reason instead of
+    /// stalling invisibly or failing terminally until the daemon restarts. The carried
+    /// [`OnePasswordHold`](crate::onepassword::OnePasswordHold) is a non-secret operator sentence
+    /// naming the project plus the last probe's non-secret details.
     #[error("1password refused: {0}")]
-    OnePasswordRefused(String),
+    OnePasswordRefused(crate::onepassword::OnePasswordHold),
 }
 
 /// The dependencies a single worker attempt needs (Go `WorkerDeps`). The `Arc`-held deps are the
@@ -1055,18 +1057,55 @@ pub async fn run_agent_attempt(
                 (None, crate::onepassword::OnePasswordHealth::Absent)
             }
         };
-        if let Some(reason) = crate::onepassword::hold_reason(&deps.project_slug, &health) {
+        if let Some(hold) =
+            crate::onepassword::OnePasswordHold::from_health(&deps.project_slug, &health)
+        {
             tracing::warn!(
                 issue_identifier = %issue.identifier,
                 onepassword_id = %id,
-                reason = %reason,
+                reason = %hold.reason,
+                account_type = %hold.account_type,
+                vaults = ?hold.vaults,
+                expires_at = ?hold.expires_at,
                 "holding dispatch: the bound 1Password credential is unusable"
             );
             return (
                 issue.state.clone(),
                 WorkerDeclaration::default(),
-                Some(WorkerError::OnePasswordRefused(reason)),
+                Some(WorkerError::OnePasswordRefused(hold)),
             );
+        }
+        if let crate::onepassword::OnePasswordHealth::Ok {
+            account_type,
+            expires_at,
+            ..
+        } = &health
+        {
+            // Out of scope: writes stay human, so warn when a binding looks like it can write.
+            if crate::onepassword::account_type_looks_writable(account_type) {
+                tracing::warn!(
+                    issue_identifier = %issue.identifier,
+                    onepassword_id = %id,
+                    account_type = %account_type,
+                    "1Password: the bound credential is not a read-only service account; service \
+                     accounts are the read-only design target"
+                );
+            }
+            // Warn 14 days before expiry when the expiry is readable.
+            if let Some(expires_at) = expires_at
+                && let Some(soon) =
+                    crate::onepassword::expiry_within_warning(expires_at, chrono::Utc::now())
+                && soon
+            {
+                tracing::warn!(
+                    issue_identifier = %issue.identifier,
+                    onepassword_id = %id,
+                    expires_at = %expires_at,
+                    "1Password: the bound service-account credential expires within {} days; mint a \
+                     replacement",
+                    crate::onepassword::EXPIRY_WARN_DAYS
+                );
+            }
         }
         if matches!(health, crate::onepassword::OnePasswordHealth::Timeout) {
             tracing::warn!(
@@ -2348,6 +2387,7 @@ fi
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         assert!(o.claimed.contains("1"));
@@ -3106,7 +3146,10 @@ exit 1
         let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
         d.project_slug = "studio-infra".to_string();
         d.onepassword_id = Some("studio-infra-readonly".to_string());
-        d.onepassword_source = Some(map_source(&[("studio-infra-readonly", "ops_sentinel_token")]));
+        d.onepassword_source = Some(map_source(&[(
+            "studio-infra-readonly",
+            "ops_sentinel_token",
+        )]));
         d.onepassword_op_command = op;
 
         let (_last, _declared, err) =
@@ -3129,7 +3172,10 @@ exit 1
         let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
         d.project_slug = "kid-coder".to_string();
         // The daemon holds studio-infra's token, but kid-coder binds nothing.
-        d.onepassword_source = Some(map_source(&[("studio-infra-readonly", "ops_sentinel_token")]));
+        d.onepassword_source = Some(map_source(&[(
+            "studio-infra-readonly",
+            "ops_sentinel_token",
+        )]));
 
         let (_last, _declared, err) =
             run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
@@ -3157,9 +3203,11 @@ exit 1
         let (_last, _declared, err) =
             run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         match err {
-            Some(WorkerError::OnePasswordRefused(reason)) => assert!(
-                reason.contains("no service account bound for project studio-infra"),
-                "reason = {reason}"
+            Some(WorkerError::OnePasswordRefused(hold)) => assert!(
+                hold.reason
+                    .contains("no service account bound for project studio-infra"),
+                "reason = {}",
+                hold.reason
             ),
             other => panic!("expected OnePasswordRefused, got {other:?}"),
         }
@@ -3191,16 +3239,26 @@ exit 1
         let (_last, _declared, err) =
             run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         match err {
-            Some(WorkerError::OnePasswordRefused(reason)) => {
+            Some(WorkerError::OnePasswordRefused(hold)) => {
                 assert!(
-                    reason.contains("token rejected for project studio-infra"),
-                    "reason = {reason}"
+                    hold.reason
+                        .contains("token rejected for project studio-infra"),
+                    "reason = {}",
+                    hold.reason
                 );
-                assert!(!reason.contains(SENTINEL), "the reason leaked the token: {reason}");
+                assert!(
+                    !hold.reason.contains(SENTINEL),
+                    "the reason leaked the token: {}",
+                    hold.reason
+                );
             }
             other => panic!("expected OnePasswordRefused, got {other:?}"),
         }
-        assert_eq!(ag.start_calls(), 0, "a held dispatch must never start a session");
+        assert_eq!(
+            ag.start_calls(),
+            0,
+            "a held dispatch must never start a session"
+        );
     }
 
     /// A probe timeout is an infrastructure fault, never a credential failure: the run proceeds
@@ -3214,12 +3272,18 @@ exit 1
         let mut d = make_deps(ws, ag.clone(), tr, "p", 20);
         d.project_slug = "studio-infra".to_string();
         d.onepassword_id = Some("studio-infra-readonly".to_string());
-        d.onepassword_source = Some(map_source(&[("studio-infra-readonly", "ops_sentinel_token")]));
+        d.onepassword_source = Some(map_source(&[(
+            "studio-infra-readonly",
+            "ops_sentinel_token",
+        )]));
         d.onepassword_op_command = root.child("nonexistent-op");
 
         let (_last, _declared, err) =
             run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
-        assert!(err.is_none(), "a timeout must not hold the run, got {err:?}");
+        assert!(
+            err.is_none(),
+            "a timeout must not hold the run, got {err:?}"
+        );
         assert_eq!(
             ag.last_onepassword_token().as_deref(),
             Some("ops_sentinel_token"),

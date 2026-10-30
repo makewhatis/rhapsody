@@ -378,6 +378,7 @@ async fn replay_blocked_author_same_head_findings_parks_and_resumes_once() {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
     };
@@ -417,6 +418,7 @@ async fn replay_blocked_author_same_head_findings_parks_and_resumes_once() {
         review_verdict: None,
         verdict_text: None,
         refused: false,
+        onepassword_hold: None,
         auth_needed: false,
     });
     // Two already-admitted lead answers race to escalate with paraphrased text. They update one
@@ -1884,6 +1886,7 @@ fn lead_launch_reuses_selftest_ordered_fallback_and_generation_budget() {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
         });
         if daily_cap {
             assert_eq!(dispatched.lock().unwrap().len(), 1);

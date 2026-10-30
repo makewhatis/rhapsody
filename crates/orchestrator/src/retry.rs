@@ -88,6 +88,12 @@ pub struct EvWorkerExit {
     /// so the next tick does not re-dispatch it, and schedules no retry; `err_msg` carries the
     /// typed reason.
     pub refused: bool,
+    /// The 1Password credential hold when the exit is a 1Password refusal (STUDIO-1584): the
+    /// project's bound service-account credential is rejected or absent. `on_worker_exit` records it
+    /// `failed` ONCE, drops the claim, and schedules no retry — the hold is a control-task record
+    /// cleared by a later probe that succeeds, so the ticket is HELD rather than failed until a
+    /// restart. `None` on every other exit.
+    pub onepassword_hold: Option<crate::onepassword::OnePasswordHold>,
     /// True when the exit is the agent's typed AUTH-NEEDED outcome (STUDIO-1118,
     /// `AgentError::AuthNeeded`): the provider rejected the run's native login, and the operator's
     /// current login is the very one it rejected (the runner has already re-seeded and, where the
@@ -1291,6 +1297,30 @@ impl Orchestrator {
             self.rearm_tick_for_held_capacity();
             return;
         }
+        // A 1Password credential refusal HOLDS the ticket rather than failing it terminally
+        // (STUDIO-1584). Record the hold for the project, record the run `failed` ONCE, and schedule
+        // no retry; the in-memory claim is dropped so the ticket is re-offered, and selection refuses
+        // it while the hold stands. A probe that later succeeds clears the hold (see
+        // `Orchestrator::onepassword_preflight`), releasing the ticket without a daemon restart.
+        if let Some(hold) = e.onepassword_hold.clone() {
+            self.completed.remove(&e.issue_id);
+            self.claimed.remove(&e.issue_id);
+            let reason = hold.reason.clone();
+            tracing::warn!(
+                run_id = re.run_id,
+                issue_id = %e.issue_id,
+                issue_identifier = %re.issue.identifier,
+                project_slug = %re.project_slug,
+                reason = %reason,
+                "holding dispatch: the bound 1Password credential is unusable; recording failed \
+                 once and scheduling no retry until a probe succeeds"
+            );
+            self.persist_end_run(&re, store::OUTCOME_FAILED, &reason);
+            self.persist_complete(&re.issue.identifier);
+            self.persist_totals();
+            self.record_onepassword_hold(&re.project_slug, hold);
+            return;
+        }
         // A TYPED CAPABILITY REFUSAL is terminal and NOT retryable (STUDIO-978). The failure branch
         // below would schedule exponential backoff forever: a profile's harness name and the
         // adapter's declared capabilities do not change between attempts, so every retry re-refuses
@@ -2075,6 +2105,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
 
@@ -2119,6 +2150,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
 
@@ -2361,6 +2393,7 @@ mod tests {
                 review_verdict: None,
                 verdict_text: None,
                 refused: false,
+                onepassword_hold: None,
                 auth_needed: false,
             });
             let runs = store_handle
@@ -2597,6 +2630,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         assert!(
@@ -2634,6 +2668,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         assert_eq!(
@@ -2659,6 +2694,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         assert_eq!(
@@ -2683,6 +2719,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         let re = o.retry_attempts.get("1").expect("backoff retry");
@@ -2721,6 +2758,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: true,
+            onepassword_hold: None,
             auth_needed: false,
         });
 
@@ -2774,6 +2812,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: true,
         });
 
@@ -2881,6 +2920,7 @@ mod tests {
                 review_verdict: None,
                 verdict_text: None,
                 refused: false,
+                onepassword_hold: None,
                 auth_needed: true,
             });
         }
@@ -3044,6 +3084,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         assert!(
@@ -3104,6 +3145,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
 
@@ -3137,6 +3179,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
 
@@ -3167,6 +3210,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
 
@@ -3202,6 +3246,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
 
@@ -3235,6 +3280,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
 

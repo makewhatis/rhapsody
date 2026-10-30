@@ -2683,6 +2683,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         run_id
@@ -2708,6 +2709,7 @@ mod tests {
             review_verdict: Some(verdict),
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
         run_id
@@ -2751,6 +2753,7 @@ mod tests {
                 review_verdict: None,
                 verdict_text: Some(text.into()),
                 refused: false,
+                onepassword_hold: None,
                 auth_needed: false,
             });
             let c = rx.try_recv().expect("completion");
@@ -3625,6 +3628,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
 
@@ -3796,6 +3800,7 @@ mod tests {
             review_verdict: None,
             verdict_text: None,
             refused: false,
+            onepassword_hold: None,
             auth_needed: false,
         });
 

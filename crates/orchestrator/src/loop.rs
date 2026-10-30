@@ -1333,6 +1333,10 @@ impl Orchestrator {
         // BO-59/STUDIO-1144: refresh per-context verdicts before selection; only a definite failure
         // holds that credential's work. Timeouts are unknown and never skip the whole tick.
         self.credential_preflight().await;
+        // STUDIO-1584: re-probe any held 1Password credential and release the hold on a healthy
+        // probe, so a bound-but-unusable credential HOLDS its runs rather than failing them until a
+        // daemon restart.
+        self.onepassword_preflight().await;
         // symphony.poll wraps this tick's candidate fetch + dispatch decisions (a short control-loop
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
@@ -2426,10 +2430,13 @@ impl Orchestrator {
             // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
             // succeed, and the failure backoff would loop forever.
-            let refused = matches!(
-                err,
-                Some(WorkerError::CapabilityRefused(_)) | Some(WorkerError::OnePasswordRefused(_))
-            );
+            let refused = matches!(err, Some(WorkerError::CapabilityRefused(_)));
+            // A 1Password credential refusal is its own terminal-until-released HOLD (STUDIO-1584):
+            // `on_worker_exit` records the hold and schedules no retry, and a later probe clears it.
+            let onepassword_hold = match &err {
+                Some(WorkerError::OnePasswordRefused(hold)) => Some(hold.clone()),
+                _ => None,
+            };
             // The control task holds the shared credential after a typed login rejection.
             let auth_needed = matches!(
                 err,
@@ -2463,6 +2470,7 @@ impl Orchestrator {
                 review_verdict: declared.review_verdict,
                 verdict_text: declared.verdict_text,
                 refused,
+                onepassword_hold,
                 auth_needed,
             };
             let _ = events_exit.send(Event::WorkerExit(exit));
@@ -3016,6 +3024,7 @@ mod tests {
                 review_verdict: None,
                 verdict_text: None,
                 refused: false,
+                onepassword_hold: None,
                 auth_needed: false,
             }));
         }));

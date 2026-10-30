@@ -1193,6 +1193,17 @@ pub struct Orchestrator {
     /// else — never logged, recorded, or returned by an API.
     pub onepassword_source: Option<Arc<dyn crate::onepassword::OnePasswordSource>>,
 
+    /// The `op` command the 1Password health probe runs (STUDIO-1584). Defaults to
+    /// [`crate::onepassword::DEFAULT_OP_COMMAND`]; a test points it at a fake script.
+    pub onepassword_op_command: String,
+
+    /// Projects whose bound 1Password credential is currently unusable (STUDIO-1584), with the
+    /// operator-facing reason and the last probe's non-secret details. Loop-confined: written by
+    /// `on_worker_exit` (a refusal) and by `onepassword_preflight` (a release), read by the dispatch
+    /// gate. A run for a held project is refused at selection until a probe succeeds and clears it.
+    pub(crate) onepassword_holds:
+        std::collections::BTreeMap<String, crate::onepassword::OnePasswordHold>,
+
     /// The daemon's provider-set reload sink (STUDIO-990, P9, Rhapsody-only). `None` by default, so
     /// the reload path is byte-identical for tests and any embedding with no provider runtime; the
     /// composition root installs the real one before `Run`. See [`crate::providerreload`].
@@ -1395,6 +1406,8 @@ impl Orchestrator {
             // STUDIO-1584: no 1Password source by default. The desktop-supervised daemon injects the
             // real one before `Run`; tests leave it `None`, which resolves every bound id as Absent.
             onepassword_source: None,
+            onepassword_op_command: crate::onepassword::DEFAULT_OP_COMMAND.to_string(),
+            onepassword_holds: std::collections::BTreeMap::new(),
         }
     }
 

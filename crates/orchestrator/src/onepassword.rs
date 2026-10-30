@@ -215,11 +215,195 @@ pub fn hold_reason(project_slug: &str, health: &OnePasswordHealth) -> Option<Str
     }
 }
 
+/// A recorded hold on a project whose bound 1Password credential is unusable (STUDIO-1584). Held on
+/// the control task until a probe succeeds (or the credential becomes absent-then-present), so a bad
+/// credential HOLDS the ticket instead of failing it terminally until the daemon restarts. Carries
+/// the last probe's non-secret details so the operator can see WHY without reading the log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnePasswordHold {
+    /// The operator-facing reason (names the project, never the token).
+    pub reason: String,
+    /// The probe's account type, if it reported one.
+    pub account_type: String,
+    /// The vaults the credential can read, if the probe listed them.
+    pub vaults: Vec<String>,
+    /// The credential's expiry, if the probe exposed one.
+    pub expires_at: Option<String>,
+}
+
+impl OnePasswordHold {
+    /// Build a hold from a probe that does not authenticate, or `None` when the health does not
+    /// warrant a hold (a healthy credential, or an infrastructure timeout).
+    pub fn from_health(project_slug: &str, health: &OnePasswordHealth) -> Option<OnePasswordHold> {
+        let reason = hold_reason(project_slug, health)?;
+        let (account_type, vaults, expires_at) = match health {
+            OnePasswordHealth::Ok {
+                account_type,
+                vaults,
+                expires_at,
+            } => (account_type.clone(), vaults.clone(), expires_at.clone()),
+            _ => (String::new(), Vec::new(), None),
+        };
+        Some(OnePasswordHold {
+            reason,
+            account_type,
+            vaults,
+            expires_at,
+        })
+    }
+}
+
+impl std::fmt::Display for OnePasswordHold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// How many days before a credential's expiry the operator should be warned (STUDIO-1584). Service
+/// accounts are minted with `--expires-in 90d`, so a 14-day warning leaves time to mint a
+/// replacement before the current one lapses and starts holding runs.
+pub const EXPIRY_WARN_DAYS: i64 = 14;
+
+/// Whether `expires_at` (an RFC3339-ish string `op whoami` reported) is within
+/// [`EXPIRY_WARN_DAYS`] of `now`, or already past. `None` when the expiry is unreadable, which is
+/// never a warning (an unreadable expiry must not manufacture one).
+pub fn expiry_within_warning(expires_at: &str, now: chrono::DateTime<chrono::Utc>) -> Option<bool> {
+    let parsed = chrono::DateTime::parse_from_rfc3339(expires_at).ok()?;
+    let delta = parsed.with_timezone(&chrono::Utc) - now;
+    Some(delta.num_days() <= EXPIRY_WARN_DAYS)
+}
+
+/// Whether the probe's account type names a credential with WRITE access. The ticket's out-of-scope
+/// note says a binding with write permission should be WARNED about (writes stay human). `op whoami`
+/// reports the account type; a service account is read-scoped by construction, so anything that is
+/// not a service-account type is flagged for the operator to check.
+pub fn account_type_looks_writable(account_type: &str) -> bool {
+    let lowered = account_type.to_ascii_lowercase();
+    !lowered.is_empty() && !lowered.contains("service")
+}
+
+impl crate::Orchestrator {
+    /// Record a hold for `project_slug` (STUDIO-1584). Loop-confined: written by the worker-exit
+    /// path when a dispatch is refused for an unusable credential.
+    pub(crate) fn record_onepassword_hold(&mut self, project_slug: &str, hold: OnePasswordHold) {
+        if project_slug.is_empty() {
+            return;
+        }
+        self.onepassword_holds
+            .insert(project_slug.to_string(), hold);
+    }
+
+    /// The hold on `project_slug`'s bound credential, if any.
+    pub(crate) fn onepassword_project_hold(&self, project_slug: &str) -> Option<&OnePasswordHold> {
+        self.onepassword_holds.get(project_slug)
+    }
+
+    /// Re-probe every held project's bound credential and RELEASE the hold when a probe
+    /// authenticates (STUDIO-1584). Mirrors `credential_preflight`: the probes run concurrently as
+    /// tasks and the control task awaits the join, so a probe that never returns is bounded by
+    /// [`PROBE_TIMEOUT`] rather than stranding the daemon. A timeout is an infrastructure fault and
+    /// keeps the hold; only a healthy `op whoami` releases it. A healthy probe also warns when the
+    /// credential looks writable or is within [`EXPIRY_WARN_DAYS`] of expiry.
+    pub(crate) async fn onepassword_preflight(&mut self) {
+        if self.onepassword_holds.is_empty() {
+            return;
+        }
+        let Some(source) = self.onepassword_source.clone() else {
+            // No desktop channel: a bound id can never resolve, so the hold can only stand until a
+            // token is stored. Nothing to probe.
+            return;
+        };
+        // Snapshot the (project_slug, credential id) pairs for held projects.
+        let held: Vec<(String, String)> = self
+            .eff
+            .as_ref()
+            .map(|eff| {
+                eff.projects
+                    .iter()
+                    .filter(|p| self.onepassword_holds.contains_key(&p.slug))
+                    .filter_map(|p| p.onepassword.clone().map(|id| (p.slug.clone(), id)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if held.is_empty() {
+            return;
+        }
+        let command = self.onepassword_op_command.clone();
+        let mut tasks = tokio::task::JoinSet::new();
+        for (slug, id) in held {
+            let source = source.clone();
+            let command = command.clone();
+            tasks.spawn(async move {
+                let read = source.read(&id).await;
+                let token = match read {
+                    OnePasswordRead::Present(t) if !t.is_empty() => Some(t),
+                    _ => None,
+                };
+                let health = match &token {
+                    Some(t) => probe_whoami(&command, Some(t), PROBE_TIMEOUT).await,
+                    None => OnePasswordHealth::Absent,
+                };
+                (slug, health)
+            });
+        }
+        let now = chrono::Utc::now();
+        while let Some(result) = tasks.join_next().await {
+            let Ok((slug, health)) = result else {
+                continue;
+            };
+            match &health {
+                OnePasswordHealth::Ok {
+                    account_type,
+                    expires_at,
+                    ..
+                } => {
+                    self.onepassword_holds.remove(&slug);
+                    tracing::warn!(
+                        project_slug = %slug,
+                        "1Password: the bound credential recovered; releasing the hold"
+                    );
+                    self.schedule_tick(Duration::ZERO);
+                    if account_type_looks_writable(account_type) {
+                        tracing::warn!(
+                            project_slug = %slug,
+                            account_type = %account_type,
+                            "1Password: the bound credential is not a read-only service account"
+                        );
+                    }
+                    if let Some(expires_at) = expires_at
+                        && let Some(true) = expiry_within_warning(expires_at, now)
+                    {
+                        tracing::warn!(
+                            project_slug = %slug,
+                            expires_at = %expires_at,
+                            "1Password: the bound service-account credential expires within {} \
+                             days; mint a replacement",
+                            EXPIRY_WARN_DAYS
+                        );
+                    }
+                }
+                OnePasswordHealth::Timeout => {
+                    tracing::warn!(
+                        project_slug = %slug,
+                        "1Password: the health probe timed out; keeping the hold (infrastructure \
+                         fault, not a credential failure)"
+                    );
+                }
+                OnePasswordHealth::Rejected(_) | OnePasswordHealth::Absent => {
+                    if let Some(hold) = OnePasswordHold::from_health(&slug, &health) {
+                        self.onepassword_holds.insert(slug.clone(), hold);
+                    }
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
-
+    use std::sync::Arc;
     fn fake_op(dir: &std::path::Path, body: &str) -> String {
         let path = dir.join("op");
         let mut f = std::fs::File::create(&path).expect("create fake op");
@@ -337,5 +521,149 @@ mod tests {
         }
         assert!(matches!(src.read("empty").await, OnePasswordRead::Absent));
         assert!(matches!(src.read("missing").await, OnePasswordRead::Absent));
+    }
+
+    #[test]
+    fn expiry_within_warning_only_flags_a_readable_near_expiry() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-10-30T00:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        // 10 days out: within the 14-day window.
+        assert_eq!(
+            expiry_within_warning("2026-11-09T00:00:00Z", now),
+            Some(true)
+        );
+        // 40 days out: not yet.
+        assert_eq!(
+            expiry_within_warning("2026-12-09T00:00:00Z", now),
+            Some(false)
+        );
+        // Unreadable is never a warning.
+        assert_eq!(expiry_within_warning("not a date", now), None);
+    }
+
+    #[test]
+    fn account_type_looks_writable_flags_non_service_accounts() {
+        assert!(!account_type_looks_writable("SERVICE_ACCOUNT"));
+        assert!(!account_type_looks_writable(""));
+        assert!(account_type_looks_writable("INDIVIDUAL"));
+        assert!(account_type_looks_writable("BUSINESS"));
+    }
+
+    // --- Hold + release (STUDIO-1584 review B3) -------------------------------------------------
+
+    /// An orchestrator with one project bound to `id`, a source holding `token`, and a fake `op`.
+    fn orch_holding(
+        id: &str,
+        token: Option<&str>,
+        op_body: &str,
+    ) -> (crate::Orchestrator, std::path::PathBuf) {
+        use crate::testsupport::{empty_effective, empty_resolved_project};
+        let mut eff = empty_effective(Arc::new(rhapsody_tracker::fake::Fake::new()));
+        let mut proj = empty_resolved_project(
+            "studio-infra",
+            Arc::new(rhapsody_tracker::fake::Fake::new()),
+        );
+        proj.onepassword = Some(id.to_string());
+        eff.projects = vec![proj];
+        let mut o = crate::Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        let mut map = std::collections::HashMap::new();
+        if let Some(token) = token {
+            map.insert(id.to_string(), token.to_string());
+        }
+        o.onepassword_source = Some(Arc::new(MapOnePasswordSource::new(map)));
+        let dir = tmp();
+        let script = fake_op(&dir, op_body);
+        o.onepassword_op_command = script;
+        o.record_onepassword_hold(
+            "studio-infra",
+            OnePasswordHold {
+                reason: "1Password: token rejected for project studio-infra (stale)".into(),
+                account_type: String::new(),
+                vaults: Vec::new(),
+                expires_at: None,
+            },
+        );
+        (o, dir)
+    }
+
+    #[tokio::test]
+    async fn a_successful_probe_releases_the_hold() {
+        let (mut o, dir) = orch_holding(
+            "studio-infra-readonly",
+            Some("ops_sentinel"),
+            "#!/usr/bin/env bash\necho '{\"type\":\"SERVICE_ACCOUNT\"}'\n",
+        );
+        assert!(o.onepassword_project_hold("studio-infra").is_some());
+        o.onepassword_preflight().await;
+        assert!(
+            o.onepassword_project_hold("studio-infra").is_none(),
+            "a healthy probe must release the hold"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_rejected_probe_keeps_the_hold() {
+        let (mut o, dir) = orch_holding(
+            "studio-infra-readonly",
+            Some("ops_sentinel"),
+            "#!/usr/bin/env bash\necho '[ERROR] authentication failed' >&2\nexit 1\n",
+        );
+        o.onepassword_preflight().await;
+        let hold = o
+            .onepassword_project_hold("studio-infra")
+            .expect("a rejected probe keeps the hold");
+        assert!(
+            hold.reason
+                .contains("token rejected for project studio-infra"),
+            "{hold}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_absent_credential_keeps_the_hold_with_a_bound_reason() {
+        let (mut o, _dir) = orch_holding(
+            "studio-infra-readonly",
+            None,
+            "#!/usr/bin/env bash\nexit 0\n",
+        );
+        o.onepassword_preflight().await;
+        let hold = o
+            .onepassword_project_hold("studio-infra")
+            .expect("an absent credential keeps the hold");
+        assert!(hold.reason.contains("no service account bound"), "{hold}");
+    }
+
+    #[tokio::test]
+    async fn a_probe_timeout_keeps_the_hold() {
+        let (mut o, _dir) = orch_holding(
+            "studio-infra-readonly",
+            Some("ops_sentinel"),
+            "#!/usr/bin/env bash\nsleep 30\n",
+        );
+        o.onepassword_op_command = "/nonexistent/op-xyz".to_string();
+        o.onepassword_preflight().await;
+        assert!(
+            o.onepassword_project_hold("studio-infra").is_some(),
+            "an infrastructure timeout must not release the hold"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_source_keeps_the_hold() {
+        let (mut o, _dir) = orch_holding(
+            "studio-infra-readonly",
+            Some("ops_sentinel"),
+            "#!/usr/bin/env bash\necho '{}'\n",
+        );
+        o.onepassword_source = None;
+        o.onepassword_preflight().await;
+        assert!(
+            o.onepassword_project_hold("studio-infra").is_some(),
+            "with no source there is nothing to probe, so the hold stands"
+        );
     }
 }

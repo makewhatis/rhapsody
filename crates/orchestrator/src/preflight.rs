@@ -854,6 +854,7 @@ mod tests {
                 String::new()
             },
             refused: false,
+            onepassword_hold: None,
             declared_handoff: false,
             review_verdict: None,
             verdict_text: None,
