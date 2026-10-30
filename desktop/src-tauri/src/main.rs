@@ -18,7 +18,8 @@ use rhapsody_desktop::drain::{DEFAULT_DRAIN_BUDGET, DrainOutcome, REASON_OPERATO
 use rhapsody_desktop::linearprojects::Project;
 use rhapsody_desktop::logbridge::{LogBridge, LogMsg};
 use rhapsody_desktop::onepassword_credential::{
-    OnePasswordCommandError, OnePasswordCommandService, OnePasswordMutationDto, OnePasswordStatusDto,
+    OnePasswordCommandError, OnePasswordCommandService, OnePasswordMutationDto,
+    OnePasswordStatusDto,
 };
 use rhapsody_desktop::provider_commands::{
     DaemonObservation, HttpConnectionTester, MutationResultDto, PreparedCommandDto,
@@ -548,8 +549,7 @@ fn run() -> tauri::Result<()> {
             application.set_credential_bootstrap(supervisor::CredentialBootstrap {
                 socket_dir: default_socket_dir(),
                 lookup: Arc::new(
-                    ServiceOwnerLookup::new(service.clone())
-                        .with_onepassword(onepassword.clone()),
+                    ServiceOwnerLookup::new(service.clone()).with_onepassword(onepassword.clone()),
                 ),
                 observations: observations.clone(),
             });

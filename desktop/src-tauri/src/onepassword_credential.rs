@@ -42,7 +42,8 @@ pub fn onepassword_binding(id: &str) -> Binding {
 
 /// How the service creates (and caches) the per-id credential owner. Injected so tests use
 /// in-memory keychain doubles and production uses the real Keychain under the 1Password namespace.
-pub type OnePasswordOwnerFactory = Arc<dyn Fn(&str) -> Option<Arc<dyn CredentialOwner>> + Send + Sync>;
+pub type OnePasswordOwnerFactory =
+    Arc<dyn Fn(&str) -> Option<Arc<dyn CredentialOwner>> + Send + Sync>;
 
 /// The production owner factory: the real OS Keychain under the 1Password service namespace, one
 /// owner per canonical id. A non-canonical id yields no owner (never a panic).
@@ -164,7 +165,8 @@ impl OnePasswordCommandService {
     /// surface mutates (two instances over one Keychain item would keep independent revision
     /// counters). A non-1Password or non-canonical account yields `None`, never another owner.
     pub fn owner_for_account(&self, account: &str) -> Option<Arc<dyn CredentialOwner>> {
-        let id = account.strip_prefix(rhapsody_credential_ipc::domain::ONEPASSWORD_ACCOUNT_PREFIX)?;
+        let id =
+            account.strip_prefix(rhapsody_credential_ipc::domain::ONEPASSWORD_ACCOUNT_PREFIX)?;
         if CredentialRef::for_onepassword(id).is_err() {
             return None;
         }
@@ -206,7 +208,9 @@ impl OnePasswordCommandService {
         let binding = onepassword_binding(&id);
         let revision = owner.read_bound(&binding).revision;
         match owner.connect(revision, binding, token) {
-            Ok(MutationOutcome::Advanced(_)) => Ok(mutation_dto(&id, "connect", true, "configured")),
+            Ok(MutationOutcome::Advanced(_)) => {
+                Ok(mutation_dto(&id, "connect", true, "configured"))
+            }
             Ok(MutationOutcome::AlreadyAbsent(_)) => {
                 Ok(mutation_dto(&id, "connect", false, "unconfigured"))
             }
@@ -228,7 +232,9 @@ impl OnePasswordCommandService {
         let binding = onepassword_binding(&id);
         let revision = owner.read_bound(&binding).revision;
         match owner.replace(revision, &binding, token) {
-            Ok(MutationOutcome::Advanced(_)) => Ok(mutation_dto(&id, "replace", true, "configured")),
+            Ok(MutationOutcome::Advanced(_)) => {
+                Ok(mutation_dto(&id, "replace", true, "configured"))
+            }
             Ok(MutationOutcome::AlreadyAbsent(_)) => {
                 Ok(mutation_dto(&id, "replace", false, "unconfigured"))
             }
@@ -245,7 +251,9 @@ impl OnePasswordCommandService {
         let binding = onepassword_binding(&id);
         let revision = owner.read_bound(&binding).revision;
         match owner.remove(revision) {
-            Ok(MutationOutcome::Advanced(_)) => Ok(mutation_dto(&id, "remove", true, "unconfigured")),
+            Ok(MutationOutcome::Advanced(_)) => {
+                Ok(mutation_dto(&id, "remove", true, "unconfigured"))
+            }
             Ok(MutationOutcome::AlreadyAbsent(_)) => {
                 Ok(mutation_dto(&id, "remove", false, "unconfigured"))
             }
@@ -419,7 +427,10 @@ mod tests {
     fn a_non_token_value_is_refused() {
         let svc = service_over("studio-infra-readonly", MockKeyring::empty());
         let err = svc
-            .connect("studio-infra-readonly", "not-a-service-account-token".into())
+            .connect(
+                "studio-infra-readonly",
+                "not-a-service-account-token".into(),
+            )
             .expect_err("non-token refused");
         assert_eq!(err.code(), "invalid_token");
         assert!(err.to_string().contains("ops_"));
@@ -428,7 +439,10 @@ mod tests {
     #[test]
     fn owner_for_account_routes_only_onepassword_accounts() {
         let svc = service_over("studio-infra-readonly", MockKeyring::empty());
-        assert!(svc.owner_for_account("op:v1:studio-infra-readonly").is_some());
+        assert!(
+            svc.owner_for_account("op:v1:studio-infra-readonly")
+                .is_some()
+        );
         assert!(svc.owner_for_account("v1:anthropic").is_none());
         assert!(svc.owner_for_account("op:v1:Not An Id").is_none());
         assert!(svc.owner_for_account("op:studio-infra").is_none());
@@ -441,7 +455,10 @@ mod tests {
         svc.connect("studio-infra-readonly", "ops_secret_value".into())
             .expect("connect");
         let owner = svc.owner("studio-infra-readonly").expect("owner");
-        match owner.read_bound(&onepassword_binding("studio-infra-readonly")).state {
+        match owner
+            .read_bound(&onepassword_binding("studio-infra-readonly"))
+            .state
+        {
             CredentialState::Present(lease) => {
                 assert_eq!(lease.into_lease_payload().value, "ops_secret_value")
             }
@@ -456,6 +473,11 @@ mod tests {
             CredentialStateTag::BindingMismatch
         );
         // The revision advanced from INITIAL.
-        assert!(owner.read_bound(&onepassword_binding("studio-infra-readonly")).revision > Revision::INITIAL);
+        assert!(
+            owner
+                .read_bound(&onepassword_binding("studio-infra-readonly"))
+                .revision
+                > Revision::INITIAL
+        );
     }
 }

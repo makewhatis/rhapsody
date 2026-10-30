@@ -176,7 +176,10 @@ impl ProviderCredentialOwner {
     /// The test-only seam for a 1Password credential (STUDIO-1584): an owner over an injected
     /// keychain double under the derived `op:v1:<id>` account.
     #[cfg(test)]
-    pub(crate) fn for_test_onepassword(id: &str, keyring: Arc<dyn Keyring>) -> ProviderCredentialOwner {
+    pub(crate) fn for_test_onepassword(
+        id: &str,
+        keyring: Arc<dyn Keyring>,
+    ) -> ProviderCredentialOwner {
         let credential_ref = CredentialRef::for_onepassword(id).expect("valid id");
         ProviderCredentialOwner::with_keyring(&credential_ref, keyring)
     }
