@@ -1077,6 +1077,31 @@ mod tests {
             "a hold on alice's credential must not block a teammate whose credential is fine"
         );
 
+        // The two REAL dispatch gates — not just the id-resolution helper — must resolve the
+        // profile override and refuse alice while bob is admitted. This pins the gate wiring the
+        // review's M2+M3 mutations removed (B6's dispatch half), which the helper-only assertions
+        // above left unpinned.
+        use crate::testsupport::{issue as ts_issue, running_entry};
+        let mut alice_issue = ts_issue("1", "MT-1", "Todo");
+        alice_issue.labels = Some(vec!["rhapsody:@alice".into()]);
+        assert_eq!(
+            o.planned_identity(&alice_issue, &o.teammate_load())
+                .as_deref(),
+            Some("alice"),
+            "the fixture must route to alice, or these gate assertions pin nothing"
+        );
+        assert!(
+            !o.limit_dispatch_ready(&alice_issue, "studio-infra"),
+            "the select gate must refuse alice's held profile-bound credential (review B6)"
+        );
+        let mut re = running_entry(alice_issue.clone(), "studio-infra", "studio-infra");
+        re.model_override.identity = "alice".into();
+        let mut engine = None;
+        assert!(
+            !o.gate_limit_dispatch(&mut re, &mut engine, None),
+            "the final dispatch gate must refuse alice's held profile-bound credential (review B6)"
+        );
+
         // A preflight tick probes the HELD id (not the project's), finds it still rejected, keeps it.
         let op_dir = tmp();
         let script = fake_op(

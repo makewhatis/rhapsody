@@ -1223,11 +1223,18 @@ impl Orchestrator {
         // only — a review or manager run holds no project credential binding.
         if re.review.is_none() && !crate::managerrun::is_manager_key(&re.issue.id) {
             match &e.onepassword_auth_failure {
-                Some(advisory) if !re.project_slug.is_empty() => {
-                    self.onepassword_inrun_failures
-                        .insert(re.project_slug.clone(), advisory.clone());
+                Some(advisory) => {
+                    if !re.project_slug.is_empty() {
+                        self.onepassword_inrun_failures
+                            .insert(re.project_slug.clone(), advisory.clone());
+                    }
+                    // AC6 (review B5): the advisory must also reach the RUN's own status, not only
+                    // the project-level sweep feed — that feed is keyed by project and overwritten
+                    // by the project's next run, so the run detail/history would otherwise carry no
+                    // 1Password reason at all. Record it as a timeline row on the run (best-effort:
+                    // a run with no row, i.e. store off, records nothing).
+                    self.record_run_event(&re, "onepassword.auth_failure", advisory);
                 }
-                Some(_) => {}
                 None => {
                     self.onepassword_inrun_failures.remove(&re.project_slug);
                 }
@@ -2678,9 +2685,11 @@ mod tests {
     /// STUDIO-1584 review B4: the 1Password HOLD's production wiring, end to end. A worker exit
     /// carrying `onepassword_hold` records a hold keyed by the credential id; the dispatch gate
     /// refuses the ticket while it stands; a healthy `onepassword_preflight` releases it and the gate
-    /// admits again. Removing ANY of those production sites — the exit's `record_onepassword_hold`,
-    /// the gate's `onepassword_hold_for_dispatch`, or the tick's `onepassword_preflight` — reds this
-    /// test. Before it existed, the review removed all of them and the suite stayed green.
+    /// admits again. Removing the exit's `record_onepassword_hold` or the gate's
+    /// `onepassword_hold_for_dispatch` reds this test. NOTE: it calls `onepassword_preflight`
+    /// DIRECTLY, so removing the TICK's call site (`loop.rs`) is NOT pinned here — see the review's
+    /// M4 follow-up. Before this test existed, the review removed all of them and the suite stayed
+    /// green.
     #[tokio::test]
     async fn a_worker_exit_hold_refuses_dispatch_until_a_healthy_preflight_releases_it() {
         let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
@@ -2803,6 +2812,76 @@ mod tests {
         assert!(
             o.onepassword_human_feed().is_empty(),
             "an advisory-free run must clear the stale in-run failure"
+        );
+    }
+
+    /// STUDIO-1584 (AC6, review B5): the in-run 1Password auth-failure advisory must reach the RUN's
+    /// OWN recorded history, not only the project-level reconciliation feed — that feed is keyed by
+    /// project and is overwritten by the project's next run, so the run detail/history for THIS
+    /// ticket would otherwise carry no 1Password reason at all. A ticket run whose exit carries the
+    /// advisory records an `onepassword.auth_failure` timeline row on its own `run_id`; an
+    /// advisory-free exit records none.
+    #[test]
+    fn an_in_run_op_failure_reaches_the_runs_own_history() {
+        let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(store::Sqlite::open(store::StorePath::InMemory).expect("open"));
+        o.set_store(Arc::clone(&store));
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        o.running.get_mut("1").expect("running").project_slug = "kid-coder".to_string();
+        let run_id = o.running["1"].run_id;
+        assert_ne!(run_id, 0, "the store must have recorded a run row");
+        let started = o.running["1"].started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: true,
+            started_at: started,
+            err_msg: "op failed".into(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: Some(
+                "1Password: no service account bound for project kid-coder".into(),
+            ),
+            auth_needed: false,
+        });
+        let events = store.run_events(run_id).expect("run events");
+        let row = events
+            .iter()
+            .find(|e| e.kind == "onepassword.auth_failure")
+            .expect("the advisory must be recorded on the run itself, not only the sweep feed");
+        assert!(
+            row.text
+                .contains("no service account bound for project kid-coder"),
+            "the run row must carry the reason: {}",
+            row.text
+        );
+
+        // An advisory-free exit for the same ticket records no such row on its own run.
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), None, None, String::new());
+        let run_id2 = o.running["1"].run_id;
+        let started2 = o.running["1"].started_at;
+        o.on_worker_exit(EvWorkerExit {
+            issue_id: "1".into(),
+            failed: false,
+            started_at: started2,
+            err_msg: String::new(),
+            last_state: "In Progress".into(),
+            declared_handoff: false,
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
+            auth_needed: false,
+        });
+        let events2 = store.run_events(run_id2).expect("run events");
+        assert!(
+            !events2.iter().any(|e| e.kind == "onepassword.auth_failure"),
+            "an advisory-free run must record no advisory row"
         );
     }
 

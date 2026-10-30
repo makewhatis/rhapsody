@@ -526,6 +526,27 @@ impl Orchestrator {
         self.persist_run_messages_expired(re);
     }
 
+    /// Appends ONE best-effort timeline row to a run's own history (STUDIO-1584 AC6). This is how a
+    /// run-status advisory that is not a terminal `outcome`/`error` reaches the run detail and
+    /// history — the reconciliation feed is project-keyed and is overwritten by the project's next
+    /// run, so it cannot carry a reason for THIS run. A run with no row (store disabled / the insert
+    /// failed) records nothing; like every other persist call it never fails the run.
+    pub fn record_run_event(&self, re: &RunningEntry, kind: &str, text: &str) {
+        if re.run_id == 0 {
+            return;
+        }
+        let row = store::EventRow {
+            seq: re.event_seq + 1,
+            at: rfc3339((self.now)()),
+            kind: kind.to_string(),
+            text: text.to_string(),
+            ..Default::default()
+        };
+        if let Err(e) = self.store.append_events(re.run_id, &[row]) {
+            tracing::warn!(issue_identifier = %re.issue.identifier, error = %e, "record run event failed");
+        }
+    }
+
     /// Writes per-turn progress (turns + tokens + last event). Called per TURN, not per event. A zero
     /// `run_id` is a no-op. Mirrors Go `persistProgress`.
     pub fn persist_progress(&self, re: &RunningEntry) {
