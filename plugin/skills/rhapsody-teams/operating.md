@@ -205,7 +205,7 @@ echo it, never paste it into a file or a chat:
 
 ```sh
 op service-account create studio-infra-readonly \
-  --vault Studio49:read_items \
+  --vault MyVault:read_items \
   --expires-in 90d --raw
 ```
 
@@ -219,7 +219,7 @@ scope — if a probe shows write permission, that is a warning, not a supported 
 ```yaml
 projects:
   - slugs: [studio-infra]
-    repo: git@github.com:studio49/studio-infra.git
+    repo: git@github.com:acme/studio-infra.git
     onepassword: studio-infra-readonly
 ```
 
