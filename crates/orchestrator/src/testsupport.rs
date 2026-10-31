@@ -623,6 +623,57 @@ pub(crate) fn proj_with_tracker(slug: &str, tr: Arc<Fake>, prompt: &str) -> Reso
     p
 }
 
+/// A custody-bearing [`PreparedHarnessSpec`](agent::PreparedHarnessSpec): a real broker registration
+/// for the `opencode`/`fireworks` selection, so a test can drive the BROKERED half of the dispatch
+/// path without a real CLI. The custody is move-only, so callers build one per case.
+pub(crate) fn custody_harness_spec() -> agent::PreparedHarnessSpec {
+    use rhapsody_provider_broker::{
+        BoundCredentialLease, Broker, OsRandom, SessionPolicy, SystemClock,
+    };
+    let broker = Broker::new(
+        "http://127.0.0.1:0/v1",
+        Arc::new(SystemClock::new()),
+        Arc::new(OsRandom::new()),
+    )
+    .expect("broker");
+    let plan = agent::ResolvedProviderPlan {
+        stable_id: "fireworks".to_string(),
+        protocol: agent::ProviderProtocol::OpenAiCompatible,
+        normalized_endpoint: "https://api.fireworks.ai/inference/v1".to_string(),
+        allow_insecure_http: false,
+        credential_binding:
+            "fireworks\u{1f}openai-chat-completions-bearer-v1\u{1f}https://api.fireworks.ai/inference/v1"
+                .to_string(),
+        credential_ref: "keychain".to_string(),
+        limits: agent::ProviderLimits::default(),
+        model: "accounts/fireworks/models/x".to_string(),
+        origins: agent::ProviderOrigins {
+            provider: "ticket".to_string(),
+            model: "ticket".to_string(),
+        },
+    };
+    let lowered = agent::lower_provider_plan(&plan).expect("lowered");
+    let binding = lowered.binding().expect("binding");
+    let lease =
+        BoundCredentialLease::new(binding, b"sk-fake-provider-key".to_vec()).expect("lease");
+    let policy = SessionPolicy::new(*lowered.limits()).expect("policy");
+    let registration = broker
+        .registrar()
+        .register_session(lowered, lease, policy)
+        .expect("register");
+    let provider = agent::PreparedProvider::from_registration(
+        "fireworks".to_string(),
+        agent::ProviderProtocol::OpenAiCompatible,
+        registration,
+    );
+    agent::PreparedHarnessSpec {
+        harness: agent::HarnessId::Opencode,
+        model: Some("accounts/fireworks/models/x".to_string()),
+        provider: Some(provider),
+        knobs: agent::HarnessKnobs::Opencode(Default::default()),
+    }
+}
+
 /// Seeds a retained opencode session record and its managed state directory under `root`, returning
 /// `(directory, record_path)`. `saved_at_ms` is the record's retention clock, so a caller can seed an
 /// already-expired session. For STUDIO-1043's cleanup tests.
