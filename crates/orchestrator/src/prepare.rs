@@ -226,25 +226,28 @@ impl PreparedDispatch {
     }
 
     /// Build the dispatch-time `PreparedHarnessSpec` this completion will run on, consuming the
-    /// move-only custody exactly once. `Ok(None)` is the legacy/native-login branch: no custody, so
-    /// the caller keeps the ordinary shared runner and the dispatch is byte-identical to a daemon
-    /// built before this feature. `Some` is a brokered run whose factory will own the custody.
+    /// move-only custody (when there is one) exactly once.
+    ///
+    /// The spec is built for BOTH branches, and that is the point of this method: the resolved
+    /// SELECTION — the harness/model `prepare` logged — is what the run must use, so a ticket-tier
+    /// `rhapsody:harness|model` label beats the routed profile (STUDIO-1602). A spec with no
+    /// `provider` custody is the legacy/native-login branch: the dispatch-time factory still builds
+    /// the adapter from the resolved harness's knobs, but owns no broker session and its usage folds
+    /// into the cumulative aggregate as any legacy run's does. `provider` is `Some` only for a
+    /// brokered run whose factory owns the custody.
     ///
     /// `cfg` is the target project's materialized config (its knobs build the adapter). The model
     /// comes from the pure plan the custody was opened against, falling back to the recorded model.
     pub fn into_harness_spec(
         mut self,
         cfg: &rhapsody_config::Config,
-    ) -> Result<Option<PreparedHarnessSpec>, rhapsody_agent::DispatchRefusal> {
-        let Some(custody) = self.custody.take() else {
-            return Ok(None);
-        };
-        let Some(harness) = self.harness_id() else {
-            return Err(rhapsody_agent::DispatchRefusal::Broker(format!(
+    ) -> Result<PreparedHarnessSpec, rhapsody_agent::DispatchRefusal> {
+        let harness = self.harness_id().ok_or_else(|| {
+            rhapsody_agent::DispatchRefusal::Broker(format!(
                 "prepared harness {:?} is not implemented by this build",
                 self.harness
-            )));
-        };
+            ))
+        })?;
         let model = self
             .plan
             .take()
@@ -252,12 +255,12 @@ impl PreparedDispatch {
             .filter(|m| !m.is_empty())
             .unwrap_or_else(|| self.model.clone());
         let knobs = crate::effective::knobs_for_harness(cfg, harness);
-        Ok(Some(PreparedHarnessSpec {
+        Ok(PreparedHarnessSpec {
             harness,
             model: (!model.is_empty()).then_some(model),
-            provider: Some(custody),
+            provider: self.custody.take(),
             knobs,
-        }))
+        })
     }
 
     /// The selection half of the payload, without the move-only credential lease.
@@ -1651,10 +1654,12 @@ impl Orchestrator {
     /// Runs the ordinary dispatch side effects for an accepted successful preparation. A pool pick
     /// runs its cross-daemon claim election HERE — after preparation, so a refusal never claims — and
     /// dispatches only if it won.
-    /// Build the dispatch-time [`PreparedHarnessSpec`] this accepted completion will run on, or
-    /// `Ok(None)` on the legacy branch. `Err(())` is a refusal: a completion that carries custody
-    /// but cannot produce a spec must NOT fall back to the shared runner, so the caller drops the
-    /// completion without dispatching (the custody is revoked by the drop).
+    /// Build the dispatch-time [`PreparedHarnessSpec`] this accepted completion will run on. The
+    /// spec is built for both the brokered and the legacy/native-login branch — the resolved
+    /// selection is what the run uses (STUDIO-1602) — so `Ok(None)` only ever means "no effective
+    /// config to build knobs from". `Err(())` is a refusal: a completion whose harness this build
+    /// cannot run must NOT fall back to the shared runner, so the caller drops the completion
+    /// without dispatching (the custody is revoked by the drop).
     fn prepared_spec(
         &self,
         prepared: PreparedDispatch,
@@ -1666,7 +1671,7 @@ impl Orchestrator {
         let cfg = slug
             .and_then(|s| eff.project_by_slug(s).map(|p| &p.mcfg))
             .unwrap_or(&eff.cfg);
-        prepared.into_harness_spec(cfg).map_err(|e| {
+        prepared.into_harness_spec(cfg).map(Some).map_err(|e| {
             tracing::error!(
                 err = %e,
                 "a prepared dispatch's spec could not be built; refusing the dispatch rather than \
@@ -2384,6 +2389,216 @@ mod tests {
             pool_proj: None,
             reopen: None,
         }
+    }
+
+    /// A ticket target for a specific candidate, so a test can carry routing labels.
+    fn ticket_target_issue(iss: Issue) -> PreparedTarget {
+        PreparedTarget::Ticket {
+            issue: iss,
+            attempt: None,
+            route: None,
+            stack_context: String::new(),
+            pool: false,
+            pool_proj: None,
+            reopen: None,
+        }
+    }
+
+    /// A legacy-path orchestrator whose ROUTED teammate's profile names `opencode` (a real profile
+    /// file, so `route_teams` resolves it exactly as production does), with the given candidate.
+    /// For STUDIO-1602: a ticket-tier `rhapsody:harness|model` label must beat this profile.
+    fn orch_with_resolver_and_opencode_profile(
+        scripted: Scripted,
+        candidate: Issue,
+    ) -> (Orchestrator, DispatchedEntries, crate::testsupport::TempDir) {
+        let dir = crate::testsupport::TempDir::new();
+        let profiles = std::path::PathBuf::from(dir.child("profiles"));
+        std::fs::create_dir_all(&profiles).expect("profiles dir");
+        std::fs::write(
+            profiles.join("opencode-prof.md"),
+            "---\nextends: swe\nharness: opencode\n---\nOpenCode profile.\n",
+        )
+        .expect("write profile");
+        let mut tr = Fake::new();
+        tr.candidates = vec![candidate.clone()];
+        // Completion revalidation re-reads the issue by id, so the Fake must answer that read.
+        tr.by_id.insert(candidate.id.clone(), candidate.clone());
+        let mut eff = empty_effective(Arc::new(tr));
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.max_concurrent = 10;
+        eff.poll_interval = Duration::from_secs(3600);
+        eff.max_retry_backoff_ms = 300_000;
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            roster: vec![rhapsody_config::teams::Identity {
+                name: "jerry".to_string(),
+                profile: "opencode-prof".to_string(),
+                labels: vec!["rust".to_string()],
+                ..Default::default()
+            }],
+            ..rhapsody_config::teams::Teams::disabled()
+        });
+        o.teams_profiles_dir = Some(profiles);
+        o.prepare_resolver = Some(Arc::new(FakeResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Mutex::new(scripted),
+        }));
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+        (o, sink, dir)
+    }
+
+    /// A Todo candidate wearing the `rust` routing label (so it routes to `jerry`) plus the given
+    /// ticket-tier routing labels.
+    fn routed_candidate(extra: &[&str]) -> Issue {
+        let mut labels = vec!["rust".to_string()];
+        labels.extend(extra.iter().map(|s| (*s).to_string()));
+        Issue {
+            labels: Some(labels),
+            ..issue("1", "MT-1", "Todo")
+        }
+    }
+
+    /// STUDIO-1602 acceptance #1: a ticket labeled `rhapsody:harness/claude` + `rhapsody:model/m`
+    /// for an identity whose PROFILE is `opencode` runs on Claude with model `m`. Before the fix the
+    /// resolved selection was dropped on the legacy/native-login branch and the run kept the
+    /// profile's opencode harness.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_harness_and_model_beat_the_opencode_profile() {
+        let candidate =
+            routed_candidate(&["rhapsody:harness/claude", "rhapsody:model/claude-opus-5-5"]);
+        let (mut o, sink, _dir) =
+            orch_with_resolver_and_opencode_profile(Scripted::Ready, candidate.clone());
+        // Sanity: the profile really does route this ticket to opencode.
+        let td = o.route_teams(&candidate).expect("routed to jerry");
+        assert_eq!(td.harness, "opencode", "the profile names opencode");
+        assert_eq!(td.identity, "jerry");
+
+        assert!(matches!(
+            o.begin_preparation(ticket_target_issue(candidate), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                // The legacy/native-login branch: claude has no provider adapter, so no custody.
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new(
+                    "claude",
+                    "claude-opus-5-5",
+                    "",
+                    "",
+                )),
+                observed_revision: String::new(),
+                resolved: PreparedSelection {
+                    harness: "claude".to_string(),
+                    model: "claude-opus-5-5".to_string(),
+                    provider: String::new(),
+                },
+            },
+        )
+        .await;
+
+        let entries = sink.lock().expect("dispatch sink");
+        assert_eq!(entries.len(), 1, "the ticket dispatches exactly once");
+        assert_eq!(
+            entries[0].harness, "claude",
+            "the ticket-tier harness must beat the profile's opencode"
+        );
+        assert_eq!(
+            entries[0].model_override.model, "claude-opus-5-5",
+            "the ticket-tier model must beat the profile's"
+        );
+        assert_eq!(entries[0].identity, "jerry", "still routed to the teammate");
+    }
+
+    /// STUDIO-1602 acceptance #3 (no regression): a ticket with NO routing labels keeps the
+    /// profile's harness — the resolved selection IS the profile's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_ticket_without_routing_labels_keeps_the_profile_harness() {
+        let candidate = routed_candidate(&[]);
+        let (mut o, sink, _dir) =
+            orch_with_resolver_and_opencode_profile(Scripted::Ready, candidate.clone());
+        assert!(matches!(
+            o.begin_preparation(ticket_target_issue(candidate), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new("opencode", "m", "", "")),
+                observed_revision: String::new(),
+                resolved: PreparedSelection {
+                    harness: "opencode".to_string(),
+                    model: "m".to_string(),
+                    provider: String::new(),
+                },
+            },
+        )
+        .await;
+        let entries = sink.lock().expect("dispatch sink");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].harness, "opencode",
+            "with no routing labels the profile's opencode still wins"
+        );
+    }
+
+    /// STUDIO-1602 acceptance #2: a retained OpenCode session is NOT resumed when the ticket
+    /// resolves to Claude. The resolved harness chooses the Claude runner, so the OpenCode resume
+    /// path is never reached and the retained session is left untouched — a cold Claude session
+    /// starts. (The runner-level model guard is pinned by the agent crate's
+    /// `opencode::runner::tests::a_model_mismatch_starts_cold`.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retained_opencode_session_is_not_resumed_when_the_ticket_resolves_to_claude() {
+        let candidate = routed_candidate(&["rhapsody:harness/claude"]);
+        let (mut o, sink, dir) =
+            orch_with_resolver_and_opencode_profile(Scripted::Ready, candidate.clone());
+        // Point the opencode state root at a temp dir and seed a retained session there.
+        let state_root = std::path::PathBuf::from(dir.child("state"));
+        std::fs::create_dir_all(&state_root).expect("state root");
+        o.eff.as_mut().expect("eff").cfg.opencode.state_root =
+            state_root.to_string_lossy().into_owned();
+        let (kept_dir, record) =
+            crate::testsupport::seed_opencode_session(&state_root, "MT-1", 1_000_000);
+        assert!(kept_dir.is_dir() && record.is_file());
+
+        assert!(matches!(
+            o.begin_preparation(ticket_target_issue(candidate), false),
+            BeginPreparation::Started(_)
+        ));
+        let token = o.preparing.get("1").map(|e| e.token).expect("reservation");
+        o.handle_dispatch_prepared(
+            "1".to_string(),
+            token,
+            PreparationCompletion {
+                outcome: PreparationOutcome::Ready(PreparedDispatch::new("claude", "m", "", "")),
+                observed_revision: String::new(),
+                resolved: PreparedSelection {
+                    harness: "claude".to_string(),
+                    model: "m".to_string(),
+                    provider: String::new(),
+                },
+            },
+        )
+        .await;
+
+        let entries = sink.lock().expect("dispatch sink");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].harness, "claude",
+            "the ticket resolves to claude, so the opencode runner (and its resume) is never chosen"
+        );
+        assert!(
+            kept_dir.is_dir() && record.is_file(),
+            "the retained opencode session is untouched: no resume consumed it"
+        );
     }
 
     // --- no resolver: byte-identical / inert by default -------------------------------------------

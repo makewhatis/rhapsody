@@ -2731,6 +2731,78 @@ mod tests {
         assert_eq!(o.running["1"].identity, "alice");
     }
 
+    /// STUDIO-1602 review B1 (regression). A legacy/native-login spec IS the run's resolved
+    /// selection and is normally carried to the worker — but when `gate_limit_dispatch` switches the
+    /// run to a healthy FALLBACK engine, the selection has been left behind: the engine's harness and
+    /// model are what run. Before the fix the spec survived (the drop keyed only on broker CUSTODY),
+    /// so `spawn_worker` rebuilt the runner from the spec's PRIMARY harness and the worker then
+    /// handed that runner the fallback engine's model — `claude --model fireworks-ai/model` on the
+    /// very account the fallback exists to avoid, while the run row recorded the engine.
+    ///
+    /// The pool holds a fake ONLY for the engine's harness (`opencode`); the primary harness
+    /// (`claude`) is absent, so a carried spec makes `spawn_worker` REFUSE the dispatch rather than
+    /// build a real CLI. Green here therefore proves the spec was dropped and the engine's runner ran.
+    ///
+    /// MUTATION: revert the drop to `spec.provider.is_some() && !re.brokered` and the run is refused
+    /// (the `claude` runner is selected from the carried spec) — this test reds.
+    #[tokio::test]
+    async fn a_fallback_engine_switch_drops_the_resolved_selection_spec() {
+        let (mut o, _st, _clock, _dir) = setup(true);
+        let ws = TempDir::new();
+        let engine_agent = Arc::new(rhapsody_agent::fake::Fake::new());
+        if let Some(eff) = o.eff.as_mut() {
+            eff.workspace = crate::testsupport::mk_workspace(&ws.child("ws"));
+            eff.prompt_tmpl = "do it".to_string();
+            eff.agents.insert("opencode".into(), engine_agent.clone());
+        }
+        // Drive the real spawn, not the recording seam.
+        o.spawn = None;
+        o.accounts
+            .observe("claude-subscription", observation(0.91, 5000));
+        let mut rx = o.take_events_rx().expect("control-event receiver");
+
+        let spec = rhapsody_agent::PreparedHarnessSpec {
+            harness: rhapsody_agent::HarnessId::Claude,
+            model: Some("opus".to_string()),
+            provider: None,
+            knobs: rhapsody_agent::HarnessKnobs::Claude(Default::default()),
+        };
+        let mut iss = issue("1", "MT-1", "Todo");
+        iss.labels = Some(vec!["rhapsody:@alice".into()]);
+        o.dispatch_issue_prepared(iss, None, None, String::new(), Some(spec));
+
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await {
+                    Some(crate::Event::WorkerExit(e)) => return e,
+                    Some(_) => continue,
+                    None => panic!("control channel closed before a worker exit"),
+                }
+            }
+        })
+        .await
+        .expect("the worker must post an exit");
+
+        assert!(
+            !exit.refused,
+            "the fallback engine's runner must run, not a refusal for the carried spec's primary harness"
+        );
+        assert_eq!(
+            engine_agent.started_fresh(),
+            1,
+            "the fallback engine's runner starts the run; a carried spec would refuse instead"
+        );
+        assert_eq!(
+            engine_agent.last_model_override().map(|m| m.model),
+            Some("fireworks-ai/model".to_string()),
+            "the run carries the ENGINE's model, not the dropped spec's"
+        );
+        let re = &o.running["1"];
+        assert_eq!(re.engine_index, 1);
+        assert_eq!(re.harness, "opencode");
+        assert_eq!(re.model_override.model, "fireworks-ai/model");
+    }
+
     #[test]
     fn handoff_sends_message_via_mailbox() {
         let (mut o, st, _, _dir) = setup(false);

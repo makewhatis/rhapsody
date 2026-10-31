@@ -915,6 +915,17 @@ pub async fn run_agent_attempt(
     // The move-only prepared custody is taken exactly once, here. If this attempt never reaches
     // `start`, it is dropped at return and revokes the prepared broker session (design §10.3).
     let prepared = deps.prepared.take();
+    // STUDIO-1602: every preparation now produces a spec (the resolved selection), but only one
+    // carrying broker CUSTODY freezes its launch context and takes no late setter. A legacy/
+    // native-login spec still needs the routed teammate's profile identity/effort landed on the
+    // session after it starts, exactly as the inline path does.
+    let prepared_brokered = prepared
+        .as_ref()
+        .is_some_and(|spec| spec.provider.is_some());
+    let prepared_harness = prepared
+        .as_ref()
+        .map(|spec| spec.harness.name().to_string());
+    let prepared_model = prepared.as_ref().and_then(|spec| spec.model.clone());
     // CAPABILITY VALIDATION, BEFORE ANYTHING IS SPAWNED (STUDIO-978; design §5).
     //
     // The ticket's mutation discipline is explicit: moving this check after the runner spawn must
@@ -1418,6 +1429,14 @@ pub async fn run_agent_attempt(
     // (no binding, or no stored token) leaves the session's env with only the biometric-disable
     // variable, so an unbound `op` call fails fast.
     sess.set_onepassword_token(onepassword_token.clone());
+    // STUDIO-1602: on the legacy/native-login branch the routed teammate's profile identity/effort
+    // must still reach the session. `DispatchRunner::start`'s bridge applied only the spec's MODEL,
+    // so re-apply the whole override (which carries the resolved model AND the profile identity/
+    // effort) here. A brokered run is deliberately excluded: its launch context is frozen at start
+    // and takes no late setter.
+    if !prepared_brokered {
+        sess.set_model_override(deps.model_override.clone());
+    }
     if !deps.resume_session.is_empty()
         && let Err(error) = sess.resume_from(&deps.resume_session)
     {
@@ -1456,6 +1475,25 @@ pub async fn run_agent_attempt(
     {
         slots.install_receiver(receiver);
     }
+    // STUDIO-1602: say WHICH harness and model this run is actually starting on, right after the
+    // session exists, so `prepare`'s `harness=… model=…` line can never quietly disagree with
+    // reality (the reported bug: `prepare` logged `harness=claude model=claude-opus-5-5` while the
+    // run executed on the profile's opencode/deepseek). The prepared spec is what built the session,
+    // so its harness/model win; an inline dispatch falls back to the selected runner and the routed
+    // override. The model is empty only when the harness keeps its own configured default.
+    let running_harness = prepared_harness
+        .as_deref()
+        .unwrap_or_else(|| deps.agent.id().name());
+    let running_model = prepared_model
+        .as_deref()
+        .filter(|m| !m.is_empty())
+        .unwrap_or(deps.model_override.model.as_str());
+    tracing::info!(
+        issue = %issue.identifier,
+        harness = %running_harness,
+        model = %running_model,
+        "agent run starting on the resolved harness/model"
+    );
 
     let (final_state, result_text, loop_err) = deps
         .run_turns(
@@ -5886,6 +5924,80 @@ exit 1
             },
             err: None,
         }])
+    }
+
+    /// STUDIO-1602 acceptance #4: a run logs, right after its session starts, the harness and model
+    /// it is ACTUALLY running — so `prepare`'s `harness=… model=…` line can never quietly disagree.
+    /// Driven on BOTH harnesses: the fake reports `claude` by default and `opencode` when its
+    /// `harness` field says so, and each run's line must name the right pair.
+    #[tokio::test]
+    async fn the_running_line_names_the_harness_and_model_on_every_harness() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
+        let (logs, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+
+        // TRA-243: warm the callsite so a parallel no-subscriber test cannot cache it
+        // `Interest::never`, then capture fresh attempts.
+        {
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let mut warm = make_deps(
+                ws,
+                fake_agent(vec![succeeded_turn()]),
+                fake_tracker_by_id(&[("1", "MT-1", "Done")]),
+                "p",
+                20,
+            );
+            let _ =
+                run_agent_attempt(&mut warm, dispatched(), None, None, &noop_event(), None).await;
+        }
+        tracing::callsite::rebuild_interest_cache();
+        logs.lock().expect("event buffer lock").clear();
+
+        for harness in [agent::HarnessId::Claude, agent::HarnessId::Opencode] {
+            let mut ag = agentfake::Fake::new();
+            ag.harness = harness;
+            ag.turns = vec![succeeded_turn()];
+            let (ws, _root) = test_workspace(HookScripts::default());
+            let mut d = make_deps(
+                ws,
+                Arc::new(ag),
+                fake_tracker_by_id(&[("1", "MT-1", "Done")]),
+                "p",
+                20,
+            );
+            d.model_override = agent::ModelOverride {
+                model: "resolved-model".to_string(),
+                ..Default::default()
+            };
+            let (_last, _declared, err) =
+                run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+            assert!(err.is_none(), "expected a normal run, got {err:?}");
+        }
+        drop(guard);
+
+        let captured = logs.lock().expect("event buffer lock");
+        let lines: Vec<_> = captured
+            .iter()
+            .filter(|e| e.message == "agent run starting on the resolved harness/model")
+            .collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "one running line per run: {:?}",
+            captured.iter().map(|e| &e.message).collect::<Vec<_>>()
+        );
+        for (line, want_name) in lines.iter().zip(["claude", "opencode"]) {
+            assert_eq!(
+                line.fields.get("harness").map(String::as_str),
+                Some(want_name),
+                "the running line must name the harness actually running: {line:?}"
+            );
+            assert_eq!(
+                line.fields.get("model").map(String::as_str),
+                Some("resolved-model"),
+                "the running line must name the model actually running: {line:?}"
+            );
+        }
     }
 
     // STUDIO-1375: an empty-message keepalive notification must not produce a blank line in the

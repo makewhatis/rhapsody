@@ -2324,16 +2324,22 @@ impl Orchestrator {
                 }
             }
         }
-        // PB7: a prepared (brokered) dispatch runs on the harness the SELECTION resolved, not the
-        // routed profile's. The shared runner is stamped only so the worker's capability validation
-        // reads the right harness's declaration; the move-only spec is what builds the real adapter
-        // and owns the broker custody. A prepared dispatch always has an implemented harness
+        // PB7: a prepared dispatch runs on the harness the SELECTION resolved, not the routed
+        // profile's. The shared runner is stamped so the worker's capability validation reads the
+        // right harness's declaration; the spec is what builds the real adapter and (when it carries
+        // one) owns the broker custody. A prepared dispatch always has an implemented harness
         // (unsupported selections were refused before registration), so the pool lookup cannot miss
         // — but if it did, the run is refused rather than silently run on another harness.
+        //
+        // STUDIO-1602: EVERY preparation produces a spec now, including the legacy/native-login
+        // branch (no custody) — the resolved selection is what the run uses. Only a spec carrying
+        // broker CUSTODY arms the broker turn supervisor; a legacy spec runs on the ordinary shared
+        // session and its usage folds into the aggregate as any legacy run's does.
         if let Some(spec) = prepared {
             let name = spec.harness.name();
             account_harness = name.to_string();
             account_model = spec.model.clone().unwrap_or_default();
+            let brokered = spec.provider.is_some();
             provider_account = spec.provider.as_ref().map(|p| p.stable_id().to_string());
             let pool = eff
                 .project_by_slug(&project_slug)
@@ -2348,9 +2354,11 @@ impl Orchestrator {
                 }
             }
             deps.prepared = Some(spec);
-            deps.broker = Some(Arc::new(std::sync::Mutex::new(
-                crate::worker::BrokerTurnSlots::default(),
-            )));
+            if brokered {
+                deps.broker = Some(Arc::new(std::sync::Mutex::new(
+                    crate::worker::BrokerTurnSlots::default(),
+                )));
+            }
         }
         // The loop-external broker supervisor, retained by this closure across the run future so a
         // cancelled turn's finalized receipt is still drained and persisted (design §10.3).
