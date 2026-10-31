@@ -861,15 +861,28 @@ impl Orchestrator {
         let canary = self
             .credential_canary_due(&re, &canary_account)
             .then(|| (self.effective_harness(&re.harness), canary_account));
-        // A CUSTODY-bearing spec that is not brokered would strand a broker session nothing
-        // accounts for (STUDIO-1211): drop it rather than carry it. A legacy/native-login spec (no
-        // custody) is the resolved selection and must be carried (STUDIO-1602).
-        if prepared
-            .as_ref()
-            .is_some_and(|spec| spec.provider.is_some())
-            && !re.brokered
+        // A prepared spec IS the run's resolved selection and is carried only while that selection
+        // is what will actually run. Two things revoke it:
+        //  * an ENGINE was selected — pinned on a retry above, or a healthy fallback chosen by
+        //    `gate_limit_dispatch` — so the engine's harness/model are what run. Carrying the spec
+        //    would let `spawn_worker` rebuild the runner from it (the PRIMARY harness) and the
+        //    worker's `set_model_override` then hand that runner the ENGINE's model, running on the
+        //    limited primary account the fallback exists to avoid while the run row records the
+        //    engine (STUDIO-1602 review B1);
+        //  * a CUSTODY-bearing spec that is no longer brokered would strand a broker session
+        //    nothing accounts for (STUDIO-1211).
+        if engine.is_some()
+            || (prepared
+                .as_ref()
+                .is_some_and(|spec| spec.provider.is_some())
+                && !re.brokered)
         {
             prepared = None;
+            // The run holds no spec custody any more and is not on a brokered runner, so its child
+            // figure must fold into the cumulative aggregate as any ordinary run's does — the receipt
+            // that would have settled it never arrives. (Already false on the fallback and
+            // legacy/native-login paths; this corrects a custody spec dropped for a pinned engine.)
+            re.brokered = false;
         }
         if engine.is_some() {
             re.harness_origin = format!("profile.engine[{}]", re.engine_index);
