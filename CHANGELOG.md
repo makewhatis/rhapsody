@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.9](https://github.com/makewhatis/rhapsody/compare/v0.3.8...v0.3.9) (2026-10-31)
+
+
+### Features
+
+* **orchestrator:** first-class 1Password service-account credentials for agent runs (STUDIO-1584) ([#385](https://github.com/makewhatis/rhapsody/issues/385)) ([2b8cba4](https://github.com/makewhatis/rhapsody/commit/2b8cba43453b6c5063502ef5c7527fcfcc2967e8))
+
+
+### Bug Fixes
+
+* **orchestrator:** run on the resolved selection, not the routed profile (STUDIO-1602) ([#387](https://github.com/makewhatis/rhapsody/issues/387)) ([27ae2af](https://github.com/makewhatis/rhapsody/commit/27ae2af32e4a66c141ee7cb17e9337f9efe4d094))
+
 ## [0.3.8](https://github.com/makewhatis/rhapsody/compare/v0.3.7...v0.3.8) (2026-10-24)
 
 
