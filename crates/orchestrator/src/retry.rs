@@ -463,7 +463,12 @@ impl Orchestrator {
             self.log_subject_parked_dispatch(&iss.identifier);
             return;
         }
-        if prepared.is_none()
+        // The coarse pre-gate is skipped only for a dispatch that carries broker CUSTODY: its
+        // preparation already read the credential, so the real gate (`gate_limit_dispatch`, below)
+        // is the only one that must run. A legacy/native-login spec (STUDIO-1602: the resolved
+        // selection with no provider) is an ordinary run and keeps this pre-check, exactly as the
+        // inline path it replaced did.
+        if prepared.as_ref().is_none_or(|spec| spec.provider.is_none())
             && engine.is_none()
             && !crate::landing::is_landing_key(&iss.id)
             && !self.pending_manager.contains_key(&iss.id)
@@ -611,8 +616,14 @@ impl Orchestrator {
         re.review = review.clone();
         // PB7 (STUDIO-1002, STUDIO-1047): a prepared dispatch's usage is settled from the broker
         // receipt, so its child figure is excluded from the cumulative aggregate (`on_agent_update`)
-        // while still kept on the entry for the ceiling/floor. `false` on every legacy dispatch.
-        re.brokered = prepared.is_some();
+        // while still kept on the entry for the ceiling/floor. STUDIO-1602: EVERY preparation now
+        // produces a spec (the resolved selection), but only one carrying broker CUSTODY is
+        // settled from a receipt — a legacy/native-login spec (no provider) is an ordinary run
+        // whose child figure must fold in as before. So the flag keys on the custody, not on the
+        // spec's presence.
+        re.brokered = prepared
+            .as_ref()
+            .is_some_and(|spec| spec.provider.is_some());
         re.started_at = (self.now)();
         re.retry_attempt = attempt_norm;
         re.stack_context = stack_context;
@@ -628,10 +639,13 @@ impl Orchestrator {
             // so the worker keeps the configured backend's runner and the dispatch is unchanged.
             re.harness = td.harness.clone();
         }
-        // PB7 (STUDIO-1002): a prepared dispatch runs on the harness/model the pure SELECTION
-        // resolved, not the routed profile's — the move-only spec owns the real adapter. Recording
+        // PB7 (STUDIO-1002, STUDIO-1602): a prepared dispatch runs on the harness/model the pure
+        // SELECTION resolved, not the routed profile's — the spec owns the real adapter. Recording
         // the selection here keeps the run's provenance (and the agent child's model env) describing
-        // what actually ran. `None` on every legacy dispatch, so nothing changes for one.
+        // what actually ran. This now covers the legacy/native-login branch too: a ticket-tier
+        // `rhapsody:harness|model` label beats the profile, exactly as the documented precedence
+        // chain says. Only an INLINE dispatch (no preparation at all — a daemon with no provider
+        // configured) still reaches here with `prepared == None` and keeps the profile's values.
         if let Some(spec) = &prepared {
             re.harness = spec.harness.name().to_string();
             if let Some(model) = spec.model.as_deref()
@@ -847,7 +861,14 @@ impl Orchestrator {
         let canary = self
             .credential_canary_due(&re, &canary_account)
             .then(|| (self.effective_harness(&re.harness), canary_account));
-        if prepared.is_some() && !re.brokered {
+        // A CUSTODY-bearing spec that is not brokered would strand a broker session nothing
+        // accounts for (STUDIO-1211): drop it rather than carry it. A legacy/native-login spec (no
+        // custody) is the resolved selection and must be carried (STUDIO-1602).
+        if prepared
+            .as_ref()
+            .is_some_and(|spec| spec.provider.is_some())
+            && !re.brokered
+        {
             prepared = None;
         }
         if engine.is_some() {
@@ -2476,23 +2497,29 @@ mod tests {
         assert_eq!(*dispatched.lock().unwrap(), vec!["1".to_string()]);
     }
 
-    /// MUTATION GUARD (STUDIO-1047, alice's blocking finding B1). `re.brokered = prepared.is_some()`
-    /// is PRODUCTION wiring — every other accounting test hand-builds an entry and sets the flag
-    /// itself, so nothing pinned the line that actually decides it. This drives the real
-    /// `dispatch_issue_prepared` through both halves: a legacy dispatch (`None`) folds its child's
-    /// committed figure into the cumulative aggregate, a prepared one (`Some`) does not, because its
-    /// usage is settled from the broker receipt instead. Flipping the assignment either way reds
-    /// this test: `= true` stops a legacy aggregate growing, `= false` folds a brokered child figure
-    /// in (which the receipt then adds on top of, double-counting).
+    /// MUTATION GUARD (STUDIO-1047, alice's blocking finding B1; corrected by STUDIO-1602).
+    /// `re.brokered` is PRODUCTION wiring — every other accounting test hand-builds an entry and
+    /// sets the flag itself, so nothing pinned the line that actually decides it. This drives the
+    /// real `dispatch_issue_prepared` through every shape and asserts the flag keys on broker
+    /// CUSTODY, not merely on a spec being present: an inline dispatch (`None`) and a
+    /// legacy/native-login prepared spec (a resolved selection with NO provider) fold their child's
+    /// committed figure into the cumulative aggregate; only a custody-bearing spec does not,
+    /// because its usage is settled from the broker receipt instead. Flipping the assignment either
+    /// way reds this test: `= true` stops a legacy aggregate growing, `= false` folds a brokered
+    /// child figure in (which the receipt then adds on top of, double-counting).
     #[test]
     fn dispatch_wiring_decides_whether_a_child_figure_enters_the_aggregate() {
-        let spec = || rhapsody_agent::PreparedHarnessSpec {
+        let legacy_spec = || rhapsody_agent::PreparedHarnessSpec {
             harness: rhapsody_agent::HarnessId::Opencode,
             model: Some("accounts/fireworks/models/x".to_string()),
             provider: None,
             knobs: rhapsody_agent::HarnessKnobs::Opencode(Default::default()),
         };
-        for (prepared, want_brokered) in [(None, false), (Some(spec()), true)] {
+        for (prepared, want_brokered) in [
+            (None, false),
+            (Some(legacy_spec()), false),
+            (Some(custody_harness_spec()), true),
+        ] {
             let (mut o, _) = orch_for_retry(Arc::new(Fake::new()), 10);
             o.dispatch_issue_prepared(
                 issue("1", "MT-1", "Todo"),
@@ -2503,7 +2530,8 @@ mod tests {
             );
             assert_eq!(
                 o.running["1"].brokered, want_brokered,
-                "the flag must be stamped from prepared.is_some() at dispatch, not by a fixture"
+                "the flag must be stamped from the spec's broker CUSTODY at dispatch, not by a \
+                 fixture and not merely from a spec being present"
             );
 
             o.on_agent_update(crate::agentupdate::AgentUpdate {
