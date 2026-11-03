@@ -597,10 +597,83 @@ const PR_LIST_LIMIT: &str = "20";
 #[async_trait]
 pub trait OpenPrSource: Send + Sync {
     async fn open_pr_for_branch(&self, owner: &str, repo: &str, branch: &str) -> OpenPrResult;
+
+    /// Companion discovery (STUDIO-1691): exact prefix or a `-`, `_`, `.` suffix, with the
+    /// same open-state and head-owner guards as the exact lookup. Unsupported sources fail loudly.
+    async fn open_prs_for_branch_prefix(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _prefix: &str,
+    ) -> Result<Vec<OpenPr>, Box<dyn std::error::Error + Send + Sync>> {
+        Err("branch-prefix pull-request discovery is unsupported".into())
+    }
+}
+
+fn branch_matches_prefix(branch: &str, prefix: &str) -> bool {
+    !prefix.is_empty()
+        && branch.strip_prefix(prefix).is_some_and(|tail| {
+            tail.is_empty() || matches!(tail.as_bytes().first(), Some(b'-' | b'_' | b'.'))
+        })
 }
 
 #[async_trait]
 impl OpenPrSource for GH {
+    async fn open_prs_for_branch_prefix(
+        &self,
+        owner: &str,
+        repo: &str,
+        prefix: &str,
+    ) -> Result<Vec<OpenPr>, Box<dyn std::error::Error + Send + Sync>> {
+        if owner.is_empty() || repo.is_empty() || prefix.is_empty() {
+            return Ok(Vec::new());
+        }
+        let slug = format!("{owner}/{repo}");
+        // Search narrows the bounded result set; it is NOT the matching/security decision.
+        // Only headRefName and headRepositoryOwner below decide membership, never title/body.
+        let search = format!("head:{prefix}");
+        let args = [
+            "pr",
+            "list",
+            "--repo",
+            &slug,
+            "--state",
+            "open",
+            "--search",
+            &search,
+            "--json",
+            "url,headRefName,headRefOid,headRepositoryOwner",
+            "--limit",
+            PR_LIST_LIMIT,
+        ];
+        let body = self.run_off_task(args.map(String::from).into()).await?;
+        let prs: Vec<serde_json::Value> = serde_json::from_slice(&body).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("decode gh pr list --repo {slug} --search {search}: {e}").into()
+            },
+        )?;
+        Ok(prs
+            .iter()
+            .filter_map(|p| {
+                let branch = p.get("headRefName")?.as_str()?;
+                let head_owner = p.get("headRepositoryOwner")?.get("login")?.as_str()?;
+                if !branch_matches_prefix(branch, prefix) || !head_owner.eq_ignore_ascii_case(owner)
+                {
+                    return None;
+                }
+                let url = p.get("url")?.as_str().filter(|u| !u.is_empty())?;
+                Some(OpenPr {
+                    url: url.to_string(),
+                    head_sha: p
+                        .get("headRefOid")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                })
+            })
+            .collect())
+    }
+
     /// One bounded `gh pr list --repo <owner>/<repo> --head <branch> --state open --json
     /// url,headRefOid,headRepositoryOwner --limit <PR_LIST_LIMIT>`, answering the newest matching
     /// PR whose head repository belongs to the account that was queried.
@@ -3089,6 +3162,83 @@ mod tests {
     }
 
     // ── open_pr_for_branch (STUDIO-674; no Go counterpart) ──────────────────────────────────────
+
+    #[test]
+    fn companion_branch_matching_has_an_anchored_ticket_boundary() {
+        for branch in [
+            "symphony/STUDIO-1621",
+            "symphony/STUDIO-1621-publisher",
+            "symphony/STUDIO-1621_publisher",
+            "symphony/STUDIO-1621.publisher",
+        ] {
+            assert!(
+                branch_matches_prefix(branch, "symphony/STUDIO-1621"),
+                "{branch}"
+            );
+        }
+        for branch in [
+            "symphony/STUDIO-16210",
+            "symphony/STUDIO-1621x",
+            "symphony/STUDIO-1621/publisher",
+            "x/symphony/STUDIO-1621",
+            "symphony/STUDIO-1621é",
+            "STUDIO-1621-publisher",
+        ] {
+            assert!(
+                !branch_matches_prefix(branch, "symphony/STUDIO-1621"),
+                "{branch}"
+            );
+        }
+        assert!(!branch_matches_prefix("symphony/STUDIO-1621", ""));
+    }
+
+    #[tokio::test]
+    async fn companion_lookup_rejects_forks_missing_heads_and_body_only_matches() {
+        let src = GH::new(
+            "@symphony",
+            Some(Box::new(|_| {
+                Ok(br#"[
+            {"url":"https://github.com/o/r/pull/1", "headRefName":"symphony/MT-1-fork",
+             "headRepositoryOwner":{"login":"stranger"}},
+            {"url":"https://github.com/o/r/pull/2", "headRefName":"symphony/MT-1-deleted",
+             "headRepositoryOwner":null},
+            {"url":"https://github.com/o/r/pull/3", "headRefName":"unrelated",
+             "headRepositoryOwner":{"login":"o"}, "body":"Fixes MT-1 symphony/MT-1"},
+            {"url":"https://github.com/o/r/pull/4", "headRefName":"symphony/MT-1-real",
+             "headRepositoryOwner":{"login":"O"}},
+            {"url":"https://github.com/o/r/pull/5", "headRefName":"symphony/MT-1.other",
+             "headRepositoryOwner":{"login":"o"}}
+        ]"#
+                .to_vec())
+            })),
+        );
+        let prs = src
+            .open_prs_for_branch_prefix("o", "r", "symphony/MT-1")
+            .await
+            .expect("lookup");
+        assert_eq!(
+            prs.iter().map(|p| p.url.as_str()).collect::<Vec<_>>(),
+            [
+                "https://github.com/o/r/pull/4",
+                "https://github.com/o/r/pull/5"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn companion_lookup_propagates_exec_and_decode_failures() {
+        for run in [
+            Box::new(|_: &[&str]| Err("unavailable".into())) as RunFn,
+            Box::new(|_: &[&str]| Ok(b"not JSON".to_vec())) as RunFn,
+        ] {
+            let src = GH::new("@symphony", Some(run));
+            assert!(
+                src.open_prs_for_branch_prefix("o", "r", "symphony/MT-1")
+                    .await
+                    .is_err()
+            );
+        }
+    }
 
     /// One open PR on the branch, opened from the queried repository itself.
     const PR_LIST_OWN: &str = r#"[{"url":"https://github.com/o/r/pull/64",
