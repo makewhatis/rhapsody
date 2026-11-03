@@ -148,7 +148,7 @@ use rhapsody_store::{
 use crate::control_loop::{CancelWait, Event};
 use crate::ghsummons::{
     HeadAllowlist, MERGE_STATE_DIRTY, PrLookup, PrSnapshot, PrStateSource, PrStatus,
-    ReviewDiffSource,
+    ReviewDiffSource, ReviewMirrorSource,
 };
 use crate::orchestrator::Orchestrator;
 use crate::prstate::{PrCoord, PrObservation, sweep_pr_states};
@@ -429,6 +429,12 @@ pub struct WatchedPr {
     /// trigger arms nothing and the comparison is not needed either; carrying these is what keeps a
     /// long review from re-spending two `gh` calls per tick for its whole duration.
     pub requested_shas: Vec<String>,
+    /// The clone URL of the repository this pull request lives in, resolved by the control task from
+    /// the configured projects ([`Orchestrator::review_repo_url`]). It is what lets the off-loop
+    /// watcher read the no-op-rebase proof from the LOCAL bare mirror (STUDIO-1672) instead of
+    /// GitHub's compare API. `None` when no enabled project owns the repository, which falls back to
+    /// the compare-API path exactly as before.
+    pub repo_url: Option<String>,
 }
 
 impl WatchedPr {
@@ -438,6 +444,7 @@ impl WatchedPr {
             pr,
             reviewed_shas: Vec::new(),
             requested_shas: Vec::new(),
+            repo_url: None,
         }
     }
 }
@@ -691,6 +698,11 @@ pub struct ReviewWatchDeps {
     /// this feature, so a daemon that cannot ask (or an installation that never wires it) loses the
     /// saving and never the review.
     pub diff_source: Option<Arc<dyn ReviewDiffSource>>,
+    /// The LOCAL-MIRROR reads that prove a head move carried no new work when the compare API cannot
+    /// (STUDIO-1672): a large or binary file has no `patch` there, so the diff can never be proven
+    /// unchanged and every rebase re-arms a full round. Tried BEFORE [`Self::diff_source`]; `None`
+    /// (or a mirror read that fails) falls back to the compare-API path.
+    pub mirror_source: Option<Arc<dyn ReviewMirrorSource>>,
     /// How often to sweep, in milliseconds, read fresh each tick (STUDIO-974). A shared atomic
     /// rather than a copied value so a hot reload of `polling.pr_state_interval_ms` applies on the
     /// next tick without respawning the task. Defaults to
@@ -767,24 +779,35 @@ async fn refresh_observed_head(
 
 /// Which of a pull request's previously-reviewed heads carry a diff against the base whose
 /// CHANGE is the same as `head`'s — the proof that a head move did no work (STUDIO-960, widened by
-/// STUDIO-977).
+/// STUDIO-977, and read from the local mirror by STUDIO-1672).
 ///
-/// One `gh` read per DISTINCT reviewed head plus one for `head`, and none at all when nothing could
-/// have moved (the caller filters that case out). The comparison is a patch-id
-/// ([`crate::ghsummons::same_change`]), not the diff text and not the SHAs: a rebase, a squash, an
-/// amend, a `gh pr update-branch` AND a merge from the base branch all rewrite the head and can all
-/// carry the same change, which is exactly the case this exists to detect. STUDIO-960's byte
-/// comparison only caught the first four; a merge from the base moves the hunk line numbers, so only
-/// a patch-id catches it (STUDIO-977). A rebase that resolved a conflict changes the change itself
-/// and is therefore NOT in the answer.
+/// Two sources, tried in order:
 ///
-/// Every failure — an unreadable base, a compare that timed out, a diff with a file GitHub will not
-/// render — returns the reviewed heads it could NOT prove, i.e. omits them, so the caller arms a
-/// normal round. The function never reports "unchanged" from a comparison it did not complete:
-/// that direction is the one that silently skips a review of real work.
+/// 1. the LOCAL BARE MIRROR ([`ReviewMirrorSource`], STUDIO-1672), when the watcher has one and the
+///    control task named the repository's clone URL. The mirror has every object and needs no
+///    `patch`, so it proves a diff with a large or binary file that GitHub's compare API refuses to
+///    render — the carini#22 lockfile case, where every rebase re-armed a full round. Tree equality
+///    is checked first (cheap, and it covers a re-stack onto the same tree exactly); otherwise the
+///    two heads' `git patch-id --verbatim` are compared (`--verbatim` keeps whitespace, so a
+///    whitespace-only edit is seen as new work; `--stable` would collapse it — review B1).
+/// 2. the compare API ([`ReviewDiffSource`], STUDIO-960/977), used only when the mirror cannot be
+///    fetched or the head is not in it. One `gh` read per DISTINCT reviewed head plus one for
+///    `head`, and none at all when nothing could have moved (the caller filters that case out).
+///
+/// Both comparisons are patch-id based, never a byte comparison and never the SHAs: a rebase, a
+/// squash, an amend, a `gh pr update-branch` AND a merge from the base branch all rewrite the head
+/// and can all carry the same change, which is exactly the case this exists to detect. A rebase
+/// that resolved a conflict changes the change itself and is therefore NOT in the answer.
+///
+/// Every failure — an unreadable base, an unfetchable mirror, a compare that timed out, a diff with
+/// a file GitHub will not render — returns the reviewed heads it could NOT prove, i.e. omits them,
+/// so the caller arms a normal round. The function never reports "unchanged" from a comparison it
+/// did not complete: that direction is the one that silently skips a review of real work.
 async fn unchanged_reviewed_shas(
     ctx: &CancelWait,
     src: &dyn ReviewDiffSource,
+    mirror: Option<&dyn ReviewMirrorSource>,
+    repo_url: Option<&str>,
     pr: &PrCoord,
     head: &str,
     reviewed: &[String],
@@ -812,6 +835,15 @@ async fn unchanged_reviewed_shas(
             return (Vec::new(), String::new());
         }
     };
+    // The local mirror first (STUDIO-1672): it renders the large/binary diffs the compare API omits.
+    // `None` (no source, no repo URL, or an unusable mirror) falls through to the compare API.
+    if let (Some(mirror), Some(repo_url)) = (mirror, repo_url)
+        && !repo_url.is_empty()
+        && let Some(proof) =
+            mirror_unchanged_reviewed_shas(ctx, mirror, repo_url, &base, head, &olds).await
+    {
+        return proof;
+    }
     let head_patch = match src.merge_base_patch(&pr.owner, &pr.repo, &base, head).await {
         Ok(patch) => patch,
         Err(e) => {
@@ -852,6 +884,88 @@ async fn unchanged_reviewed_shas(
         }
     }
     (unchanged, head_patch_id)
+}
+
+/// The local-mirror half of [`unchanged_reviewed_shas`] (STUDIO-1672).
+///
+/// `Some((unchanged, head_patch_id))` when the mirror was fetched and the HEAD's tree and patch-id
+/// both read from it — the reviewed heads it could not prove are simply omitted, so the caller arms
+/// a round for them. `None` when the mirror itself is unusable (unfetchable, or the head is not in
+/// it), which tells the caller to fall back to the compare-API path. The `head_patch_id` is the
+/// mirror's `git patch-id` (a different digest scheme from the compare path's
+/// [`stable_patch_id`](crate::ghsummons::stable_patch_id)); a comparison always uses ONE path for
+/// both sides, so the two schemes never meet inside a single decision.
+async fn mirror_unchanged_reviewed_shas(
+    ctx: &CancelWait,
+    mirror: &dyn ReviewMirrorSource,
+    repo_url: &str,
+    base: &str,
+    head: &str,
+    olds: &[&str],
+) -> Option<(Vec<String>, String)> {
+    if let Err(e) = mirror.sync(repo_url).await {
+        tracing::warn!(
+            repo_url, error = %e,
+            "ticketless review: the local mirror could not be fetched; falling back to the \
+             compare API for the no-op-rebase proof"
+        );
+        return None;
+    }
+    let head_tree = match mirror.tree_id(repo_url, head).await {
+        Ok(tree) => tree,
+        Err(e) => {
+            tracing::warn!(
+                repo_url, head, error = %e,
+                "ticketless review: the head's tree could not be read from the local mirror; \
+                 falling back to the compare API"
+            );
+            return None;
+        }
+    };
+    let head_patch_id = match mirror.merge_base_patch_id(repo_url, base, head).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                repo_url, head, error = %e,
+                "ticketless review: the head's patch-id could not be read from the local mirror; \
+                 falling back to the compare API"
+            );
+            return None;
+        }
+    };
+    let mut unchanged = Vec::new();
+    for old in olds {
+        if ctx.is_cancelled() {
+            break;
+        }
+        // Tree equality first: cheapest, and it covers a re-stack onto an identical tree exactly.
+        match mirror.tree_id(repo_url, old).await {
+            Ok(tree) if tree == head_tree => {
+                unchanged.push((*old).to_string());
+                continue;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    repo_url, reviewed_sha = old, error = %e,
+                    "ticketless review: a reviewed head's tree could not be read from the local \
+                     mirror; that head is not proven unchanged"
+                );
+            }
+        }
+        match mirror.merge_base_patch_id(repo_url, base, old).await {
+            Ok(id) if id == head_patch_id => unchanged.push((*old).to_string()),
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(
+                    repo_url, reviewed_sha = old, error = %e,
+                    "ticketless review: a reviewed head's patch-id could not be read from the \
+                     local mirror; that head is not proven unchanged"
+                );
+            }
+        }
+    }
+    Some((unchanged, head_patch_id))
 }
 
 /// The effective watcher cadence in milliseconds, read fresh from the shared atomic (STUDIO-974).
@@ -985,6 +1099,8 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 let (unchanged, head_patch_id) = unchanged_reviewed_shas(
                     &ctx,
                     diff.as_ref(),
+                    deps.mirror_source.as_deref(),
+                    known.repo_url.as_deref(),
                     &fresh.pr,
                     &snap.head_sha,
                     &known.reviewed_shas,
@@ -1168,11 +1284,13 @@ impl Orchestrator {
                 Some(i) => *i,
                 None => {
                     let i = out.len();
-                    out.push(WatchedPr::new(PrCoord::new(
-                        &row.key.owner,
-                        &row.key.repo,
-                        row.key.number,
-                    )));
+                    let mut watched =
+                        WatchedPr::new(PrCoord::new(&row.key.owner, &row.key.repo, row.key.number));
+                    // The clone URL the off-loop watcher reads the no-op-rebase proof from
+                    // (STUDIO-1672). Resolved here because only the control task holds the
+                    // configured projects; `None` (no owning project) falls back to the compare API.
+                    watched.repo_url = self.review_repo_url(&row.key.owner, &row.key.repo);
+                    out.push(watched);
                     seen.insert(k, i);
                     i
                 }
@@ -4874,13 +4992,14 @@ mod tests {
 
     use super::*;
     use crate::control_loop::CancelSignal;
-    use crate::ghsummons::{PrSnapshot, PrStateResult, ReviewDiffResult};
+    use crate::ghsummons::{PrSnapshot, PrStateResult, ReviewDiffResult, WorkspaceMirrorSource};
     use crate::orchestrator::RunningEntry;
     use crate::testsupport::{
         DispatchedEntries, TempDir, capture_events, empty_effective, empty_resolved_project,
         retry_entry, set_of,
     };
     use rhapsody_config::room::{Cursor, LocalRoom};
+    use rhapsody_workspace::{Config as WsConfig, HookScripts, Manager};
 
     const REPO_URL: &str = "git@github.com:makewhatis/rhapsody.git";
     const OWNER: &str = "makewhatis";
@@ -4911,6 +5030,7 @@ mod tests {
             teams: ticketless(&["alice"]),
             sink: Arc::new(FakeSink::default()),
             diff_source: None,
+            mirror_source: None,
             poll_interval_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(ms)),
         };
         assert_eq!(poll_interval(&deps(5_000)), 5_000);
@@ -4943,6 +5063,7 @@ mod tests {
             poll_interval_ms: Arc::clone(&interval),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
+            mirror_source: None,
             sink: Arc::new(FakeSink {
                 watched: vec![WatchedPr::new(coord(12))],
                 seen: Arc::clone(&seen),
@@ -6278,6 +6399,8 @@ mod tests {
         let proven = unchanged_reviewed_shas(
             &signal.wait(),
             &FakeDiffSource::same(),
+            None,
+            None,
             &coord(12),
             HEAD_B,
             &[HEAD_A.to_string()],
@@ -6349,6 +6472,8 @@ mod tests {
         let proven = unchanged_reviewed_shas(
             &signal.wait(),
             &FakeDiffSource::changed(),
+            None,
+            None,
             &coord(12),
             HEAD_B,
             &[HEAD_A.to_string()],
@@ -6379,6 +6504,8 @@ mod tests {
         let proven = unchanged_reviewed_shas(
             &signal.wait(),
             &FakeDiffSource::base_fails(),
+            None,
+            None,
             &coord(12),
             HEAD_B,
             &[HEAD_A.to_string()],
@@ -6430,6 +6557,8 @@ mod tests {
             let proven = unchanged_reviewed_shas(
                 &signal.wait(),
                 &source,
+                None,
+                None,
                 &coord(12),
                 HEAD_B,
                 &[HEAD_A.to_string()],
@@ -6466,6 +6595,8 @@ mod tests {
         let proven = unchanged_reviewed_shas(
             &signal.wait(),
             &FakeDiffSource::merged_from_base_213(),
+            None,
+            None,
             &coord(12),
             HEAD_B,
             &[HEAD_A.to_string()],
@@ -6537,6 +6668,8 @@ mod tests {
         let proven = unchanged_reviewed_shas(
             &signal.wait(),
             &FakeDiffSource::merged_from_base_213(),
+            None,
+            None,
             &coord(12),
             HEAD_B,
             &[HEAD_A.to_string()],
@@ -6590,6 +6723,8 @@ mod tests {
         let proven = unchanged_reviewed_shas(
             &signal.wait(),
             &source,
+            None,
+            None,
             &coord(12),
             HEAD_B,
             &[HEAD_A.to_string()],
@@ -6607,6 +6742,320 @@ mod tests {
         );
         let merged = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
         assert_eq!(merged.merge.len(), 1, "#209's approved patch merges");
+    }
+
+    // --- STUDIO-1672: the no-op-rebase proof from the local bare mirror -------------------------
+
+    /// A real local repository whose review history exercises the mirror-side proof (STUDIO-1672):
+    /// a "large" file (the lockfile shape GitHub's compare API will not render) plus the heads the
+    /// proof must tell apart. The origin temp dir IS the clone URL.
+    struct NoOpRebaseRepo {
+        origin: TempDir,
+        _root: TempDir,
+        manager: Arc<Manager>,
+        /// The reviewed head: the large file edited, off the old base.
+        reviewed: String,
+        /// The SAME change, same parent, a different commit message — an identical tree.
+        restacked: String,
+        /// The SAME change, off the advanced base — a DIFFERENT tree, same patch-id.
+        rebased: String,
+        /// Only the large file's CONTENT differs.
+        changed_only_large: String,
+        /// Only one line of a small file differs.
+        changed_one_line: String,
+        /// The same large-file change as `rebased` but with one in-line space: a whitespace-only
+        /// difference that `git patch-id --stable` would collapse onto `reviewed` (review B1).
+        whitespace_only: String,
+    }
+
+    fn git_in(dir: &str, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@t")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@t")
+            .output()
+            .expect("git");
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    fn noop_rebase_repo() -> NoOpRebaseRepo {
+        let big = |marker: &str| {
+            (1..=2000)
+                .map(|i| {
+                    if i == 1000 {
+                        format!("line{i}-{marker}")
+                    } else {
+                        format!("line{i}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        let origin = TempDir::new();
+        git_in(&origin.path, &["init", "-b", "main"]);
+        std::fs::write(origin.child("package-lock.json"), big("v1")).unwrap();
+        git_in(&origin.path, &["add", "package-lock.json"]);
+        git_in(&origin.path, &["commit", "-m", "lock v1"]);
+        let base0 = git_in(&origin.path, &["rev-parse", "HEAD"]);
+        // Main advances by an UNRELATED file, so a rebase onto the new main keeps the large file's
+        // own change identical while the tree (and the base) move.
+        std::fs::write(origin.child("other.txt"), "x\n").unwrap();
+        git_in(&origin.path, &["add", "other.txt"]);
+        git_in(&origin.path, &["commit", "-m", "main advance"]);
+        let base = git_in(&origin.path, &["rev-parse", "HEAD"]);
+
+        let commit = |branch: &str, parent: &str, file: &str, body: &str, msg: &str| -> String {
+            git_in(&origin.path, &["checkout", "-b", branch, parent]);
+            std::fs::write(origin.child(file), body).unwrap();
+            git_in(&origin.path, &["add", file]);
+            git_in(&origin.path, &["commit", "-m", msg]);
+            git_in(&origin.path, &["rev-parse", "HEAD"])
+        };
+        let reviewed = commit(
+            "reviewed",
+            &base0,
+            "package-lock.json",
+            &big("v2"),
+            "reviewed",
+        );
+        let restacked = commit(
+            "restacked",
+            &base0,
+            "package-lock.json",
+            &big("v2"),
+            "restacked",
+        );
+        let rebased = commit("rebased", &base, "package-lock.json", &big("v2"), "rebased");
+        let changed_only_large = commit(
+            "bigchange",
+            &base,
+            "package-lock.json",
+            &big("v3"),
+            "big change",
+        );
+        let changed_one_line = commit("linechange", &base, "other.txt", "y\n", "line change");
+        // The same change as `rebased`, but with one in-line space: whitespace-only new work.
+        let whitespace_only = commit(
+            "whitespace",
+            &base,
+            "package-lock.json",
+            &big("v 2"),
+            "whitespace change",
+        );
+        git_in(&origin.path, &["checkout", "main"]);
+
+        let root = TempDir::new();
+        let manager = Arc::new(
+            Manager::new(WsConfig {
+                root: root.path.clone(),
+                hooks: HookScripts::default(),
+                hook_timeout: std::time::Duration::from_secs(5),
+            })
+            .expect("workspace manager"),
+        );
+        NoOpRebaseRepo {
+            origin,
+            _root: root,
+            manager,
+            reviewed,
+            restacked,
+            rebased,
+            changed_only_large,
+            changed_one_line,
+            whitespace_only,
+        }
+    }
+
+    /// A `&'static str` for the fixed state source — the test's leak lives for the test.
+    fn leaked(s: &str) -> &'static str {
+        Box::leak(s.to_string().into_boxed_str())
+    }
+
+    fn mirror_watched(repo: &NoOpRebaseRepo) -> WatchedPr {
+        WatchedPr {
+            pr: coord(12),
+            reviewed_shas: vec![repo.reviewed.clone()],
+            requested_shas: Vec::new(),
+            repo_url: Some(repo.origin.path.clone()),
+        }
+    }
+
+    /// **Acceptance (identical tree).** A reviewed head, then a re-stacked head with the SAME tree,
+    /// plus a large file in the diff the compare API cannot render. The mirror proves the move
+    /// unchanged and the control task arms no round.
+    ///
+    /// MUTATION: make the mirror tree-equality check always return false and this still passes —
+    /// the patch-id path proves the same change (see
+    /// `the_patch_id_path_alone_proves_the_same_change`). Make BOTH mirror paths return false (or
+    /// drop `mirror_source`) and `unchanged_from` is empty, so the control task arms a round and
+    /// the assertions red.
+    #[tokio::test]
+    async fn a_no_op_rebase_on_a_large_file_is_proven_unchanged_from_the_mirror() {
+        let repo = noop_rebase_repo();
+        let handed = run_one_watch_tick_with_mirror(
+            mirror_watched(&repo),
+            Arc::new(FakeDiffSource::large_file_unreadable()),
+            Some(Arc::new(WorkspaceMirrorSource::new(Arc::clone(
+                &repo.manager,
+            )))),
+            leaked(&repo.restacked),
+        )
+        .await;
+        assert_eq!(handed.len(), 1);
+        assert_eq!(
+            handed[0].unchanged_from,
+            vec![repo.reviewed.clone()],
+            "the mirror must prove an identical tree even when the compare API cannot render the \
+             large file"
+        );
+
+        // No round is armed for a proven-unchanged head move.
+        let (mut o, dispatched) = orch(ticketless(&["alice", "bob"]));
+        introduce(&o, approved_row(12, "bob", &repo.reviewed));
+        let before = dispatched.lock().expect("lock").len();
+        let report = o.handle_review_sweep(&[open_at_proven(
+            12,
+            &repo.restacked,
+            &handed[0].unchanged_from,
+        )]);
+        assert_eq!(report.dispatched, 0, "a no-op rebase arms nobody");
+        assert_eq!(report.skipped, 1);
+        assert_eq!(dispatched.lock().expect("lock").len(), before);
+    }
+
+    /// **Acceptance (the patch-id path alone).** A rebase onto a moved base carries the SAME change
+    /// at a DIFFERENT tree, so tree equality cannot prove it — the mirror's `git patch-id --verbatim`
+    /// does. This is the case the tree-equality mutation falls back to.
+    #[tokio::test]
+    async fn the_patch_id_path_alone_proves_the_same_change() {
+        let repo = noop_rebase_repo();
+        repo.manager
+            .sync_mirror(&repo.origin.path)
+            .await
+            .expect("sync mirror");
+        // Precondition: the trees genuinely differ, so this exercises the patch-id path.
+        let reviewed_tree = repo
+            .manager
+            .tree_id(&repo.origin.path, &repo.reviewed)
+            .await
+            .expect("tree");
+        let rebased_tree = repo
+            .manager
+            .tree_id(&repo.origin.path, &repo.rebased)
+            .await
+            .expect("tree");
+        assert_ne!(reviewed_tree, rebased_tree, "the premise: trees differ");
+
+        let handed = run_one_watch_tick_with_mirror(
+            mirror_watched(&repo),
+            Arc::new(FakeDiffSource::large_file_unreadable()),
+            Some(Arc::new(WorkspaceMirrorSource::new(Arc::clone(
+                &repo.manager,
+            )))),
+            leaked(&repo.rebased),
+        )
+        .await;
+        assert_eq!(handed.len(), 1);
+        assert_eq!(
+            handed[0].unchanged_from,
+            vec![repo.reviewed.clone()],
+            "the same change at a new tree must be proven by patch-id"
+        );
+    }
+
+    /// **Acceptance (content changed).** A rebase that also edits one line of a small file is real
+    /// work: the mirror proves nothing and a round is armed.
+    #[tokio::test]
+    async fn a_rebase_that_edits_a_line_arms_a_round() {
+        let repo = noop_rebase_repo();
+        let handed = run_one_watch_tick_with_mirror(
+            mirror_watched(&repo),
+            Arc::new(FakeDiffSource::large_file_unreadable()),
+            Some(Arc::new(WorkspaceMirrorSource::new(Arc::clone(
+                &repo.manager,
+            )))),
+            leaked(&repo.changed_one_line),
+        )
+        .await;
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0].unchanged_from.is_empty(),
+            "an edited line is new work, not a no-op rebase"
+        );
+    }
+
+    /// **Acceptance (content changed only in the large file).** The changed content lives in the
+    /// very file the compare API will not render, so only the mirror's patch-id can tell it apart.
+    #[tokio::test]
+    async fn a_rebase_that_changes_only_the_large_file_arms_a_round() {
+        let repo = noop_rebase_repo();
+        let handed = run_one_watch_tick_with_mirror(
+            mirror_watched(&repo),
+            Arc::new(FakeDiffSource::large_file_unreadable()),
+            Some(Arc::new(WorkspaceMirrorSource::new(Arc::clone(
+                &repo.manager,
+            )))),
+            leaked(&repo.changed_only_large),
+        )
+        .await;
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0].unchanged_from.is_empty(),
+            "a changed large file is new work: the patch-id must differ"
+        );
+    }
+
+    /// **Regression (review B1).** A head that differs from the reviewed one only in whitespace is
+    /// real new work and must arm a round. The mirror proof used `git patch-id --stable`, which
+    /// strips whitespace, so this case was reported unchanged and an approval carried over the edit.
+    /// The proof is now `--verbatim`. MUTATION: switch `merge_base_patch_id` back to `--stable` and
+    /// `unchanged_from` becomes non-empty here (the move is wrongly proven unchanged).
+    #[tokio::test]
+    async fn a_whitespace_only_change_arms_a_round() {
+        let repo = noop_rebase_repo();
+        let handed = run_one_watch_tick_with_mirror(
+            mirror_watched(&repo),
+            Arc::new(FakeDiffSource::large_file_unreadable()),
+            Some(Arc::new(WorkspaceMirrorSource::new(Arc::clone(
+                &repo.manager,
+            )))),
+            leaked(&repo.whitespace_only),
+        )
+        .await;
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0].unchanged_from.is_empty(),
+            "a whitespace-only edit is new work, not a no-op rebase"
+        );
+    }
+
+    /// The mirror is a FALLBACK when the compare API cannot render the head: when the mirror is
+    /// absent the compare path still runs, and when the compare path is what fails (the large file)
+    /// with no mirror, the move is not proven and a round is armed — the pre-STUDIO-1672 behaviour.
+    #[tokio::test]
+    async fn without_a_mirror_the_compare_api_still_decides() {
+        let repo = noop_rebase_repo();
+        let handed = run_one_watch_tick_with_mirror(
+            mirror_watched(&repo),
+            Arc::new(FakeDiffSource::large_file_unreadable()),
+            None,
+            leaked(&repo.restacked),
+        )
+        .await;
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0].unchanged_from.is_empty(),
+            "with no mirror the unreadable compare API proves nothing, so a round is armed"
+        );
     }
 
     /// The skip is confined to a row that COMPLETED a round. A `truncated` row read the head only
@@ -15736,6 +16185,20 @@ mod tests {
                 old_patch: Err("gh: boom".to_string()),
             }
         }
+        /// **The live incident (STUDIO-1672).** The compare API omits the `patch` for a large or
+        /// binary file, so BOTH the head read and the reviewed read fail — exactly the carini#22
+        /// `web/package-lock.json` error. The mirror path must prove the move without them.
+        fn large_file_unreadable() -> FakeDiffSource {
+            FakeDiffSource {
+                base: Ok("main".to_string()),
+                head_patch: Err(
+                    "web/package-lock.json has no readable patch (binary or too large)".to_string(),
+                ),
+                old_patch: Err(
+                    "web/package-lock.json has no readable patch (binary or too large)".to_string(),
+                ),
+            }
+        }
     }
 
     fn diff_err(e: String) -> Box<dyn std::error::Error + Send + Sync> {
@@ -15869,6 +16332,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
+            mirror_source: None,
             sink: Arc::new(FakeSink {
                 watched: vec![WatchedPr::new(coord(12)), WatchedPr::new(coord(13))],
                 seen: Arc::clone(&seen),
@@ -15989,6 +16453,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
+            mirror_source: None,
             sink: Arc::new(FakeSink {
                 watched: vec![WatchedPr::new(coord(12)), WatchedPr::new(coord(13))],
                 seen: Arc::clone(&seen),
@@ -16103,6 +16568,7 @@ mod tests {
             pr: coord(12),
             reviewed_shas: reviewed.iter().map(|s| (*s).to_string()).collect(),
             requested_shas: requested.iter().map(|s| (*s).to_string()).collect(),
+            repo_url: None,
         }
     }
 
@@ -16112,14 +16578,28 @@ mod tests {
         watched: WatchedPr,
         diff: Arc<dyn ReviewDiffSource>,
     ) -> Vec<PrObservation> {
+        run_one_watch_tick_with_mirror(watched, diff, None, HEAD_B).await
+    }
+
+    /// [`run_one_watch_tick`], with a local-mirror source the watcher may prefer over the compare
+    /// API (STUDIO-1672) and an explicit head the fixed state source reports.
+    async fn run_one_watch_tick_with_mirror(
+        watched: WatchedPr,
+        diff: Arc<dyn ReviewDiffSource>,
+        mirror: Option<Arc<dyn ReviewMirrorSource>>,
+        head: &'static str,
+    ) -> Vec<PrObservation> {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let boundaries = Arc::new(Mutex::new(Vec::new()));
         let done = Arc::new(tokio::sync::Notify::new());
         let signal = CancelSignal::new();
         let deps = ReviewWatchDeps {
-            pr_source: Some(Arc::new(FixedHeadSource(HEAD_B))),
+            pr_source: Some(Arc::new(FixedHeadSource(head))),
             allow: HeadAllowlist::none(),
-            poll_interval_ms: test_poll_interval(),
+            // A real millisecond tick, not the pinned interval: the mirror tests run on a REAL clock
+            // (their git subprocesses cannot be advanced by a paused timer), so a 120s sleep before
+            // the first tick would hang them.
+            poll_interval_ms: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1)),
             teams: ticketless(&["alice", "bob"]),
             sink: Arc::new(FakeSink {
                 watched: vec![watched],
@@ -16129,6 +16609,7 @@ mod tests {
                 ..FakeSink::default()
             }),
             diff_source: Some(diff),
+            mirror_source: mirror,
         };
         let task = tokio::spawn(run_review_watch_task(signal.wait(), deps));
         done.notified().await;
@@ -16149,10 +16630,17 @@ mod tests {
         let ctx = signal.wait();
         let reviewed = [HEAD_A.to_string()];
 
-        let same =
-            unchanged_reviewed_shas(&ctx, &FakeDiffSource::same(), &coord(12), HEAD_B, &reviewed)
-                .await
-                .0;
+        let same = unchanged_reviewed_shas(
+            &ctx,
+            &FakeDiffSource::same(),
+            None,
+            None,
+            &coord(12),
+            HEAD_B,
+            &reviewed,
+        )
+        .await
+        .0;
         assert_eq!(same, vec![HEAD_A.to_string()]);
 
         for source in [
@@ -16160,9 +16648,10 @@ mod tests {
             FakeDiffSource::base_fails(),
             FakeDiffSource::old_fails(),
         ] {
-            let got = unchanged_reviewed_shas(&ctx, &source, &coord(12), HEAD_B, &reviewed)
-                .await
-                .0;
+            let got =
+                unchanged_reviewed_shas(&ctx, &source, None, None, &coord(12), HEAD_B, &reviewed)
+                    .await
+                    .0;
             assert!(got.is_empty(), "only a fully-read, identical diff is proof");
         }
     }
@@ -16176,15 +16665,25 @@ mod tests {
         let ctx = signal.wait();
 
         assert!(
-            unchanged_reviewed_shas(&ctx, &FakeDiffSource::same(), &coord(12), HEAD_B, &[])
-                .await
-                .0
-                .is_empty()
+            unchanged_reviewed_shas(
+                &ctx,
+                &FakeDiffSource::same(),
+                None,
+                None,
+                &coord(12),
+                HEAD_B,
+                &[]
+            )
+            .await
+            .0
+            .is_empty()
         );
         assert!(
             unchanged_reviewed_shas(
                 &ctx,
                 &FakeDiffSource::same(),
+                None,
+                None,
                 &coord(12),
                 HEAD_A,
                 &[HEAD_A.to_string()],
@@ -16216,6 +16715,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
+            mirror_source: None,
             sink: Arc::new(FakeSink {
                 watched: watched.clone(),
                 seen: Arc::clone(&seen),
@@ -16278,6 +16778,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
+            mirror_source: None,
             sink: Arc::new(FakeSink {
                 watched: vec![WatchedPr::new(coord(64))],
                 seen: Arc::clone(&seen),
@@ -16318,6 +16819,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: teams_with(false, ReviewMode::Ticketless, vec![ident("bob", 0)]),
             diff_source: None,
+            mirror_source: None,
             sink: Arc::new(FakeSink {
                 watched: vec![WatchedPr::new(coord(12))],
                 seen: Arc::clone(&seen),
@@ -16585,6 +17087,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
+            mirror_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();
@@ -16750,6 +17253,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
+            mirror_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();
@@ -16798,6 +17302,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob"]),
             diff_source: None,
+            mirror_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();
@@ -16902,6 +17407,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob", "carol", "dave"]),
             diff_source: None,
+            mirror_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();
@@ -17035,6 +17541,7 @@ mod tests {
             poll_interval_ms: test_poll_interval(),
             teams: ticketless(&["alice", "bob", "carol", "dave"]),
             diff_source: None,
+            mirror_source: None,
             sink: sink.clone(),
         };
         let signal = CancelSignal::new();

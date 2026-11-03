@@ -1715,6 +1715,133 @@ impl ReviewDiffSource for GH {
     }
 }
 
+/// The LOCAL-MIRROR half of the no-op-rebase proof (STUDIO-1672).
+///
+/// [`ReviewDiffSource`] proves a head move carried no work from GitHub's compare API, whose `patch`
+/// is omitted for a large or binary file — so a pull request that touches a lockfile can never be
+/// proven unchanged there and re-arms a full round on every rebase (carini#22). This seam reads the
+/// same proof from the repository's own bare mirror instead: the tree ids, and the `git patch-id
+/// --verbatim` of `merge-base(base, sha)..sha`, which GitHub never has to render. (`--verbatim`, not
+/// `--stable`, so a whitespace-only edit is seen as new work — review B1.)
+///
+/// Object-safe (the off-loop watcher holds it as `Option<Arc<dyn ReviewMirrorSource>>`).
+#[async_trait]
+pub trait ReviewMirrorSource: Send + Sync {
+    /// Freshens the mirror from origin. An error means the mirror could not be fetched, and the
+    /// caller must fall back to the compare-API path.
+    async fn sync(&self, repo_url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+    /// The tree object id of `sha` in the mirror. An error means `sha` is not in the mirror (or the
+    /// read failed); the caller then fails closed for that head rather than guessing.
+    async fn tree_id(&self, repo_url: &str, sha: &str) -> ReviewDiffResult;
+
+    /// The `git patch-id --verbatim` of `merge-base(base, sha)..sha` from the mirror — content, not
+    /// commit identity, so a rebase that carries the same change keeps it, while a whitespace-only
+    /// edit changes it.
+    async fn merge_base_patch_id(&self, repo_url: &str, base: &str, sha: &str) -> ReviewDiffResult;
+}
+
+/// Boxes any displayable mirror error, matching [`ReviewDiffResult`]'s opaque error.
+fn mirror_err(e: impl std::fmt::Display) -> Box<dyn std::error::Error + Send + Sync> {
+    format!("{e}").into()
+}
+
+/// A [`ReviewMirrorSource`] over an already-built workspace [`Manager`](rhapsody_workspace::Manager).
+/// Used by the daemon when a live manager is in hand and by tests that drive the mirror against a
+/// real temporary repository.
+pub struct WorkspaceMirrorSource {
+    manager: Arc<rhapsody_workspace::Manager>,
+}
+
+impl WorkspaceMirrorSource {
+    pub fn new(manager: Arc<rhapsody_workspace::Manager>) -> WorkspaceMirrorSource {
+        WorkspaceMirrorSource { manager }
+    }
+}
+
+#[async_trait]
+impl ReviewMirrorSource for WorkspaceMirrorSource {
+    async fn sync(&self, repo_url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.manager.sync_mirror(repo_url).await.map_err(mirror_err)
+    }
+
+    async fn tree_id(&self, repo_url: &str, sha: &str) -> ReviewDiffResult {
+        self.manager
+            .tree_id(repo_url, sha)
+            .await
+            .map_err(mirror_err)
+    }
+
+    async fn merge_base_patch_id(&self, repo_url: &str, base: &str, sha: &str) -> ReviewDiffResult {
+        self.manager
+            .merge_base_patch_id(repo_url, base, sha)
+            .await
+            .map_err(mirror_err)
+    }
+}
+
+/// The daemon's [`ReviewMirrorSource`]: it resolves the LIVE workspace manager through the control
+/// handle — the same round-trip the manager reads and the prune driver use — so the review watcher
+/// shares the orchestrator's per-repo lock registry rather than standing up a second one. The
+/// manager is resolved once and cached; a reload that swaps it for an equivalent-rooted manager is
+/// invisible to mirror reads, which key only on the root.
+pub struct LiveMirrorSource {
+    control: crate::ControlHandle,
+    manager: tokio::sync::OnceCell<Arc<rhapsody_workspace::Manager>>,
+}
+
+impl LiveMirrorSource {
+    pub fn new(control: crate::ControlHandle) -> LiveMirrorSource {
+        LiveMirrorSource {
+            control,
+            manager: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn manager(
+        &self,
+    ) -> Result<&Arc<rhapsody_workspace::Manager>, Box<dyn std::error::Error + Send + Sync>> {
+        self.manager
+            .get_or_try_init(|| async {
+                let plan = self
+                    .control
+                    .workspace_gc_plan()
+                    .await
+                    .ok_or_else(|| mirror_err("the control task is gone"))?;
+                plan.mgr
+                    .ok_or_else(|| mirror_err("the workspace is not available yet"))
+            })
+            .await
+    }
+}
+
+#[async_trait]
+impl ReviewMirrorSource for LiveMirrorSource {
+    async fn sync(&self, repo_url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.manager()
+            .await?
+            .sync_mirror(repo_url)
+            .await
+            .map_err(mirror_err)
+    }
+
+    async fn tree_id(&self, repo_url: &str, sha: &str) -> ReviewDiffResult {
+        self.manager()
+            .await?
+            .tree_id(repo_url, sha)
+            .await
+            .map_err(mirror_err)
+    }
+
+    async fn merge_base_patch_id(&self, repo_url: &str, base: &str, sha: &str) -> ReviewDiffResult {
+        self.manager()
+            .await?
+            .merge_base_patch_id(repo_url, base, sha)
+            .await
+            .map_err(mirror_err)
+    }
+}
+
 /// One entry of a pull request's status-check rollup: what ran, and how it went.
 ///
 /// Two fields, because two is what an operator reads off a checks row and everything else GitHub
