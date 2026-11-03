@@ -361,6 +361,24 @@ impl Manager {
         Ok(dir_path)
     }
 
+    /// Freshens `repo_url`'s bare mirror from origin under the per-repo lock, so a caller that only
+    /// needs the mirror's objects (not a worktree) gets the same serialized fetch every other mirror
+    /// mutation takes. A public wrapper over [`Self::ensure_mirror`] for the ticketless review
+    /// watcher's no-op-rebase proof (STUDIO-1672), which reads tree ids and patch-ids from the mirror
+    /// rather than from GitHub's compare API. Like `ensure_mirror`'s reuse path, a fetch FAILURE is
+    /// tolerated: the caller detects a missing object on its own read and fails closed, so a
+    /// transient GitHub blip never turns into a wrong "unchanged".
+    pub async fn sync_mirror(&self, repo_url: &str) -> Result<(), Error> {
+        if repo_url.is_empty() {
+            return Err(Error::MirrorClone(
+                "sync_mirror requires a repo URL".to_string(),
+            ));
+        }
+        let lk = self.repo_lock(repo_url);
+        let _guard = lk.lock_owned().await;
+        self.ensure_mirror(repo_url).await.map(|_| ())
+    }
+
     /// Resolves the SHORT name of the mirror's default branch (e.g. "main"). Prefers the recorded
     /// `refs/remotes/origin/HEAD` symbolic ref (whose `--short` form is `origin/main`, from which
     /// the leading `origin/` is stripped); falls back to the remote-tracking `main` then `master`.
@@ -1380,6 +1398,28 @@ mod tests {
         std::fs::create_dir_all(&bogus).unwrap();
         assert!(matches!(
             m.ensure_mirror(&bogus).await,
+            Err(Error::MirrorClone(_))
+        ));
+    }
+
+    /// STUDIO-1672: the review watcher's public mirror sync. It clones on first use, freshens on
+    /// reuse (a new branch becomes visible), and refuses an empty URL rather than reaching the
+    /// legacy no-git workspace path.
+    #[tokio::test]
+    async fn sync_mirror_clones_reuses_and_refuses_an_empty_url() {
+        let origin = init_local_origin();
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        m.sync_mirror(&origin.path).await.expect("first sync");
+        let mirror = m.mirror_dir(&origin.path);
+        let (before, _) = m.git(&mirror, &["rev-parse", "origin/main"]).await;
+
+        add_origin_commit(&origin.path);
+        m.sync_mirror(&origin.path).await.expect("reuse sync");
+        let (after, _) = m.git(&mirror, &["rev-parse", "origin/main"]).await;
+        assert_ne!(before.trim(), after.trim(), "reuse must fetch new commits");
+
+        assert!(matches!(
+            m.sync_mirror("").await,
             Err(Error::MirrorClone(_))
         ));
     }

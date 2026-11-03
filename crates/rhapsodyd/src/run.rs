@@ -1752,6 +1752,16 @@ where
             diff_source: Some(
                 Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::ReviewDiffSource>
             ),
+            // The LOCAL-MIRROR half of the same proof (STUDIO-1672): it renders the large and binary
+            // diffs the compare API omits, so a pull request that touches a lockfile is still proven
+            // unchanged across a rebase. It resolves the LIVE workspace manager through the control
+            // handle (so it shares the orchestrator's per-repo lock registry) and falls back to the
+            // compare API above whenever the mirror cannot be fetched.
+            mirror_source: Some(
+                Arc::new(rhapsody_orchestrator::ghsummons::LiveMirrorSource::new(
+                    handle.clone(),
+                )) as Arc<dyn rhapsody_orchestrator::ghsummons::ReviewMirrorSource>,
+            ),
         };
         tokio::spawn(async move {
             rhapsody_orchestrator::reviewwatch::run_review_watch_task(watch_ctx, deps).await;

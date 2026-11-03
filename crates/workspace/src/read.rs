@@ -112,6 +112,21 @@ pub struct GrepRead {
     pub truncated: bool,
 }
 
+/// Whether `s` is a plausible git ref NAME (a branch) safe to interpolate into a git argument list
+/// under a `refs/remotes/origin/` prefix: no leading dash, no `..`/`@{` revision syntax, and only
+/// characters git branch names use. Conservative on purpose — a false negative merely refuses the
+/// mirror path and falls back to the compare API.
+fn is_safe_ref_name(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.contains("..")
+        && !s.contains("@{")
+        && !s.ends_with('/')
+        && !s.ends_with(".lock")
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '/'))
+}
+
 /// Parses one `git ls-tree` line: `<mode> <type> <sha>\t<path>`.
 fn parse_ls_tree_line(line: &str) -> Option<TreeEntry> {
     let (meta, path) = line.split_once('\t')?;
@@ -364,6 +379,91 @@ impl Manager {
             return Err(ReadError::TooLarge);
         }
         self.patch_id_stdin(&mirror, &out).await
+    }
+
+    /// The tree object id of `sha` from the bare mirror (`git rev-parse <sha>^{tree}`). An unknown
+    /// `sha` is an error, never an empty string, so a caller can tell "not in the mirror" from a real
+    /// tree. Used to prove a head move carried no work by tree EQUALITY alone (STUDIO-1672): it is
+    /// cheap, and it covers a re-stack onto the same tree exactly.
+    pub async fn tree_id(&self, repo_url: &str, sha: &str) -> Result<String, ReadError> {
+        if !is_commit_sha(sha) {
+            return Err(ReadError::InvalidRevision);
+        }
+        let mirror = self.mirror_dir(repo_url);
+        let expr = format!("{sha}^{{tree}}");
+        let (out, err) = self
+            .git(&mirror, &["rev-parse", "--verify", "--quiet", &expr])
+            .await;
+        if err.is_some() {
+            return Err(ReadError::Git(out));
+        }
+        let tree = out.trim();
+        if tree.is_empty() {
+            return Err(ReadError::NotFound);
+        }
+        Ok(tree.to_string())
+    }
+
+    /// A stable patch-id for the change `sha` carries against `base` — the THREE-dot change
+    /// `merge-base(base, sha)..sha` (`git patch-id --stable`), not the two-dot [`Self::patch_id`].
+    /// Content, not commit identity, and blind to the hunk line numbers and blob hashes a
+    /// base-preserving merge rewrites, so it is the mirror-side proof that a head move carried no
+    /// work (STUDIO-1672). `base` is a branch name (GitHub's `pulls.base.ref`) or a commit SHA;
+    /// [`Self::resolve_base`] turns it into a commit. Errors when there is no merge base, when the
+    /// diff is unreadable, or when the change is empty.
+    pub async fn merge_base_patch_id(
+        &self,
+        repo_url: &str,
+        base: &str,
+        sha: &str,
+    ) -> Result<String, ReadError> {
+        if !is_commit_sha(sha) {
+            return Err(ReadError::InvalidRevision);
+        }
+        let base_sha = self.resolve_base(repo_url, base).await?;
+        let mirror = self.mirror_dir(repo_url);
+        let mb = self.merge_base(repo_url, &base_sha, sha).await?;
+        if mb.is_empty() {
+            return Err(ReadError::Git(
+                "no merge base with the pull request's base".to_string(),
+            ));
+        }
+        let (out, err) = self.git(&mirror, &["diff", "--no-color", &mb, sha]).await;
+        if err.is_some() {
+            return Err(ReadError::Git(out));
+        }
+        if out.len() > MAX_DIFF_BYTES {
+            return Err(ReadError::TooLarge);
+        }
+        self.patch_id_stdin(&mirror, &out).await
+    }
+
+    /// Resolves a pull request's base REF (GitHub's `pulls.base.ref`, a branch name) to a commit in
+    /// the bare mirror. A commit SHA is accepted as-is; anything else is resolved under
+    /// `refs/remotes/origin/`, so a value interpolated into the git argument list can never name a
+    /// flag or an arbitrary revision expression. `main`/`master` are ordinary branch names here —
+    /// the mirror's remote-tracking refs are what the review worktree fetch keeps current.
+    pub async fn resolve_base(&self, repo_url: &str, base: &str) -> Result<String, ReadError> {
+        let base = base.trim();
+        if is_commit_sha(base) {
+            return Ok(base.to_string());
+        }
+        if !is_safe_ref_name(base) {
+            return Err(ReadError::InvalidRevision);
+        }
+        let mirror = self.mirror_dir(repo_url);
+        let refname = format!("refs/remotes/origin/{base}^{{commit}}");
+        let (out, err) = self
+            .git(&mirror, &["rev-parse", "--verify", "--quiet", &refname])
+            .await;
+        if err.is_some() {
+            return Err(ReadError::Git(out));
+        }
+        let sha = out.trim();
+        if !is_commit_sha(sha) {
+            return Err(ReadError::NotFound);
+        }
+        Ok(sha.to_string())
     }
 
     /// Feeds `diff` to `git patch-id --stable` on stdin and returns the first id. `git patch-id`
@@ -679,5 +779,128 @@ mod tests {
             .await
             .expect("patch-id");
         assert_eq!(id1, id2, "a stable patch-id is deterministic");
+    }
+
+    /// STUDIO-1672: the mirror-side no-op-rebase proof. A "large" file (the lockfile shape the
+    /// compare API cannot render) is in the diff, and the three outcomes the watcher must tell
+    /// apart are: the SAME tree at a new SHA (tree equality), the SAME change at a new parent (a
+    /// rebase — patch-id equality), and a changed line in that large file (patch-id differs).
+    #[tokio::test]
+    async fn tree_id_and_merge_base_patch_id_prove_a_no_op_rebase() {
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let origin = init_local_origin();
+        let rev = |r: &str| {
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .args(["-C", &origin.path, "rev-parse", r])
+                    .output()
+                    .expect("rev-parse")
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
+        let big = |marker: &str| {
+            (1..=2000)
+                .map(|i| {
+                    if i == 1000 {
+                        format!("line{i}-{marker}")
+                    } else {
+                        format!("line{i}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        // The base carries the large file; then main advances by an UNRELATED file, so a rebase
+        // onto the new main keeps the large file's own change identical.
+        std::fs::write(origin.child("package-lock.json"), big("v1")).unwrap();
+        git_run(&origin.path, &["add", "package-lock.json"]);
+        git_run(&origin.path, &["commit", "-m", "lock v1"]);
+        let base = rev("HEAD");
+        std::fs::write(origin.child("unrelated.txt"), "x\n").unwrap();
+        git_run(&origin.path, &["add", "unrelated.txt"]);
+        git_run(&origin.path, &["commit", "-m", "main advance"]);
+        let base2 = rev("HEAD");
+
+        // `reviewed`: the large file edited, off the old base.
+        git_run(&origin.path, &["checkout", "-b", "reviewed", &base]);
+        std::fs::write(origin.child("package-lock.json"), big("v2")).unwrap();
+        git_run(&origin.path, &["add", "package-lock.json"]);
+        git_run(&origin.path, &["commit", "-m", "reviewed change"]);
+        let reviewed = rev("reviewed");
+
+        // `restacked`: the SAME change, same parent, different commit message — identical tree.
+        git_run(&origin.path, &["checkout", "-b", "restacked", &base]);
+        std::fs::write(origin.child("package-lock.json"), big("v2")).unwrap();
+        git_run(&origin.path, &["add", "package-lock.json"]);
+        git_run(&origin.path, &["commit", "-m", "restacked change"]);
+        let restacked = rev("restacked");
+
+        // `rebased`: the SAME change, off the advanced main — a different tree, same patch-id.
+        git_run(&origin.path, &["checkout", "-b", "rebased", &base2]);
+        std::fs::write(origin.child("package-lock.json"), big("v2")).unwrap();
+        git_run(&origin.path, &["add", "package-lock.json"]);
+        git_run(&origin.path, &["commit", "-m", "rebased change"]);
+        let rebased = rev("rebased");
+
+        // `changed`: only the large file's content differs.
+        git_run(&origin.path, &["checkout", "-b", "changed", &base2]);
+        std::fs::write(origin.child("package-lock.json"), big("v3")).unwrap();
+        git_run(&origin.path, &["add", "package-lock.json"]);
+        git_run(&origin.path, &["commit", "-m", "changed change"]);
+        let changed = rev("changed");
+        git_run(&origin.path, &["checkout", "main"]);
+
+        m.sync_mirror(&origin.path).await.expect("sync mirror");
+
+        assert_eq!(
+            m.tree_id(&origin.path, &reviewed).await.expect("tree"),
+            m.tree_id(&origin.path, &restacked).await.expect("tree"),
+            "a re-stack onto an identical tree must be caught by tree equality"
+        );
+        assert_ne!(
+            m.tree_id(&origin.path, &reviewed).await.expect("tree"),
+            m.tree_id(&origin.path, &rebased).await.expect("tree"),
+            "the rebased head carries main's unrelated file, so its tree differs"
+        );
+        assert_eq!(
+            m.merge_base_patch_id(&origin.path, &base2, &reviewed)
+                .await
+                .expect("patch-id"),
+            m.merge_base_patch_id(&origin.path, &base2, &rebased)
+                .await
+                .expect("patch-id"),
+            "the same change at a new parent must keep its patch-id"
+        );
+        assert_ne!(
+            m.merge_base_patch_id(&origin.path, &base2, &reviewed)
+                .await
+                .expect("patch-id"),
+            m.merge_base_patch_id(&origin.path, &base2, &changed)
+                .await
+                .expect("patch-id"),
+            "a changed line in the large file must change the patch-id"
+        );
+        // The base arrives from GitHub as a branch NAME, not a SHA; `resolve_base` maps it onto the
+        // mirror's remote-tracking ref and the patch-id is the same either way.
+        assert_eq!(
+            m.resolve_base(&origin.path, "main").await.expect("resolve"),
+            base2
+        );
+        assert_eq!(
+            m.merge_base_patch_id(&origin.path, "main", &reviewed)
+                .await
+                .expect("branch-name base"),
+            m.merge_base_patch_id(&origin.path, &base2, &reviewed)
+                .await
+                .expect("sha base"),
+        );
+        // A base that is not a plausible ref name is refused rather than interpolated.
+        assert_eq!(
+            m.resolve_base(&origin.path, "--upload-pack=evil").await,
+            Err(ReadError::InvalidRevision)
+        );
     }
 }
