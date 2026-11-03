@@ -151,6 +151,22 @@ pub struct ReviewIntroRequest {
     /// the ADOPTION sweep's, and it is what makes a repair a repair: it may create the row that is
     /// missing and may never disturb one that is not.
     pub only_if_unwatched: bool,
+    /// Adoption already has an own-repo origin row; only the companion lookups remain.
+    pub skip_own_repo: bool,
+    /// Other enabled, distinct configured repositories to probe under the SAME ticket pace/cap.
+    /// Empty for handoffs and lead-only missing-PR probes.
+    pub companions: Vec<CompanionReviewRepo>,
+}
+
+/// A configured companion repository, plus the local per-PR snapshot used to avoid sending
+/// already-watched coordinates back to control. The write-side gate remains authoritative.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionReviewRepo {
+    pub owner: String,
+    pub repo: String,
+    pub repo_url: String,
+    pub link: Option<crate::prlink::PrLinkTarget>,
+    pub watched: Vec<i64>,
 }
 
 /// A pull request RESOLVED to the coordinate the watch set is keyed by, on its way back to the
@@ -267,14 +283,13 @@ pub struct ReviewIntroDeps {
 /// Consumes [`ReviewIntroRequest`]s until `ctx` is cancelled or every sender is dropped.
 ///
 /// One at a time, serially and with no `spawn`, for [`crate::quorum::run_quorum_task`]'s reason: the
-/// `gh` call blocks, so concurrency here would occupy several runtime workers and multiply the
-/// rate-limit pressure of a subsystem nobody is waiting on.
+/// serial lookups avoid multiplying the rate-limit pressure of a subsystem nobody is waiting on.
 ///
 /// There is no back-off, deliberately, and the difference from the quorum is real rather than an
 /// omission: the quorum retries nothing but pays for a Linear outage with a burst of failing
 /// writes, whereas this task performs exactly one read per handoff and writes nothing itself. A
-/// failed lookup costs one introduction, and the next handoff of the same run — the only thing that
-/// should ever ask again — asks again.
+/// failed lookup costs one introduction; another handoff or a paced adoption sweep can ask again.
+/// Adoption requests carry at most one lookup per other configured repository (STUDIO-1691).
 pub async fn run_review_intro_task(
     mut ctx: CancelWait,
     deps: ReviewIntroDeps,
@@ -304,85 +319,126 @@ pub async fn run_review_intro_task(
         // Only the URL is wanted here: the watch row records no head until the watcher's own
         // `gh pr view` sweep reports one (§14.1 F-SHA), so `OpenPr::head_sha` is deliberately
         // dropped rather than half-trusted.
-        let url = match src
-            .open_pr_for_branch(&req.owner, &req.repo, &req.head_branch)
-            .await
-        {
-            Ok(Some(pr)) => pr.url,
-            Ok(None) => {
-                if req.only_if_unwatched {
-                    deps.sink.missing_pr(&req).await;
+        let mut missing_own_pr = false;
+        let mut companion_found = false;
+        let mut companion_lookup_failed = false;
+        if !req.skip_own_repo {
+            match src
+                .open_pr_for_branch(&req.owner, &req.repo, &req.head_branch)
+                .await
+            {
+                Ok(Some(pr)) => introduce_resolved_pr(&deps, &req, &pr.url).await,
+                Ok(None) => {
+                    missing_own_pr = req.only_if_unwatched;
+                    tracing::debug!(
+                        owner = %req.owner, repo = %req.repo, branch = %req.head_branch,
+                        "ticketless review: no open pull request on the run's branch; nothing to review yet"
+                    );
                 }
-                tracing::debug!(
-                    owner = %req.owner, repo = %req.repo, branch = %req.head_branch,
-                    "ticketless review: no open pull request on the run's branch; nothing to review yet"
-                );
-                continue;
+                Err(e) => {
+                    tracing::warn!(
+                        owner = %req.owner, repo = %req.repo, branch = %req.head_branch, err = %e,
+                        "ticketless review: the open-pull-request lookup failed; nothing is introduced"
+                    );
+                }
             }
-            Err(e) => {
-                tracing::warn!(
-                    owner = %req.owner, repo = %req.repo, branch = %req.head_branch, err = %e,
-                    "ticketless review: the open-pull-request lookup failed; nothing is introduced"
-                );
-                continue;
+        }
+        for companion in &req.companions {
+            let prs = match src
+                .open_prs_for_branch_prefix(&companion.owner, &companion.repo, &req.head_branch)
+                .await
+            {
+                Ok(prs) => prs,
+                Err(e) => {
+                    companion_lookup_failed = true;
+                    tracing::warn!(owner = %companion.owner, repo = %companion.repo,
+                        branch = %req.head_branch, err = %e,
+                        "ticketless review: companion lookup failed; nothing is introduced for this repo");
+                    continue;
+                }
+            };
+            let companion_req = ReviewIntroRequest {
+                owner: companion.owner.clone(),
+                repo: companion.repo.clone(),
+                repo_url: companion.repo_url.clone(),
+                link: companion.link.clone(),
+                only_if_unwatched: true,
+                companions: Vec::new(),
+                ..req.clone()
+            };
+            for pr in prs {
+                if let Some(coord) = pr_from_url(&pr.url, &companion.owner, &companion.repo) {
+                    companion_found = true;
+                    if companion.watched.contains(&coord.number) {
+                        continue;
+                    }
+                }
+                introduce_resolved_pr(&deps, &companion_req, &pr.url).await;
             }
-        };
-        if req.only_if_unwatched && req.reviewers.is_empty() {
-            continue; // a lead-only probe found a PR; it never introduces reviews or links it.
+            // No companion is an ordinary outcome, never evidence that the OWN repo has no PR.
         }
-        let Some(pr) = pr_from_url(&url, &req.owner, &req.repo) else {
-            tracing::warn!(
-                url = %url, owner = %req.owner, repo = %req.repo,
-                "ticketless review: the resolved pull-request URL does not name the repository that \
-                 was asked about; nothing is introduced"
-            );
-            continue;
-        };
-        // STUDIO-875, and deliberately BEFORE the introduction rather than after it: the
-        // attachment is what lets the review's eventual findings comment reach this ticket, and
-        // that matters whether or not the watch-set write ends up introducing anything (a row
-        // already mid-review introduces nothing and still gets reviewed). Best-effort throughout —
-        // `link_pr_best_effort` reports and returns, so a Linear refusal costs the next summons,
-        // never this introduction.
-        crate::prlink::link_pr_best_effort(deps.linker.as_deref(), req.link.as_ref(), &url).await;
-        let outcome = deps
-            .sink
-            .introduce(IntroducedPr {
-                pr: pr.clone(),
-                repo_url: req.repo_url.clone(),
-                reviewers: req.reviewers.clone(),
-                author: req.author.clone(),
-                introduced_by: req.introduced_by.clone(),
-                only_if_unwatched: req.only_if_unwatched,
-            })
-            .await;
-        match outcome {
-            // `Introduced(0)` is not a failure and not an introduction: every candidate row had a
-            // review already in flight or already carried an approval at the current head, so the
-            // watch set already says what needs saying.
-            ReviewIntroOutcome::Introduced(0) => tracing::debug!(
-                pr = %pr,
-                "ticketless review: every reviewer of this pull request is already mid-review or \
-                 has already approved the current head; its watch rows were left as they are"
-            ),
-            ReviewIntroOutcome::Introduced(n) => tracing::info!(
-                pr = %pr, rows = n, origin = %req.introduced_by,
-                "ticketless review: pull request introduced into the watch set"
-            ),
-            ReviewIntroOutcome::AlreadyWatched => tracing::debug!(
-                pr = %pr, origin = %req.introduced_by,
-                "ticketless review: this pull request is already in the watch set, so the \
-                 adoption had nothing to repair"
-            ),
-            ReviewIntroOutcome::Dormant => tracing::debug!(
-                pr = %pr,
-                "ticketless review: the subsystem is off, so nothing was introduced"
-            ),
-            ReviewIntroOutcome::Refused(why) => tracing::warn!(
-                pr = %pr, reason = why,
-                "ticketless review: the introduction was refused"
-            ),
+        if missing_own_pr && !companion_found && !companion_lookup_failed {
+            deps.sink.missing_pr(&req).await;
         }
+    }
+}
+
+async fn introduce_resolved_pr(deps: &ReviewIntroDeps, req: &ReviewIntroRequest, url: &str) {
+    if req.only_if_unwatched && req.reviewers.is_empty() {
+        return; // a lead-only probe found a PR; it never introduces reviews or links it.
+    }
+    let Some(pr) = pr_from_url(url, &req.owner, &req.repo) else {
+        tracing::warn!(
+            url = %url, owner = %req.owner, repo = %req.repo,
+            "ticketless review: the resolved pull-request URL does not name the repository that \
+             was asked about; nothing is introduced"
+        );
+        return;
+    };
+    // STUDIO-875, and deliberately BEFORE the introduction rather than after it: the
+    // attachment is what lets the review's eventual findings comment reach this ticket, and
+    // that matters whether or not the watch-set write ends up introducing anything (a row
+    // already mid-review introduces nothing and still gets reviewed). Best-effort throughout —
+    // `link_pr_best_effort` reports and returns, so a Linear refusal costs the next summons,
+    // never this introduction.
+    crate::prlink::link_pr_best_effort(deps.linker.as_deref(), req.link.as_ref(), url).await;
+    let outcome = deps
+        .sink
+        .introduce(IntroducedPr {
+            pr: pr.clone(),
+            repo_url: req.repo_url.clone(),
+            reviewers: req.reviewers.clone(),
+            author: req.author.clone(),
+            introduced_by: req.introduced_by.clone(),
+            only_if_unwatched: req.only_if_unwatched,
+        })
+        .await;
+    match outcome {
+        // `Introduced(0)` is not a failure and not an introduction: every candidate row had a
+        // review already in flight or already carried an approval at the current head, so the
+        // watch set already says what needs saying.
+        ReviewIntroOutcome::Introduced(0) => tracing::debug!(
+            pr = %pr,
+            "ticketless review: every reviewer of this pull request is already mid-review or \
+             has already approved the current head; its watch rows were left as they are"
+        ),
+        ReviewIntroOutcome::Introduced(n) => tracing::info!(
+            pr = %pr, rows = n, origin = %req.introduced_by,
+            "ticketless review: pull request introduced into the watch set"
+        ),
+        ReviewIntroOutcome::AlreadyWatched => tracing::debug!(
+            pr = %pr, origin = %req.introduced_by,
+            "ticketless review: this pull request is already in the watch set, so the \
+             adoption had nothing to repair"
+        ),
+        ReviewIntroOutcome::Dormant => tracing::debug!(
+            pr = %pr,
+            "ticketless review: the subsystem is off, so nothing was introduced"
+        ),
+        ReviewIntroOutcome::Refused(why) => tracing::warn!(
+            pr = %pr, reason = why,
+            "ticketless review: the introduction was refused"
+        ),
     }
 }
 
@@ -535,6 +591,8 @@ impl Orchestrator {
             // `handle_review_introduce` leaves alone (STUDIO-1006). Only the adoption sweep refuses
             // to touch a row that already exists.
             only_if_unwatched: false,
+            skip_own_repo: false,
+            companions: Vec::new(),
         })
     }
 
@@ -2465,6 +2523,8 @@ mod tests {
             introduced_by: "handoff:STUDIO-720".to_string(),
             only_if_unwatched: false,
             link: None,
+            skip_own_repo: false,
+            companions: Vec::new(),
         }
     }
 

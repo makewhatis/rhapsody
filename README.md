@@ -3890,11 +3890,11 @@ lookup must not make. A newest run recording `teams.unrouted reason=solo` is als
 no author to exclude (STUDIO-1173). A ticket this daemon never ran, or whose newest run has no
 teammate/solo dispatch evidence, is not adopted at all; today's solo label is not proof of a run.
 
-**Bounded, and free in the steady state.** The candidate set is the poll tick's own fetch, which is
-already active ∪ review, so learning that a ticket is parked costs no tracker call. A ticket whose
-handoff DID introduce it is skipped before any `gh` lookup, the same ticket is re-probed at most
-every `REVIEW_ADOPT_PROBE_INTERVAL` (15 minutes), and one tick plans at most
-`MAX_REVIEW_ADOPTIONS_PER_TICK` (4). A Teams-off or non-`ticketless` daemon reaches none of it.
+**Bounded discovery.** The candidate set is the poll tick's own fetch, which is already active ∪
+review, so learning that a ticket is parked costs no tracker call. An own-repo origin row suppresses
+the own-repo lookup. The same ticket is re-probed at most every `REVIEW_ADOPT_PROBE_INTERVAL`
+(15 minutes), and one tick plans at most `MAX_REVIEW_ADOPTIONS_PER_TICK` (4) ticket probes, including
+their companion passes described below. Healthy single-repo handoffs remain lookup-free.
 
 **The retry is narrow on purpose.** `handoff::move_is_transient` retries a transport failure or a
 408/429/5xx — the tracker never CONSIDERED the request — and nothing else; a rejected move, a
@@ -3913,6 +3913,24 @@ rather than appended to, because the sweep re-observes the same orphan on every 
 ticket is one line, refreshed rather than duplicated, capped at
 `warnings::ORPHANED_REVIEW_WARN_CAP`. The endpoint's shape is unchanged and the two ported producers
 keep their golden ordering ahead of the additions.
+
+### Cross-repository companion pull requests enter the review watch set (STUDIO-1691)
+
+Adoption also discovers companions in each OTHER distinct enabled configured repository, even when
+the ticket already has an own-repo watch row. Only a head branch anchored at `symphony/<key>`
+followed by end-of-string, `-`, `_` or `.` matches: `symphony/STUDIO-1621-publisher` qualifies,
+`symphony/STUDIO-16210` does not. The head-owner/fork guard and configured-repo allowlist still
+apply; PR bodies, titles and room text never supply discovery evidence. Every resolved coordinate
+uses the existing `only_if_unwatched` gate, with a watch-set snapshot avoiding repeat introductions.
+Lead-only missing-PR probes do not discover companions. A ticket with a companion but no own-repo
+PR is not reported as missing a PR.
+
+Companions share the SAME 15-minute ticket pace and four-ticket per-tick cap above. For `P` distinct
+enabled repositories, the added cost is at most `4 × (P - 1)` `gh pr list` lookups per tick (at most
+`4 × P` including own-repo lookups), off-loop and serial. Each companion lookup asks GitHub for at
+most 20 open PRs narrowed by the head-branch search, then applies the anchored boundary locally.
+No configuration, schema, API or golden fixture changes; this extends the Rhapsody-only review
+feature and has no frozen Go counterpart.
 
 ### The daemon links a pull request to its ticket, and routes summons off its own record (STUDIO-875, corrected by STUDIO-882)
 

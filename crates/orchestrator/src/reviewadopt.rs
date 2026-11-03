@@ -36,8 +36,8 @@
 //! `plan_review_intro` reads all three off the run. This planner has no run, so each has to be
 //! re-derived from a source that is at least as trustworthy:
 //!
-//! * **The repository** comes from the ticket's own resolved project — that is, from CONFIG, which
-//!   is where the allowlist itself lives and is strictly less reachable than a run's binding.
+//! * **The repositories** come from CONFIG: the ticket's own resolved project, plus the other
+//!   enabled configured repositories for companion discovery (STUDIO-1691).
 //! * **The author** comes from this daemon's OWN event ledger: the newest run of the ticket, and
 //!   the `teams.route` row that run recorded, or `teams.unrouted reason=solo` for a solo dispatch.
 //!   Solo has no roster author to exclude. A ticket this daemon never ran, or whose newest run
@@ -54,12 +54,11 @@
 //! What is NOT free is resolving a branch to a pull-request number, which is a `gh` round trip on
 //! the off-loop task. Three bounds keep it rare:
 //!
-//! * a ticket whose watch set already carries a row introduced FOR it is skipped before any lookup
-//!   ([`Orchestrator::review_adopt_origins`]) — which is every healthy handoff, i.e. almost all of
-//!   them;
+//! * a ticket with an own-repo origin row skips the own-repo lookup, but still probes other
+//!   configured repositories for companions; resolved coordinates already watched are skipped;
 //! * [`REVIEW_ADOPT_PROBE_INTERVAL`] paces how often the same ticket may be asked about, so a
-//!   ticket parked in review whose branch has no pull request costs one lookup a quarter of an hour
-//!   rather than one per tick;
+//!   ticket costs at most one lookup per distinct enabled repository a quarter of an hour rather
+//!   than once per poll tick;
 //! * [`MAX_REVIEW_ADOPTIONS_PER_TICK`] caps the burst, so a first tick after a long outage cannot
 //!   turn into a run of blocking round trips.
 
@@ -70,13 +69,14 @@ use rhapsody_core::{Issue, normalize_state};
 use rhapsody_workspace::sanitize_key;
 
 use crate::orchestrator::Orchestrator;
-use crate::reviewintro::{REVIEW_ORIGIN_ADOPT, REVIEW_ORIGIN_HANDOFF, ReviewIntroRequest};
+use crate::reviewintro::{
+    CompanionReviewRepo, REVIEW_ORIGIN_ADOPT, REVIEW_ORIGIN_HANDOFF, ReviewIntroRequest,
+};
 
-/// How many adoptions ONE tick may plan — the blast-radius bound on a `gh` round trip per plan,
+/// How many TICKETS one tick may probe — shared by own-repo and companion discovery,
 /// [`crate::prstate::MAX_PR_STATE_CALLS_PER_TICK`]'s idea at a tenth the size.
 ///
-/// Four, because an orphan is by construction rare (it takes a failed handoff to make one) and the
-/// cap is not a throughput knob: the remainder is not dropped, it is simply considered again on the
+/// The cap is not a throughput knob: the remainder is not dropped, it is simply considered again on the
 /// next tick. Sizing it for the ordinary case rather than the recovery case is deliberate — a
 /// daemon coming up against a backlog of parked tickets should trickle, not stampede.
 pub const MAX_REVIEW_ADOPTIONS_PER_TICK: usize = 4;
@@ -141,9 +141,9 @@ impl Orchestrator {
         if !self.review_ticketless_enabled() && !self.lead_enabled() {
             return out;
         }
-        // Read ONCE per tick rather than once per candidate: the origins are a whole-table read and
+        // Read ONCE per tick rather than once per candidate: the watch set is a whole-table read and
         // the candidate list is a whole poll's worth of tickets.
-        let origins = self.review_adopt_origins();
+        let watched = self.review_adopt_rows();
         let load = crate::teams::LoadSnapshot::from_running(&self.running);
         // The issue-id set `review_reopen_eligible` takes, built once for the whole sweep.
         let running: std::collections::HashSet<String> = self.running.keys().cloned().collect();
@@ -152,7 +152,7 @@ impl Orchestrator {
             if out.planned.len() >= MAX_REVIEW_ADOPTIONS_PER_TICK {
                 break;
             }
-            match self.adopt_verdict(iss, proj, &origins, &running, load.counts(), now) {
+            match self.adopt_verdict(iss, proj, &watched, &running, load.counts(), now) {
                 Verdict::Skip => {
                     // A `rhapsody:human` ticket is HELD, not orphaned (STUDIO-949 round 4). The gate
                     // returns Skip, so it never reaches the Adopt arm that retires an advisory filed
@@ -341,7 +341,7 @@ impl Orchestrator {
         &self,
         iss: &Issue,
         proj: Option<usize>,
-        origins: &HashSet<String>,
+        watched: &[rhapsody_store::ReviewWatchRow],
         running: &HashSet<String>,
         load: &std::collections::HashMap<String, i64>,
         now: Instant,
@@ -392,32 +392,70 @@ impl Orchestrator {
         if self.review_reopen_eligible(iss, running) {
             return Verdict::Skip;
         }
-        // Gate: the watch set holds no row introduced FOR this ticket. The cheap pre-filter, and
-        // the reason a sweep every tick is affordable: every healthy handoff leaves one of these,
-        // so almost every candidate stops here rather than at a `gh` lookup. It is not the
-        // idempotency guarantee — that is `handle_review_introduce`'s `only_if_unwatched`, keyed on
-        // the pull request itself, because an operator's console introduction and a row whose
-        // origin was rewritten would both slip past a tag comparison.
-        if origins.contains(&handoff_origin(&iss.identifier))
-            || origins.contains(&adopt_origin(&iss.identifier))
-        {
-            return Verdict::Skip;
-        }
-        // Gate: paced — and everything below this line is the EXPENSIVE half, which is why the pace
-        // sits exactly here. The candidate it exists for is the one no sweep can ever settle: a
-        // ticket parked in review whose branch has no pull request at all, indistinguishable from
-        // an orphan without the `gh` lookup this paces. Every verdict below is recorded against the
-        // pace, including the one that adopts nothing, so a review column full of tickets this
-        // daemon never ran does not re-read the run ledger on every tick.
+        // Pace BEFORE building companion snapshots as well as before the run-ledger reads.
+        // Every costly verdict below is memoized, even when no PR can be adopted.
         if let Some(at) = self.review_adopt_probed.get(&iss.identifier)
             && now.duration_since(*at) < REVIEW_ADOPT_PROBE_INTERVAL
         {
+            return Verdict::Skip;
+        }
+        // A healthy own-repo handoff suppresses only the OWN lookup (STUDIO-1691), never
+        // discovery in another configured repo. Scope the origin to its repo too: a previously
+        // adopted companion is not evidence that the own-repo PR was introduced.
+        let skip_own_repo = watched.iter().any(|row| {
+            (row.introduced_by == handoff_origin(&iss.identifier)
+                || row.introduced_by == adopt_origin(&iss.identifier))
+                && crate::ghsummons::parse_repo(&repo_url).is_some_and(|(owner, repo)| {
+                    row.key.owner.eq_ignore_ascii_case(&owner)
+                        && row.key.repo.eq_ignore_ascii_case(&repo)
+                })
+        });
+        let mut companions = Vec::new();
+        if self.review_ticketless_enabled() {
+            for p in &eff.projects {
+                if p.disabled || crate::reviewintro::same_repository(&p.repo, &repo_url) {
+                    continue;
+                }
+                let Some((owner, repo)) = crate::ghsummons::parse_repo(&p.repo) else {
+                    continue;
+                };
+                if !self.review_repo_is_configured(&owner, &repo)
+                    || companions.iter().any(|c: &CompanionReviewRepo| {
+                        c.owner.eq_ignore_ascii_case(&owner) && c.repo.eq_ignore_ascii_case(&repo)
+                    })
+                {
+                    continue;
+                }
+                companions.push(CompanionReviewRepo {
+                    link: crate::prlink::pr_link_target(iss, &owner, &repo),
+                    watched: watched
+                        .iter()
+                        .filter(|row| {
+                            row.key.owner.eq_ignore_ascii_case(&owner)
+                                && row.key.repo.eq_ignore_ascii_case(&repo)
+                        })
+                        .map(|row| row.key.number)
+                        .collect(),
+                    owner,
+                    repo,
+                    repo_url: p.repo.clone(),
+                });
+            }
+        }
+        if skip_own_repo && companions.is_empty() {
             return Verdict::Skip;
         }
         // Gate: this daemon's newest run recorded a teammate or an explicit solo dispatch.
         // Some("") is proven solo, not missing provenance; it excludes nobody from the roster.
         let recorded_author = self.adopt_author(&iss.identifier);
         let adoptable = self.review_ticketless_enabled() && recorded_author.is_some();
+        if !adoptable {
+            // Lead-only probes may diagnose the ticket's own missing PR, never companions.
+            companions.clear();
+            if skip_own_repo {
+                return Verdict::Considered;
+            }
+        }
         let author = match recorded_author {
             Some(author) if self.review_ticketless_enabled() => author,
             _ if self.lead_enabled() => String::new(),
@@ -433,7 +471,13 @@ impl Orchestrator {
         // never leaves the loop, and again at `handle_review_introduce`, which is the load-bearing
         // one — a guard that lives only at the far end of a channel is a guard the next sender can
         // forget.
-        if !self.review_repo_is_configured(&owner, &repo) {
+        //
+        // A ticket whose OWN repo already holds a watch row is not an orphan (STUDIO-1691 review
+        // B1), so this own-repo refusal must not run for it: the companion repositories it may
+        // still adopt were already filtered to the allowlist above, so the own repo's configuration
+        // is not this ticket's gate. Refusing here would file a false "no watch row" advisory for a
+        // ticket whose own row is healthy.
+        if !skip_own_repo && !self.review_repo_is_configured(&owner, &repo) {
             return Verdict::Refuse("no configured project owns the ticket's repository");
         }
         let Some(teams) = self.teams.as_ref() else {
@@ -452,7 +496,17 @@ impl Orchestrator {
         };
         reviewers.truncate(teams.review.effective_reviewers());
         if reviewers.is_empty() && !self.lead_enabled() {
-            return Verdict::Refuse("the roster holds nobody but the author");
+            // A ticket with a healthy own-repo watch row is not an orphan, whatever it cannot be
+            // adopted for on the companion path: the advisory this refusal files says "parked in a
+            // review state with no watch row", which is false for it, and nothing clears it until
+            // an adoption with reviewers runs — so it would stand forever and evict real orphans
+            // from the capped list (STUDIO-1691 review B1). Considered is paced like every other
+            // not-adoptable verdict, so the run-ledger read stays memoized.
+            return if skip_own_repo {
+                Verdict::Considered
+            } else {
+                Verdict::Refuse("the roster holds nobody but the author")
+            };
         }
         // STUDIO-875: the repair sweep repairs the attachment too. An orphaned pull request is
         // exactly the population whose ticket was never linked, so adopting one without linking it
@@ -467,26 +521,28 @@ impl Orchestrator {
             author,
             introduced_by: adopt_origin(&iss.identifier),
             only_if_unwatched: true,
+            skip_own_repo,
+            companions,
             link,
         }))
     }
 
-    /// Every `introduced_by` tag the watch set currently carries — the pre-filter's input.
+    /// The watch-set snapshot: own-repo origins and per-PR companion deduplication.
     ///
-    /// An unreadable store answers an EMPTY set, which is the loud direction rather than the quiet
+    /// An unreadable store answers an EMPTY snapshot, which is the loud direction rather than the quiet
     /// one: every candidate then looks unintroduced and reaches the lookup. That is safe because
     /// the write itself re-reads the watch set (`review_pr_is_watched`) and refuses on the same
     /// failure — so a broken store costs `gh` calls, never a duplicate reviewer.
-    fn review_adopt_origins(&self) -> HashSet<String> {
+    fn review_adopt_rows(&self) -> Vec<rhapsody_store::ReviewWatchRow> {
         match self.store().load_review_watch() {
-            Ok(rows) => rows.into_iter().map(|r| r.introduced_by).collect(),
+            Ok(rows) => rows,
             Err(e) => {
                 tracing::warn!(
                     err = %e,
                     "ticketless review: the watch set could not be read, so this tick's adoption \
                      sweep cannot tell an introduced pull request from an orphaned one"
                 );
-                HashSet::new()
+                Vec::new()
             }
         }
     }
@@ -560,7 +616,7 @@ fn adopt_origin(identifier: &str) -> String {
     format!("{REVIEW_ORIGIN_ADOPT}:{identifier}")
 }
 
-/// The origin tag a HANDOFF of `identifier` wrote — the cheap pre-filter's other half.
+/// The origin tag a HANDOFF of `identifier` wrote — the own-repo pre-filter's other half.
 fn handoff_origin(identifier: &str) -> String {
     format!("{REVIEW_ORIGIN_HANDOFF}:{identifier}")
 }
@@ -689,6 +745,31 @@ mod tests {
         assert!(
             sweep(&mut o, &issues, now).planned.is_empty(),
             "reuse the existing probe pace"
+        );
+    }
+
+    /// F3 (STUDIO-1691 review): a lead-only probe has no reviewer and can never introduce a watch
+    /// row, so it must diagnose only the ticket's OWN missing pull request — never fan out a
+    /// companion lookup. The companion repositories are cleared before the request is built.
+    #[test]
+    fn a_lead_only_probe_never_searches_companions() {
+        let mut teams = teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]);
+        teams.manager.lead.enabled = true;
+        let mut o = orch(teams);
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+
+        let plan = sweep(&mut o, &[parked("STUDIO-1123")], Instant::now());
+        assert_eq!(
+            plan.planned.len(),
+            1,
+            "a lead-only probe still checks the own repo"
+        );
+        assert!(plan.planned[0].reviewers.is_empty());
+        assert!(
+            plan.planned[0].companions.is_empty(),
+            "a lead-only probe must not search companion repositories"
         );
     }
 
@@ -1474,6 +1555,391 @@ mod tests {
         assert_eq!(
             sweep(&mut o, &[parked("STUDIO-836")], Instant::now()),
             AdoptSweep::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn an_own_repo_watch_row_does_not_hide_a_companion_probe() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "rhapsody".into(),
+                    number: 229,
+                    reviewer: "bob".into(),
+                },
+                author: "alice".into(),
+                introduced_by: "handoff:STUDIO-1621".into(),
+                status: rhapsody_store::REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+                ..Default::default()
+            })
+            .expect("own-repo watch row");
+
+        let now = Instant::now();
+        let first = sweep(&mut o, &[parked("STUDIO-1621")], now);
+        assert_eq!(first.planned.len(), 1, "the companion must still be probed");
+        assert!(first.planned[0].skip_own_repo);
+        assert_eq!(first.planned[0].companions.len(), 1);
+        let link = first.planned[0].companions[0].link.as_ref().expect("link");
+        assert_eq!(link.repo, "tally");
+        assert_eq!(link.identifier, "STUDIO-1621");
+        let introductions = resolve_companions(first.planned).await;
+        assert_eq!(introductions.len(), 1, "exactly one companion introduction");
+        let pr = &introductions[0];
+        assert_eq!(
+            pr.pr,
+            crate::prstate::PrCoord::new("makewhatis", "tally", 360)
+        );
+        assert_eq!(pr.author, "alice");
+        assert_eq!(pr.reviewers, ["bob"]);
+        assert!(pr.only_if_unwatched);
+        assert_eq!(
+            o.handle_review_introduce(pr),
+            crate::reviewintro::ReviewIntroOutcome::Introduced(1)
+        );
+        assert_eq!(
+            o.handle_review_introduce(pr),
+            crate::reviewintro::ReviewIntroOutcome::AlreadyWatched,
+            "write-side dedup also protects a stale discovery snapshot"
+        );
+        assert_eq!(o.store().load_review_watch().expect("rows").len(), 2);
+        assert!(
+            sweep(
+                &mut o,
+                &[parked("STUDIO-1621")],
+                now + Duration::from_secs(1)
+            )
+            .planned
+            .is_empty(),
+            "the next tick must re-plan nothing"
+        );
+        let later = sweep(
+            &mut o,
+            &[parked("STUDIO-1621")],
+            now + REVIEW_ADOPT_PROBE_INTERVAL,
+        );
+        assert_eq!(
+            later.planned.len(),
+            1,
+            "discovery continues for later companion PRs"
+        );
+        assert!(
+            resolve_companions(later.planned).await.is_empty(),
+            "re-discovery after the pace expires plans no already-watched introduction"
+        );
+    }
+
+    /// F1 (STUDIO-1691 review): the own-repo suppression is scoped to the OWN repository. A
+    /// companion `adopt:<key>` row is not evidence that the ticket's own-repo pull request was
+    /// introduced, so it must not suppress the own-repo lookup — otherwise a ticket whose own pull
+    /// request is genuinely orphaned would be skipped forever.
+    #[test]
+    fn a_companion_adopt_row_does_not_suppress_the_own_repo_lookup() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "tally".into(),
+                    number: 360,
+                    reviewer: "bob".into(),
+                },
+                author: "alice".into(),
+                introduced_by: "adopt:STUDIO-1621".into(),
+                status: rhapsody_store::REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+                ..Default::default()
+            })
+            .expect("companion watch row");
+
+        let plan = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
+        assert_eq!(
+            plan.planned.len(),
+            1,
+            "only a companion row exists, so the own-repo pull request must still be probed"
+        );
+        assert!(
+            !plan.planned[0].skip_own_repo,
+            "a companion row is not evidence that the own-repo pull request was introduced"
+        );
+        assert!(plan.planned[0].companions.is_empty());
+    }
+
+    /// B1 (STUDIO-1691 review): a ticket that already has its OWN-repo watch row is not an orphan,
+    /// so a companion probe that cannot be adopted must never be REFUSED. The refusal files a
+    /// "parked in a review state with no watch row" advisory that is false for it, and because only
+    /// an adoption with reviewers clears that advisory it would stand forever and evict real
+    /// orphans from the capped list. Before the fix the own-repo refusal gates ran for such a
+    /// ticket as soon as any other enabled project existed, so a roster that shrank (or whose other
+    /// reviewers were transiently unusable) refused it here.
+    #[test]
+    fn a_watched_ticket_is_never_refused_for_a_companion_it_cannot_adopt() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "rhapsody".into(),
+                    number: 229,
+                    reviewer: "bob".into(),
+                },
+                author: "alice".into(),
+                introduced_by: "handoff:STUDIO-1621".into(),
+                status: rhapsody_store::REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+                ..Default::default()
+            })
+            .expect("own-repo watch row");
+
+        let out = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
+        assert!(
+            out.refused.is_empty(),
+            "a ticket with a healthy own-repo watch row must never be reported orphaned: {:?}",
+            out.refused
+        );
+        assert!(
+            out.planned.is_empty(),
+            "the author is the only roster member, so no companion can be adopted"
+        );
+    }
+
+    /// B1 (STUDIO-1691 review), the second refusal site: a ticket whose OWN repository is no longer
+    /// configured (its project was paused, or the allowlist narrowed) still holds a healthy own-repo
+    /// watch row, so it is not an orphan and must not be refused. The companion repositories it may
+    /// still adopt were filtered to the allowlist on their own.
+    #[test]
+    fn a_watched_ticket_with_an_unconfigured_own_repo_is_not_refused() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        o.eff.as_mut().expect("effective").projects[0].disabled = true;
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "rhapsody".into(),
+                    number: 229,
+                    reviewer: "bob".into(),
+                },
+                author: "alice".into(),
+                introduced_by: "handoff:STUDIO-1621".into(),
+                status: rhapsody_store::REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+                ..Default::default()
+            })
+            .expect("own-repo watch row");
+
+        let out = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
+        assert!(
+            out.refused.is_empty(),
+            "a watched ticket is never refused for its own repo's configuration: {:?}",
+            out.refused
+        );
+        assert_eq!(
+            out.planned.len(),
+            1,
+            "the still-configured companion is adopted"
+        );
+        assert!(out.planned[0].skip_own_repo);
+        assert_eq!(out.planned[0].companions.len(), 1);
+    }
+
+    async fn resolve_companions(
+        requests: Vec<ReviewIntroRequest>,
+    ) -> Vec<crate::reviewintro::IntroducedPr> {
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<crate::reviewintro::IntroducedPr>>);
+        #[async_trait::async_trait]
+        impl crate::reviewintro::ReviewIntroSink for Sink {
+            async fn introduce(
+                &self,
+                pr: crate::reviewintro::IntroducedPr,
+            ) -> crate::reviewintro::ReviewIntroOutcome {
+                self.0.lock().expect("sink").push(pr);
+                crate::reviewintro::ReviewIntroOutcome::Introduced(1)
+            }
+            async fn missing_pr(&self, _: &ReviewIntroRequest) {
+                panic!("an absent companion must never report the ticket as missing a PR");
+            }
+        }
+        let source = crate::ghsummons::GH::new(
+            "@symphony",
+            Some(Box::new(|args| {
+                if args.contains(&"--head") {
+                    assert!(args.contains(&"makewhatis/rhapsody"));
+                    return Ok(b"[]".to_vec());
+                }
+                assert_eq!(
+                    args,
+                    [
+                        "pr",
+                        "list",
+                        "--repo",
+                        "makewhatis/tally",
+                        "--state",
+                        "open",
+                        "--search",
+                        "head:symphony/STUDIO-1621",
+                        "--json",
+                        "url,headRefName,headRefOid,headRepositoryOwner",
+                        "--limit",
+                        "20"
+                    ]
+                );
+                Ok(br#"[{"url":"https://github.com/makewhatis/tally/pull/360",
+                "headRefName":"symphony/STUDIO-1621-publisher",
+                "headRepositoryOwner":{"login":"makewhatis"}},
+                {"url":"https://github.com/makewhatis/tally/pull/361",
+                "headRefName":"symphony/STUDIO-16210",
+                "headRepositoryOwner":{"login":"makewhatis"}}]"#
+                    .to_vec())
+            })),
+        );
+        let sink = Arc::new(Sink::default());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for req in requests {
+            tx.send(req).expect("send");
+        }
+        drop(tx);
+        let signal = crate::control_loop::CancelSignal::new();
+        crate::reviewintro::run_review_intro_task(
+            signal.wait(),
+            crate::reviewintro::ReviewIntroDeps {
+                pr_source: Some(Arc::new(source)),
+                sink: sink.clone(),
+                linker: None,
+            },
+            rx,
+        )
+        .await;
+        sink.0.lock().expect("sink").clone()
+    }
+
+    #[tokio::test]
+    async fn a_companion_only_ticket_is_not_reported_as_missing_a_pr() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        let plan = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
+        assert_eq!(resolve_companions(plan.planned).await.len(), 1);
+    }
+
+    /// F4 (STUDIO-1691 review): a companion lookup that FAILS is not evidence that the ticket's own
+    /// repository has no pull request. The missing-PR report is withheld while any companion lookup
+    /// is unresolved, so a transient `gh` failure cannot page a human about a ticket that may be
+    /// perfectly fine.
+    #[tokio::test]
+    async fn a_failed_companion_lookup_does_not_report_the_ticket_missing_a_pr() {
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl crate::reviewintro::ReviewIntroSink for Sink {
+            async fn introduce(
+                &self,
+                _: crate::reviewintro::IntroducedPr,
+            ) -> crate::reviewintro::ReviewIntroOutcome {
+                crate::reviewintro::ReviewIntroOutcome::Introduced(0)
+            }
+            async fn missing_pr(&self, req: &ReviewIntroRequest) {
+                self.0.lock().expect("sink").push(req.head_branch.clone());
+            }
+        }
+        let source = crate::ghsummons::GH::new(
+            "@symphony",
+            Some(Box::new(|args| {
+                if args.contains(&"--head") {
+                    return Ok(b"[]".to_vec()); // the own repo: an authoritative empty answer
+                }
+                Err("companion lookup failed".into())
+            })),
+        );
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        let plan = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
+        assert_eq!(plan.planned.len(), 1);
+        assert!(!plan.planned[0].skip_own_repo);
+
+        let sink = Arc::new(Sink::default());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for req in plan.planned {
+            tx.send(req).expect("send");
+        }
+        drop(tx);
+        let signal = crate::control_loop::CancelSignal::new();
+        crate::reviewintro::run_review_intro_task(
+            signal.wait(),
+            crate::reviewintro::ReviewIntroDeps {
+                pr_source: Some(Arc::new(source)),
+                sink: sink.clone(),
+                linker: None,
+            },
+            rx,
+        )
+        .await;
+        assert!(
+            sink.0.lock().expect("sink").is_empty(),
+            "a failed companion lookup must not report the ticket as missing a PR"
+        );
+    }
+
+    #[test]
+    fn companion_probes_share_the_ticket_cap_and_exclude_paused_or_duplicate_repos() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        for (name, url, disabled) in [
+            ("tally", "git@github.com:makewhatis/tally.git", false),
+            ("duplicate", "https://github.com/MakeWhatIs/TALLY", false),
+            ("own-alias", "https://github.com/MakeWhatIs/RHAPSODY", false),
+            ("paused", OUTSIDE_URL, true),
+        ] {
+            let mut p = empty_resolved_project(name, Arc::new(Fake::new()));
+            p.repo = url.into();
+            p.disabled = disabled;
+            o.eff.as_mut().expect("effective").projects.push(p);
+        }
+        let issues: Vec<_> = (0..MAX_REVIEW_ADOPTIONS_PER_TICK + 2)
+            .map(|n| {
+                let id = format!("STUDIO-80{n}");
+                record_run(&o, &id, "alice");
+                parked(&id)
+            })
+            .collect();
+        let now = Instant::now();
+        let plan = sweep(&mut o, &issues, now);
+        assert_eq!(plan.planned.len(), MAX_REVIEW_ADOPTIONS_PER_TICK);
+        for req in &plan.planned {
+            assert_eq!(req.companions.len(), 1);
+            assert_eq!(req.companions[0].repo, "tally");
+            assert!(req.only_if_unwatched);
+        }
+        assert_eq!(
+            sweep(&mut o, &issues, now + Duration::from_secs(1))
+                .planned
+                .len(),
+            2,
+            "next tick probes only the tickets the shared cap deferred"
+        );
+        assert!(
+            sweep(&mut o, &issues, now + Duration::from_secs(2))
+                .planned
+                .is_empty()
         );
     }
 

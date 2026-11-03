@@ -1308,6 +1308,7 @@ mod tests {
                 introduced_by: "adopt:STUDIO-1123".into(),
                 only_if_unwatched: true,
                 link: None,
+                ..Default::default()
             },
         ))
         .await;
