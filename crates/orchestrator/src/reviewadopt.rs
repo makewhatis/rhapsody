@@ -471,7 +471,13 @@ impl Orchestrator {
         // never leaves the loop, and again at `handle_review_introduce`, which is the load-bearing
         // one — a guard that lives only at the far end of a channel is a guard the next sender can
         // forget.
-        if !self.review_repo_is_configured(&owner, &repo) {
+        //
+        // A ticket whose OWN repo already holds a watch row is not an orphan (STUDIO-1691 review
+        // B1), so this own-repo refusal must not run for it: the companion repositories it may
+        // still adopt were already filtered to the allowlist above, so the own repo's configuration
+        // is not this ticket's gate. Refusing here would file a false "no watch row" advisory for a
+        // ticket whose own row is healthy.
+        if !skip_own_repo && !self.review_repo_is_configured(&owner, &repo) {
             return Verdict::Refuse("no configured project owns the ticket's repository");
         }
         let Some(teams) = self.teams.as_ref() else {
@@ -490,7 +496,17 @@ impl Orchestrator {
         };
         reviewers.truncate(teams.review.effective_reviewers());
         if reviewers.is_empty() && !self.lead_enabled() {
-            return Verdict::Refuse("the roster holds nobody but the author");
+            // A ticket with a healthy own-repo watch row is not an orphan, whatever it cannot be
+            // adopted for on the companion path: the advisory this refusal files says "parked in a
+            // review state with no watch row", which is false for it, and nothing clears it until
+            // an adoption with reviewers runs — so it would stand forever and evict real orphans
+            // from the capped list (STUDIO-1691 review B1). Considered is paced like every other
+            // not-adoptable verdict, so the run-ledger read stays memoized.
+            return if skip_own_repo {
+                Verdict::Considered
+            } else {
+                Verdict::Refuse("the roster holds nobody but the author")
+            };
         }
         // STUDIO-875: the repair sweep repairs the attachment too. An orphaned pull request is
         // exactly the population whose ticket was never linked, so adopting one without linking it
@@ -729,6 +745,31 @@ mod tests {
         assert!(
             sweep(&mut o, &issues, now).planned.is_empty(),
             "reuse the existing probe pace"
+        );
+    }
+
+    /// F3 (STUDIO-1691 review): a lead-only probe has no reviewer and can never introduce a watch
+    /// row, so it must diagnose only the ticket's OWN missing pull request — never fan out a
+    /// companion lookup. The companion repositories are cleared before the request is built.
+    #[test]
+    fn a_lead_only_probe_never_searches_companions() {
+        let mut teams = teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]);
+        teams.manager.lead.enabled = true;
+        let mut o = orch(teams);
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+
+        let plan = sweep(&mut o, &[parked("STUDIO-1123")], Instant::now());
+        assert_eq!(
+            plan.planned.len(),
+            1,
+            "a lead-only probe still checks the own repo"
+        );
+        assert!(plan.planned[0].reviewers.is_empty());
+        assert!(
+            plan.planned[0].companions.is_empty(),
+            "a lead-only probe must not search companion repositories"
         );
     }
 
@@ -1594,6 +1635,128 @@ mod tests {
         );
     }
 
+    /// F1 (STUDIO-1691 review): the own-repo suppression is scoped to the OWN repository. A
+    /// companion `adopt:<key>` row is not evidence that the ticket's own-repo pull request was
+    /// introduced, so it must not suppress the own-repo lookup — otherwise a ticket whose own pull
+    /// request is genuinely orphaned would be skipped forever.
+    #[test]
+    fn a_companion_adopt_row_does_not_suppress_the_own_repo_lookup() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "tally".into(),
+                    number: 360,
+                    reviewer: "bob".into(),
+                },
+                author: "alice".into(),
+                introduced_by: "adopt:STUDIO-1621".into(),
+                status: rhapsody_store::REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+                ..Default::default()
+            })
+            .expect("companion watch row");
+
+        let plan = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
+        assert_eq!(
+            plan.planned.len(),
+            1,
+            "only a companion row exists, so the own-repo pull request must still be probed"
+        );
+        assert!(
+            !plan.planned[0].skip_own_repo,
+            "a companion row is not evidence that the own-repo pull request was introduced"
+        );
+        assert!(plan.planned[0].companions.is_empty());
+    }
+
+    /// B1 (STUDIO-1691 review): a ticket that already has its OWN-repo watch row is not an orphan,
+    /// so a companion probe that cannot be adopted must never be REFUSED. The refusal files a
+    /// "parked in a review state with no watch row" advisory that is false for it, and because only
+    /// an adoption with reviewers clears that advisory it would stand forever and evict real
+    /// orphans from the capped list. Before the fix the own-repo refusal gates ran for such a
+    /// ticket as soon as any other enabled project existed, so a roster that shrank (or whose other
+    /// reviewers were transiently unusable) refused it here.
+    #[test]
+    fn a_watched_ticket_is_never_refused_for_a_companion_it_cannot_adopt() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "rhapsody".into(),
+                    number: 229,
+                    reviewer: "bob".into(),
+                },
+                author: "alice".into(),
+                introduced_by: "handoff:STUDIO-1621".into(),
+                status: rhapsody_store::REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+                ..Default::default()
+            })
+            .expect("own-repo watch row");
+
+        let out = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
+        assert!(
+            out.refused.is_empty(),
+            "a ticket with a healthy own-repo watch row must never be reported orphaned: {:?}",
+            out.refused
+        );
+        assert!(
+            out.planned.is_empty(),
+            "the author is the only roster member, so no companion can be adopted"
+        );
+    }
+
+    /// B1 (STUDIO-1691 review), the second refusal site: a ticket whose OWN repository is no longer
+    /// configured (its project was paused, or the allowlist narrowed) still holds a healthy own-repo
+    /// watch row, so it is not an orphan and must not be refused. The companion repositories it may
+    /// still adopt were filtered to the allowlist on their own.
+    #[test]
+    fn a_watched_ticket_with_an_unconfigured_own_repo_is_not_refused() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        o.eff.as_mut().expect("effective").projects[0].disabled = true;
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "rhapsody".into(),
+                    number: 229,
+                    reviewer: "bob".into(),
+                },
+                author: "alice".into(),
+                introduced_by: "handoff:STUDIO-1621".into(),
+                status: rhapsody_store::REVIEW_STATUS_REQUESTED.into(),
+                open: true,
+                ..Default::default()
+            })
+            .expect("own-repo watch row");
+
+        let out = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
+        assert!(
+            out.refused.is_empty(),
+            "a watched ticket is never refused for its own repo's configuration: {:?}",
+            out.refused
+        );
+        assert_eq!(
+            out.planned.len(),
+            1,
+            "the still-configured companion is adopted"
+        );
+        assert!(out.planned[0].skip_own_repo);
+        assert_eq!(out.planned[0].companions.len(), 1);
+    }
+
     async fn resolve_companions(
         requests: Vec<ReviewIntroRequest>,
     ) -> Vec<crate::reviewintro::IntroducedPr> {
@@ -1674,6 +1837,67 @@ mod tests {
         o.eff.as_mut().expect("effective").projects.push(companion);
         let plan = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
         assert_eq!(resolve_companions(plan.planned).await.len(), 1);
+    }
+
+    /// F4 (STUDIO-1691 review): a companion lookup that FAILS is not evidence that the ticket's own
+    /// repository has no pull request. The missing-PR report is withheld while any companion lookup
+    /// is unresolved, so a transient `gh` failure cannot page a human about a ticket that may be
+    /// perfectly fine.
+    #[tokio::test]
+    async fn a_failed_companion_lookup_does_not_report_the_ticket_missing_a_pr() {
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<String>>);
+        #[async_trait::async_trait]
+        impl crate::reviewintro::ReviewIntroSink for Sink {
+            async fn introduce(
+                &self,
+                _: crate::reviewintro::IntroducedPr,
+            ) -> crate::reviewintro::ReviewIntroOutcome {
+                crate::reviewintro::ReviewIntroOutcome::Introduced(0)
+            }
+            async fn missing_pr(&self, req: &ReviewIntroRequest) {
+                self.0.lock().expect("sink").push(req.head_branch.clone());
+            }
+        }
+        let source = crate::ghsummons::GH::new(
+            "@symphony",
+            Some(Box::new(|args| {
+                if args.contains(&"--head") {
+                    return Ok(b"[]".to_vec()); // the own repo: an authoritative empty answer
+                }
+                Err("companion lookup failed".into())
+            })),
+        );
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, "STUDIO-1621", "alice");
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        let plan = sweep(&mut o, &[parked("STUDIO-1621")], Instant::now());
+        assert_eq!(plan.planned.len(), 1);
+        assert!(!plan.planned[0].skip_own_repo);
+
+        let sink = Arc::new(Sink::default());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for req in plan.planned {
+            tx.send(req).expect("send");
+        }
+        drop(tx);
+        let signal = crate::control_loop::CancelSignal::new();
+        crate::reviewintro::run_review_intro_task(
+            signal.wait(),
+            crate::reviewintro::ReviewIntroDeps {
+                pr_source: Some(Arc::new(source)),
+                sink: sink.clone(),
+                linker: None,
+            },
+            rx,
+        )
+        .await;
+        assert!(
+            sink.0.lock().expect("sink").is_empty(),
+            "a failed companion lookup must not report the ticket as missing a PR"
+        );
     }
 
     #[test]
