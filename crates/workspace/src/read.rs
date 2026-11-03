@@ -378,7 +378,7 @@ impl Manager {
         if out.len() > MAX_DIFF_BYTES {
             return Err(ReadError::TooLarge);
         }
-        self.patch_id_stdin(&mirror, &out).await
+        self.patch_id_stdin(&mirror, &out, false).await
     }
 
     /// The tree object id of `sha` from the bare mirror (`git rev-parse <sha>^{tree}`). An unknown
@@ -404,13 +404,21 @@ impl Manager {
         Ok(tree.to_string())
     }
 
-    /// A stable patch-id for the change `sha` carries against `base` — the THREE-dot change
-    /// `merge-base(base, sha)..sha` (`git patch-id --stable`), not the two-dot [`Self::patch_id`].
+    /// A content patch-id for the change `sha` carries against `base` — the THREE-dot change
+    /// `merge-base(base, sha)..sha` (`git patch-id --verbatim`), not the two-dot [`Self::patch_id`].
     /// Content, not commit identity, and blind to the hunk line numbers and blob hashes a
     /// base-preserving merge rewrites, so it is the mirror-side proof that a head move carried no
     /// work (STUDIO-1672). `base` is a branch name (GitHub's `pulls.base.ref`) or a commit SHA;
     /// [`Self::resolve_base`] turns it into a commit. Errors when there is no merge base, when the
     /// diff is unreadable, or when the change is empty.
+    ///
+    /// **`--verbatim`, deliberately, not `--stable`.** `--stable` strips ALL whitespace before
+    /// hashing, including whitespace inside a line, so a head that differs from the reviewed one only
+    /// in whitespace (re-indentation, a string literal) would hash to the same id and be reported
+    /// unchanged — carrying an approval over a real change (STUDIO-1672 review B1). `--verbatim`
+    /// keeps whitespace and is still independent of file order. The two-dot [`Self::patch_id`], used
+    /// by the manager's own reads, keeps `--stable`; only this three-dot no-op-rebase proof is
+    /// verbatim.
     pub async fn merge_base_patch_id(
         &self,
         repo_url: &str,
@@ -435,7 +443,7 @@ impl Manager {
         if out.len() > MAX_DIFF_BYTES {
             return Err(ReadError::TooLarge);
         }
-        self.patch_id_stdin(&mirror, &out).await
+        self.patch_id_stdin(&mirror, &out, true).await
     }
 
     /// Resolves a pull request's base REF (GitHub's `pulls.base.ref`, a branch name) to a commit in
@@ -466,28 +474,37 @@ impl Manager {
         Ok(sha.to_string())
     }
 
-    /// Feeds `diff` to `git patch-id --stable` on stdin and returns the first id. `git patch-id`
-    /// has no file-input mode, so this is the one read that needs a pipe; it reuses the crate's
-    /// hardened git environment. Runs on the blocking pool, since the std child API is synchronous.
-    async fn patch_id_stdin(&self, mirror: &str, diff: &str) -> Result<String, ReadError> {
+    /// Feeds `diff` to `git patch-id` on stdin and returns the first id. `verbatim` selects
+    /// `--verbatim` (keep whitespace, for the no-op-rebase proof) over `--stable` (strip it, for the
+    /// manager's own [`Self::patch_id`] reads). `git patch-id` has no file-input mode, so this is the
+    /// one read that needs a pipe; it reuses the crate's hardened git environment. Runs on the
+    /// blocking pool, since the std child API is synchronous.
+    async fn patch_id_stdin(
+        &self,
+        mirror: &str,
+        diff: &str,
+        verbatim: bool,
+    ) -> Result<String, ReadError> {
         let mirror = mirror.to_string();
         let diff = diff.to_string();
-        tokio::task::spawn_blocking(move || patch_id_blocking(&mirror, &diff))
+        tokio::task::spawn_blocking(move || patch_id_blocking(&mirror, &diff, verbatim))
             .await
             .map_err(|e| ReadError::Git(format!("patch-id task: {e}")))?
     }
 }
 
 /// The synchronous half of [`Manager::patch_id_stdin`] — `spawn_blocking`'s closure, factored out so
-/// it is testable without a runtime.
-fn patch_id_blocking(mirror: &str, diff: &str) -> Result<String, ReadError> {
+/// it is testable without a runtime. `verbatim` picks `--verbatim` over `--stable`; see
+/// [`Manager::patch_id_stdin`].
+fn patch_id_blocking(mirror: &str, diff: &str, verbatim: bool) -> Result<String, ReadError> {
     use std::io::Write;
+    let algorithm = if verbatim { "--verbatim" } else { "--stable" };
     let mut child = std::process::Command::new("git")
         .arg("-c")
         .arg("gc.auto=0")
         .arg("-C")
         .arg(mirror)
-        .args(["patch-id", "--stable"])
+        .args(["patch-id", algorithm])
         .env_clear()
         .envs(git_env())
         .stdin(Stdio::piped())
@@ -901,6 +918,86 @@ mod tests {
         assert_eq!(
             m.resolve_base(&origin.path, "--upload-pack=evil").await,
             Err(ReadError::InvalidRevision)
+        );
+    }
+
+    /// STUDIO-1672 review B1: the mirror-side no-op-rebase proof must keep whitespace. `git patch-id
+    /// --stable` strips whitespace before hashing, so two changes differing only in an in-line space
+    /// collapse to the same id and an approval would carry over a real edit. `merge_base_patch_id`
+    /// uses `--verbatim`, which keeps it; the manager's two-dot `patch_id` keeps `--stable`.
+    #[tokio::test]
+    async fn merge_base_patch_id_keeps_whitespace_that_stable_strips() {
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let origin = init_local_origin();
+        let rev = |r: &str| {
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .args(["-C", &origin.path, "rev-parse", r])
+                    .output()
+                    .expect("rev-parse")
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
+        let big = |marker: &str| {
+            (1..=2000)
+                .map(|i| {
+                    if i == 1000 {
+                        format!("line{i}-{marker}")
+                    } else {
+                        format!("line{i}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n"
+        };
+        std::fs::write(origin.child("package-lock.json"), big("v1")).unwrap();
+        git_run(&origin.path, &["add", "package-lock.json"]);
+        git_run(&origin.path, &["commit", "-m", "lock v1"]);
+        let base = rev("HEAD");
+
+        // Two heads off the same base whose only difference is one in-line space.
+        git_run(&origin.path, &["checkout", "-b", "reviewed", &base]);
+        std::fs::write(origin.child("package-lock.json"), big("v2")).unwrap();
+        git_run(&origin.path, &["add", "package-lock.json"]);
+        git_run(&origin.path, &["commit", "-m", "reviewed"]);
+        let reviewed = rev("reviewed");
+        git_run(&origin.path, &["checkout", "-b", "spaced", &base]);
+        std::fs::write(origin.child("package-lock.json"), big("v 2")).unwrap();
+        git_run(&origin.path, &["add", "package-lock.json"]);
+        git_run(&origin.path, &["commit", "-m", "spaced"]);
+        let spaced = rev("spaced");
+        git_run(&origin.path, &["checkout", "main"]);
+
+        m.sync_mirror(&origin.path).await.expect("sync mirror");
+
+        // The content genuinely differs, so a round is owed.
+        assert_ne!(
+            m.tree_id(&origin.path, &reviewed).await.expect("tree"),
+            m.tree_id(&origin.path, &spaced).await.expect("tree"),
+        );
+        // The proof the watcher uses keeps the whitespace, so it sees new work.
+        assert_ne!(
+            m.merge_base_patch_id(&origin.path, &base, &reviewed)
+                .await
+                .expect("patch-id"),
+            m.merge_base_patch_id(&origin.path, &base, &spaced)
+                .await
+                .expect("patch-id"),
+            "a whitespace-only edit must change the verbatim patch-id"
+        );
+        // The manager's own stable patch-id is the whitespace-BLIND one; this pins the divergence so
+        // nobody "unifies" the two and re-opens the regression.
+        assert_eq!(
+            m.patch_id(&origin.path, &base, &reviewed)
+                .await
+                .expect("stable patch-id"),
+            m.patch_id(&origin.path, &base, &spaced)
+                .await
+                .expect("stable patch-id"),
+            "`--stable` is documented to strip whitespace; only the no-op-rebase proof is verbatim"
         );
     }
 }

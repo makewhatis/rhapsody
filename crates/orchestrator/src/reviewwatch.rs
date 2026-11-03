@@ -788,7 +788,8 @@ async fn refresh_observed_head(
 ///    `patch`, so it proves a diff with a large or binary file that GitHub's compare API refuses to
 ///    render — the carini#22 lockfile case, where every rebase re-armed a full round. Tree equality
 ///    is checked first (cheap, and it covers a re-stack onto the same tree exactly); otherwise the
-///    two heads' `git patch-id --stable` are compared.
+///    two heads' `git patch-id --verbatim` are compared (`--verbatim` keeps whitespace, so a
+///    whitespace-only edit is seen as new work; `--stable` would collapse it — review B1).
 /// 2. the compare API ([`ReviewDiffSource`], STUDIO-960/977), used only when the mirror cannot be
 ///    fetched or the head is not in it. One `gh` read per DISTINCT reviewed head plus one for
 ///    `head`, and none at all when nothing could have moved (the caller filters that case out).
@@ -6762,6 +6763,9 @@ mod tests {
         changed_only_large: String,
         /// Only one line of a small file differs.
         changed_one_line: String,
+        /// The same large-file change as `rebased` but with one in-line space: a whitespace-only
+        /// difference that `git patch-id --stable` would collapse onto `reviewed` (review B1).
+        whitespace_only: String,
     }
 
     fn git_in(dir: &str, args: &[&str]) -> String {
@@ -6839,6 +6843,14 @@ mod tests {
             "big change",
         );
         let changed_one_line = commit("linechange", &base, "other.txt", "y\n", "line change");
+        // The same change as `rebased`, but with one in-line space: whitespace-only new work.
+        let whitespace_only = commit(
+            "whitespace",
+            &base,
+            "package-lock.json",
+            &big("v 2"),
+            "whitespace change",
+        );
         git_in(&origin.path, &["checkout", "main"]);
 
         let root = TempDir::new();
@@ -6859,6 +6871,7 @@ mod tests {
             rebased,
             changed_only_large,
             changed_one_line,
+            whitespace_only,
         }
     }
 
@@ -6920,7 +6933,7 @@ mod tests {
     }
 
     /// **Acceptance (the patch-id path alone).** A rebase onto a moved base carries the SAME change
-    /// at a DIFFERENT tree, so tree equality cannot prove it — the mirror's `git patch-id --stable`
+    /// at a DIFFERENT tree, so tree equality cannot prove it — the mirror's `git patch-id --verbatim`
     /// does. This is the case the tree-equality mutation falls back to.
     #[tokio::test]
     async fn the_patch_id_path_alone_proves_the_same_change() {
@@ -6998,6 +7011,30 @@ mod tests {
         assert!(
             handed[0].unchanged_from.is_empty(),
             "a changed large file is new work: the patch-id must differ"
+        );
+    }
+
+    /// **Regression (review B1).** A head that differs from the reviewed one only in whitespace is
+    /// real new work and must arm a round. The mirror proof used `git patch-id --stable`, which
+    /// strips whitespace, so this case was reported unchanged and an approval carried over the edit.
+    /// The proof is now `--verbatim`. MUTATION: switch `merge_base_patch_id` back to `--stable` and
+    /// `unchanged_from` becomes non-empty here (the move is wrongly proven unchanged).
+    #[tokio::test]
+    async fn a_whitespace_only_change_arms_a_round() {
+        let repo = noop_rebase_repo();
+        let handed = run_one_watch_tick_with_mirror(
+            mirror_watched(&repo),
+            Arc::new(FakeDiffSource::large_file_unreadable()),
+            Some(Arc::new(WorkspaceMirrorSource::new(Arc::clone(
+                &repo.manager,
+            )))),
+            leaked(&repo.whitespace_only),
+        )
+        .await;
+        assert_eq!(handed.len(), 1);
+        assert!(
+            handed[0].unchanged_from.is_empty(),
+            "a whitespace-only edit is new work, not a no-op rebase"
         );
     }
 

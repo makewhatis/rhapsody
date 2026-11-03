@@ -1721,7 +1721,8 @@ impl ReviewDiffSource for GH {
 /// is omitted for a large or binary file — so a pull request that touches a lockfile can never be
 /// proven unchanged there and re-arms a full round on every rebase (carini#22). This seam reads the
 /// same proof from the repository's own bare mirror instead: the tree ids, and the `git patch-id
-/// --stable` of `merge-base(base, sha)..sha`, which GitHub never has to render.
+/// --verbatim` of `merge-base(base, sha)..sha`, which GitHub never has to render. (`--verbatim`, not
+/// `--stable`, so a whitespace-only edit is seen as new work — review B1.)
 ///
 /// Object-safe (the off-loop watcher holds it as `Option<Arc<dyn ReviewMirrorSource>>`).
 #[async_trait]
@@ -1734,8 +1735,9 @@ pub trait ReviewMirrorSource: Send + Sync {
     /// read failed); the caller then fails closed for that head rather than guessing.
     async fn tree_id(&self, repo_url: &str, sha: &str) -> ReviewDiffResult;
 
-    /// The stable patch-id of `merge-base(base, sha)..sha` from the mirror — content, not commit
-    /// identity, so a rebase that carries the same change keeps it.
+    /// The `git patch-id --verbatim` of `merge-base(base, sha)..sha` from the mirror — content, not
+    /// commit identity, so a rebase that carries the same change keeps it, while a whitespace-only
+    /// edit changes it.
     async fn merge_base_patch_id(&self, repo_url: &str, base: &str, sha: &str) -> ReviewDiffResult;
 }
 
