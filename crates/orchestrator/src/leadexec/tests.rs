@@ -303,6 +303,7 @@ async fn replay_blocked_author_same_head_findings_parks_and_resumes_once() {
         .into_iter()
         .map(|name| rhapsody_config::teams::Identity {
             name: name.into(),
+            profile: "swe".into(),
             ..Default::default()
         })
         .collect();

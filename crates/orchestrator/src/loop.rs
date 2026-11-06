@@ -494,7 +494,13 @@ pub enum Event {
     /// with no new `pr:` Intent anywhere in the Linear-anchored room reader.
     ReviewRerun {
         pr: crate::prstate::PrCoord,
+        reviewer: Option<String>,
         reply: oneshot::Sender<crate::reviewconsole::ReviewControlOutcome>,
+    },
+    ReviewSurface {
+        pr: crate::prstate::PrCoord,
+        head: String,
+        surface: Option<crate::ghsummons::ReviewSurface>,
     },
     /// The operator taking a pull request out of the watch set from the authenticated console
     /// (STUDIO-722; NEW beyond Go v0.4.0). The same terminal a merge or a close reaches.
@@ -1101,8 +1107,18 @@ impl Orchestrator {
             Event::ReviewConsoleList { reply } => {
                 let _ = reply.send(self.review_console_list());
             }
-            Event::ReviewRerun { pr, reply } => {
-                let _ = reply.send(self.handle_review_rerun(&pr));
+            Event::ReviewRerun {
+                pr,
+                reviewer,
+                reply,
+            } => {
+                let _ = reply.send(self.handle_review_rerun_named(&pr, reviewer.as_deref()));
+            }
+            Event::ReviewSurface { pr, head, surface } => {
+                self.review_surfaces.remove(&pr);
+                if let Some(surface) = surface {
+                    self.review_surfaces.insert(pr, (head, surface));
+                }
             }
             Event::ReviewDismiss {
                 pr,

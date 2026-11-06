@@ -521,8 +521,8 @@ impl StateProvider for DaemonState {
         self.handle.list_reviews().await
     }
 
-    async fn review_rerun(&self, pr: PrCoord) -> ReviewControlOutcome {
-        self.handle.rerun_review(pr).await
+    async fn review_rerun(&self, pr: PrCoord, reviewer: Option<String>) -> ReviewControlOutcome {
+        self.handle.rerun_review_named(pr, reviewer).await
     }
 
     async fn review_dismiss(&self, pr: PrCoord, reviewer: Option<String>) -> ReviewControlOutcome {

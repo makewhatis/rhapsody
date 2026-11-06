@@ -1459,6 +1459,43 @@ pub type ReviewDiffResult = Result<String, Box<dyn std::error::Error + Send + Sy
 /// whose failure mode is a review that never happens.
 pub const MAX_COMPARE_FILES: usize = 300;
 
+/// Complete changed-file evidence for a PR head. Missing evidence requires code review.
+#[derive(Debug, Clone, Default)]
+pub struct ReviewSurface {
+    pub files: Vec<String>,
+    pub labels: Vec<String>,
+}
+
+fn review_surface_from_json(
+    pr: &serde_json::Value,
+    diff: &serde_json::Value,
+) -> Option<ReviewSurface> {
+    let files = diff.get("files")?.as_array()?;
+    if files.is_empty()
+        || files.len() >= MAX_COMPARE_FILES
+        || pr.get("changed_files")?.as_u64()? != files.len() as u64
+    {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for file in files {
+        paths.push(file.get("filename")?.as_str()?.to_string());
+        if file.get("status")?.as_str()? == "renamed" {
+            paths.push(file.get("previous_filename")?.as_str()?.to_string());
+        }
+    }
+    let labels = pr
+        .get("labels")?
+        .as_array()?
+        .iter()
+        .map(|l| l.get("name")?.as_str().map(str::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    Some(ReviewSurface {
+        files: paths,
+        labels,
+    })
+}
+
 /// A strict patch-id: the normalization that lets two patches introducing the SAME change against
 /// DIFFERENT bases compare equal (STUDIO-977).
 ///
@@ -1582,6 +1619,16 @@ pub fn same_change(a: &str, b: &str) -> bool {
 /// declared via `async_trait`.
 #[async_trait]
 pub trait ReviewDiffSource: Send + Sync {
+    /// Complete changed paths (including rename sources) at a pinned head, or no proof.
+    async fn review_surface(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _number: i64,
+        _head: &str,
+    ) -> Result<Option<ReviewSurface>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
     /// The branch the pull request targets, e.g. `main` — the base half of every compare below.
     ///
     /// An EMPTY string is an error rather than a default: the diff-against-base is meaningless
@@ -1611,6 +1658,27 @@ pub trait ReviewDiffSource: Send + Sync {
 
 #[async_trait]
 impl ReviewDiffSource for GH {
+    async fn review_surface(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        head: &str,
+    ) -> Result<Option<ReviewSurface>, Box<dyn std::error::Error + Send + Sync>> {
+        let path = format!("repos/{owner}/{repo}/pulls/{number}");
+        let body = self.run_off_task(vec!["api".into(), path]).await?;
+        let pr: serde_json::Value = serde_json::from_slice(&body)?;
+        if pr["head"]["sha"].as_str() != Some(head) {
+            return Ok(None);
+        }
+        let Some(base) = pr["base"]["sha"].as_str().filter(|s| !s.is_empty()) else {
+            return Ok(None);
+        };
+        let path = format!("repos/{owner}/{repo}/compare/{base}...{head}");
+        let body = self.run_off_task(vec!["api".into(), path]).await?;
+        let diff: serde_json::Value = serde_json::from_slice(&body)?;
+        Ok(review_surface_from_json(&pr, &diff))
+    }
     /// One bounded `gh api repos/<owner>/<repo>/pulls/<number> --jq .base.ref`.
     async fn pr_base_ref(&self, owner: &str, repo: &str, number: i64) -> ReviewDiffResult {
         if owner.is_empty() || repo.is_empty() || number <= 0 {
@@ -2907,6 +2975,36 @@ impl SummonSource for GH {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn review_surface_requires_a_complete_inventory_and_includes_rename_sources() {
+        let pr = serde_json::json!({"changed_files": 1, "labels": [{"name": "design"}]});
+        let diff = serde_json::json!({"files": [{"filename": "web/auth.ts", "status": "renamed", "previous_filename": "server/auth.ts"}]});
+        let surface = super::review_surface_from_json(&pr, &diff).unwrap();
+        assert_eq!(surface.files, ["web/auth.ts", "server/auth.ts"]);
+        assert_eq!(surface.labels, ["design"]);
+        assert!(
+            super::review_surface_from_json(
+                &serde_json::json!({"changed_files": 2, "labels": []}),
+                &diff
+            )
+            .is_none()
+        );
+        assert!(
+            super::review_surface_from_json(
+                &pr,
+                &serde_json::json!({"files": [{"filename": "web/auth.ts", "status": "renamed"}]})
+            )
+            .is_none()
+        );
+        let capped = serde_json::json!({"files": vec![serde_json::json!({"filename": "web/x", "status": "modified"}); super::MAX_COMPARE_FILES]});
+        assert!(
+            super::review_surface_from_json(
+                &serde_json::json!({"changed_files": super::MAX_COMPARE_FILES, "labels": []}),
+                &capped
+            )
+            .is_none()
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
@@ -2917,6 +3015,34 @@ mod tests {
     /// `time.Date(y, mo, d, h, mi, s, 0, UTC)` — a UTC instant for assertions.
     fn utc(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(y, mo, d, h, mi, s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn review_surface_pins_both_compare_commits_and_refuses_a_moved_head() {
+        let src = GH::new(
+            "@symphony",
+            Some(Box::new(|args| {
+                match args[1] {
+                "repos/o/r/pulls/12" => Ok(br#"{"head":{"sha":"head-a"},"base":{"sha":"base-a"},"changed_files":1,"labels":[]}"#.to_vec()),
+                "repos/o/r/compare/base-a...head-a" => Ok(br#"{"files":[{"filename":"web/view.tsx","status":"modified"}]}"#.to_vec()),
+                other => panic!("unexpected endpoint {other}"),
+            }
+            })),
+        );
+        assert_eq!(
+            src.review_surface("o", "r", 12, "head-a")
+                .await
+                .unwrap()
+                .unwrap()
+                .files,
+            ["web/view.tsx"]
+        );
+        assert!(
+            src.review_surface("o", "r", 12, "older-head")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     // Mirrors Go `ghsummons.TestParseRepo`: ssh + https forms parse, a dotted repo name is kept

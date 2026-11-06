@@ -888,11 +888,19 @@ pub struct Review {
     /// that an operator cleared, spent nothing and must not count. The point is to bound real spend.
     #[serde(default)]
     pub hold_after_rounds: i64,
+    /// Profiles eligible to supply the mandatory code review of a non-UI change.
+    #[serde(default = "default_code_review_profiles")]
+    pub code_review_profiles: Vec<String>,
+    /// Repository-relative UI paths. Empty means every PR requires code review.
+    #[serde(default)]
+    pub ui_globs: Vec<String>,
 }
 
 impl Default for Review {
     fn default() -> Self {
         Self {
+            code_review_profiles: default_code_review_profiles(),
+            ui_globs: Vec::new(),
             mode: ReviewMode::default(),
             reviewers: DEFAULT_REVIEW_REVIEWERS,
             done_state: String::new(),
@@ -906,6 +914,35 @@ impl Default for Review {
             hold_after_rounds: 0,
         }
     }
+}
+
+fn default_code_review_profiles() -> Vec<String> {
+    ["swe", "swe-jr", "swe-sr", "sre", "reviewer"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+/// A complete, nonempty change must match the configured UI globs in its entirety.
+/// Unknown/truncated file lists are represented by `None`, never an empty success.
+pub fn review_is_ui_only(globs: &[String], files: Option<&[String]>) -> bool {
+    let Some(files) = files.filter(|files| !files.is_empty()) else {
+        return false;
+    };
+    let patterns: Result<Vec<_>, _> = globs.iter().map(|g| glob::Pattern::new(g)).collect();
+    let Ok(patterns) = patterns else { return false };
+    files.iter().all(|file| {
+        patterns.iter().any(|pattern| {
+            pattern.matches_with(
+                file,
+                glob::MatchOptions {
+                    case_sensitive: true,
+                    require_literal_separator: true,
+                    require_literal_leading_dot: false,
+                },
+            )
+        })
+    })
 }
 
 impl Review {
@@ -971,6 +1008,9 @@ pub struct TeamsProject {
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectReview {
+    /// Presence overrides the installation UI globs; `[]` requires code review for all changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_globs: Option<Vec<String>>,
     /// `Some(false)` keeps THIS project human-merged even when the top-level
     /// `review.auto_merge` is on; `Some(true)` turns it on for a project whose
     /// default would be off. `None` — the default — inherits the top-level
@@ -1688,6 +1728,34 @@ impl Teams {
     /// rather than with a second implementation of these rules that could
     /// disagree with the one that decides whether the file loads at boot.
     pub fn validate(&self) -> Result<(), TeamsError> {
+        if self.review.code_review_profiles.is_empty()
+            || self
+                .review
+                .code_review_profiles
+                .iter()
+                .any(|p| p.trim().is_empty())
+        {
+            return Err(TeamsError::Invalid(
+                "review.code_review_profiles must name at least one profile".into(),
+            ));
+        }
+        for pattern in self.review.ui_globs.iter().chain(
+            self.projects
+                .iter()
+                .flat_map(|p| p.review.ui_globs.iter().flatten()),
+        ) {
+            glob::Pattern::new(pattern).map_err(|e| {
+                TeamsError::Invalid(format!("invalid review UI glob {pattern:?}: {e}"))
+            })?;
+            if pattern.is_empty()
+                || pattern.starts_with('/')
+                || pattern.split('/').any(|p| p == "..")
+            {
+                return Err(TeamsError::Invalid(format!(
+                    "review UI glob must be repository-relative: {pattern:?}"
+                )));
+            }
+        }
         let lead = &self.manager.lead;
         if lead.digest_at.len() != 5
             || chrono::NaiveTime::parse_from_str(&lead.digest_at, "%H:%M").is_err()
@@ -2040,6 +2108,26 @@ impl Teams {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ui_globs_require_every_changed_file_and_unknown_is_not_ui() {
+        let globs = vec!["web/**".into(), "assets/*.svg".into()];
+        assert!(super::review_is_ui_only(
+            &globs,
+            Some(&["web/src/view.tsx".into(), "assets/logo.svg".into()])
+        ));
+        for files in [
+            None,
+            Some(vec![]),
+            Some(vec!["server/auth.rs".into()]),
+            Some(vec!["web/view.tsx".into(), "migration.sql".into()]),
+        ] {
+            assert!(!super::review_is_ui_only(&globs, files.as_deref()));
+        }
+        assert!(!super::review_is_ui_only(
+            &["[".into()],
+            Some(&["web/view.tsx".into()])
+        ));
+    }
     use super::*;
 
     #[test]
@@ -3744,6 +3832,8 @@ mod tests {
                 required: vec!["jimmy".to_string()],
                 adjudicate_after_rounds: 3,
                 hold_after_rounds: 5,
+                code_review_profiles: vec!["reviewer".into(), "swe".into()],
+                ui_globs: vec!["web/**".into()],
             },
             // Four, because `reviewers: 3` must be a config the ceiling accepts
             // (STUDIO-891: a roster of N satisfies at most N−1). The property
@@ -3924,6 +4014,7 @@ mod tests {
             projects: vec![TeamsProject {
                 slugs: vec!["booch".to_string()],
                 review: ProjectReview {
+                    ui_globs: Some(vec!["ui/**".into()]),
                     auto_merge: Some(false),
                 },
             }],

@@ -561,6 +561,8 @@ impl Orchestrator {
             load.counts(),
             &self.reviewer_exclusions(teams),
         );
+        // Introduction has no file evidence yet: reserve a code-review slot conservatively.
+        reviewers.sort_by_key(|name| !self.is_code_reviewer(name));
         reviewers.truncate(teams.review.effective_reviewers());
         if reviewers.is_empty() {
             tracing::warn!(
@@ -818,8 +820,21 @@ impl Orchestrator {
                 status: REVIEW_STATUS_REQUESTED.to_string(),
                 open: true,
             };
+            let key = row.key.clone();
             match self.store().save_review_watch(row) {
-                Ok(()) => written += 1,
+                Ok(()) => {
+                    written += 1;
+                    if stored.is_none() {
+                        self.record_review_selection(
+                            &key,
+                            if self.is_code_reviewer(reviewer) {
+                                "profile rule"
+                            } else {
+                                "least-loaded"
+                            },
+                        );
+                    }
+                }
                 Err(e) => {
                     tracing::warn!(review = %id, err = %e, "ticketless review: the watch-set write failed")
                 }

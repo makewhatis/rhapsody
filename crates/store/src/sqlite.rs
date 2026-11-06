@@ -66,7 +66,7 @@ use std::sync::{Mutex, MutexGuard};
 /// evidence-access log, then the manager intervention lifecycle, then the verdict ledger's durable
 /// completion sequence, STUDIO-1440) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 39;
+const SCHEMA_VERSION: i64 = 40;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -817,6 +817,15 @@ CREATE INDEX rhapsody_landing_project ON rhapsody_landing(project_slug, id);
     r#"
 ALTER TABLE rhapsody_review_verdicts ADD COLUMN completed_seq INTEGER NOT NULL DEFAULT 0;
 "#,
+    // v39 -> v40: reviewer selection provenance and operator pins (STUDIO-1305).
+    "CREATE TABLE rhapsody_review_selection (
+        owner TEXT NOT NULL COLLATE NOCASE,
+        repo TEXT NOT NULL COLLATE NOCASE,
+        number INTEGER NOT NULL,
+        reviewer TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        PRIMARY KEY (owner, repo, number, reviewer)
+    );",
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -3626,6 +3635,22 @@ impl Store for Sqlite {
                 w.status,
                 w.open,
             ],
+        )?;
+        Ok(())
+    }
+
+    fn review_selection(&self, key: &ReviewWatchKey) -> Result<Option<String>, StoreError> {
+        Ok(self.lock().query_row(
+            "SELECT reason FROM rhapsody_review_selection WHERE owner=?1 AND repo=?2 AND number=?3 AND reviewer=?4",
+            params![key.owner, key.repo, key.number, key.reviewer], |row| row.get(0)
+        ).optional()?)
+    }
+
+    fn save_review_selection(&self, key: &ReviewWatchKey, reason: &str) -> Result<(), StoreError> {
+        self.lock().execute(
+            "INSERT INTO rhapsody_review_selection (owner,repo,number,reviewer,reason) VALUES (?1,?2,?3,?4,?5)
+             ON CONFLICT(owner,repo,number,reviewer) DO UPDATE SET reason=excluded.reason",
+            params![key.owner, key.repo, key.number, key.reviewer, reason],
         )?;
         Ok(())
     }
@@ -6572,6 +6597,38 @@ mod tests {
         let dir = scratch_dir();
         let store = Sqlite::open(StorePath::Disk(dir.join("symphony.db"))).expect("open temp");
         (dir, store)
+    }
+
+    #[test]
+    fn review_selection_upgrades_v39_and_survives_reopen() {
+        let dir = scratch_dir();
+        let path = dir.join("selection.db");
+        let conn = Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..39] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.pragma_update(None, "user_version", 39).unwrap();
+        drop(conn);
+        let store = Sqlite::open(StorePath::Disk(path.clone())).unwrap();
+        let key = ReviewWatchKey {
+            owner: "Org".into(),
+            repo: "Repo".into(),
+            number: 12,
+            reviewer: "bob".into(),
+        };
+        assert_eq!(store.review_selection(&key).unwrap(), None);
+        store.save_review_selection(&key, "operator").unwrap();
+        drop(store);
+        let reopened = Sqlite::open(StorePath::Disk(path)).unwrap();
+        let lowercase = ReviewWatchKey {
+            owner: "org".into(),
+            repo: "repo".into(),
+            ..key
+        };
+        assert_eq!(
+            reopened.review_selection(&lowercase).unwrap().as_deref(),
+            Some("operator")
+        );
     }
 
     #[test]
@@ -10601,6 +10658,7 @@ mod tests {
                 "rhapsody_queued_run_messages_pending".to_string(),
                 "rhapsody_landing".to_string(),
                 "rhapsody_landing_project".to_string(),
+                "rhapsody_review_selection".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

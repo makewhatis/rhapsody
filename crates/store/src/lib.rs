@@ -628,6 +628,18 @@ pub trait Store {
     /// F-DUP double-dispatches and F-SHA loses a pushed fix.
     fn save_review_watch(&self, w: ReviewWatchRow) -> Result<(), StoreError>;
 
+    /// Durable selection rationale; `operator` pins an explicitly assigned reviewer's row.
+    fn review_selection(&self, _key: &ReviewWatchKey) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
+    fn save_review_selection(
+        &self,
+        _key: &ReviewWatchKey,
+        _reason: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
     /// Records the head SHA a reviewer run was DISPATCHED against and moves the row to
     /// [`REVIEW_STATUS_IN_FLIGHT`]. Never touches `last_reviewed_sha`.
     ///

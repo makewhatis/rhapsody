@@ -156,6 +156,7 @@ pub(crate) struct FakeProvider {
     /// pattern, for a struct rather than an id).
     review_outcome: Option<ReviewControlOutcome>,
     review_rerun_pr: Mutex<Option<PrCoord>>,
+    review_rerun_reviewer: Mutex<Option<String>>,
     review_dismiss_pr: Mutex<Option<PrCoord>>,
     /// The `reviewer` the last dismiss carried, so a test can assert the optional per-reviewer
     /// lever reached the provider (STUDIO-1022).
@@ -295,6 +296,7 @@ impl FakeProvider {
             reviews_err: None,
             review_outcome: None,
             review_rerun_pr: Mutex::new(None),
+            review_rerun_reviewer: Mutex::new(None),
             review_dismiss_pr: Mutex::new(None),
             review_dismiss_reviewer: Mutex::new(None),
             review_clear_pr: Mutex::new(None),
@@ -589,6 +591,13 @@ impl FakeProvider {
     /// how a test asserts the handler forwarded the body's own owner/repo/number and nothing else.
     pub(crate) fn review_rerun_pr(&self) -> Option<PrCoord> {
         self.review_rerun_pr
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub(crate) fn review_rerun_reviewer(&self) -> Option<String> {
+        self.review_rerun_reviewer
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
@@ -1065,8 +1074,12 @@ impl StateProvider for FakeProvider {
         }
     }
 
-    async fn review_rerun(&self, pr: PrCoord) -> ReviewControlOutcome {
+    async fn review_rerun(&self, pr: PrCoord, reviewer: Option<String>) -> ReviewControlOutcome {
         self.touch();
+        *self
+            .review_rerun_reviewer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = reviewer;
         *self
             .review_rerun_pr
             .lock()

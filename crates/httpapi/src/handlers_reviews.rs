@@ -54,13 +54,8 @@ use crate::server::StateProvider;
 /// is not one.
 const MAX_CONTROL_BODY: usize = 8 << 10;
 
-/// The body every control route takes: the pull request, and — for dismiss alone — an optional
-/// reviewer to narrow it to (STUDIO-1022).
-///
-/// `reviewer` is optional and ignored by `rerun` and `clear`, whose subject is always the whole
-/// pull request. For `dismiss` it names one watch row, which is the lever the incident had no answer
-/// for: dropping every row of a pull request also stops the reviews somebody is still waiting on,
-/// so an operator who only wants to retire one departed reviewer's slot can now say `sol`.
+/// A watched PR and an optional reviewer. Rerun adds/re-arms that named reviewer;
+/// dismiss retires that row. Clear remains a PR-wide budget operation.
 #[derive(Debug, Default, Deserialize)]
 struct ReviewControlReq {
     #[serde(default)]
@@ -137,7 +132,7 @@ pub(crate) async fn handle_review_rerun(
     };
     let pr = req.coord();
     let label = pr.to_string();
-    render(provider.review_rerun(pr).await, label)
+    render(provider.review_rerun(pr, req.reviewer()).await, label)
 }
 
 /// `POST /api/v1/reviews/dismiss` — take a pull request out of the watch set (§15-e), or one
@@ -282,12 +277,25 @@ mod tests {
             .to_string()
     }
 
+    #[tokio::test]
+    async fn rerun_forwards_the_named_reviewer() {
+        let provider = Arc::new(FakeProvider::ok(empty_snapshot()));
+        let addr = spawn(provider.clone()).await;
+        let _ = post(
+            &format!("{addr}/api/v1/reviews/rerun"),
+            r#"{"owner":"o","repo":"r","number":12,"reviewer":" bob "}"#,
+        )
+        .await;
+        assert_eq!(provider.review_rerun_reviewer().as_deref(), Some("bob"));
+    }
+
     fn row(reviewer: &str, status: &str, reviewed: &str, open: bool) -> ReviewJobRow {
         ReviewJobRow {
             owner: "makewhatis".to_string(),
             repo: "rhapsody".to_string(),
             number: 12,
             reviewer: reviewer.to_string(),
+            selection_reason: None,
             author: "alice".to_string(),
             introduced_by: "handoff:STUDIO-720".to_string(),
             requested_sha: HEAD_A.to_string(),
