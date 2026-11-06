@@ -112,6 +112,9 @@
 //!
 //! Only a row that COMPLETED a round can be carried: a `requested`, `in_flight` or `truncated` row
 //! still owes a review of this head, whatever the diff says.
+//! STUDIO-1801 chooses this carry-forward as authoritative for the manager too: a later patch-id
+//! comparison against main does not invalidate the proven approval. Pure approved-still-open stalls
+//! are classified without a model in both act and advise mode (`managerintervention`).
 //!
 //! # Off the loop, then back onto it (§5, F3)
 //!

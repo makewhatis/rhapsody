@@ -814,6 +814,7 @@ fn case_packet(f: &IncidentFixture) -> String {
             reviewer: r.reviewer.to_string(),
             status: r.status.to_string(),
             requested_sha: String::new(),
+            last_reviewed_sha: r.sha.to_string(),
             last_completed_generation: r.generation,
             last_completed_sha: r.sha.to_string(),
             last_completed_patch_id: r.patch_id.to_string(),

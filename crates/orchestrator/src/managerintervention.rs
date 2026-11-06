@@ -273,6 +273,8 @@ pub struct CaseRow {
     pub reviewer: String,
     pub status: String,
     pub requested_sha: String,
+    /// Includes the watcher's proven carry-forward; completion metadata remains historical.
+    pub last_reviewed_sha: String,
     pub last_completed_generation: i64,
     pub last_completed_sha: String,
     pub last_completed_patch_id: String,
@@ -316,12 +318,13 @@ impl ManagerCasePacket {
         out.push_str("watch_rows:\n");
         for row in &self.rows {
             out.push_str(&format!(
-                "  - reviewer: {}\n    status: {}\n    requested_sha: {}\n    \
+                "  - reviewer: {}\n    status: {}\n    requested_sha: {}\n    last_reviewed_sha: {}\n    \
                  last_completed_generation: {}\n    last_completed_sha: {}\n    \
                  last_completed_patch_id: {}\n    last_completed_verdict: {}\n",
                 row.reviewer,
                 row.status,
                 row.requested_sha,
+                row.last_reviewed_sha,
                 row.last_completed_generation,
                 row.last_completed_sha,
                 row.last_completed_patch_id,
@@ -855,17 +858,20 @@ impl Orchestrator {
             // "approved still open" qualifies — an intervention that merged a `review_escalated`
             // into it still needs the manager. The "every live row is satisfied" fact is read from
             // the rows, not inferred from the stall kind.
-            // §9: `no_review_gap` STOPs the live generation, so it can only be classified for an
-            // `act` intervention. In `advise` the shadow run still happens — a proposal is worth
-            // recording even when a merge gate is what blocks — and nothing live is stopped.
+            // STUDIO-1801, rule (a): a proven carry-forward remains a valid approval. Do not ask
+            // an advise run to second-guess it from historical completion patch IDs: it would
+            // propose a rerun the same eligibility check below refuses. Classify both modes, but
+            // an advise classification ends only the shadow intervention, never the live generation.
             let only_approved_still_open = !row.stall_kinds.is_empty()
                 && row.stall_kinds.iter().all(|k| k == "approved_still_open");
-            if row.mode != MANAGER_MODE_ADVISE
-                && classifies_no_review_gap(
-                    self.manager_all_rows_satisfied(&row.pr),
-                    only_approved_still_open,
-                )
-            {
+            if classifies_no_review_gap(
+                self.manager_all_rows_satisfied(&row.pr),
+                only_approved_still_open,
+            ) {
+                if row.mode == MANAGER_MODE_ADVISE {
+                    self.set_manager_state(row, MANAGER_INTERVENTION_NO_REVIEW_GAP);
+                    continue;
+                }
                 // ONE transaction: the intervention ends `no_review_gap` AND the generation is
                 // stopped, so a crash between the two writes can never leave a terminal row with a
                 // live generation for the next sweep to recreate (§7.2, §15.4).
@@ -1130,6 +1136,7 @@ impl Orchestrator {
                     reviewer: r.key.reviewer.clone(),
                     status: r.status.clone(),
                     requested_sha: r.requested_sha.clone(),
+                    last_reviewed_sha: r.last_reviewed_sha.clone(),
                     last_completed_generation: completed.as_ref().map_or(0, |c| c.generation),
                     last_completed_sha: completed
                         .as_ref()
@@ -1167,7 +1174,8 @@ impl Orchestrator {
     /// then revalidates it WITHOUT the model via M3 and advances to `validated`, `stale`,
     /// `superseded` or `complete` (`proposed` in `advise`). Anything else — a failed run, no block,
     /// an invalid block, a refused final decision — is a `failed_attempt`, which the pump re-queues
-    /// while the budgets allow. Called after [`Orchestrator::on_manager_exit`]'s run bookkeeping.
+    /// while the budgets allow. `NoEligibleRows` is terminal: another model attempt cannot create
+    /// review work. Called after [`Orchestrator::on_manager_exit`]'s run bookkeeping.
     pub(crate) fn settle_manager_intervention(
         &mut self,
         issue_id: &str,
@@ -1232,7 +1240,26 @@ impl Orchestrator {
             eligible_rows: managerdecision::eligible_rows(&rows, row.generation, &patch_id).len(),
         };
         if let Err(err) = managerdecision::preconditions(decision, &precondition) {
-            self.record_manager_failed_attempt(row, &format!("refused: {err:?}"));
+            let reason = format!("refused: {err:?}");
+            if err == managerdecision::DecisionError::NoEligibleRows {
+                // STUDIO-1801: the requested effect has no remaining target, just as in rerun
+                // revalidation's Complete outcome. Persist the refusal and terminal state together
+                // so neither the next tick nor restart spends another attempt on this id. Do not
+                // stop the live generation: in advise mode this is only a shadow intervention.
+                let mut updated = row.clone();
+                updated.state = MANAGER_INTERVENTION_COMPLETE.to_string();
+                updated.failure_reason = reason.clone();
+                updated.lease_boot_id.clear();
+                updated.lease_expires_at.clear();
+                match self.store().save_manager_intervention(updated) {
+                    Ok(()) => tracing::warn!(pr = %row.pr, id = %row.id, reason = %reason,
+                        "manager: intervention refused terminally; no retry"),
+                    Err(e) => tracing::warn!(pr = %row.pr, id = %row.id, err = %e,
+                        "manager: writing the terminal refusal failed"),
+                }
+            } else {
+                self.record_manager_failed_attempt(row, &reason);
+            }
             return;
         }
         // Store the decision and move to `decided`, clearing the lease. The stored body is the
@@ -2689,6 +2716,7 @@ mod tests {
                 reviewer: "alice".to_string(),
                 status: "reviewed".to_string(),
                 requested_sha: "abc".to_string(),
+                last_reviewed_sha: "abc".to_string(),
                 last_completed_generation: 1,
                 last_completed_sha: "abc".to_string(),
                 last_completed_patch_id: "p".to_string(),
@@ -4736,6 +4764,151 @@ mod tests {
     }
 
     // --- no_review_gap (§7.2) ------------------------------------------------------------------
+
+    /// The watcher proved a base merge unchanged and carried its approval, while the historical
+    /// completion still names the old patch (the manager's later comparison can differ).
+    fn carried_approval(o: &mut Orchestrator) {
+        seed_watch(o, "adopt:STUDIO-1");
+        record_approved(o);
+        let key = rhapsody_store::ReviewWatchKey {
+            owner: "makewhatis".into(),
+            repo: "rhapsody".into(),
+            number: 12,
+            reviewer: "alice".into(),
+        };
+        o.store()
+            .mark_review_completed(&key, "deadbeef", rhapsody_store::REVIEW_STATUS_APPROVED)
+            .expect("approve");
+        let advance = o.handle_review_head_advanced(
+            &PrCoord::new("makewhatis", "rhapsody", 12),
+            "merge-from-main",
+            &["deadbeef".into()],
+        );
+        assert_eq!(advance.skipped, vec![key.clone()]);
+        assert_eq!(advance.armed, 0);
+        let watch = o.store().load_live_review_watch().expect("watch");
+        assert_eq!(watch[0].last_reviewed_sha, "merge-from-main");
+        assert_eq!(watch[0].status, rhapsody_store::REVIEW_STATUS_APPROVED);
+        let completed = o
+            .store()
+            .review_completed(&key)
+            .expect("completion")
+            .unwrap();
+        assert_eq!(completed.sha, "deadbeef");
+        assert_eq!(completed.patch_id, "patch-1");
+        assert_eq!(
+            managerdecision::eligible_rows(
+                &o.manager_review_rows(PR_KEY),
+                1,
+                "patch-after-base-merge"
+            )
+            .len(),
+            1,
+            "a raw patch-id mismatch suggests a rerun despite the carried approval"
+        );
+    }
+
+    /// STUDIO-1801: a stale/in-flight manager can still propose the redundant rerun. Refuse it
+    /// once, durably, rather than spending the remaining attempts on the same intervention id.
+    #[test]
+    fn carried_approval_no_eligible_rows_is_terminal_without_retry() {
+        for authority in [ReviewAuthority::Advise, ReviewAuthority::Act] {
+            let (mut o, dispatched) = orch(authority);
+            pass_self_test(&o);
+            prime_holds(&o);
+            let id = launch_running(&mut o);
+            carried_approval(&mut o);
+            let text = decision_text(
+                r#"{"decision":"RERUN_REVIEW","head":"merge-from-main","evidence_rev":1,
+                    "rationale":"the reviewed patch-id differs from the live patch-id"}"#,
+            );
+            let (_, events) = crate::testsupport::capture_events(|| {
+                for _ in 0..3 {
+                    o.settle_manager_intervention(
+                        "pr:makewhatis/rhapsody#12@manager",
+                        &exit_with(Some(&text)),
+                    );
+                    o.pump_manager_interventions();
+                }
+                // A new daemon over the same durable records must not retry it either.
+                let (mut restarted, launches) = orch(authority);
+                restarted.set_store(o.store.clone());
+                pass_self_test(&restarted);
+                prime_holds(&restarted);
+                restarted.pump_manager_interventions();
+                assert!(launches.lock().expect("lock").is_empty());
+            });
+            let row = o.store().manager_intervention(&id).expect("read").unwrap();
+            assert!(manager_intervention_is_terminal(&row.state), "{row:?}");
+            assert_eq!(row.failure_reason, "refused: NoEligibleRows");
+            assert_eq!(row.attempts, 1);
+            assert!(row.lease_boot_id.is_empty() && row.lease_expires_at.is_empty());
+            assert_eq!(dispatched.lock().expect("lock").len(), 1);
+            let warnings: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    e.level == "WARN"
+                        && e.fields
+                            .get("reason")
+                            .is_some_and(|r| r == "refused: NoEligibleRows")
+                })
+                .collect();
+            assert_eq!(warnings.len(), 1, "{events:?}");
+            assert_eq!(
+                warnings[0].fields.get("pr").map(String::as_str),
+                Some(PR_KEY)
+            );
+            assert_eq!(warnings[0].fields.get("id"), Some(&id));
+            assert!(
+                !o.store()
+                    .manager_budget(PR_KEY)
+                    .unwrap()
+                    .unwrap()
+                    .is_stopped()
+            );
+        }
+    }
+
+    /// Rule (a): the watcher's proven carry-forward is valid even when a later comparison to
+    /// main produces a different patch-id. Advise must not launch a model to suggest a rerun.
+    #[test]
+    fn carried_approval_is_no_review_gap_in_advise_without_stopping_live_work() {
+        let (mut o, dispatched) = orch(ReviewAuthority::Advise);
+        pass_self_test(&o);
+        prime_holds(&o);
+        carried_approval(&mut o);
+        let stall = divergence(DivergenceKind::ApprovedStillOpen, PR_DISPLAY);
+        o.route_stalls_to_manager(std::slice::from_ref(&stall));
+        let row = active(&o).expect("intervention");
+        let packet = o.manager_case_packet(&row).render();
+        assert!(
+            packet.contains("last_reviewed_sha: merge-from-main"),
+            "{packet}"
+        );
+        assert!(packet.contains("last_completed_sha: deadbeef"), "{packet}");
+        for _ in 0..3 {
+            o.pump_manager_interventions();
+            o.route_stalls_to_manager(std::slice::from_ref(&stall));
+        }
+        assert_eq!(state_of(&o, &row.id), MANAGER_INTERVENTION_NO_REVIEW_GAP);
+        assert!(dispatched.lock().expect("lock").is_empty());
+        let rows = o
+            .store()
+            .load_manager_interventions()
+            .expect("interventions");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the same stall must not create a new intervention"
+        );
+        assert_eq!(rows[0].attempts, 0);
+        let budget = o.store().manager_budget(PR_KEY).expect("budget").unwrap();
+        assert!(
+            !budget.is_stopped(),
+            "shadow classification cannot stop live work"
+        );
+        assert_eq!(budget.runs_used, 0);
+    }
 
     fn record_approved(o: &Orchestrator) {
         o.store()
