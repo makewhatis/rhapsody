@@ -175,6 +175,20 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Carried approvals and terminal manager rerun refusals (STUDIO-1801)
+
+A review approval carried by the watcher's unchanged-change proof remains valid at the new head,
+including a merge from main. The manager receives that carried `last_reviewed_sha` alongside the
+original completion metadata; a later patch-id mismatch alone is not a reason to request another
+review. Pure approved-still-open stalls with satisfied reviewers end `no_review_gap` before a model
+launch in both act and advise modes. Advise ends only its shadow intervention and never stops the
+live generation.
+
+If an already-running manager nevertheless requests a rerun with `NoEligibleRows`, the intervention
+ends `complete` with `failure_reason: refused: NoEligibleRows` and one WARN naming the PR and id.
+That id is never retried, including after restart. This extends the Rhapsody-only manager/review
+subsystem; no Go-owned schema, API shape or golden fixture changes.
+
 ### Profile-aware ticketless reviewers (STUDIO-1305)
 
 Ticketless reviews require a code-review-profile teammate unless **every changed path** matches

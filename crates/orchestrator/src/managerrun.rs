@@ -101,6 +101,10 @@ Common fields, on every variant:
 Variant payloads:
 - `RERUN_REVIEW`: `rerun` is optional: {"reviewers": ["..."], "note": "..."}. Invalid when there is
   no eligible row (every live reviewer row already approved at the current patch).
+  A watch row with `status: approved` and `last_reviewed_sha` at the current head is valid,
+  including an approval the watcher carried across a proven unchanged merge from main. Its
+  `last_completed_*` fields describe the original review: a later patch-id mismatch against main
+  alone does not invalidate that carried approval and must not prompt `RERUN_REVIEW`.
 - `ROUTE_TO_AUTHOR`: `route` required: {"fix": [{"finding": "alice:F1", "revision": 1}],
   "instructions": "..."}. Every `fix` entry must name an open, blocking finding revision listed
   below.
