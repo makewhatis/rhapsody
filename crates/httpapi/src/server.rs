@@ -570,7 +570,7 @@ pub trait StateProvider: Send + Sync {
 
     /// `POST /api/v1/reviews/rerun` — the operator asking for one more review round of a WATCHED
     /// pull request. §15-e's trusted lever, and the reason the room reader needs no `pr:` Intent.
-    async fn review_rerun(&self, _pr: PrCoord) -> ReviewControlOutcome {
+    async fn review_rerun(&self, _pr: PrCoord, _reviewer: Option<String>) -> ReviewControlOutcome {
         ReviewControlOutcome::Dormant
     }
 

@@ -523,6 +523,13 @@ pub trait ReviewWatchSink: Send + Sync {
     /// A DEFAULT no-op so the many test doubles need no change; the production
     /// [`ControlWatchSink`] reaches the control handle's off-loop retry.
     async fn retry_pending(&self) {}
+    async fn surface(
+        &self,
+        _pr: PrCoord,
+        _head: String,
+        _surface: Option<crate::ghsummons::ReviewSurface>,
+    ) {
+    }
 }
 
 /// The production [`ReviewWatchSink`]: the control channel, through the same [`ControlHandle`] seam
@@ -592,6 +599,17 @@ impl ControlWatchSink {
 
 #[async_trait]
 impl ReviewWatchSink for ControlWatchSink {
+    async fn surface(
+        &self,
+        pr: PrCoord,
+        head: String,
+        surface: Option<crate::ghsummons::ReviewSurface>,
+    ) {
+        let _ = self
+            .control
+            .events
+            .send(Event::ReviewSurface { pr, head, surface });
+    }
     async fn watched(&self) -> Vec<WatchedPr> {
         self.control.review_watch_list().await
     }
@@ -1077,6 +1095,38 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         for obs in sweep.observed {
             let mut fresh =
                 refresh_observed_head(&ctx, &deps.teams, src.as_ref(), &deps.allow, obs).await;
+            if let PrLookup::Found(snap) = &fresh.lookup
+                && snap.status == PrStatus::Open
+            {
+                let surface = if let Some(diff) = deps.diff_source.as_ref()
+                    && deps
+                        .teams
+                        .roster
+                        .iter()
+                        .any(|i| !deps.teams.review.code_review_profiles.contains(&i.profile))
+                {
+                    match diff
+                        .review_surface(
+                            &fresh.pr.owner,
+                            &fresh.pr.repo,
+                            fresh.pr.number,
+                            &snap.head_sha,
+                        )
+                        .await
+                    {
+                        Ok(surface) => surface,
+                        Err(error) => {
+                            tracing::warn!(pr = %fresh.pr, %error, "review surface unreadable; requiring code review");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                deps.sink
+                    .surface(fresh.pr.clone(), snap.head_sha.clone(), surface)
+                    .await;
+            }
             // STUDIO-960: prove the head move carried no new work before the control task decides
             // whether to arm a round. Off-loop, bounded by GH_EXEC_TIMEOUT like every other read
             // here, and only when a head move is even possible: a head equal to one of this pull
@@ -1507,6 +1557,7 @@ impl Orchestrator {
                 // a lingering head could falsely supersede a current escalation.
                 _ => {
                     self.review_observed_head.remove(&obs.pr);
+                    self.review_surfaces.remove(&obs.pr);
                 }
             }
         }
@@ -1533,6 +1584,11 @@ impl Orchestrator {
         // about a `gh` answer. It only ever retires rows; it never introduces one, so it cannot
         // become a second introduction path, and a row a substitute could take is left for the
         // dispatch loop to reassign under STUDIO-988's deferred-retirement protocol.
+        for obs in observed {
+            if matches!(&obs.lookup, PrLookup::Found(snap) if snap.status == PrStatus::Open) {
+                self.ensure_code_review(&obs.pr, &mut rows);
+            }
+        }
         self.reconcile_review_watch(&mut rows, &mut report);
         // The daemon-wide dispatch budget, honoured for the same reason `select` honours it: a
         // review is a full agent run on this machine, and twenty pull requests coming due in one
@@ -2798,6 +2854,7 @@ impl Orchestrator {
         // current head to compare an escalation against, and leaving the entry would grow this map
         // for the daemon's whole life.
         self.review_observed_head.remove(pr);
+        self.review_surfaces.remove(pr);
         for id in retired_ids {
             self.review_unassignable.remove(&id);
             // A round cannot be held for capacity once its pull request has left the watch set
@@ -2938,6 +2995,9 @@ impl Orchestrator {
                 continue;
             }
             let mut working: Vec<&ReviewWatchRow> = mine.clone();
+            // Operator additions are additional obligations, not surplus automatic slots.
+            let operator_count = mine.iter().filter(|r| self.operator_review(&r.key)).count();
+            let effective = effective.saturating_add(operator_count);
             let mut peers: HashSet<String> = mine.iter().map(|r| r.key.reviewer.clone()).collect();
             let mut retires: Vec<ReconcileRetire> = Vec::new();
 
@@ -3023,14 +3083,23 @@ impl Orchestrator {
                     let running = self.running.contains_key(&id) || self.claimed.contains(&id);
                     let rank = if running {
                         0
-                    } else if required.contains(r.key.reviewer.as_str()) {
+                    } else if self.operator_review(&r.key)
+                        || (self.review_requires_code(&pr)
+                            && self.is_code_reviewer(&r.key.reviewer)
+                            && working.iter().any(|peer| {
+                                teams.roster.iter().any(|i| i.name == peer.key.reviewer)
+                                    && !self.is_code_reviewer(&peer.key.reviewer)
+                            }))
+                    {
                         1
-                    } else if most_recent.as_deref() == Some(r.key.reviewer.as_str()) {
+                    } else if required.contains(r.key.reviewer.as_str()) {
                         2
-                    } else if has_history(r) {
+                    } else if most_recent.as_deref() == Some(r.key.reviewer.as_str()) {
                         3
-                    } else {
+                    } else if has_history(r) {
                         4
+                    } else {
+                        5
                     };
                     let idx = roster_index
                         .get(r.key.reviewer.as_str())
@@ -3861,6 +3930,19 @@ impl Orchestrator {
                 reviewer: chosen.clone(),
                 ..row.key.clone()
             };
+            let reason = if self.review_requires_code(pr)
+                && self.is_code_reviewer(&chosen)
+                && !peers.iter().any(|name| self.is_code_reviewer(name))
+            {
+                "profile rule"
+            } else if self.review_label_match(pr, &chosen) {
+                "label match"
+            } else if chosen == row.key.reviewer && !row.last_reviewed_sha.is_empty() {
+                "continuity"
+            } else {
+                "least-loaded"
+            };
+            self.record_review_selection(&chosen_key, reason);
             if let Some(attempt) = self.review_attempts.get(&chosen_key)
                 && attempt.head == head
                 && attempt.next_at > (self.now)()
@@ -4289,6 +4371,19 @@ impl Orchestrator {
             }
             return;
         }
+        if self.review_requires_code(pr)
+            && !mine.iter().any(|row| {
+                self.is_code_reviewer(&row.key.reviewer)
+                    && matches!(
+                        row.status.as_str(),
+                        REVIEW_STATUS_REVIEWED | REVIEW_STATUS_APPROVED
+                    )
+                    && proven.contains(&row.last_reviewed_sha.as_str())
+            })
+        {
+            tracing::info!(pr = %pr, "profile rule: auto-merge requires a completed code review");
+            return;
+        }
         // STUDIO-964: the fail-closed human-hold gate lives HERE, not at the tail of
         // `service_review_pr`. It used to guard only the one tail call, while the seven
         // adjudication arms (STUDIO-956) each called this function at their own early return —
@@ -4501,6 +4596,15 @@ impl Orchestrator {
         // teammate at their `max_concurrent` is a candidate like any other (D2).
         let exclusions = self.reviewer_exclusions(teams);
         let incumbent = row.key.reviewer.as_str();
+        let pr = PrCoord::new(&row.key.owner, &row.key.repo, row.key.number);
+        let needs_code = self.review_requires_code(&pr);
+        let peer_code = peers.iter().any(|name| self.is_code_reviewer(name));
+        let eligible = |name: &str| {
+            !needs_code
+                || self.is_code_reviewer(name)
+                || (peer_code
+                    && (self.review_label_match(&pr, name) || self.operator_review(&row.key)))
+        };
         if row.author.trim().is_empty() {
             // Roster membership, and deliberately NOT capacity (D2): a reviewer who has left the
             // roster since the row was written has no identity left to dispatch under, which is a
@@ -4510,15 +4614,27 @@ impl Orchestrator {
             // records failed and never completes.
             let on_roster = teams.roster.iter().any(|i| i.name == incumbent);
             return (on_roster
+                && eligible(incumbent)
                 && !exclusions.unselectable.contains(incumbent)
                 && !peers.contains(incumbent))
             .then(|| incumbent.to_string());
         }
-        let candidates: Vec<String> =
+        let mut candidates: Vec<String> =
             crate::quorum::rank_reviewers(teams, row.author.trim(), load.counts(), &exclusions)
                 .into_iter()
                 .filter(|name| !peers.contains(name.as_str()))
+                .filter(|name| eligible(name))
                 .collect();
+        let pinned =
+            crate::quorum::pinned_required_reviewers(teams, row.author.trim(), &exclusions);
+        candidates
+            .sort_by_key(|name| (!pinned.contains(name), !self.review_label_match(&pr, name)));
+        if self.operator_review(&row.key) {
+            return candidates
+                .iter()
+                .any(|name| name == incumbent)
+                .then(|| incumbent.to_string());
+        }
         // Decision B, applied where it earns its keep: a reviewer who READ the previous round knows
         // the pull request and their own findings, so they keep it as long as they are still a
         // candidate — on the roster, not the author, not already holding another of this pull
@@ -4549,6 +4665,137 @@ impl Orchestrator {
             }
         }
         candidates.into_iter().next()
+    }
+
+    pub(crate) fn is_code_reviewer(&self, name: &str) -> bool {
+        self.teams.as_ref().is_some_and(|teams| {
+            teams
+                .roster
+                .iter()
+                .any(|i| i.name == name && teams.review.code_review_profiles.contains(&i.profile))
+        })
+    }
+
+    pub(crate) fn operator_review(&self, key: &ReviewWatchKey) -> bool {
+        match self.store().review_selection(key) {
+            Ok(reason) => reason.as_deref() == Some("operator"),
+            Err(error) => {
+                tracing::warn!(%error, reviewer = %key.reviewer, "review assignment unreadable; preserving incumbent");
+                true
+            }
+        }
+    }
+
+    fn current_review_surface(&self, pr: &PrCoord) -> Option<&crate::ghsummons::ReviewSurface> {
+        let (head, surface) = self.review_surfaces.get(pr)?;
+        (self.review_observed_head.get(pr)?.head == *head).then_some(surface)
+    }
+
+    fn review_requires_code(&self, pr: &PrCoord) -> bool {
+        let Some(teams) = self.teams.as_ref() else {
+            return true;
+        };
+        let files = self.current_review_surface(pr).map(|s| s.files.as_slice());
+        let slugs = self.review_project_slugs_for_repo(&pr.owner, &pr.repo);
+        if slugs.is_empty() {
+            !rhapsody_config::teams::review_is_ui_only(&teams.review.ui_globs, files)
+        } else {
+            slugs.iter().any(|slug| {
+                let globs = teams
+                    .projects
+                    .iter()
+                    .find(|p| p.slugs.iter().any(|s| s == slug))
+                    .and_then(|p| p.review.ui_globs.as_ref())
+                    .unwrap_or(&teams.review.ui_globs);
+                !rhapsody_config::teams::review_is_ui_only(globs, files)
+            })
+        }
+    }
+
+    fn review_label_match(&self, pr: &PrCoord, name: &str) -> bool {
+        let Some(surface) = self.current_review_surface(pr) else {
+            return false;
+        };
+        self.teams.as_ref().is_some_and(|teams| {
+            teams.roster.iter().any(|i| {
+                i.name == name
+                    && i.labels
+                        .iter()
+                        .any(|label| surface.labels.iter().any(|l| l.eq_ignore_ascii_case(label)))
+            })
+        })
+    }
+
+    /// Repair old watches and UI-to-server head changes before reconciliation/merge decisions.
+    fn ensure_code_review(&self, pr: &PrCoord, rows: &mut Vec<ReviewWatchRow>) {
+        if !self.review_repo_is_configured(&pr.owner, &pr.repo)
+            || !self.review_requires_code(pr)
+            || rows
+                .iter()
+                .any(|r| row_is(r, pr) && self.is_code_reviewer(&r.key.reviewer))
+        {
+            return;
+        }
+        // Departed identities already use the dispatcher's deferred-replacement protocol.
+        // Only an incumbent that is still on the roster but has a non-code profile needs repair.
+        if !rows.iter().any(|r| {
+            row_is(r, pr)
+                && self
+                    .teams
+                    .as_ref()
+                    .is_some_and(|teams| teams.roster.iter().any(|i| i.name == r.key.reviewer))
+        }) {
+            return;
+        }
+        let Some(origin) = rows.iter().find(|r| row_is(r, pr)) else {
+            return;
+        };
+        if origin.author.is_empty() {
+            return;
+        }
+        let Some(teams) = self.teams.as_ref() else {
+            return;
+        };
+        let load = LoadSnapshot::from_running(&self.running);
+        let Some(name) = crate::quorum::rank_reviewers(
+            teams,
+            &origin.author,
+            load.counts(),
+            &self.reviewer_exclusions(teams),
+        )
+        .into_iter()
+        .find(|name| self.is_code_reviewer(name)) else {
+            tracing::warn!(pr = %pr, "profile rule: no eligible code reviewer; merge remains blocked");
+            return;
+        };
+        let mut row = origin.clone();
+        row.key.reviewer = name;
+        row.requested_sha.clear();
+        row.last_reviewed_sha.clear();
+        row.status = rhapsody_store::REVIEW_STATUS_REQUESTED.into();
+        if let Err(error) = self.store().save_review_watch(row.clone()) {
+            tracing::warn!(pr = %pr, %error, "profile rule: could not add code reviewer");
+            return;
+        }
+        self.record_review_selection(&row.key, "profile rule");
+        rows.push(row);
+    }
+
+    pub(crate) fn record_review_selection(&self, key: &ReviewWatchKey, reason: &str) {
+        match self.store().review_selection(key) {
+            Ok(Some(old)) if old == "operator" || old == reason => return,
+            Err(error) => {
+                tracing::warn!(%error, reviewer = %key.reviewer, "review assignment unreadable; leaving provenance unchanged");
+                return;
+            }
+            _ => {}
+        }
+        if let Err(error) = self.store().save_review_selection(key, reason) {
+            tracing::warn!(%error, reviewer = %key.reviewer, "review selection could not be recorded");
+            return;
+        }
+        tracing::info!(owner = %key.owner, repo = %key.repo, number = key.number,
+            reviewer = %key.reviewer, reason, "ticketless review: reviewer selected");
     }
 
     /// The clone URL of the ENABLED project that owns `owner/repo`, or `None` — the watched-repo
@@ -5142,6 +5389,166 @@ mod tests {
             ReviewMode::Ticketless,
             names.iter().map(|n| ident(n, 0)).collect(),
         )
+    }
+
+    #[test]
+    fn designer_is_never_sole_reviewer_of_a_server_pr() {
+        let mut teams = ticketless(&["alice", "iris", "bob"]);
+        teams.roster[1].profile = "designer".into();
+        teams.review.ui_globs = vec!["web/**".into()];
+        let (mut o, _) = orch(teams);
+        set_surface(&mut o, &["server/auth.rs", "web/settings.tsx"], &["design"]);
+        let mut busy = RunningEntry::empty(crate::testsupport::issue("busy", "BUSY-1", "Todo"));
+        busy.identity = "bob".into();
+        o.running.insert("busy".into(), busy);
+        let load = LoadSnapshot::from_running(&o.running);
+        assert_eq!(
+            o.choose_review_reviewer(&row(12, "iris"), &HashSet::new(), &load),
+            Some("bob".into())
+        );
+    }
+
+    fn set_surface(o: &mut Orchestrator, files: &[&str], labels: &[&str]) {
+        o.review_observed_head.insert(
+            coord(12),
+            crate::prepare::ReviewHeadObservation {
+                head: HEAD_A.into(),
+                open: true,
+                unchanged_from: Vec::new(),
+            },
+        );
+        o.review_surfaces.insert(
+            coord(12),
+            (
+                HEAD_A.into(),
+                crate::ghsummons::ReviewSurface {
+                    files: files.iter().map(|s| s.to_string()).collect(),
+                    labels: labels.iter().map(|s| s.to_string()).collect(),
+                },
+            ),
+        );
+    }
+
+    #[test]
+    fn designer_may_review_ui_only_pr() {
+        let mut teams = ticketless(&["alice", "iris", "bob"]);
+        teams.roster[1].profile = "designer".into();
+        teams.review.ui_globs = vec!["web/**".into()];
+        let (mut o, _) = orch(teams);
+        set_surface(&mut o, &["web/settings.tsx", "web/style.css"], &[]);
+        let load = LoadSnapshot::from_running(&o.running);
+        assert_eq!(
+            o.choose_review_reviewer(&row(12, "iris"), &HashSet::new(), &load),
+            Some("iris".into())
+        );
+        introduce(&o, row(12, "iris"));
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(report.dispatched, 1);
+        assert!(watch_row(&o, 12, "iris").open);
+    }
+
+    #[test]
+    fn profile_rule_repairs_old_approvals_and_ui_to_server_changes() {
+        let mut teams = ticketless(&["alice", "iris", "bob"]);
+        teams.roster[1].profile = "designer".into();
+        teams.review.ui_globs = vec!["web/**".into()];
+        teams.review.auto_merge = true;
+        let (mut o, _) = orch(teams);
+        introduce(&o, row(12, "iris"));
+        o.store()
+            .mark_review_completed(&key(12, "iris"), HEAD_A, REVIEW_STATUS_APPROVED)
+            .unwrap();
+        set_surface(&mut o, &["web/settings.tsx"], &[]);
+        // Evidence for the old UI head cannot classify the new head.
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert!(report.merge.is_empty());
+        assert_eq!(report.dispatched, 1);
+        assert!(watch_row(&o, 12, "bob").open);
+        assert!(!watch_row(&o, 12, "iris").open);
+        assert_eq!(
+            o.store()
+                .review_selection(&key(12, "bob"))
+                .unwrap()
+                .as_deref(),
+            Some("profile rule")
+        );
+    }
+
+    #[test]
+    fn designer_can_be_an_additional_label_matched_reviewer() {
+        let mut teams = ticketless(&["alice", "iris", "bob", "carol"]);
+        teams.roster[1].profile = "designer".into();
+        teams.roster[1].labels = vec!["design".into()];
+        let (mut o, _) = orch(teams);
+        set_surface(&mut o, &["server/auth.rs"], &["design"]);
+        let load = LoadSnapshot::from_running(&o.running);
+        let peers = HashSet::from(["bob".into()]);
+        assert_eq!(
+            o.choose_review_reviewer(&row(12, "iris"), &peers, &load),
+            Some("iris".into())
+        );
+        set_surface(&mut o, &["server/auth.rs"], &[]);
+        assert_eq!(
+            o.choose_review_reviewer(&row(12, "iris"), &peers, &load),
+            Some("carol".into())
+        );
+    }
+
+    #[test]
+    fn profile_rule_blocks_a_legacy_designer_approval_without_a_code_candidate() {
+        let mut teams = ticketless(&["alice", "iris"]);
+        teams.roster[1].profile = "designer".into();
+        teams.review.auto_merge = true;
+        let (mut o, _) = orch(teams);
+        introduce(&o, row(12, "iris"));
+        o.store()
+            .mark_review_completed(&key(12, "iris"), HEAD_A, REVIEW_STATUS_APPROVED)
+            .unwrap();
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert!(
+            report.merge.is_empty(),
+            "a designer verdict cannot meet the code-review gate"
+        );
+        assert_eq!(report.dispatched, 0);
+    }
+
+    #[test]
+    fn operator_can_add_named_reviewer() {
+        let teams = ticketless(&["alice", "iris", "bob"]);
+        let store = Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let (mut o, _) = orch_on(teams.clone(), store.clone());
+        introduce(&o, row(12, "iris"));
+        assert_eq!(
+            o.handle_review_rerun_named(&coord(12), Some("nobody")),
+            crate::reviewconsole::ReviewControlOutcome::Refused("unknown reviewer")
+        );
+        assert_eq!(o.store().load_live_review_watch().unwrap().len(), 1);
+        assert_eq!(
+            o.handle_review_rerun_named(&coord(12), Some("alice")),
+            crate::reviewconsole::ReviewControlOutcome::Refused(
+                "the author cannot review their own pull request"
+            )
+        );
+        assert_eq!(
+            o.handle_review_rerun_named(&coord(12), Some("bob")),
+            crate::reviewconsole::ReviewControlOutcome::Applied(1)
+        );
+        let (mut restarted, _) = orch_on(teams, store);
+        let report = restarted.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(report.retired, 0, "operator additions are not surplus");
+        assert_eq!(report.dispatched, 2);
+        assert_eq!(
+            restarted
+                .review_console_list()
+                .unwrap()
+                .reviews
+                .iter()
+                .find(|r| r.reviewer == "bob")
+                .unwrap()
+                .selection_reason
+                .as_deref(),
+            Some("operator")
+        );
     }
 
     /// An orchestrator with one enabled project owning [`REPO_URL`], an in-memory store and a
@@ -9305,6 +9712,7 @@ mod tests {
         teams.projects = vec![rhapsody_config::teams::TeamsProject {
             slugs: vec!["rhapsody".to_string()],
             review: rhapsody_config::teams::ProjectReview {
+                ui_globs: None,
                 auto_merge: Some(false),
             },
         }];
@@ -9334,6 +9742,7 @@ mod tests {
         teams.projects = vec![rhapsody_config::teams::TeamsProject {
             slugs: vec!["161ac721c8bc".to_string()],
             review: rhapsody_config::teams::ProjectReview {
+                ui_globs: None,
                 auto_merge: Some(false),
             },
         }];

@@ -255,7 +255,7 @@ repair as a per-project advisory on `GET /api/v1/projects`.
 **Who reviews can be pinned, not only arranged.** `review.required` (a list of roster names,
 default empty) names identities selected on **every** pull request regardless of load or roster
 order — the case a review-only or specialist teammate otherwise loses to a busy roster. Required
-reviewers are chosen first and the remaining slots are filled by the usual least-loaded ranking,
+reviewers are chosen first within the eligible candidates and the remaining slots are load-ranked,
 so on both paths `reviewers` stays the **total**: `reviewers: 2` with one required means one
 pinned plus one ranked. A pinned teammate is still never handed its own authored pull request. A
 pin the daemon cannot use **degrades rather than blocking** — the round always proceeds with the
@@ -264,6 +264,16 @@ at boot by name; a profile naming a harness this build cannot run drops the pin 
 teammate a ranked candidate, since it reviews on `agent.backend`; and a ticketless `review.model`
 refusal removes it from the round entirely with one warning. More pins than `reviewers` clamps to
 the first `reviewers` in `required:` order, with one boot warning naming both numbers.
+
+**Ticketless eligibility is profile-aware.** Unless every changed path matches `review.ui_globs`
+(or `projects[].review.ui_globs` for the owning slugs), at least one reviewer must have a profile
+listed in `review.code_review_profiles` (default `swe`, `swe-jr`, `swe-sr`, `sre`, `reviewer`).
+Empty UI globs or an unreadable/incomplete inventory require code review. Include custom code
+profiles explicitly. A non-code profile can review UI-only work; on mixed changes it can fill an
+additional slot when its topic labels match PR labels. Pins and continuity cannot waive the rule.
+The operator's `/api/v1/reviews/rerun` accepts `reviewer` to add/re-arm a named roster member on a
+watched PR. That additional row stays pinned across restart and surplus trimming; unknown names
+and the author are refused. The Reviews API's `selection_reason` and INFO logs explain the choice.
 
 **Ticket state follows the verdict, when configured** (both empty-means-off):
 

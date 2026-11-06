@@ -62,6 +62,9 @@ pub struct ReviewJobRow {
     pub number: i64,
     /// The teammate holding this review.
     pub reviewer: String,
+    /// Why this reviewer was selected; absent on watches created before selection provenance.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selection_reason: Option<String>,
     /// The teammate whose handoff produced the pull request; empty ⇒ unknown.
     pub author: String,
     /// How the pull request entered the watch set, e.g. `handoff:STUDIO-720`.
@@ -137,6 +140,7 @@ impl From<ReviewWatchRow> for ReviewJobRow {
             repo: row.key.repo,
             number: row.key.number,
             reviewer: row.key.reviewer,
+            selection_reason: None,
             author: row.author,
             introduced_by: row.introduced_by,
             requested_sha: row.requested_sha,
@@ -230,16 +234,18 @@ impl Orchestrator {
                     .then(|| self.review_infrastructure_for(&row.key))
                     .flatten()
                     .map(|(key, attempt)| attempt.message(key));
+                let reason = self.store().review_selection(&row.key)?;
                 let mut job = ReviewJobRow::from(row);
+                job.selection_reason = reason;
                 job.infrastructure = infrastructure;
                 let key = format!("{}/{}#{}", job.owner, job.repo, job.number).to_ascii_lowercase();
                 job.manager = states
                     .entry(key.clone())
                     .or_insert_with(|| self.manager_console_state(&key))
                     .clone();
-                job
+                Ok(job)
             })
-            .collect();
+            .collect::<Result<Vec<_>, StoreError>>()?;
         Ok(ReviewsView {
             enabled: true,
             reviews,
@@ -368,9 +374,8 @@ impl Orchestrator {
     /// `requested`, which is the status [`crate::reviewwatch::review_round_due`] answers "due" for
     /// at any head, so the next watcher tick dispatches.
     ///
-    /// It re-arms rows and introduces none, exactly like
-    /// [`Orchestrator::handle_review_head_advanced`]: a pull request nobody introduced is refused
-    /// rather than watched, so this control cannot become a second, weaker introduction path.
+    /// With no name it only re-arms existing rows. A named rerun may add that roster member to an
+    /// already watched PR (STUDIO-1305); an unwatched coordinate is always refused.
     ///
     /// Two things it does beyond a head advance, both because a human asked rather than a poller:
     ///
@@ -384,7 +389,16 @@ impl Orchestrator {
     ///   the escape hatch the cap defers to. A refund and not a reset, though: the operator asked
     ///   for one re-read, and clearing the counter would hand an already-runaway pull request the
     ///   whole budget again UNATTENDED, which is the exact cost the cap is there to bound.
+    #[cfg(test)]
     pub(crate) fn handle_review_rerun(&mut self, pr: &PrCoord) -> ReviewControlOutcome {
+        self.handle_review_rerun_named(pr, None)
+    }
+
+    pub(crate) fn handle_review_rerun_named(
+        &mut self,
+        pr: &PrCoord,
+        reviewer: Option<&str>,
+    ) -> ReviewControlOutcome {
         if !self.review_ticketless_enabled() {
             return ReviewControlOutcome::Dormant; // §16
         }
@@ -416,9 +430,60 @@ impl Orchestrator {
             Ok(rows) => rows,
             Err(e) => return ReviewControlOutcome::Failed(e.to_string()),
         };
-        let mine: Vec<ReviewWatchRow> = rows.into_iter().filter(|r| row_is(r, pr)).collect();
+        let mut mine: Vec<ReviewWatchRow> = rows.into_iter().filter(|r| row_is(r, pr)).collect();
         if mine.is_empty() {
             return ReviewControlOutcome::Refused("no live review of that pull request is watched");
+        }
+        if let Some(name) = reviewer {
+            let Some(teams) = self.teams.as_ref() else {
+                return ReviewControlOutcome::Dormant;
+            };
+            if !teams.roster.iter().any(|i| i.name == name) {
+                return ReviewControlOutcome::Refused("unknown reviewer");
+            }
+            if mine.iter().any(|r| r.author == name) {
+                return ReviewControlOutcome::Refused(
+                    "the author cannot review their own pull request",
+                );
+            }
+            if self.reviewer_exclusions(teams).excludes(name) {
+                return ReviewControlOutcome::Refused(
+                    "reviewer cannot be dispatched for this configuration",
+                );
+            }
+            let Some(origin) = mine.first() else {
+                return ReviewControlOutcome::Refused("no watched origin");
+            };
+            if origin.author.is_empty() && !mine.iter().any(|r| r.key.reviewer == name) {
+                return ReviewControlOutcome::Refused(
+                    "cannot add a reviewer when the author is unknown",
+                );
+            }
+            let key = rhapsody_store::ReviewWatchKey {
+                reviewer: name.into(),
+                ..origin.key.clone()
+            };
+            let selected = mine
+                .iter()
+                .find(|r| r.key == key)
+                .cloned()
+                .unwrap_or_else(|| ReviewWatchRow {
+                    key: key.clone(),
+                    author: origin.author.clone(),
+                    introduced_by: origin.introduced_by.clone(),
+                    status: REVIEW_STATUS_REQUESTED.into(),
+                    open: true,
+                    ..ReviewWatchRow::default()
+                });
+            if let Err(error) = self
+                .store()
+                .save_review_selection(&key, "operator")
+                .and_then(|()| self.store().save_review_watch(selected.clone()))
+            {
+                return ReviewControlOutcome::Failed(error.to_string());
+            }
+            tracing::info!(pr = %pr, reviewer = name, reason = "operator", "ticketless review: reviewer selected");
+            mine = vec![selected];
         }
         if let Err(error) = self
             .store()
@@ -743,6 +808,7 @@ impl Orchestrator {
             // watch lifecycle's head — which the reconciliation sweep would read as a supersession
             // of a fresh escalation until the rotating watcher reached it.
             self.review_observed_head.remove(&dismissed);
+            self.review_surfaces.remove(&dismissed);
             // ...and any in-flight preparation for the coordinate: the sweep will never observe it
             // again, so a completion that started before the dismissal must not dispatch a review of
             // work the operator took out of the watch set (STUDIO-988 review round 4, alice #2).
@@ -779,8 +845,20 @@ impl ControlHandle {
     /// The operator's **re-run** (`POST /api/v1/reviews/rerun`) — §15-e's trusted lever, delivered
     /// as an in-process control Event rather than a room post (§14.1 F-SEC).
     pub async fn rerun_review(&self, pr: PrCoord) -> ReviewControlOutcome {
-        self.review_control(|reply| Event::ReviewRerun { pr, reply })
-            .await
+        self.rerun_review_named(pr, None).await
+    }
+
+    pub async fn rerun_review_named(
+        &self,
+        pr: PrCoord,
+        reviewer: Option<String>,
+    ) -> ReviewControlOutcome {
+        self.review_control(|reply| Event::ReviewRerun {
+            pr,
+            reviewer,
+            reply,
+        })
+        .await
     }
 
     /// The operator's **dismiss** (`POST /api/v1/reviews/dismiss`), the same path for the same

@@ -3406,6 +3406,7 @@ pub(crate) mod tests {
             enabled: true,
             roster: vec![rhapsody_config::teams::Identity {
                 name: "bob".into(),
+                profile: "swe".into(),
                 ..Default::default()
             }],
             review: rhapsody_config::teams::Review {

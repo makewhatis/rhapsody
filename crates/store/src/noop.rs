@@ -12,6 +12,16 @@ use crate::*;
 pub struct Noop;
 
 impl Store for Noop {
+    fn review_selection(&self, _key: &ReviewWatchKey) -> Result<Option<String>, StoreError> {
+        Ok(None)
+    }
+    fn save_review_selection(
+        &self,
+        _key: &ReviewWatchKey,
+        _reason: &str,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn save_landing(&self, _row: LandingRow) -> Result<i64, StoreError> {
         Ok(0)
     }

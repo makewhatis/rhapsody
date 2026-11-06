@@ -175,6 +175,51 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Profile-aware ticketless reviewers (STUDIO-1305)
+
+Ticketless reviews require a code-review-profile teammate unless **every changed path** matches
+the project's UI globs. The default code profiles are `swe`, `swe-jr`, `swe-sr`, `sre`, and
+`reviewer`; custom code profiles must be listed explicitly. Configuration lives in `teams.yaml`:
+
+```yaml
+review:
+  mode: ticketless
+  reviewers: 1
+  code_review_profiles: [swe, reviewer, backend-specialist]
+  ui_globs: []
+projects:
+  - slugs: [your-project-slug]
+    review:
+      ui_globs: ['web/components/**', 'web/styles/**', 'assets/*.svg']
+```
+
+Globs are case-sensitive and repository-relative; `*` does not cross a directory separator,
+and `**` does. An absent per-project list inherits the global list; `[]` requires code review
+for all changes. When projects share a repository, all owning projects must classify it as UI-only.
+Empty, missing, malformed or truncated file inventories require code review. Renames include both
+paths. The watcher reads an immutable base/head comparison off-loop, validates its file count against
+the PR, and treats GitHub's 300-file compare limit as unknown. Mixed-profile rosters spend up to two
+additional bounded GitHub reads per open PR observation; all-code rosters need none.
+
+Introduction conservatively prefers a code profile; the watcher can select a designer for a proven
+UI-only change. For mixed changes, non-code reviewers can fill additional slots when their roster
+topic labels match GitHub PR labels (case-insensitively). Required pins and prior-review continuity
+remain preferences within eligible candidates. Old designer-only watches and UI-to-server head
+changes acquire a code-review obligation before merge; an unavailable code reviewer blocks merge.
+The ticketless count is `review.reviewers`, independently of ticket mode's `quorum.reviewers`.
+
+Operator-guarded `POST /api/v1/reviews/rerun` accepts
+`{"owner":"org","repo":"repo","number":123,"reviewer":"name"}` to add/re-arm that roster
+member's row on an already watched PR. Unknown names, the author, and reviewers whose harness cannot
+run are refused. Named additions survive restart and surplus trimming, remain pinned at dispatch,
+and add to the automatic review count. They do not waive the code-review requirement. Omitting the
+name retains the whole-PR rerun. Dismiss can retire the named row; clear remains PR-wide.
+
+`GET /api/v1/reviews` adds optional `selection_reason`; selection/intro INFO logs name the reviewer
+and reason (`least-loaded`, `label match`, `profile rule`, `continuity`, or `operator`). Migration 40
+stores selection provenance in `rhapsody_review_selection`. This extends the Rhapsody-only review
+subsystem; Go-owned tables and parity fixtures are unchanged.
+
 ### The terminal-workspace cleanup also runs periodically while the daemon is up (STUDIO-1520)
 
 The frozen Go reference removes a terminal ticket's workspace only at startup (`startupCleanup`). A

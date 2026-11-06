@@ -48,6 +48,13 @@ selected on every pull request regardless of load or roster position. A pin the 
 degrades to the remaining reviewers rather than blocking the round; see `rhapsody-teams`'s Review
 section for the four cases.
 
+For ticketless review, list custom engineering profiles in `review.code_review_profiles`; the
+defaults are `swe`, `swe-jr`, `swe-sr`, `sre`, and `reviewer`. A designer cannot be the only reviewer
+of non-UI changes. Set repository-relative `review.ui_globs` globally or under a project's review
+override to identify UI-only changes; the empty default requires a code reviewer for every PR.
+For a one-PR addition, the operator can name `reviewer` in `/api/v1/reviews/rerun` without editing
+the roster. See the README's profile-aware review configuration for the complete contract.
+
 Built-ins available today: **`swe`**, **`reviewer`**, **`sre`** (each versioned).
 
 ## Step 2 — write the specialist's profile

@@ -899,6 +899,8 @@ pub struct Orchestrator {
     /// prepared-review completion revalidation (by `.open` + `.head`).
     pub(crate) review_observed_head:
         HashMap<crate::prstate::PrCoord, crate::prepare::ReviewHeadObservation>,
+    pub(crate) review_surfaces:
+        HashMap<crate::prstate::PrCoord, (String, crate::ghsummons::ReviewSurface)>,
     /// The evidence ledger's per-pull-request last-seen fingerprint and revision (STUDIO-1009;
     /// design record `manager-agent-design.md` §5.2). Written and read ONLY on the control task,
     /// beside `review_rounds`. The revision half is durable (`rhapsody_review_bound.evidence_rev`);
@@ -1344,6 +1346,7 @@ impl Orchestrator {
             review_watch_swept: None,
             review_watch_unreadable: HashMap::new(),
             review_observed_head: HashMap::new(),
+            review_surfaces: HashMap::new(),
             review_evidence: HashMap::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
