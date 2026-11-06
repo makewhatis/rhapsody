@@ -1103,7 +1103,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                         .teams
                         .roster
                         .iter()
-                        .any(|i| !deps.teams.review.code_review_profiles.contains(&i.profile))
+                        .any(|i| !deps.teams.review.is_code_reviewer(i))
                 {
                     match diff
                         .review_surface(
@@ -4672,7 +4672,7 @@ impl Orchestrator {
             teams
                 .roster
                 .iter()
-                .any(|i| i.name == name && teams.review.code_review_profiles.contains(&i.profile))
+                .any(|i| i.name == name && teams.review.is_code_reviewer(i))
         })
     }
 
@@ -5389,6 +5389,50 @@ mod tests {
             ReviewMode::Ticketless,
             names.iter().map(|n| ident(n, 0)).collect(),
         )
+    }
+
+    #[test]
+    fn a_roster_with_no_profiles_still_dispatches_reviews() {
+        let mut teams = ticketless(&["alice", "bob"]);
+        for identity in &mut teams.roster {
+            identity.profile.clear();
+        }
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, row(12, "bob"));
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert_eq!(
+            report.dispatched, 1,
+            "profile-less rosters must not defer forever"
+        );
+        assert_eq!(dispatched.lock().unwrap()[0].identity, "bob");
+        assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_A);
+    }
+
+    #[test]
+    fn an_unchanged_legacy_designer_approval_acquires_code_review_before_merge() {
+        let mut teams = ticketless(&["alice", "iris", "bob"]);
+        teams.roster[1].profile = "designer".into();
+        teams.review.auto_merge = true;
+        let (mut o, dispatched) = orch(teams);
+        introduce(&o, row(12, "iris"));
+        o.store()
+            .mark_review_completed(&key(12, "iris"), HEAD_A, REVIEW_STATUS_APPROVED)
+            .unwrap();
+        set_surface(&mut o, &["server/auth.rs"], &[]);
+        let report = o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        assert!(
+            report.merge.is_empty(),
+            "the old same-head approval cannot merge"
+        );
+        assert_eq!(report.dispatched, 1);
+        assert_eq!(dispatched.lock().unwrap()[0].identity, "bob");
+        assert!(watch_row(&o, 12, "bob").open);
+        assert_eq!(watch_row(&o, 12, "bob").requested_sha, HEAD_A);
+        assert!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)])
+                .merge
+                .is_empty()
+        );
     }
 
     #[test]

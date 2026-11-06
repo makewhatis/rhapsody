@@ -844,6 +844,40 @@ mod tests {
         assert_eq!(err_code(resp).await, "not_running");
     }
 
+    /// The HTTP roster carries the same eligibility flag as dispatch and the CLI.
+    #[tokio::test]
+    async fn roster_reports_code_reviewer_eligibility() {
+        let dir = TempDir::new();
+        let mut teams = Teams {
+            enabled: true,
+            roster: ["swe", "", "designer", "custom-code"]
+                .into_iter()
+                .enumerate()
+                .map(|(n, profile)| Identity {
+                    name: format!("member-{n}"),
+                    profile: profile.into(),
+                    ..Identity::default()
+                })
+                .collect(),
+            ..Teams::disabled()
+        };
+        teams.review.code_review_profiles.push("custom-code".into());
+        let mem = Arc::new(TeamsMemory::new(
+            Arc::new(teams),
+            Arc::new(LocalBank::new(dir.0.join(DEFAULT_BANKS_SUBDIR), "agent-")),
+        ));
+        let url = spawn_with(mem).await;
+        let view = body_json(
+            reqwest::get(format!("{url}/api/v1/teams/roster"))
+                .await
+                .unwrap(),
+        )
+        .await;
+        for (n, expected) in [true, true, false, true].into_iter().enumerate() {
+            assert_eq!(view["roster"][n]["code_reviewer"], expected, "{view}");
+        }
+    }
+
     /// The roster reports who exists and what each is doing (§6.7).
     #[tokio::test]
     async fn the_roster_endpoint_reports_derived_status() {

@@ -946,6 +946,14 @@ pub fn review_is_ui_only(globs: &[String], files: Option<&[String]>) -> bool {
 }
 
 impl Review {
+    /// Exact profile-name eligibility; inheritance does not confer code-review authority.
+    /// Profile-less identities count as the built-in `swe` for this check only.
+    pub fn is_code_reviewer(&self, identity: &Identity) -> bool {
+        self.code_review_profiles
+            .iter()
+            .any(|profile| profile == identity.code_review_profile())
+    }
+
     /// [`Review::reviewers`] with the floor applied — the number an introduction
     /// asks for, before the roster clamps it further.
     ///
@@ -1153,6 +1161,17 @@ pub struct Identity {
     /// 0 ⇒ unlimited (§3.4).
     #[serde(default)]
     pub max_concurrent: i64,
+}
+
+impl Identity {
+    /// The profile name used by the ticketless code-review eligibility check.
+    pub fn code_review_profile(&self) -> &str {
+        if self.profile.is_empty() {
+            "swe"
+        } else {
+            &self.profile
+        }
+    }
 }
 
 /// The parsed `~/.rhapsody/teams.yaml`.

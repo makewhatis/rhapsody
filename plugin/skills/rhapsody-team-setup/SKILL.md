@@ -55,6 +55,12 @@ override to identify UI-only changes; the empty default requires a code reviewer
 For a one-PR addition, the operator can name `reviewer` in `/api/v1/reviews/rerun` without editing
 the roster. See the README's profile-aware review configuration for the complete contract.
 
+Before upgrading to 0.3.9, list every code-capable profile name, or in-flight non-UI reviews move
+off unlisted profiles. The list replaces the defaults and matches names exactly, never `extends:`.
+No `profile` counts as `swe` for this check. Boot warns for each non-code identity and when none
+can review code. Check `rhapsodyd teams show <name>` for `code reviewer: yes|no
+(review.code_review_profiles)` or read each roster API row's `code_reviewer` boolean.
+
 Built-ins available today: **`swe`**, **`reviewer`**, **`sre`** (each versioned).
 
 ## Step 2 — write the specialist's profile

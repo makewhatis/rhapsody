@@ -274,6 +274,15 @@ additional slot when its topic labels match PR labels. Pins and continuity canno
 The operator's `/api/v1/reviews/rerun` accepts `reviewer` to add/re-arm a named roster member on a
 watched PR. That additional row stays pinned across restart and surplus trimming; unknown names
 and the author are refused. The Reviews API's `selection_reason` and INFO logs explain the choice.
+An unreadable saved reason is omitted with a warning; it cannot hide the reviews list.
+
+**Before upgrading to 0.3.9**, list every code-capable profile name, including custom reviewers,
+or in-flight non-UI reviews move off unlisted profiles. The list replaces the defaults. Matching
+is exact, never inferred from `extends:`; an absent `profile` counts as `swe` for this check.
+Boot emits a WARN per non-code identity with its profile and remedy, and another when none can
+review code. `rhapsodyd teams show <name>` reports `code reviewer: yes|no
+(review.code_review_profiles)`; `/api/v1/teams/roster` and `/api/v1/teams` expose each identity's
+`code_reviewer` boolean.
 
 **Ticket state follows the verdict, when configured** (both empty-means-off):
 
