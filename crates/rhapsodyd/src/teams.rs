@@ -198,9 +198,15 @@ fn show(
         Err(e) => (Teams::disabled(), e.to_string()),
     };
     let identity = teams.roster.iter().find(|i| i.name == name);
+    let code_reviewer = identity.map(|i| teams.review.is_code_reviewer(i));
     let profile_name = match identity {
         Some(i) if i.profile.is_empty() => {
-            return Err(format!("identity {name:?} names no profile"));
+            // Dispatch supplies only the identity header here; do not pretend a local swe
+            // overlay (including its harness/model) runs merely because eligibility uses swe.
+            return Ok(format!(
+                "identity:      {name}\nprofile:       (unset; swe for code-review eligibility)\n{}",
+                render_code_reviewer(code_reviewer)
+            ));
         }
         Some(i) => i.profile.clone(),
         None => name.clone(),
@@ -259,6 +265,7 @@ fn show(
         effective: &effective,
         comms: &comms,
         onepassword: &onepassword,
+        code_reviewer,
     };
     Ok(render_show(
         identity.map(|i| i.name.as_str()),
@@ -279,6 +286,16 @@ struct ShowGlobals<'a> {
     effective: &'a str,
     comms: &'a str,
     onepassword: &'a str,
+    code_reviewer: Option<bool>,
+}
+
+fn render_code_reviewer(eligible: Option<bool>) -> String {
+    eligible.map_or_else(String::new, |eligible| {
+        format!(
+            "code reviewer: {} (review.code_review_profiles)\n",
+            if eligible { "yes" } else { "no" }
+        )
+    })
 }
 
 /// The per-project 1Password service-account credential bindings (STUDIO-1584). Renders one line per
@@ -490,6 +507,7 @@ fn render_show(
         effective,
         comms,
         onepassword,
+        code_reviewer,
     } = g;
     let mut out = String::new();
     // First, so it is the line an operator reads before anything else. Empty on
@@ -500,6 +518,7 @@ fn render_show(
         out.push_str(&format!("identity:      {i}\n"));
     }
     out.push_str(&format!("profile:       {}\n", r.name));
+    out.push_str(&render_code_reviewer(code_reviewer));
     match &r.provenance.base {
         Some(b) => out.push_str(&format!(
             "base:          {}@{} ({})\n",
@@ -1148,6 +1167,37 @@ mod tests {
             out.contains("comms:         linear [textual] (tracker.kind)"),
             "out = {out}"
         );
+    }
+
+    /// Eligibility follows the configured name, not the profile's base, including no profile.
+    #[test]
+    fn show_reports_code_reviewer_eligibility() {
+        let dir = TempDir::new();
+        let (env, profiles_dir) = hermetic(&dir);
+        std::fs::create_dir_all(&profiles_dir).unwrap();
+        std::fs::write(
+            profiles_dir.join("designer.md"),
+            "---\nextends: swe\n---\nDesign only.\n",
+        )
+        .unwrap();
+        for (profile, list, expected) in [
+            ("reviewer", "[swe, reviewer]", "yes"),
+            ("designer", "[swe, reviewer]", "no"),
+            ("designer", "[designer]", "yes"),
+            ("", "[swe, reviewer]", "yes"),
+            ("", "[reviewer]", "no"),
+        ] {
+            std::fs::write(dir.child("teams.yaml"), format!(
+                "enabled: true\nreview:\n  mode: ticketless\n  code_review_profiles: {list}\nroster:\n  - name: alice\n    profile: '{profile}'\n"
+            )).unwrap();
+            let out = run(&["show", "alice"], &env[0]).expect("show identity");
+            assert!(
+                out.contains(&format!(
+                    "code reviewer: {expected} (review.code_review_profiles)"
+                )),
+                "{profile:?}: {out}"
+            );
+        }
     }
 
     /// `teams show <identity>` resolves through the roster, which is the

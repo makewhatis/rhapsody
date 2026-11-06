@@ -181,6 +181,18 @@ Ticketless reviews require a code-review-profile teammate unless **every changed
 the project's UI globs. The default code profiles are `swe`, `swe-jr`, `swe-sr`, `sre`, and
 `reviewer`; custom code profiles must be listed explicitly. Configuration lives in `teams.yaml`:
 
+**Upgrading to 0.3.9 (STUDIO-1766):** before upgrading, list **every code-capable profile name**
+in `review.code_review_profiles`, including custom engineering and reviewer profiles. This list
+replaces the defaults; keep the built-in names your roster uses. Otherwise in-flight non-UI reviews
+move off unlisted profiles. Matching is exact and does **not** follow `extends: swe` — a designer
+can extend `swe` without being a code reviewer. An identity with no `profile` counts as `swe` for
+this check, preserving profile-less rosters under the default list.
+
+At boot, enabled Teams logs one WARN per non-code identity with its name, effective review profile
+and the setting to change, plus another WARN if no identity can review code. Inspect eligibility
+with `rhapsodyd teams show <name>` (`code reviewer: yes|no (review.code_review_profiles)`) or the
+`code_reviewer` boolean on each identity in `GET /api/v1/teams/roster` and `GET /api/v1/teams`.
+
 ```yaml
 review:
   mode: ticketless
@@ -219,6 +231,8 @@ name retains the whole-PR rerun. Dismiss can retire the named row; clear remains
 and reason (`least-loaded`, `label match`, `profile rule`, `continuity`, or `operator`). Migration 40
 stores selection provenance in `rhapsody_review_selection`. This extends the Rhapsody-only review
 subsystem; Go-owned tables and parity fixtures are unchanged.
+If a saved selection reason cannot be read, the Reviews API omits that optional reason and logs
+the failure while continuing to serve the review rows.
 
 ### The terminal-workspace cleanup also runs periodically while the daemon is up (STUDIO-1520)
 

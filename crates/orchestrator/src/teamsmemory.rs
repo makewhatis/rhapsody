@@ -86,6 +86,8 @@ pub struct RunProvenance {
 pub struct RosterRow {
     pub name: String,
     pub profile: String,
+    /// Eligibility under `review.code_review_profiles`, independent of current load.
+    pub code_reviewer: bool,
     pub labels: Vec<String>,
     pub bank: String,
     pub max_concurrent: i64,
@@ -707,6 +709,7 @@ impl TeamsMemory {
                 RosterRow {
                     name: i.name.clone(),
                     profile: i.profile.clone(),
+                    code_reviewer: self.teams.review.is_code_reviewer(i),
                     labels: i.labels.clone(),
                     bank: self.bank_ids.get(&i.name).cloned().unwrap_or_default(),
                     max_concurrent: i.max_concurrent,

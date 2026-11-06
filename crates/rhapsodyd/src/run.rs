@@ -495,6 +495,7 @@ where
         report_manager_limit_fallback(&teams_cfg);
         report_over_pinned_reviewers(o.teams.as_ref());
         report_unknown_required_reviewers(o.teams.as_ref());
+        report_non_code_reviewers(o.teams.as_ref());
         report_unmatched_project_slugs(o.teams.as_ref(), resolved.as_ref());
         // Rhapsody Teams memory (STUDIO-645, T4). Two handles are installed, deliberately DIFFERENT
         // types, and the difference is the design:
@@ -2766,6 +2767,33 @@ fn report_unknown_required_reviewers(teams: Option<&rhapsody_config::teams::Team
     );
 }
 
+/// Make the profile-name guard visible before it can repair or defer a review.
+fn report_non_code_reviewers(teams: Option<&rhapsody_config::teams::Teams>) {
+    let Some(teams) = teams.filter(|t| t.enabled) else {
+        return;
+    };
+    for identity in &teams.roster {
+        if !teams.review.is_code_reviewer(identity) {
+            let name = &identity.name;
+            let profile = identity.code_review_profile();
+            tracing::warn!(
+                "review: {name} (profile {profile}) is not a code-review profile; it will never be \
+                 the sole reviewer of a non-UI pull request — add it to review.code_review_profiles if that is wrong"
+            );
+        }
+    }
+    if !teams
+        .roster
+        .iter()
+        .any(|i| teams.review.is_code_reviewer(i))
+    {
+        tracing::warn!(
+            "review: ticketless reviews of non-UI pull requests cannot be dispatched; \
+             add a code-capable identity and list its profile in review.code_review_profiles"
+        );
+    }
+}
+
 /// Warns about every `teams.yaml` `projects:` slug that matches no resolved project
 /// slug (STUDIO-927). The near-certain cause is a Linear project NAME where its
 /// `slugId` hex belongs (`slugs: [booch]` instead of `[4f4a2350682f]`), and the
@@ -4256,6 +4284,91 @@ mod tests {
             !dir.child("ws").join("symphony.db").exists(),
             "storage.path: off must not create a symphony.db file"
         );
+    }
+
+    // Exercise the boot wiring as well as the warning text: removing the call must fail these tests.
+    async fn code_review_boot_log(roster: &str) -> String {
+        use tracing::instrument::WithSubscriber;
+        let dir = TempDir::new();
+        let home = TempDir::new();
+        let wf = write_wf(&dir, "", "");
+        std::fs::write(dir.child("teams.yaml"), format!(
+            "enabled: true\nmanager:\n  mode: off\nmemory:\n  backend: none\nreview:\n  mode: ticketless\nroster:\n{roster}"
+        )).unwrap();
+        let buf = SharedBuf::new();
+        let logs = SharedBuf::new();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_writer(logs.clone())
+            .finish();
+        let signal = CancelSignal::new();
+        let argv = vec![
+            "--db".into(),
+            dir.child("rhapsody.db").to_string_lossy().into_owned(),
+            wf.to_string_lossy().into_owned(),
+        ];
+        let boot = run_with_seam(
+            signal.wait(),
+            &argv,
+            buf.clone(),
+            false,
+            false,
+            BootSeams {
+                home: Some(home.path.clone()),
+                ..BootSeams::default()
+            },
+        )
+        .with_subscriber(subscriber);
+        let (code, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(boot, async {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                signal.cancel();
+            })
+        })
+        .await
+        .expect("boot and shutdown deadline");
+        assert_eq!(code, 0, "{}", buf.contents());
+        logs.contents()
+    }
+
+    #[tokio::test]
+    async fn boot_warns_once_per_non_code_reviewer_with_remedy() {
+        let logs = code_review_boot_log("  - name: alice\n    profile: reviewer-claude\n  - name: iris\n    profile: designer\n  - name: bob\n").await;
+        let warnings: Vec<_> = logs
+            .lines()
+            .filter(|l| l.contains("is not a code-review profile"))
+            .collect();
+        assert_eq!(warnings.len(), 2, "{logs}");
+        for (line, identity, profile) in [
+            (warnings[0], "alice", "reviewer-claude"),
+            (warnings[1], "iris", "designer"),
+        ] {
+            assert!(
+                line.contains("WARN")
+                    && line.contains(&format!("{identity} (profile {profile})"))
+                    && line.contains("sole reviewer of a non-UI pull request")
+                    && line.contains("add it to review.code_review_profiles"),
+                "{line}"
+            );
+        }
+        assert!(
+            !logs.contains("ticketless reviews of non-UI pull requests cannot be dispatched"),
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn boot_warns_when_no_identity_can_review_code() {
+        let logs = code_review_boot_log("  - name: iris\n    profile: designer\n").await;
+        let warnings: Vec<_> = logs
+            .lines()
+            .filter(|l| {
+                l.contains("ticketless reviews of non-UI pull requests cannot be dispatched")
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "{logs}");
+        assert!(warnings[0].contains("WARN"), "{logs}");
     }
 
     // STUDIO-639 (Teams T1), design §2.1: a `teams.yaml` that is NOT there stays not there. This is

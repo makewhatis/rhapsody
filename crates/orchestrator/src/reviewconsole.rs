@@ -234,7 +234,17 @@ impl Orchestrator {
                     .then(|| self.review_infrastructure_for(&row.key))
                     .flatten()
                     .map(|(key, attempt)| attempt.message(key));
-                let reason = self.store().review_selection(&row.key)?;
+                let reason = match self.store().review_selection(&row.key) {
+                    Ok(reason) => reason,
+                    Err(error) => {
+                        tracing::warn!(
+                            %error, owner = %row.key.owner, repo = %row.key.repo,
+                            number = row.key.number, reviewer = %row.key.reviewer,
+                            "review selection reason unreadable; omitting optional provenance"
+                        );
+                        None
+                    }
+                };
                 let mut job = ReviewJobRow::from(row);
                 job.selection_reason = reason;
                 job.infrastructure = infrastructure;
@@ -243,9 +253,9 @@ impl Orchestrator {
                     .entry(key.clone())
                     .or_insert_with(|| self.manager_console_state(&key))
                     .clone();
-                Ok(job)
+                job
             })
-            .collect::<Result<Vec<_>, StoreError>>()?;
+            .collect();
         Ok(ReviewsView {
             enabled: true,
             reviews,
@@ -1051,6 +1061,44 @@ mod tests {
     }
 
     // ── the read surface ─────────────────────────────────────────────────────────────────────────
+
+    /// A bad optional provenance value must not hide the whole Reviews API read model.
+    #[test]
+    fn unreadable_selection_reason_does_not_hide_reviews() {
+        let dir = crate::testsupport::TempDir::new();
+        let path = dir.child("reviews.db");
+        let mut o = ticketless();
+        o.set_store(Arc::new(
+            Sqlite::open(StorePath::Disk(path.clone().into())).unwrap(),
+        ));
+        watch(&mut o, "bob", REVIEW_STATUS_REVIEWED, HEAD_A, HEAD_A);
+        watch(&mut o, "carol", REVIEW_STATUS_IN_FLIGHT, HEAD_B, "");
+        o.store()
+            .save_review_selection(&key("bob"), "continuity")
+            .unwrap();
+        o.store()
+            .save_review_selection(&key("carol"), "operator")
+            .unwrap();
+        // One unreadable value, not a broken watch set: healthy rows keep their reasons.
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute(
+            "UPDATE rhapsody_review_selection SET reason = x'80' WHERE reviewer = 'bob'",
+            [],
+        )
+        .unwrap();
+        let (view, events) = crate::testsupport::capture_events(|| o.review_console_list());
+        let view = view.expect("optional provenance cannot fail the reviews read");
+        let json = serde_json::to_value(view).unwrap();
+        assert_eq!(json["reviews"].as_array().unwrap().len(), 2);
+        assert!(json["reviews"][0].get("selection_reason").is_none());
+        assert_eq!(json["reviews"][1]["selection_reason"], "operator");
+        assert!(
+            events.iter().any(|e| e.level == "WARN"
+                && e.message.contains("selection reason")
+                && e.fields.get("reviewer").is_some_and(|r| r == "bob")),
+            "{events:?}"
+        );
+    }
 
     /// **Acceptance 1.** The Reviews surface lists each watched pull request with its reviewer,
     /// status and `last_reviewed_sha`.
