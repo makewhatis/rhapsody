@@ -49,6 +49,7 @@ pub mod drain;
 pub mod effective;
 pub mod ghenrich;
 pub mod ghsummons;
+pub mod github;
 pub mod handoff;
 pub mod investigate;
 pub mod issuelog;

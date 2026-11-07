@@ -66,7 +66,11 @@ impl Reverter {
         holds: Arc<crate::dispatch::HumanHoldLedger>,
         reviewers: Vec<String>,
     ) -> Self {
-        let gh = Arc::new(crate::ghsummons::GH::new("", None));
+        let gh = Arc::new(crate::ghsummons::GH::scoped(
+            manager.github_credentials(),
+            "",
+            None,
+        ));
         Self {
             manager,
             repo_url,
@@ -146,6 +150,14 @@ impl Reverter {
             .await
             .map_err(|e| RevertError::Other(e.to_string()))?;
         let path = Path::new(&workspace.path);
+        let auth = rhapsody_workspace::github::resolve_repo(
+            self.manager.github_credentials(),
+            self.repo_url.clone(),
+        )
+        .await
+        .map_err(RevertError::Other)?;
+        let git =
+            async |path: &Path, args: &[&str]| git_with_auth(path, args, auth.as_deref()).await;
         git(path, &["check-ref-format", "--branch", &base]).await?;
         // A recovery must use the current base, not a stale mirror tolerated by normal provisioning.
         let base_ref = format!("refs/remotes/origin/{base}");
@@ -228,7 +240,11 @@ impl Reverter {
 
 /// These commands touch only the dedicated recovery worktree, never another ticket's checkout.
 /// Timeouts/cancellation kill the process group, including a stalled SSH child.
-async fn git(path: &Path, args: &[&str]) -> Result<String, RevertError> {
+async fn git_with_auth(
+    path: &Path,
+    args: &[&str],
+    auth: Option<&rhapsody_workspace::github::RunAuth>,
+) -> Result<String, RevertError> {
     let mut command = tokio::process::Command::new("git");
     command
         .current_dir(path)
@@ -256,6 +272,9 @@ async fn git(path: &Path, args: &[&str]) -> Result<String, RevertError> {
         .process_group(0);
     if std::env::var_os("GIT_SSH_COMMAND").is_none() {
         command.env("GIT_SSH_COMMAND", "ssh -oBatchMode=yes");
+    }
+    if let Some(auth) = auth {
+        command.env_clear().envs(auth.environment());
     }
     let child = command
         .spawn()

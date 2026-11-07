@@ -173,6 +173,23 @@ pub struct GH {
 }
 
 impl GH {
+    /// Production construction: all calls resolve the current owner policy off the control loop.
+    pub fn scoped(
+        credentials: Arc<rhapsody_workspace::github::Credentials>,
+        token: &str,
+        run: Option<RunFn>,
+    ) -> GH {
+        Self::new(
+            token,
+            Some(Box::new(move |args| {
+                let auth = credentials.for_gh(args)?;
+                if let Some(run) = &run {
+                    return run(args);
+                }
+                default_run_with_auth(args, auth.as_deref())
+            })),
+        )
+    }
     /// Landing alone needs the merged commit, not the PR's (possibly squash-merged) head.
     pub(crate) async fn landing_merge_sha(
         &self,
@@ -534,14 +551,31 @@ impl GH {
 /// whatever thread runs it for the duration of the `gh` call; [`GH::run_off_task`] is what keeps
 /// that thread a blocking-pool one rather than the control task's (STUDIO-811).
 fn default_run(args: &[&str]) -> RunResult {
-    let out = std::process::Command::new("gh").args(args).output()?;
+    default_run_with_auth(args, None)
+}
+
+fn default_run_with_auth(
+    args: &[&str],
+    auth: Option<&rhapsody_workspace::github::RunAuth>,
+) -> RunResult {
+    let mut cmd = std::process::Command::new("gh");
+    cmd.args(args);
+    if let Some(auth) = auth {
+        cmd.env_clear().envs(auth.environment());
+    }
+    let out = cmd.output()?;
     if !out.status.success() {
-        return Err(format!(
+        let message = format!(
             "gh {} exited with {}: {}",
             args.join(" "),
             out.status,
             String::from_utf8_lossy(&out.stderr).trim()
-        )
+        );
+        // Keep GitHub's 404/auth/conflict classifiers usable without exposing the selected secret.
+        return Err(match auth {
+            Some(auth) => message.replace(auth.token(), "[REDACTED]"),
+            None => message,
+        }
         .into());
     }
     Ok(out.stdout)
@@ -2975,6 +3009,38 @@ impl SummonSource for GH {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn strict_github_call_is_refused_before_exec_and_notifies_owner() {
+        let orchestrator = crate::Orchestrator::new("WORKFLOW.md");
+        let policy = orchestrator.github_credentials.clone();
+        policy.update(Some(rhapsody_config::github::Github {
+            strict: true,
+            ..Default::default()
+        }));
+        let gh = GH::scoped(
+            policy,
+            "",
+            Some(Box::new(|_| panic!("must not execute gh"))),
+        );
+        let error = gh
+            .run_off_task(vec![
+                "pr".into(),
+                "view".into(),
+                "1".into(),
+                "--repo".into(),
+                "fake-unconfigured/example".into(),
+            ])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("fake-unconfigured"));
+        assert!(
+            orchestrator
+                .notifications
+                .pending()
+                .iter()
+                .any(|notice| notice.body.contains("fake-unconfigured"))
+        );
+    }
     #[test]
     fn review_surface_requires_a_complete_inventory_and_includes_rename_sources() {
         let pr = serde_json::json!({"changed_files": 1, "labels": [{"name": "design"}]});

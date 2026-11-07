@@ -181,7 +181,14 @@ impl Manager {
     /// the same `GH_TOKEN`/`GITHUB_TOKEN`/login the agent uses; the (production-empty)
     /// [`Manager::gh_env_overlay`] is layered on top for tests. Callers log and swallow the error.
     pub(crate) async fn gh(&self, dir: &str, args: &[&str]) -> (String, Option<Error>) {
+        let auth = match self.github_auth_for_dir(dir).await {
+            Ok(auth) => auth,
+            Err(reason) => return (String::new(), Some(Error::GhFailed(reason))),
+        };
         let mut cmd = Command::new("gh");
+        if let Some(auth) = &auth {
+            cmd.env_clear().envs(auth.environment());
+        }
         cmd.args(args)
             .current_dir(dir)
             .stdin(Stdio::null())

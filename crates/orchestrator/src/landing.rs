@@ -724,9 +724,10 @@ fn deadline(now: i64, duration: Duration) -> i64 {
 #[async_trait::async_trait]
 trait LandingChecks: Send + Sync {
     async fn merge_sha(&self, row: &LandingRow) -> Result<String, String> {
-        crate::ghsummons::GH::new("", None)
-            .landing_merge_sha(&row.owner, &row.repo, row.pr)
-            .await
+        Err(format!(
+            "no merge lookup configured for {}/{}",
+            row.owner, row.repo
+        ))
     }
     async fn prepare(&self, row: &LandingRow) -> Result<Option<LandingContract>, String>;
     /// The final bool records whether an unknown-object fetch was attempted.
@@ -781,6 +782,11 @@ impl RepoChecks {
 }
 #[async_trait::async_trait]
 impl LandingChecks for RepoChecks {
+    async fn merge_sha(&self, row: &LandingRow) -> Result<String, String> {
+        crate::ghsummons::GH::scoped(self.manager.github_credentials(), "", None)
+            .landing_merge_sha(&row.owner, &row.repo, row.pr)
+            .await
+    }
     async fn prepare(&self, row: &LandingRow) -> Result<Option<LandingContract>, String> {
         if crate::ghsummons::parse_repo(&self.repo_url).is_some_and(|(owner, repo)| {
             !owner.eq_ignore_ascii_case(&row.owner) || !repo.eq_ignore_ascii_case(&row.repo)

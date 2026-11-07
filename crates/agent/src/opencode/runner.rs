@@ -32,8 +32,8 @@
 //! billing decision.
 
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -267,6 +267,7 @@ impl Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             onepassword_token: Mutex::new(None),
+            github_auth: Mutex::new(None),
             poisoned: AtomicBool::new(false),
             adopted,
             last_turn_failed: AtomicBool::new(false),
@@ -487,6 +488,7 @@ impl Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             onepassword_token: Mutex::new(None),
+            github_auth: Mutex::new(None),
             poisoned: AtomicBool::new(false),
             adopted: false,
             last_turn_failed: AtomicBool::new(false),
@@ -655,6 +657,7 @@ impl crate::Runner for Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             onepassword_token: Mutex::new(None),
+            github_auth: Mutex::new(None),
             poisoned: AtomicBool::new(false),
             adopted,
             last_turn_failed: AtomicBool::new(false),
@@ -698,6 +701,7 @@ struct OpencodeSession {
     /// no credential. Injected as `OP_SERVICE_ACCOUNT_TOKEN` into the executor child env only —
     /// never logged, never recorded. Behind a `Mutex` for the same reason `review_head` is.
     onepassword_token: Mutex<Option<String>>,
+    github_auth: Mutex<Option<Arc<rhapsody_workspace::github::RunAuth>>>,
     /// Set when a re-probe between turns finds the command changed: the already prepared session is
     /// dropped (its state removed) and every later turn refuses before minting or spawning (`§9.1`).
     poisoned: AtomicBool,
@@ -946,6 +950,12 @@ impl Session for OpencodeSession {
             .onepassword_token
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = token;
+    }
+
+    fn set_github_auth(&self, auth: Option<Arc<rhapsody_workspace::github::RunAuth>>) {
+        if self.manager.is_none() {
+            *self.github_auth.lock().unwrap_or_else(|e| e.into_inner()) = auth;
+        }
     }
 
     /// Releases the session's private state directory. Unlike claude's no-op `stop`, this backend
@@ -1469,6 +1479,14 @@ impl OpencodeSession {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             crate::onepassword::append_onepassword_env(&mut env, token.as_deref());
+        }
+        if let Some(auth) = self
+            .github_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            auth.apply(&mut env);
         }
         let control_env_bytes = control.password.len()
             + "OPENCODE_SERVER_PASSWORD=".len()
@@ -3371,6 +3389,9 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
             .await
             .expect("session");
         sess.set_onepassword_token(Some("ops_sentinel_value".to_string()));
+        sess.set_github_auth(Some(Arc::new(
+            rhapsody_workspace::github::RunAuth::new("fake-studio49dev-token".into()).unwrap(),
+        )));
         let (_seen, on_event) = collector();
         let (tr, err) = sess.run_turn("p", None, None, &on_event).await;
         assert_eq!(tr.status, TURN_SUCCEEDED, "{err:?}");
@@ -3386,6 +3407,14 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
             Some("ops_sentinel_value")
         );
         assert_eq!(get("OP_BIOMETRIC_UNLOCK_ENABLED").as_deref(), Some("false"));
+        assert_eq!(get("GH_TOKEN").as_deref(), Some("fake-studio49dev-token"));
+        assert_eq!(get("GIT_SSH_COMMAND").as_deref(), Some("false"));
+        assert_eq!(
+            std::fs::read_dir(get("GH_CONFIG_DIR").unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     // ⚠️ The env the child actually gets: a PRIVATE XDG_DATA_HOME (never the operator's), the "me"

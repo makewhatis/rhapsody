@@ -23,8 +23,8 @@
 //! crate carries no OpenTelemetry dependency and `args.rs` already dropped the Go logger — that
 //! observability readiness is out of the port's behavioral scope.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -142,6 +142,7 @@ impl crate::Runner for Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             onepassword_token: Mutex::new(None),
+            github_auth: Mutex::new(None),
             manager_config_dir: None,
             manager_credential: None,
             account_oauth: Mutex::new(None),
@@ -200,6 +201,7 @@ impl Harness for Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             onepassword_token: Mutex::new(None),
+            github_auth: Mutex::new(None),
             manager_config_dir: None,
             manager_credential: None,
             account_oauth: Mutex::new(None),
@@ -279,6 +281,7 @@ impl Harness for Runner {
             review_head: Mutex::new(String::new()),
             model_override: Mutex::new(crate::ModelOverride::default()),
             onepassword_token: Mutex::new(None),
+            github_auth: Mutex::new(None),
             manager_config_dir: Some(req.config_dir),
             manager_credential: req.model_credential,
             account_oauth: Mutex::new(None),
@@ -342,6 +345,7 @@ struct ClaudeSession {
     /// no credential. Injected as `OP_SERVICE_ACCOUNT_TOKEN` into the agent child env only — never
     /// logged, never recorded. Behind a `Mutex` for the same reason `review_head` is.
     onepassword_token: Mutex<Option<String>>,
+    github_auth: Mutex<Option<Arc<rhapsody_workspace::github::RunAuth>>>,
     /// Nonsecret auth observed from the first system/init; frozen for this run.
     account_oauth: Mutex<Option<bool>>,
     activity_callback: Mutex<Option<crate::ActivityCallback>>,
@@ -550,6 +554,12 @@ impl Session for ClaudeSession {
             .unwrap_or_else(|e| e.into_inner()) = token;
     }
 
+    fn set_github_auth(&self, auth: Option<Arc<rhapsody_workspace::github::RunAuth>>) {
+        if self.manager_config_dir.is_none() {
+            *self.github_auth.lock().unwrap_or_else(|e| e.into_inner()) = auth;
+        }
+    }
+
     async fn stop(&self) -> Result<(), AgentError> {
         Ok(()) // per-turn processes; nothing persistent
     }
@@ -645,6 +655,14 @@ impl Session for ClaudeSession {
             crate::onepassword::append_onepassword_env(&mut env, token.as_deref());
         }
         cmd.env_clear();
+        if let Some(auth) = self
+            .github_auth
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+        {
+            auth.apply(&mut env);
+        }
         for kv in &env {
             if let Some((k, v)) = kv.split_once('=') {
                 cmd.env(k, v);
@@ -2770,6 +2788,39 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"complete-sessi
             Some("false"),
             "biometric unlock must be disabled for every run"
         );
+    }
+
+    #[tokio::test]
+    async fn github_credentials_reach_the_child_and_absent_config_is_identity() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let ws = make_ws(&root, "FAKE-GH-1");
+        let (_s, script) = env_dump_script();
+        let runner = new_runner(&script, &root.path());
+        let sess = runner
+            .start_session(&ws, issue("gh1", "FAKE-GH-1"), None)
+            .await
+            .unwrap();
+        let (_, on_event) = type_collector();
+        let (_, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none());
+        let baseline = read_env_dump(&format!("{ws}/env.dump"));
+        sess.set_github_auth(None);
+        let (_, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none());
+        assert_eq!(baseline, read_env_dump(&format!("{ws}/env.dump")));
+        sess.set_github_auth(Some(Arc::new(
+            rhapsody_workspace::github::RunAuth::new("fake-studio49dev-token".into()).unwrap(),
+        )));
+        let (_, err) = sess.run_turn("p", None, None, &on_event).await;
+        assert!(err.is_none());
+        let env = read_env_dump(&format!("{ws}/env.dump"));
+        assert_eq!(env["GH_TOKEN"], "fake-studio49dev-token");
+        assert_eq!(env["GITHUB_TOKEN"], "fake-studio49dev-token");
+        assert_eq!(env["GIT_SSH_COMMAND"], "false");
+        assert_eq!(env["GIT_CONFIG_VALUE_3"], "!gh auth git-credential");
+        assert_eq!(std::fs::read_dir(&env["GH_CONFIG_DIR"]).unwrap().count(), 0);
+        assert_ne!(env["GH_CONFIG_DIR"], format!("{}/.config/gh", env["HOME"]));
     }
 
     #[tokio::test]

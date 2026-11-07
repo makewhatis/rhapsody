@@ -238,6 +238,26 @@ impl Manager {
     /// `pub(crate)` so the post-run [`crate::labeler`] can enumerate stack branches through the same
     /// helper Go's labeler does (`m.git`).
     pub(crate) async fn git(&self, dir: &str, args: &[&str]) -> (String, Option<Error>) {
+        let network = args
+            .first()
+            .is_some_and(|arg| matches!(*arg, "clone" | "fetch" | "push" | "pull" | "ls-remote"));
+        let auth = if network && self.github_credentials().configured() {
+            let auth = if args.first() == Some(&"clone") {
+                let repo = args
+                    .get(args.len().saturating_sub(2))
+                    .copied()
+                    .unwrap_or("");
+                crate::github::resolve_repo(self.github_credentials(), repo.to_string()).await
+            } else {
+                self.github_auth_for_dir(dir).await
+            };
+            match auth {
+                Ok(auth) => auth,
+                Err(reason) => return (reason.clone(), Some(Error::GitFailed(reason))),
+            }
+        } else {
+            None
+        };
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 4);
         full.push("-c");
         full.push("gc.auto=0");
@@ -252,6 +272,9 @@ impl Manager {
             .env_clear()
             .envs(git_env())
             .stdin(Stdio::null());
+        if let Some(auth) = &auth {
+            cmd.env_clear().envs(auth.environment());
+        }
         match cmd.output().await {
             Ok(output) => {
                 let mut combined = output.stdout;

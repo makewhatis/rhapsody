@@ -62,6 +62,42 @@ pub struct Manager {
 }
 
 impl Manager {
+    pub fn github_credentials(&self) -> Arc<crate::github::Credentials> {
+        self.runner
+            .github
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    pub fn set_github_credentials(&self, credentials: Arc<crate::github::Credentials>) {
+        *self
+            .runner
+            .github
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = credentials;
+    }
+
+    /// Resolve only the local origin metadata. This command performs no network I/O.
+    pub(crate) async fn github_auth_for_dir(
+        &self,
+        dir: &str,
+    ) -> Result<Option<Arc<crate::github::RunAuth>>, String> {
+        let policy = self.github_credentials();
+        if !policy.configured() {
+            return Ok(None);
+        }
+        let output = tokio::process::Command::new("git")
+            .args(["-C", dir, "config", "--get", "remote.origin.url"])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|_| "cannot read repository origin".to_string())?;
+        let repo = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        crate::github::resolve_repo(policy, repo).await
+    }
+
     /// Validates the root (must be absolute) and returns a Manager. A zero hook timeout defaults to
     /// 60s.
     pub fn new(cfg: Config) -> Result<Manager, Error> {

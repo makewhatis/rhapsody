@@ -19,6 +19,7 @@
 //! category string as its leading token so `errors.Is`-style category checks map to variant matches.
 
 mod gc;
+pub mod github;
 pub mod gtguard;
 mod hooks;
 mod investigate;

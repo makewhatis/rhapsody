@@ -28,6 +28,8 @@ const MAX_HOOK_OUTPUT: usize = 4096;
 /// and no mirrored test asserts them).
 #[derive(Debug, Clone)]
 pub struct HookRunner {
+    pub(crate) github:
+        std::sync::Arc<std::sync::RwLock<std::sync::Arc<crate::github::Credentials>>>,
     timeout: Duration,
     /// Extra `KEY=VALUE` entries layered onto every spawned hook, AFTER [`Self::run_env`]'s `extra`.
     /// Empty in production — the hook then inherits the daemon's environment unchanged (byte-for-byte
@@ -42,6 +44,9 @@ impl HookRunner {
     /// Builds a runner with the given per-hook timeout.
     pub(crate) fn new(timeout: Duration) -> HookRunner {
         HookRunner {
+            github: std::sync::Arc::new(std::sync::RwLock::new(std::sync::Arc::new(
+                crate::github::Credentials::default(),
+            ))),
             timeout,
             env_overlay: Vec::new(),
         }
@@ -78,8 +83,23 @@ impl HookRunner {
         if script.is_empty() {
             return Ok(());
         }
+        let policy = self
+            .github
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let repo = extra
+            .and_then(|entries| {
+                entries
+                    .iter()
+                    .find_map(|s| s.strip_prefix("SYMPHONY_REPO="))
+            })
+            .unwrap_or("");
+        let auth = crate::github::resolve_repo(policy, repo.to_string())
+            .await
+            .map_err(Error::HookFailed)?;
         let mut cmd = Command::new("bash");
-        cmd.arg("-lc")
+        cmd.arg(if auth.is_some() { "-c" } else { "-lc" })
             .arg(script)
             .current_dir(dir)
             .stdin(Stdio::null())
@@ -94,6 +114,16 @@ impl HookRunner {
             for kv in extra {
                 if let Some((k, v)) = kv.split_once('=') {
                     cmd.env(k, v);
+                }
+            }
+        }
+        if let Some(auth) = &auth {
+            cmd.env_clear().envs(auth.environment());
+            if let Some(extra) = extra {
+                for kv in extra {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        cmd.env(k, v);
+                    }
                 }
             }
         }

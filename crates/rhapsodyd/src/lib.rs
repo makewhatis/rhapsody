@@ -25,6 +25,7 @@ pub mod bootcfg;
 pub mod broker;
 pub mod credential_client;
 pub mod doctor;
+pub mod github;
 pub mod logsource;
 pub mod mcp;
 pub mod onepassword;
