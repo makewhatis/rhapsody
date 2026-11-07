@@ -119,6 +119,56 @@ opens a 0.3.7 store. These are the behaviour changes a 0.3.6 installation will n
 
 ## WORKFLOW.md configuration
 
+### Owner-scoped GitHub credentials
+
+Opt in to fine-grained GitHub tokens with one Keychain reference per repository owner:
+
+```yaml
+github:
+  credentials:
+    studio49dev: { keychain: rhapsody-github-studio49dev }
+    makewhatis:  { keychain: rhapsody-github-makewhatis }
+  strict: true
+```
+
+Import the tokens on the daemon's macOS account. These commands read 1Password and write a generic
+password with the named service and account `$USER`; they do not print the values. Run with shell
+tracing disabled (`set +x`), and never paste a token into WORKFLOW.md:
+
+```sh
+security add-generic-password -U -a "$USER" -s rhapsody-github-studio49dev -w "$(env -u OP_SERVICE_ACCOUNT_TOKEN op read 'op://Studio49/github-agents-studio49dev/credential')"
+security add-generic-password -U -a "$USER" -s rhapsody-github-makewhatis -w "$(env -u OP_SERVICE_ACCOUNT_TOKEN op read 'op://Studio49/github-agents-makewhatis/credential')"
+rhapsodyd github check /path/to/WORKFLOW.md
+```
+
+`github check` reports Keychain availability and reads **one configured repository per configured
+owner**. It never probes an unconfigured owner, follows a redirect, prints a token, or prints an HTTP
+response body. A missing/unreadable credential, failed request, or owner with no configured repo
+returns exit status 1. It accepts the workflow path positionally, then `SYMPHONY_WORKFLOW`, then
+`WORKFLOW.md` in the current directory. No `github` block reports that nothing is configured.
+
+Owner names are case-insensitive. HTTPS, `git@github.com:owner/repo` and
+`ssh://git@github.com/owner/repo` repository URLs are recognized. References hot-reload with the
+workflow; an agent resolves its token once at dispatch and keeps it for that run. Rotate a Keychain
+item with the same import command: subsequent runs and daemon calls read the new value.
+
+A configured run gets `GH_TOKEN`/`GITHUB_TOKEN`, an empty private `GH_CONFIG_DIR` removed at run end,
+and environment-only git URL rewrites from SSH to HTTPS with `gh auth git-credential`.
+`GIT_SSH_COMMAND=false` blocks SSH fallback. Inherited git config overrides and credential helpers
+are cleared, global/system git config is disabled for scoped subprocesses, and terminal credential
+prompts are disabled. Set commit identity in repository-local config or `GIT_AUTHOR_*`/`GIT_COMMITTER_*`
+environment variables when relying on a global git identity today. Manager runs keep their existing
+token-free posture. Daemon GitHub reads/writes, workspace clone/fetch, lifecycle hooks, PR labeling
+and automatic landing-revert git operations use the same owner policy.
+Scoped lifecycle hooks use a non-login shell so login dotfiles cannot replace that environment.
+
+With `strict: true`, an unconfigured or unparseable owner is refused before dispatch/network access
+with a named operator notification. A configured but missing/locked Keychain item always refuses;
+it never falls back to personal credentials. With `strict: false` (the default), **unconfigured**
+owners retain legacy authentication; configured owners still use their scoped tokens. With no block,
+the existing environment and authentication behavior are unchanged. This is credential selection
+and fallback prevention, not an OS sandbox against a process that deliberately reads the user's files.
+
 Landing is configured with `projects[].landing` in WORKFLOW.md's YAML front matter, not in
 `teams.yaml`. The [Landing configuration reference](LANDING.md#workflowmd-configuration-reference)
 lists all eight keys (`enabled`, `auto_revert`, `deploy_timeout`, `watch`, `failure_threshold`,
@@ -174,6 +224,17 @@ requires byte-identical output. Editing, corrupting, or losing a committed golde
 Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this section says
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
+
+### Per-owner GitHub credentials (STUDIO-1804)
+
+The additive, opt-in `github.credentials`/`github.strict` workflow block and `rhapsodyd github check`
+have no Go-reference counterpart. Each reference names a macOS Keychain generic-password service
+under `$USER`, never a literal token. Runs and daemon GitHub calls use owner-scoped authentication;
+strict mode refuses unconfigured owners and reports them to the operator. No block retains legacy
+behavior. See [operator setup](#owner-scoped-github-credentials) for imports, rotation, compatibility
+and diagnostics. GitHub's explicitly configured Keychain services are read by the daemon via the
+bounded `security` command; provider credentials retain their separate desktop-owned IPC contract.
+No parity goldens, schemas or normalization rules change.
 
 ### Carried approvals and terminal manager rerun refusals (STUDIO-1801)
 

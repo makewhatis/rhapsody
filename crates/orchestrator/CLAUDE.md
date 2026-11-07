@@ -223,6 +223,13 @@ the `Orchestrator` struct itself. Concretely:
     Their landing.verdict event is durable before run end, and landing owns their restart recovery
     rather than tracker retries. Drain gates this dispatch independently of deterministic checks.
 
+  - `Orchestrator::github_credentials` (STUDIO-1804) shares an owner-reference policy with the
+    workspace managers and off-loop GitHub clients. Reload replaces only the reference map under
+    its short `RwLock`; no token is stored there and no lock spans Keychain or network I/O. Run
+    credentials are resolved on the blocking pool and held by that session. Refusals write through
+    the existing NotificationsState queue. Every production `GH` must use `GH::scoped` with this
+    handle, including clients constructed outside the boot composition root.
+
   - `liveness.rs`'s `WorkerEmitTime` (STUDIO-1262) is a per-run `Arc<AtomicI64>` watermark.
     The worker's forwarding callback stamps it before queuing real agent events; stall detection
     reads it directly so control-channel backlog cannot turn a live worker into a wedge. It shares
