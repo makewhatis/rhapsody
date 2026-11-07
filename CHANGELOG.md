@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.3.9](https://github.com/makewhatis/rhapsody/compare/v0.3.8...v0.3.9) (2026-11-07)
+
+
+### Features
+
+* **github:** scope credentials by repository owner (STUDIO-1804) ([#393](https://github.com/makewhatis/rhapsody/issues/393)) ([5597cdf](https://github.com/makewhatis/rhapsody/commit/5597cdfc149e026ffe272449699bba2aed9765f4))
+* **orchestrator:** first-class 1Password service-account credentials for agent runs (STUDIO-1584) ([#385](https://github.com/makewhatis/rhapsody/issues/385)) ([2b8cba4](https://github.com/makewhatis/rhapsody/commit/2b8cba43453b6c5063502ef5c7527fcfcc2967e8))
+
+
+### Bug Fixes
+
+* **orchestrator:** discover cross-repo companion pull requests (STUDIO-1691) ([#388](https://github.com/makewhatis/rhapsody/issues/388)) ([edd0716](https://github.com/makewhatis/rhapsody/commit/edd07162da26443093dcefe79c2efeeda33937da))
+* **orchestrator:** prove a no-op rebase from the local mirror, not the compare API (STUDIO-1672) ([#389](https://github.com/makewhatis/rhapsody/issues/389)) ([23846fe](https://github.com/makewhatis/rhapsody/commit/23846fec7371ec9805ae91c77261c02176540b17))
+* **orchestrator:** run on the resolved selection, not the routed profile (STUDIO-1602) ([#387](https://github.com/makewhatis/rhapsody/issues/387)) ([27ae2af](https://github.com/makewhatis/rhapsody/commit/27ae2af32e4a66c141ee7cb17e9337f9efe4d094))
+* **orchestrator:** stop redundant manager review retries (STUDIO-1801) ([#392](https://github.com/makewhatis/rhapsody/issues/392)) ([d8820fb](https://github.com/makewhatis/rhapsody/commit/d8820fb32360ca8ecf3fd984953f0078cf9c91a7))
+* **review:** expose profile eligibility and preserve profile-less reviews (STUDIO-1766) ([#391](https://github.com/makewhatis/rhapsody/issues/391)) ([8e53ba6](https://github.com/makewhatis/rhapsody/commit/8e53ba6de48edc2fa00f4c389b618aa35f3aff76))
+* **review:** require code profiles for non-UI reviews (STUDIO-1305) ([#390](https://github.com/makewhatis/rhapsody/issues/390)) ([1ac6991](https://github.com/makewhatis/rhapsody/commit/1ac6991d20086d7268de1d6f8cd6e26e72020501))
+
 ## [0.3.8](https://github.com/makewhatis/rhapsody/compare/v0.3.7...v0.3.8) (2026-10-24)
 
 
