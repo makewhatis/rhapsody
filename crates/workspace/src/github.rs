@@ -420,37 +420,48 @@ mod tests {
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::write(dir.path().join(".gitconfig"), "[credential]\n helper = \"!printf 'username=personal\\npassword=personal-secret\\n'\"\n").unwrap();
         let auth = RunAuth::new("fake-scoped-secret".into()).unwrap();
-        let mut cmd = std::process::Command::new("git");
-        cmd.args(["credential", "fill"])
-            .current_dir(dir.path())
-            .env_clear()
-            .envs(auth.environment())
-            .env("HOME", dir.path())
-            .env(
-                "PATH",
-                format!(
-                    "{}:{}",
-                    dir.path().display(),
-                    std::env::var("PATH").unwrap()
-                ),
-            )
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().unwrap();
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(b"protocol=https\nhost=github.com\n\n")
-            .unwrap();
-        let output = child.wait_with_output().unwrap();
+        let lookup = |scoped: bool| {
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(["credential", "fill"])
+                .current_dir(dir.path())
+                .env_clear()
+                .envs(auth.environment())
+                .env("HOME", dir.path())
+                .env(
+                    "PATH",
+                    format!(
+                        "{}:{}",
+                        dir.path().display(),
+                        std::env::var("PATH").unwrap()
+                    ),
+                )
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped());
+            if !scoped {
+                cmd.env("GIT_CONFIG_GLOBAL", dir.path().join(".gitconfig"))
+                    .env("GIT_CONFIG_COUNT", "0");
+            }
+            let mut child = cmd.spawn().unwrap();
+            child
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"protocol=https\nhost=github.com\n\n")
+                .unwrap();
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
         assert!(
-            output.status.success(),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
+            lookup(false).contains("password=personal-secret"),
+            "the control must reproduce personal credential fallback"
         );
-        let output = String::from_utf8_lossy(&output.stdout);
+        let output = lookup(true);
         assert!(output.contains("password=fake-scoped-secret"));
         assert!(!output.contains("personal"));
     }
