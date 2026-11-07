@@ -7,6 +7,9 @@ repository.workspace = true
 
 [dependencies]
 rhapsody-core = { path = "../core" }
+rhapsody-config = { path = "../config" }
+# Run-owned empty gh config directories; already locked workspace-wide.
+tempfile = "3.27.0"
 # thiserror: the workspace layer surfaces ~15 typed error categories (errors.go sentinels), each
 # wrapped with formatted context (`fmt.Errorf("%w: …")`). thiserror's `#[error("…")]` is the clean
 # mirror of Go's sentinel-plus-wrap pattern and was anticipated by the P4 plan (Task W1 deps).

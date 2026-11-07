@@ -217,6 +217,8 @@ pub enum WorkerError {
     /// naming the project plus the last probe's non-secret details.
     #[error("1password refused: {0}")]
     OnePasswordRefused(crate::onepassword::OnePasswordHold),
+    #[error("{0}")]
+    GithubRefused(String),
 }
 
 /// The dependencies a single worker attempt needs (Go `WorkerDeps`). The `Arc`-held deps are the
@@ -1044,6 +1046,21 @@ pub async fn run_agent_attempt(
     // holds (mirrors the credential preflight's repeated-timeout rule). The token is applied to the
     // session below and reaches only the agent subprocess env. Manager and landing runs take their
     // own session paths and are out of scope for this injection.
+    let github_auth = match rhapsody_workspace::github::resolve_repo(
+        deps.workspace.github_credentials(),
+        deps.repo_url.clone(),
+    )
+    .await
+    {
+        Ok(auth) => auth,
+        Err(reason) => {
+            return (
+                issue.state.clone(),
+                WorkerDeclaration::default(),
+                Some(WorkerError::GithubRefused(reason)),
+            );
+        }
+    };
     let mut onepassword_token: Option<String> = None;
     if let Some(id) = deps.onepassword_id.clone() {
         let read = match deps.onepassword_source.clone() {
@@ -1429,6 +1446,7 @@ pub async fn run_agent_attempt(
     // (no binding, or no stored token) leaves the session's env with only the biometric-disable
     // variable, so an unbound `op` call fails fast.
     sess.set_onepassword_token(onepassword_token.clone());
+    sess.set_github_auth(github_auth);
     // STUDIO-1602: on the legacy/native-login branch the routed teammate's profile identity/effort
     // must still reach the session. `DispatchRunner::start`'s bridge applied only the spec's MODEL,
     // so re-apply the whole override (which carries the resolved model AND the profile identity/
@@ -1590,6 +1608,12 @@ async fn run_lander_attempt(
     on_transcript: Option<&(dyn Fn(&str) + Send + Sync)>,
 ) -> (String, WorkerDeclaration, Option<WorkerError>) {
     let result = async {
+        let github_auth = rhapsody_workspace::github::resolve_repo(
+            deps.workspace.github_credentials(),
+            deps.repo_url.clone(),
+        )
+        .await
+        .map_err(WorkerError::GithubRefused)?;
         let ws = deps
             .workspace
             .ensure_review_worktree(
@@ -1623,6 +1647,7 @@ async fn run_lander_attempt(
             .agent
             .start_lander_session(&ws.path, issue.clone(), transcript)?;
         session.set_run_id(deps.run_id);
+        session.set_github_auth(github_auth);
         session.set_model_override(deps.model_override.clone());
         issue.description = Some(landing.prompt);
         let (state, text, error) = deps
@@ -2379,6 +2404,42 @@ fi
             },
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn strict_github_refuses_dispatch_before_workspace_or_agent_and_notifies_owner() {
+        let (ws, _root) = test_workspace(HookScripts::default());
+        let orchestrator = crate::Orchestrator::new("WORKFLOW.md");
+        let policy = orchestrator.github_credentials.clone();
+        ws.set_github_credentials(policy.clone());
+        policy.update(Some(rhapsody_config::github::Github {
+            strict: true,
+            ..Default::default()
+        }));
+        let ag = fake_agent(vec![succeeded_turn()]);
+        let tr = Arc::new(trackerfake::Fake::new());
+        let mut deps = make_deps(ws, ag.clone(), tr, "prompt", 1);
+        deps.repo_url = "git@github.com:fake-unconfigured/example.git".into();
+        let (_, _, err) = run_agent_attempt(
+            &mut deps,
+            issue("1", "FAKE-1", "Todo"),
+            None,
+            None,
+            &|_| {},
+            None,
+        )
+        .await;
+        assert!(
+            matches!(&err, Some(WorkerError::GithubRefused(reason)) if reason.contains("fake-unconfigured"))
+        );
+        assert!(
+            orchestrator
+                .notifications
+                .pending()
+                .iter()
+                .any(|notice| notice.body.contains("fake-unconfigured"))
+        );
+        assert!(!std::path::Path::new(&deps.workspace.path_for(&deps.repo_url, "FAKE-1")).exists());
     }
 
     fn fake_agent(turns: Vec<agentfake::TurnScript>) -> Arc<agentfake::Fake> {

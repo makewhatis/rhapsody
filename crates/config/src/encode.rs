@@ -60,7 +60,10 @@ pub fn encode(c: &Config) -> Result<Definition, ConfigError> {
 /// (`github_summons`, `ultracode`, `claim_ttl`, `claim_settle_delay`) are set only when active so an
 /// absent/false knob is pruned.
 fn raw_from_config(c: &Config) -> Raw {
-    let mut r = Raw::default();
+    let mut r = Raw {
+        github: c.github.clone(),
+        ..Default::default()
+    };
     if c.limits != crate::Limits::default() {
         r.limits = Some(c.limits.clone());
     }

@@ -15,6 +15,7 @@ pub mod comms;
 pub mod decode;
 pub mod effective_json;
 pub mod encode;
+pub mod github;
 pub mod harness;
 pub mod hindsight;
 pub mod landing;

@@ -651,11 +651,19 @@ impl Orchestrator {
     pub(crate) fn new_github_summon_source(&self) -> Option<Box<dyn ghsummons::SummonSource>> {
         let eff = self.eff.as_ref()?;
         if eff.cfg.tracker.github_summons {
-            return Some(Box::new(GH::new(&eff.cfg.tracker.summon_token, None)));
+            return Some(Box::new(GH::scoped(
+                self.github_credentials.clone(),
+                &eff.cfg.tracker.summon_token,
+                None,
+            )));
         }
         for p in &eff.projects {
             if p.github_summons {
-                return Some(Box::new(GH::new(&p.mcfg.tracker.summon_token, None)));
+                return Some(Box::new(GH::scoped(
+                    self.github_credentials.clone(),
+                    &p.mcfg.tracker.summon_token,
+                    None,
+                )));
             }
         }
         None
@@ -2271,7 +2279,8 @@ impl Orchestrator {
         // readable workflow still gets a working seam. Every round is FULL the moment any read
         // fails — the safe direction, since a delta is only taken when GitHub answers.
         if deps.review.is_some() {
-            deps.review_delta = Some(std::sync::Arc::new(crate::ghsummons::GH::new(
+            deps.review_delta = Some(std::sync::Arc::new(crate::ghsummons::GH::scoped(
+                self.github_credentials.clone(),
                 &eff.cfg.tracker.summon_token,
                 None,
             ))
@@ -2285,7 +2294,8 @@ impl Orchestrator {
         // construction input and the open-PR query does not use it, so a daemon with no readable
         // workflow still gets a working seam.
         if deps.review.is_none() && deps.manager.is_none() {
-            deps.run_pr_source = Some(std::sync::Arc::new(crate::ghsummons::GH::new(
+            deps.run_pr_source = Some(std::sync::Arc::new(crate::ghsummons::GH::scoped(
+                self.github_credentials.clone(),
                 &eff.cfg.tracker.summon_token,
                 None,
             ))
@@ -2474,7 +2484,10 @@ impl Orchestrator {
             // A capability refusal is distinguished from an ordinary failure so `on_worker_exit`
             // can record it once and schedule NO retry (STUDIO-978): retrying a refusal can never
             // succeed, and the failure backoff would loop forever.
-            let refused = matches!(err, Some(WorkerError::CapabilityRefused(_)));
+            let refused = matches!(
+                err,
+                Some(WorkerError::CapabilityRefused(_) | WorkerError::GithubRefused(_))
+            );
             // A 1Password credential refusal is its own terminal-until-released HOLD (STUDIO-1584):
             // `on_worker_exit` records the hold and schedules no retry, and a later probe clears it.
             let onepassword_hold = match &err {

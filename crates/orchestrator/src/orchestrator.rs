@@ -379,6 +379,7 @@ pub struct StackHint {
 /// per-project warning maps + read-only tracker surfaces (O6/O4), the worker-spawn seam (O3), and
 /// the GitHub-summons source (O6).
 pub struct Orchestrator {
+    pub github_credentials: Arc<rhapsody_workspace::github::Credentials>,
     pub(crate) landing_requests: Vec<crate::landing::LandingRequest>,
     pub(crate) pending_landing: HashMap<String, crate::landing::LandingRun>,
     pub(crate) landing_refusals: HashSet<(crate::prstate::PrCoord, String)>,
@@ -1270,7 +1271,23 @@ impl Orchestrator {
         // The control-event channel is created up front (Go makes `events` in `New`) so the off-loop
         // Stop/Resume handle + timers can send before the loop takes the receiver.
         let (events, events_rx) = tokio::sync::mpsc::unbounded_channel();
+        let notifications = Arc::new(crate::breaker::NotificationsState::default());
+        let notices = notifications.clone();
+        let github_credentials = Arc::new(rhapsody_workspace::github::Credentials::new(
+            Arc::new(rhapsody_workspace::github::SystemKeychain),
+            Arc::new(move |message| {
+                tracing::warn!("{message}");
+                notices.push(
+                    Utc::now(),
+                    "GitHub credential refusal".into(),
+                    message.into(),
+                    String::new(),
+                    String::new(),
+                );
+            }),
+        ));
         Orchestrator {
+            github_credentials,
             workflow_path: workflow_path.into(),
             now: Box::new(Utc::now),
             // No test seam by default → dispatch launches the real `spawn_worker` (Go `New` sets
@@ -1315,7 +1332,7 @@ impl Orchestrator {
             notify_tx: None,
             notify_sent: std::sync::Mutex::new(HashSet::new()),
             escalation_notified: HashSet::new(),
-            notifications: Arc::new(crate::breaker::NotificationsState::default()),
+            notifications,
             completed: HashSet::new(),
             pending_stack: HashMap::new(),
             pending_review: HashMap::new(),

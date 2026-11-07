@@ -52,6 +52,7 @@ url = "2"
 # (OTLP + the in-memory log ring), the mcp facade (`symphony mcp`), and the core runtimeport publish.
 rhapsody-core = { path = "../core" }
 rhapsody-config = { path = "../config" }
+rhapsody-workspace = { path = "../workspace" }
 rhapsody-store = { path = "../store" }
 rhapsody-tracker = { path = "../tracker" }
 # rhapsody-agent: the humanized `LogEntry` the httpapi `StateProvider::run_transcript` yields (Go

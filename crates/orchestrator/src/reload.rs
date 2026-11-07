@@ -109,6 +109,9 @@ impl Orchestrator {
         // the SAME workflow (INF-473); Decode/Resolve only know the dir.
         cfg.workflow_path = self.workflow_path.clone();
         let eff = build_effective(&cfg)?;
+        self.github_credentials.update(cfg.github.clone());
+        eff.workspace
+            .set_github_credentials(self.github_credentials.clone());
 
         // STUDIO-948: an enabled dag/graphite scope with `promote_from_states` unset must say so at
         // boot (and on reload) — the safety-critical default treats the operator's ENTIRE backlog as

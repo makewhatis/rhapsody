@@ -313,6 +313,8 @@ pub trait Session: Send + Sync {
     /// The value is injected into the agent subprocess env only; it must never be logged, recorded in
     /// a run's environment/transcript, or returned by an API.
     fn set_onepassword_token(&self, _token: Option<String>) {}
+    /// Run-owned owner-scoped GitHub credentials; never passed to a manager session.
+    fn set_github_auth(&self, _auth: Option<std::sync::Arc<rhapsody_workspace::github::RunAuth>>) {}
 
     /// Runs one turn with the given prompt, forwarding events to `on_event`. The returned
     /// `(TurnResult, Option<AgentError>)` mirrors Go's `(TurnResult, error)`: a `Some` error means

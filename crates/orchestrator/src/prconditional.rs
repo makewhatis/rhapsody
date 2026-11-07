@@ -455,7 +455,9 @@ fn parse_rest_pr(
 /// into the client so [`ConditionalTransport::renew`] can swap it after a 401.
 pub struct GitHubRestTransport {
     client: reqwest::Client,
+    scoped_client: Result<reqwest::Client, reqwest::Error>,
     token: Mutex<String>,
+    credentials: Option<Arc<rhapsody_workspace::github::Credentials>>,
 }
 
 impl GitHubRestTransport {
@@ -464,8 +466,20 @@ impl GitHubRestTransport {
     pub fn new(token: String) -> GitHubRestTransport {
         GitHubRestTransport {
             client: reqwest::Client::new(),
+            scoped_client: reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build(),
             token: Mutex::new(token),
+            credentials: None,
         }
+    }
+
+    pub fn with_credentials(
+        mut self,
+        credentials: Arc<rhapsody_workspace::github::Credentials>,
+    ) -> Self {
+        self.credentials = Some(credentials);
+        self
     }
 }
 
@@ -477,9 +491,29 @@ impl ConditionalTransport for GitHubRestTransport {
         if_none_match: Option<&str>,
     ) -> Result<HttpAnswer, Box<dyn std::error::Error + Send + Sync>> {
         // Cloned out from under the lock, which is dropped before the `.await` below.
-        let token = self.token.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        let mut req = self
-            .client
+        let auth = if let Some(credentials) = &self.credentials {
+            let owner = url
+                .strip_prefix("https://api.github.com/repos/")
+                .and_then(|s| s.split_once('/'))
+                .map(|(o, _)| o)
+                .unwrap_or("<unknown>")
+                .to_string();
+            rhapsody_workspace::github::resolve_owner(credentials.clone(), owner).await?
+        } else {
+            None
+        };
+        let token = auth
+            .as_ref()
+            .map(|auth| auth.token().to_string())
+            .unwrap_or_else(|| self.token.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        let client = if auth.is_some() {
+            self.scoped_client
+                .as_ref()
+                .map_err(|_| "GitHub scoped HTTP client unavailable")?
+        } else {
+            &self.client
+        };
+        let mut req = client
             .get(url)
             // The REST media type; GitHub returns `mergeable_state` on this endpoint.
             .header(reqwest::header::ACCEPT, "application/vnd.github+json")
@@ -504,6 +538,9 @@ impl ConditionalTransport for GitHubRestTransport {
     /// it actually changed. An unchanged token (for example one still supplied by `GH_TOKEN`) is
     /// `false`, so the caller does not pay a second request to learn what it already knows.
     async fn renew(&self) -> bool {
+        if self.credentials.as_ref().is_some_and(|c| c.configured()) {
+            return false;
+        }
         let Some(fresh) = resolve_github_token().await else {
             return false;
         };
@@ -575,6 +612,35 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[tokio::test]
+    async fn scoped_rest_refuses_an_unconfigured_owner_before_any_request() {
+        let orchestrator = crate::Orchestrator::new("WORKFLOW.md");
+        orchestrator
+            .github_credentials
+            .update(Some(rhapsody_config::github::Github {
+                strict: true,
+                ..Default::default()
+            }));
+        let transport = GitHubRestTransport::new("fake-personal-token".into())
+            .with_credentials(orchestrator.github_credentials.clone());
+        let error = transport
+            .get(
+                "https://api.github.com/repos/fake-unconfigured/example/pulls/1",
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("fake-unconfigured"));
+        assert!(
+            orchestrator
+                .notifications
+                .pending()
+                .iter()
+                .any(|notice| notice.body.contains("fake-unconfigured"))
+        );
+        assert!(!transport.renew().await);
+    }
 
     /// A transport that answers a fixed script of `(status, etag, body)` per call, recording the
     /// `If-None-Match` each call carried. `renew` is scripted too, and counted.

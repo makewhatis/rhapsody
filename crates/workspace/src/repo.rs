@@ -238,6 +238,29 @@ impl Manager {
     /// `pub(crate)` so the post-run [`crate::labeler`] can enumerate stack branches through the same
     /// helper Go's labeler does (`m.git`).
     pub(crate) async fn git(&self, dir: &str, args: &[&str]) -> (String, Option<Error>) {
+        let network = args
+            .first()
+            .is_some_and(|arg| matches!(*arg, "clone" | "fetch" | "push" | "pull" | "ls-remote"))
+            // Automatic remote HEAD discovery queries origin even though `remote` is usually local.
+            || (args.starts_with(&["remote", "set-head"])
+                && args.iter().any(|arg| matches!(*arg, "-a" | "--auto")));
+        let auth = if network && self.github_credentials().configured() {
+            let auth = if args.first() == Some(&"clone") {
+                let repo = args
+                    .get(args.len().saturating_sub(2))
+                    .copied()
+                    .unwrap_or("");
+                crate::github::resolve_repo(self.github_credentials(), repo.to_string()).await
+            } else {
+                self.github_auth_for_dir(dir).await
+            };
+            match auth {
+                Ok(auth) => auth,
+                Err(reason) => return (reason.clone(), Some(Error::GitFailed(reason))),
+            }
+        } else {
+            None
+        };
         let mut full: Vec<&str> = Vec::with_capacity(args.len() + 4);
         full.push("-c");
         full.push("gc.auto=0");
@@ -252,6 +275,9 @@ impl Manager {
             .env_clear()
             .envs(git_env())
             .stdin(Stdio::null());
+        if let Some(auth) = &auth {
+            cmd.env_clear().envs(auth.environment());
+        }
         match cmd.output().await {
             Ok(output) => {
                 let mut combined = output.stdout;
@@ -1240,6 +1266,152 @@ mod tests {
         ] {
             assert!(last_env(&env, k).is_some(), "unconditional var {k} missing");
         }
+    }
+
+    #[tokio::test]
+    async fn fresh_mirror_remote_head_uses_scoped_auth_without_ssh_fallback() {
+        use std::os::unix::fs::PermissionsExt;
+
+        const CHILD_ROOT: &str = "RHAPSODY_TEST_MIRROR_AUTH_ROOT";
+        const REPO: &str = "git@github.com:studio49dev/example.git";
+        if let Ok(root) = std::env::var(CHILD_ROOT) {
+            struct FakeKeychain;
+            impl crate::github::Keychain for FakeKeychain {
+                fn read(&self, service: &str) -> Result<String, String> {
+                    assert_eq!(service, "rhapsody-github-studio49dev");
+                    Ok("fake-owner-token".into())
+                }
+            }
+            let policy = Arc::new(crate::github::Credentials::new(
+                Arc::new(FakeKeychain),
+                Arc::new(|reason| panic!("unexpected credential refusal: {reason}")),
+            ));
+            policy.update(Some(rhapsody_config::github::Github {
+                strict: true,
+                credentials: [(
+                    "studio49dev".into(),
+                    rhapsody_config::github::Credential {
+                        keychain: "rhapsody-github-studio49dev".into(),
+                    },
+                )]
+                .into(),
+            }));
+            let manager = Manager::new(crate::Config {
+                root: root.clone(),
+                hooks: HookScripts::default(),
+                hook_timeout: std::time::Duration::from_secs(30),
+            })
+            .unwrap();
+            manager.set_github_credentials(policy);
+            let workspace = manager
+                .ensure_from_repo(REPO, "app", "STUDIO-1804")
+                .await
+                .unwrap();
+            assert!(workspace.created_now);
+            assert_eq!(
+                std::fs::read_to_string(join(&[&workspace.path, "README.md"])).unwrap(),
+                "hello\n"
+            );
+            let log = std::fs::read_to_string(join(&[&root, "transport.log"])).unwrap();
+            assert!(
+                !log.contains("SSH_FALLBACK_EXECUTED"),
+                "personal SSH fallback executed during fresh provisioning:\n{log}"
+            );
+            // A nonstandard default branch makes a swallowed set-head failure observable.
+            let (head, err) = manager
+                .git(
+                    &manager.mirror_dir(REPO),
+                    &["symbolic-ref", "refs/remotes/origin/HEAD"],
+                )
+                .await;
+            assert!(err.is_none(), "remote HEAD was not recorded: {head}");
+            assert_eq!(head.trim(), "refs/remotes/origin/trunk");
+            assert_eq!(
+                log.lines().count(),
+                3,
+                "clone, fetch and remote HEAD: {log}"
+            );
+            assert!(log.lines().all(|line| line == "scoped HTTPS"), "{log}");
+            return;
+        }
+
+        // A separate process supplies the inherited personal environment without global env
+        // mutation. Real git uses a local remote helper: no GitHub/Keychain/network access.
+        let origin = init_local_origin();
+        git_run(&origin.path, &["branch", "-m", "trunk"]);
+        let root = TempDir::new();
+        let bin = root.child("bin");
+        let personal_gh = root.child(".config/gh");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&personal_gh).unwrap();
+        std::fs::write(root.child(".gitconfig"), "").unwrap();
+        std::fs::write(
+            join(&[&personal_gh, "hosts.yml"]),
+            "github.com:\n  oauth_token: fake-personal-token\n",
+        )
+        .unwrap();
+        for (name, script) in [
+            (
+                "git-remote-https",
+                r#"#!/bin/sh
+set -eu
+[ "$2" = 'https://github.com/studio49dev/example.git' ] || exit 1
+[ "$GH_TOKEN" = fake-owner-token ] || exit 1
+[ "$GITHUB_TOKEN" = fake-owner-token ] || exit 1
+[ "$GIT_SSH_COMMAND" = false ] || exit 1
+[ "$GH_CONFIG_DIR" != "$HOME/.config/gh" ] || exit 1
+[ -d "$GH_CONFIG_DIR" ] || exit 1
+[ -z "$(ls -A "$GH_CONFIG_DIR")" ] || exit 1
+printf 'scoped HTTPS\n' >> "$TRANSPORT_LOG"
+while IFS= read -r command; do
+    case "$command" in
+        capabilities) printf 'connect\n\n' ;;
+        'connect git-upload-pack')
+            printf '\n'
+            exec git upload-pack "$LOCAL_ORIGIN"
+            ;;
+        *) exit 1 ;;
+    esac
+done
+"#,
+            ),
+            (
+                "personal-ssh",
+                "#!/bin/sh\nprintf 'SSH_FALLBACK_EXECUTED\n' >> \"$TRANSPORT_LOG\"\nexit 1\n",
+            ),
+        ] {
+            let path = join(&[&bin, name]);
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "repo::tests::fresh_mirror_remote_head_uses_scoped_auth_without_ssh_fallback",
+                "--nocapture",
+            ])
+            .env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap())
+            .env("HOME", &root.path)
+            .env("GIT_EXEC_PATH", &bin)
+            .env("GIT_CONFIG_GLOBAL", root.child(".gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GH_TOKEN", "fake-personal-token")
+            .env("GITHUB_TOKEN", "fake-personal-token")
+            .env("GH_CONFIG_DIR", personal_gh)
+            .env("GIT_SSH_COMMAND", join(&[&bin, "personal-ssh"]))
+            .env("TRANSPORT_LOG", root.child("transport.log"))
+            .env("LOCAL_ORIGIN", &origin.path)
+            .env(CHILD_ROOT, &root.path)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated provisioning failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     // ---------------------------------------------------------------------------------------------

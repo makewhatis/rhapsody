@@ -1869,9 +1869,11 @@ name = "rhapsody-workspace"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "rhapsody-config",
  "rhapsody-core",
  "serde_json",
  "sha2 0.10.9",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -1895,6 +1897,7 @@ dependencies = [
  "rhapsody-store",
  "rhapsody-telemetry",
  "rhapsody-tracker",
+ "rhapsody-workspace",
  "serde_json",
  "tokio",
  "tracing",

@@ -56,6 +56,14 @@ pub fn render(def: &Definition) -> Value {
     let mut config = yaml_map_to_json(&def.config);
     sanitize_provider_blocks(&mut config);
     sanitize_onepassword_bindings(&mut config);
+    if def
+        .config
+        .get("github")
+        .is_some_and(|value| crate::github::parse(value).is_err())
+        && let Some(map) = config.as_object_mut()
+    {
+        map.remove("github");
+    }
     out.insert("config".to_string(), config);
     out.insert(
         "prompt_body".to_string(),

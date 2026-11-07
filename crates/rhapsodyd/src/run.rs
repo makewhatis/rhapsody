@@ -145,6 +145,9 @@ where
     if args.first().map(String::as_str) == Some("doctor") {
         return crate::doctor::run_doctor(&args[1..], std::io::stdout(), stderr.make_writer());
     }
+    if args.first().map(String::as_str) == Some("github") {
+        return crate::github::run(&args[1..], std::io::stdout(), stderr.make_writer()).await;
+    }
 
     let flags = match parse_flags(args) {
         Ok(f) => f,
@@ -300,6 +303,7 @@ where
     };
 
     let mut o = Orchestrator::new(flags.path.to_string_lossy().into_owned());
+    let github_credentials = o.github_credentials.clone();
     if let Some(now) = account_now_s.and_then(|s| chrono::DateTime::from_timestamp(s, 0)) {
         o.now = Box::new(move || now);
     }
@@ -314,6 +318,7 @@ where
     // Opened BEFORE the provider-prep source below so the source can carry the store-backed UTC-day
     // budget authority (STUDIO-979).
     let resolved = load_resolved(&flags.path);
+    github_credentials.update(resolved.as_ref().and_then(|cfg| cfg.github.clone()));
     let (store, durable_store) = open_store(resolved.as_ref(), &flags.db, flags.no_store);
     // STUDIO-979: a configured UTC-day provider budget cap is a hard boundary the broker enforces
     // through the durable authority, so it CANNOT be served by a best-effort or fail-open counter.
@@ -628,7 +633,8 @@ where
     // The summon token is the only construction input `GH::new` takes and none of these three
     // queries uses it, so a daemon with no readable workflow still merges.
     o.merge_deps = teams_cfg.enabled.then(|| {
-        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+            github_credentials.clone(),
             &resolved
                 .as_ref()
                 .map(|c| c.tracker.summon_token.clone())
@@ -670,7 +676,8 @@ where
     // token is `GH::new`'s only construction input and none of these five reads uses it, so a
     // daemon with no readable workflow still serves a diff.
     o.diff_deps = Some({
-        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+            github_credentials.clone(),
             &resolved
                 .as_ref()
                 .map(|c| c.tracker.summon_token.clone())
@@ -694,7 +701,8 @@ where
     // The manager run's pull-request reads (STUDIO-1014 §4.4): the same off-loop `gh`, one seam,
     // bounded by `GH_EXEC_TIMEOUT`. Built unconditionally for `diff_deps`' reason — a read writes
     // nothing and decides nothing, so there is no reason to make it dependency-named on Teams.
-    o.manager_gh_deps = Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+    o.manager_gh_deps = Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+        github_credentials.clone(),
         &resolved
             .as_ref()
             .map(|c| c.tracker.summon_token.clone())
@@ -709,7 +717,8 @@ where
     // daemon's own local advisory — and handed to the `ControlHandle` by `o.control()` below, so the
     // control task stays network-free. The summon token is `GH::new`'s only construction input and
     // the open-PR query does not use it, so a daemon with no readable workflow still asks.
-    o.pr_source = Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+    o.pr_source = Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+        github_credentials.clone(),
         &resolved
             .as_ref()
             .map(|c| c.tracker.summon_token.clone())
@@ -739,9 +748,15 @@ where
             store: store.clone(),
             projects: Vec::new(),
             teams: teams_cfg.clone(),
-            prs: Arc::new(rhapsody_orchestrator::ghsummons::GH::new("", None)),
-            comments: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
-                "", None,
+            prs: Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+                github_credentials.clone(),
+                "",
+                None,
+            )),
+            comments: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+                github_credentials.clone(),
+                "",
+                None,
             ))),
             room: o
                 .teams_room
@@ -1163,7 +1178,8 @@ where
         // ONE `gh` for both of the task's GitHub directions, built here rather than inside the
         // `ears` closure so the manager's answer path can share it: it holds a summon token and
         // nothing else, and a second handle would be a second place for that token to be read.
-        let ears_gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+        let ears_gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+            github_credentials.clone(),
             &resolved
                 .as_ref()
                 .map(|c| c.tracker.summon_token.clone())
@@ -1348,7 +1364,8 @@ where
             // the control loop network-free — a handoff still decides everything without asking
             // anybody. The summon token is the only construction input `GH` takes; the open-PR
             // query does not use it, so a daemon with no readable workflow still resolves PRs.
-            pr_source: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+            pr_source: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+                github_credentials.clone(),
                 &resolved
                     .as_ref()
                     .map(|c| c.tracker.summon_token.clone())
@@ -1378,7 +1395,8 @@ where
             // is all `GH::new` takes and the open-PR query does not use it, so a daemon with no
             // readable workflow still resolves pull requests. Handed to the TASK and to nothing
             // else, which is what keeps the control loop network-free.
-            pr_source: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+            pr_source: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+                github_credentials.clone(),
                 &resolved
                     .as_ref()
                     .map(|c| c.tracker.summon_token.clone())
@@ -1411,7 +1429,8 @@ where
             // token `GH::new` takes builds its MATCHER, which the comment path does not use; the
             // token the comment itself leads with is resolved on the control task from the same
             // config, so a daemon with no readable workflow still posts the shipped default.
-            comments: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+            comments: Some(Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+                github_credentials.clone(),
                 &resolved
                     .as_ref()
                     .map(|c| c.tracker.summon_token.clone())
@@ -1482,7 +1501,8 @@ where
             lead_report_rx,
         ))
     });
-    let limit_report_comments = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+    let limit_report_comments = Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+        github_credentials.clone(),
         &resolved
             .as_ref()
             .map(|c| c.tracker.summon_token.clone())
@@ -1586,7 +1606,8 @@ where
         o.manager_apply = Some(Arc::new(
             rhapsody_orchestrator::runmanagerapply::ManagerApplyChannel(tx),
         ));
-        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+            github_credentials.clone(),
             &resolved
                 .as_ref()
                 .map(|c| c.tracker.summon_token.clone())
@@ -1621,14 +1642,15 @@ where
     // rather than a stalled boot (review finding 1). Resolved once: the token does not hot-reload
     // (it is an environment/CLI fact, not a workflow key), and rebuilding the client per tick would
     // defeat the ETag cache it exists to keep. A later 401 re-resolves it in place.
-    let conditional_pr_token = if spawn_watcher {
+    let conditional_pr_token = if spawn_watcher && !github_credentials.configured() {
         rhapsody_orchestrator::prconditional::resolve_github_token().await
     } else {
         None
     };
     let review_watch_task = spawn_watcher.then(|| {
         let watch_ctx = shutdown.wait();
-        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::new(
+        let gh = Arc::new(rhapsody_orchestrator::ghsummons::GH::scoped(
+            github_credentials.clone(),
             &resolved
                 .as_ref()
                 .map(|c| c.tracker.summon_token.clone())
@@ -1733,6 +1755,7 @@ where
             // source's 401 fallback, so a credential that is rotated or expires downgrades the
             // watcher to its old (paid) path instead of silencing it until a restart.
             pr_source: Some(conditional_pr_source(
+                github_credentials.clone(),
                 conditional_pr_token.clone(),
                 Arc::clone(&gh),
             )),
@@ -2245,10 +2268,11 @@ fn spawn_review_intro(teams: &rhapsody_config::teams::Teams) -> bool {
 /// exists to keep. The `gh` source is ALSO attached as the REST source's 401 fallback, so a token
 /// that later stops being accepted has somewhere to go.
 fn conditional_pr_source(
+    credentials: Arc<rhapsody_workspace::github::Credentials>,
     token: Option<String>,
     gh: Arc<rhapsody_orchestrator::ghsummons::GH>,
 ) -> Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource> {
-    match token {
+    match token.or_else(|| credentials.configured().then(String::new)) {
         Some(token) => {
             tracing::info!(
                 "pr-state watcher: using conditional REST requests (If-None-Match); an unchanged \
@@ -2256,7 +2280,8 @@ fn conditional_pr_source(
             );
             Arc::new(
                 rhapsody_orchestrator::prconditional::ConditionalPrState::new(Arc::new(
-                    rhapsody_orchestrator::prconditional::GitHubRestTransport::new(token),
+                    rhapsody_orchestrator::prconditional::GitHubRestTransport::new(token)
+                        .with_credentials(credentials),
                 ))
                 .with_fallback(
                     Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>
