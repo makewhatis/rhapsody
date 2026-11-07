@@ -50,6 +50,12 @@ pub enum ConfigError {
 /// Both error sites map to [`ConfigError::Parse`], exactly as Go wraps them in
 /// `ErrWorkflowParse`.
 pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
+    let github = def
+        .config
+        .get("github")
+        .map(crate::github::parse)
+        .transpose()
+        .map_err(ConfigError::Parse)?;
     let bytes =
         serde_yaml_ng::to_string(&def.config).map_err(|e| ConfigError::Parse(e.to_string()))?;
     let r: Raw = serde_yaml_ng::from_str(&bytes).map_err(|e| ConfigError::Parse(e.to_string()))?;
@@ -356,6 +362,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         .collect();
 
     Ok(Config {
+        github,
         tracker,
         polling,
         workspace,

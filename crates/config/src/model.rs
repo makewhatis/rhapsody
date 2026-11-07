@@ -597,6 +597,7 @@ impl Comms {
 /// The typed runtime view of a workflow (Go `Config`, upstream §4.1.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    pub github: Option<crate::github::Github>,
     pub tracker: Tracker,
     pub polling: Polling,
     pub workspace: Workspace,
@@ -689,6 +690,7 @@ impl Config {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct Raw {
+    pub github: Option<crate::github::Github>,
     pub tracker: RawTracker,
     pub polling: RawPolling,
     pub workspace: RawWorkspace,
