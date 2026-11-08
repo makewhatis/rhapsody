@@ -4,6 +4,9 @@
 
 ### Bug Fixes
 
+* **orchestrator:** the review adoption sweep skips an already-watched pull request rather than its
+  whole ticket, and probes the ticket's own repository for `symphony/<key>*` heads, so a ticket's
+  second pull request (e.g. `symphony/<key>-apple`) gets a watch row and a reviewer (STUDIO-1839).
 * **orchestrator:** re-dispatch unread mid-run review summonses once, carrying queued bodies into the
   next run's first prompt across restart; require exact host notification provenance so an author's
   own reply cannot bypass the STUDIO-1045 run-window guard (STUDIO-1835).

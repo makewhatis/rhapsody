@@ -151,10 +151,13 @@ pub struct ReviewIntroRequest {
     /// the ADOPTION sweep's, and it is what makes a repair a repair: it may create the row that is
     /// missing and may never disturb one that is not.
     pub only_if_unwatched: bool,
-    /// Adoption already has an own-repo origin row; only the companion lookups remain.
+    /// Adoption already has an own-repo origin row, so the exact `head_branch` lookup is skipped;
+    /// only the prefix lookups in [`companions`](Self::companions) remain.
     pub skip_own_repo: bool,
-    /// Other enabled, distinct configured repositories to probe under the SAME ticket pace/cap.
-    /// Empty for handoffs and lead-only missing-PR probes.
+    /// Repositories probed by `symphony/<key>*` prefix under the SAME ticket pace/cap: the other
+    /// enabled, distinct configured repositories, and — when [`skip_own_repo`](Self::skip_own_repo)
+    /// is set — the own repository first, so a second pull request on a suffixed branch is found
+    /// (STUDIO-1839). Empty for handoffs and lead-only missing-PR probes.
     pub companions: Vec<CompanionReviewRepo>,
 }
 
