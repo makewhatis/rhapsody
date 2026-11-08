@@ -140,6 +140,45 @@ pub struct RunMessageResult {
 }
 
 impl Orchestrator {
+    /// An accepted but unread summons outlives its source run's window (STUDIO-1835). The worker
+    /// clears it only on SESSION_STARTED, after including its exact block in the turn prompt.
+    pub(crate) fn has_pending_summons(&self, identifier: &str) -> bool {
+        match self.store().pending_run_messages(identifier) {
+            Ok(rows) => rows.iter().any(|m| !m.summon_at.is_empty()),
+            Err(error) => {
+                tracing::warn!(issue_identifier = %identifier, %error, "pending summons unreadable; using run-window admission only");
+                false
+            }
+        }
+    }
+
+    fn admit_summons(&self, re: &RunningEntry, at: DateTime<Utc>, body: &str) -> bool {
+        if !re.messages_next_turn {
+            return self.deliver_to_mailbox(re, body).1;
+        }
+        if re.run_id == 0 {
+            return false;
+        }
+        match self.store().queue_summon_message(
+            re.run_id,
+            &rhapsody_store::SummonWatermark {
+                identifier: re.issue.identifier.clone(),
+                at: rhapsody_store::format_summon_at(at),
+                body: body.into(),
+            },
+            &operator_wrap(body),
+            (self.now)().timestamp_millis(),
+            OPERATOR_MAILBOX_CAP,
+        ) {
+            Ok(Some(id)) => id > 0,
+            Ok(None) => false,
+            Err(error) => {
+                tracing::warn!(issue_identifier = %re.issue.identifier, %error, "summons queue failed; admission deferred");
+                false
+            }
+        }
+    }
+
     /// Admit a worker's self-message without borrowing operator authority (STUDIO-1414).
     /// Identity is host-held, not supplied by the caller. Unlike an operator answer, this cannot
     /// release a subject hold or seed a summons for an ended run.
@@ -372,7 +411,7 @@ impl Orchestrator {
     }
 
     /// Routes each candidate that has an ACTIVE run and a summons newer than that run's start (and not
-    /// already delivered) into the run's operator mailbox (INF-448), closing the half of the summon
+    /// already admitted) into the run's operator mailbox (INF-448), closing the half of the summon
     /// dead zone where a comment posted mid-run never reached the live agent. Runs ON the control task
     /// during the poll tick, BEFORE select — which then drops the running issue as usual — and reuses
     /// [`deliver_to_mailbox`](Orchestrator::deliver_to_mailbox) (the INF-250 admission path), so
@@ -397,21 +436,30 @@ impl Orchestrator {
             if summon_at <= re.last_delivered_summon_at {
                 continue; // already delivered this (or a newer) summons to this run
             }
-            let (run_id, identifier) = (re.run_id, re.issue.identifier.clone());
+            let (run_id, identifier, next_turn) = (
+                re.run_id,
+                re.issue.identifier.clone(),
+                re.messages_next_turn,
+            );
             let body = summon_seed_text(iss);
             // Re-borrow the entry for the admission (both borrows shared: `re` from `running`, `&self`
             // for the method), then advance the watermark only on a successful admit.
             let admitted = match self.running.get(&iss.id) {
-                Some(re) => self.deliver_to_mailbox(re, &body).1,
+                Some(re) => self.admit_summons(re, summon_at, &body),
                 None => continue,
             };
             if admitted {
                 if let Some(re) = self.running.get_mut(&iss.id) {
                     re.last_delivered_summon_at = summon_at;
                 }
-                tracing::info!(issue_identifier = %identifier, run_id, summon_at = %summon_at, "mid-run summons delivered to live run");
+                if next_turn {
+                    tracing::info!(issue_identifier = %identifier, run_id, summon_at = %summon_at,
+                        "mid-run summons queued, delivered at next dispatch unless a later turn consumes it");
+                } else {
+                    tracing::info!(issue_identifier = %identifier, run_id, summon_at = %summon_at, "mid-run summons delivered to live run");
+                }
             } else {
-                tracing::info!(issue_identifier = %identifier, run_id, "mid-run summons deferred: operator mailbox full; will retry next tick");
+                tracing::info!(issue_identifier = %identifier, run_id, "mid-run summons deferred: mailbox full or durable queue unavailable; will retry next tick");
             }
         }
     }
@@ -580,13 +628,31 @@ impl Orchestrator {
         if summon_at <= re.last_delivered_summon_at {
             return; // already delivered this (or a newer) summons to this run
         }
+        // A prior run already queued this body. It may even have been consumed by the new worker
+        // between spawn and this seed, so check delivered rows too rather than the pending view.
+        match self.store().queued_summon_exists(
+            &re.issue.identifier,
+            &rhapsody_store::format_summon_at(summon_at),
+        ) {
+            Ok(true) => {
+                if let Some(re) = self.running.get_mut(issue_id) {
+                    re.last_delivered_summon_at = summon_at;
+                }
+                return;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(issue_id, %error, "reopening summons queue unreadable; seed deferred");
+                return;
+            }
+        }
         let (run_id, identifier) = (re.run_id, re.issue.identifier.clone());
         let body = if body.is_empty() {
             MID_RUN_SUMMON_FALLBACK
         } else {
             body
         };
-        let admitted = self.deliver_to_mailbox(re, body).1;
+        let admitted = self.admit_summons(re, summon_at, body);
         if admitted {
             if let Some(re) = self.running.get_mut(issue_id) {
                 re.last_delivered_summon_at = summon_at;
@@ -659,6 +725,91 @@ mod tests {
         let st: Arc<dyn Store + Send + Sync> =
             Arc::new(Sqlite::open(StorePath::InMemory).expect("open store"));
         (orch_over(Arc::clone(&st)), st)
+    }
+
+    #[test]
+    fn ordinary_queued_messages_do_not_reopen_a_ticket() {
+        let (o, store) = message_orch();
+        let ended = utc(2026, 6, 3, 12, 0, 0);
+        seed_run(store.as_ref(), "ID-1", "MT-1", ended);
+        store
+            .queue_run_message(7, "MT-1", "note", "wrapped note", 1, 16)
+            .unwrap();
+        let mut iss = issue("ID-1", "MT-1", "In Review");
+        iss.team_id = "team".into();
+        iss.linked_pr = true;
+        assert!(!o.has_pending_summons("MT-1"));
+        assert!(!o.review_reopen_eligible(&iss, &Default::default()));
+        assert!(o.pr_suppressed(&iss));
+    }
+
+    #[test]
+    fn a_between_turn_summons_logs_queueing_and_respects_human_and_terminal_gates() {
+        let (mut o, _) = message_orch();
+        let mut iss = issue("ID-1", "MT-1", "In Progress");
+        iss.team_id = "team".into();
+        o.dispatch_issue(iss.clone(), None, None, String::new());
+        let re = o.running.get_mut("ID-1").unwrap();
+        re.messages_next_turn = true;
+        iss.latest_summon_at = Some(re.started_at + Duration::seconds(1));
+        iss.latest_summon_body = "fix the finding".into();
+        let (_, events) = crate::testsupport::capture_events(|| {
+            o.deliver_mid_run_summons(std::slice::from_ref(&iss));
+        });
+        assert!(
+            events
+                .iter()
+                .any(|e| e.message.contains("queued, delivered at next dispatch"))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e.message.contains("delivered to live run"))
+        );
+        assert!(o.has_pending_summons("MT-1"));
+        o.running.clear();
+        o.claimed.clear();
+        iss.state = "In Review".into();
+        iss.labels = Some(vec!["rhapsody:human".into()]);
+        assert!(!o.review_reopen_eligible(&iss, &Default::default()));
+        iss.labels = None;
+        iss.state = "Done".into();
+        let (active, reopen, _) = o.select_dispatch_with_reopens(vec![iss]);
+        assert!(active.is_empty() && reopen.is_empty());
+    }
+
+    #[test]
+    fn a_reopening_seed_does_not_duplicate_a_block_the_new_worker_just_consumed() {
+        let (mut o, store) = message_orch();
+        let at = utc(2026, 6, 3, 12, 0, 0);
+        let id = store
+            .queue_summon_message(
+                7,
+                &rhapsody_store::SummonWatermark {
+                    identifier: "MT-1".into(),
+                    at: rhapsody_store::format_summon_at(at),
+                    body: "fix the finding".into(),
+                },
+                &operator_wrap("fix the finding"),
+                1,
+                16,
+            )
+            .unwrap()
+            .unwrap();
+        o.dispatch_issue(
+            issue("ID-1", "MT-1", "In Progress"),
+            None,
+            None,
+            String::new(),
+        );
+        let next = o.running["ID-1"].run_id;
+        store.deliver_queued_run_messages(&[id], next, 1).unwrap();
+        o.seed_reopen_summons("ID-1", at, "fix the finding");
+        assert!(
+            o.mailbox_try_recv("ID-1").is_none(),
+            "the next Claude turn already got this block in its prompt"
+        );
+        assert_eq!(store.list_run_messages(next).unwrap().len(), 1);
     }
 
     #[test]

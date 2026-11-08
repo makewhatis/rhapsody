@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Bug Fixes
+
+* **orchestrator:** re-dispatch unread mid-run summonses once, carrying all queued bodies into the
+  next run's first prompt and preserving the obligation across restart (STUDIO-1835).
+
 ## [0.3.8](https://github.com/makewhatis/rhapsody/compare/v0.3.7...v0.3.8) (2026-10-24)
 
 

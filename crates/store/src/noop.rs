@@ -584,6 +584,19 @@ impl Store for Noop {
     fn pending_run_messages(&self, _identifier: &str) -> Result<Vec<QueuedRunMessage>, StoreError> {
         Ok(Vec::new())
     }
+    fn queue_summon_message(
+        &self,
+        _run_id: i64,
+        _summon: &SummonWatermark,
+        _prompt: &str,
+        _created_at_ms: i64,
+        _cap: usize,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(Some(0))
+    }
+    fn queued_summon_exists(&self, _identifier: &str, _at: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     fn deliver_queued_run_messages(
         &self,
         _ids: &[i64],

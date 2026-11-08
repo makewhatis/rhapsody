@@ -878,6 +878,7 @@ impl Orchestrator {
     /// Store-off fallback: with no run watermark the pre-INF-448 PR-activity comparison applies; a
     /// PR with no comparable activity time stays lenient so a legitimately-summoned issue is never
     /// wedged by missing metadata. Applied to FRESH pickups only.
+    /// STUDIO-1835: an explicitly queued, unread summons lifts suppression regardless of its time.
     pub(crate) fn pr_suppressed(&self, iss: &Issue) -> bool {
         if self.subject_parked(&iss.identifier, "author") {
             return true;
@@ -902,6 +903,11 @@ impl Orchestrator {
             return false;
         }
         if !iss.linked_pr {
+            return false;
+        }
+        // Time inside an author run proves neither receipt nor consumption for a between-turn
+        // harness. An explicitly queued summons remains due until a worker reads it (STUDIO-1835).
+        if self.has_pending_summons(&iss.identifier) {
             return false;
         }
         let summon = match iss.latest_summon_at {
@@ -953,6 +959,8 @@ impl Orchestrator {
     /// an approved branch and invalidated its own review. The ladder has exactly one way in, and this
     /// is it: a summons strictly newer than the run's end. Releasing the hold still releases the
     /// PARK (the merge lock, and the ticket is a candidate again), it simply no longer dispatches.
+    /// STUDIO-1835 also admits an explicitly queued summons until a worker acknowledges its receipt;
+    /// unlike a released park, that row proves an instruction remains unread.
     pub(crate) fn review_reopen_eligible(&self, iss: &Issue, running: &HashSet<String>) -> bool {
         if self.subject_parked(&iss.identifier, "author") {
             return false;
@@ -972,6 +980,9 @@ impl Orchestrator {
         }
         if running.contains(&iss.id) || self.claimed.contains(&iss.id) {
             return false;
+        }
+        if self.has_pending_summons(&iss.identifier) {
+            return true;
         }
         // Deliberately NOT consulted here: the store's `subject_resume_pending` (STUDIO-1443). A
         // released park admits the ticket to the ordinary ladders again, but the reopen ladder

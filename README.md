@@ -225,6 +225,20 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Unread mid-run summons re-dispatch the ticket (STUDIO-1835)
+
+An accepted summons queued for a between-turn harness remains dispatchable after its source run
+ends, even when the comment falls inside that run's author window. Migration **41** adds a
+`summon_at` column and the `rhapsody_queued_run_messages_summon` unique index to the Rhapsody-only
+message queue. The queue retains every accepted body, deduplicates repeated observations, and
+admits one follow-up run carrying all pending blocks in its turn-1 prompt. Delivery is acknowledged
+on `SESSION_STARTED`; a second OpenCode turn that reads them spends the obligation, as does the
+follow-up run. Claude's live steering remains unchanged. Ordinary queued operator/agent messages
+still carry no dispatch authority. Human holds, terminal states, capacity and the other admission
+gates still apply. The pending rows survive restart and history pruning; run end wakes a poll, and
+boot's ordinary poll recovers the same obligation. Logs distinguish queued summonses from live
+delivery. No Go-owned schema, API shape, golden fixture or normalization change.
+
 ### Per-owner GitHub credentials (STUDIO-1804)
 
 The additive, opt-in `github.credentials`/`github.strict` workflow block and `rhapsodyd github check`
@@ -545,7 +559,8 @@ before acceptance; unavailable persistence returns 503 `message_queue_unavailabl
 messages survive run end, restart and history pruning. The next eligible turn (including the
 ticket's next dispatch, even on another harness) prepends each message once and marks its exact row
 delivered when the harness announces that turn's session. Failed startup leaves it pending.
-Messages do not themselves dispatch tickets. Original and destination run pages show the history;
+Ordinary messages do not themselves dispatch tickets (unread summonses do, since STUDIO-1835).
+Original and destination run pages show the history;
 the console labels queued rows pending until delivered. Claude's live `sent`/stdin behavior and
 the Go-owned schema/goldens are unchanged.
 

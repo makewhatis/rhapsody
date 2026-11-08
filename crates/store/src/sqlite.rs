@@ -56,7 +56,7 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 39 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 41 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
 /// ledger, then the structured review findings, then the breaker's persisted crossings, then the
@@ -66,7 +66,7 @@ use std::sync::{Mutex, MutexGuard};
 /// evidence-access log, then the manager intervention lifecycle, then the verdict ledger's durable
 /// completion sequence, STUDIO-1440) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 40;
+const SCHEMA_VERSION: i64 = 41;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -826,6 +826,13 @@ ALTER TABLE rhapsody_review_verdicts ADD COLUMN completed_seq INTEGER NOT NULL D
         reason TEXT NOT NULL,
         PRIMARY KEY (owner, repo, number, reviewer)
     );",
+    // v40 -> v41: an unread mid-run summons remains a durable dispatch obligation (STUDIO-1835).
+    // Empty is an ordinary queued message, which has no dispatch authority.
+    r#"
+ALTER TABLE rhapsody_queued_run_messages ADD COLUMN summon_at TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX rhapsody_queued_run_messages_summon
+    ON rhapsody_queued_run_messages(identifier, summon_at) WHERE summon_at != '';
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -3546,38 +3553,79 @@ impl Store for Sqlite {
         created_at_ms: i64,
         cap: usize,
     ) -> Result<Option<i64>, StoreError> {
+        self.queue_summon_message(
+            run_id,
+            &SummonWatermark {
+                identifier: identifier.into(),
+                body: body.into(),
+                at: String::new(),
+            },
+            prompt,
+            created_at_ms,
+            cap,
+        )
+    }
+
+    fn queue_summon_message(
+        &self,
+        run_id: i64,
+        summon: &SummonWatermark,
+        prompt: &str,
+        created_at_ms: i64,
+        cap: usize,
+    ) -> Result<Option<i64>, StoreError> {
         let mut conn = self.lock();
         let tx = conn.transaction()?;
+        if !summon.at.is_empty()
+            && let Some(id) = tx.query_row(
+                "SELECT message_id FROM rhapsody_queued_run_messages WHERE identifier = ?1 AND summon_at = ?2 AND summon_at != ''",
+                params![summon.identifier, summon.at], |row| row.get(0),
+            ).optional()?
+        {
+            return Ok(Some(id)); // includes delivered rows; repeated admission is not new work
+        }
         let pending: i64 = tx.query_row(
             "SELECT COUNT(*) FROM rhapsody_queued_run_messages WHERE identifier = ?1 AND delivered_run_id IS NULL",
-            [identifier], |row| row.get(0),
+            [&summon.identifier], |row| row.get(0),
         )?;
         if pending >= cap as i64 {
             return Ok(None);
         }
         tx.execute(
             "INSERT INTO run_messages (run_id, body, created_at_ms, status) VALUES (?1, ?2, ?3, ?4)",
-            params![run_id, body, created_at_ms, RUN_MESSAGE_QUEUED_NEXT_TURN],
+            params![run_id, summon.body, created_at_ms, RUN_MESSAGE_QUEUED_NEXT_TURN],
         )?;
         let id = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO rhapsody_queued_run_messages (message_id, identifier, prompt) VALUES (?1, ?2, ?3)",
-            params![id, identifier, prompt],
+            "INSERT INTO rhapsody_queued_run_messages (message_id, identifier, prompt, summon_at) VALUES (?1, ?2, ?3, ?4)",
+            params![id, summon.identifier, prompt, summon.at],
         )?;
         tx.commit()?;
         Ok(Some(id))
     }
 
+    fn queued_summon_exists(&self, identifier: &str, at: &str) -> Result<bool, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM rhapsody_queued_run_messages
+             WHERE identifier = ?1 AND summon_at = ?2 AND summon_at != '')",
+                params![identifier, at],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     fn pending_run_messages(&self, identifier: &str) -> Result<Vec<QueuedRunMessage>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(
-            "SELECT message_id, prompt FROM rhapsody_queued_run_messages
+            "SELECT message_id, prompt, summon_at FROM rhapsody_queued_run_messages
              WHERE identifier = ?1 AND delivered_run_id IS NULL ORDER BY message_id",
         )?;
         let rows = stmt.query_map([identifier], |row| {
             Ok(QueuedRunMessage {
                 id: row.get(0)?,
                 prompt: row.get(1)?,
+                summon_at: row.get(2)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
@@ -6847,6 +6895,74 @@ mod tests {
         );
         assert!(store.list_run_messages(7).unwrap().is_empty());
         assert!(store.pending_run_messages("MT-1").unwrap().is_empty());
+    }
+
+    #[test]
+    fn queued_summons_are_idempotent_before_and_after_delivery() {
+        let store = open_mem();
+        let mut summon = SummonWatermark {
+            identifier: "MT-1".into(),
+            at: "2030-01-01T00:00:10Z".into(),
+            body: "first finding".into(),
+        };
+        let a = store
+            .queue_summon_message(7, &summon, "wrapped first", 1, 1)
+            .unwrap()
+            .unwrap();
+        // An unchanged observation does not spend a backlog slot, even at capacity.
+        assert_eq!(
+            store
+                .queue_summon_message(7, &summon, "duplicate", 2, 1)
+                .unwrap(),
+            Some(a)
+        );
+        assert_eq!(
+            store.pending_run_messages("MT-1").unwrap()[0].summon_at,
+            summon.at
+        );
+        store.deliver_queued_run_messages(&[a], 8, 1).unwrap();
+        assert!(store.queued_summon_exists("MT-1", &summon.at).unwrap());
+        assert_eq!(
+            store
+                .queue_summon_message(8, &summon, "duplicate", 3, 1)
+                .unwrap(),
+            Some(a)
+        );
+        assert!(store.pending_run_messages("MT-1").unwrap().is_empty());
+        assert_eq!(store.list_run_messages(8).unwrap().len(), 1);
+        summon.at = "2030-01-01T00:00:11Z".into();
+        summon.body = "second finding".into();
+        assert_ne!(
+            store
+                .queue_summon_message(8, &summon, "wrapped second", 4, 1)
+                .unwrap(),
+            Some(a)
+        );
+        assert_eq!(store.pending_run_messages("MT-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn migration_keeps_ordinary_messages_without_dispatch_authority() {
+        let dir = scratch_dir();
+        let path = dir.path.join("upgrade.db");
+        let conn = Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..40] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 40;
+            INSERT INTO run_messages (id, run_id, body, created_at_ms, status)
+                VALUES (1, 7, 'ordinary note', 1, 'queued_next_turn');
+            INSERT INTO rhapsody_queued_run_messages (message_id, identifier, prompt)
+                VALUES (1, 'MT-1', 'wrapped ordinary note');",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Sqlite::open(StorePath::Disk(path)).unwrap();
+        let pending = store.pending_run_messages("MT-1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].summon_at.is_empty());
+        assert!(!store.queued_summon_exists("MT-1", "").unwrap());
     }
 
     // Mirror TestWALEnabled: journal_mode=WAL is active on a file-backed handle.
@@ -10659,6 +10775,7 @@ mod tests {
                 "rhapsody_landing".to_string(),
                 "rhapsody_landing_project".to_string(),
                 "rhapsody_review_selection".to_string(),
+                "rhapsody_queued_run_messages_summon".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

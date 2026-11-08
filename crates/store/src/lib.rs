@@ -594,6 +594,22 @@ pub trait Store {
     fn pending_run_messages(&self, _identifier: &str) -> Result<Vec<QueuedRunMessage>, StoreError> {
         Ok(Vec::new())
     }
+    /// Queues a summons atomically with its history, deduplicated by identifier + canonical time.
+    /// A pending summons also admits the ticket's next dispatch; ordinary messages do not.
+    fn queue_summon_message(
+        &self,
+        _run_id: i64,
+        _summon: &SummonWatermark,
+        _prompt: &str,
+        _created_at_ms: i64,
+        _cap: usize,
+    ) -> Result<Option<i64>, StoreError> {
+        Err(StoreError::Disabled)
+    }
+    /// Includes delivered rows, so a dispatch-time seed cannot duplicate a block the worker just read.
+    fn queued_summon_exists(&self, _identifier: &str, _at: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Marks only the supplied prompt blocks delivered, once the destination turn starts.
     fn deliver_queued_run_messages(
         &self,
