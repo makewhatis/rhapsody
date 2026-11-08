@@ -878,7 +878,7 @@ impl Orchestrator {
     /// Store-off fallback: with no run watermark the pre-INF-448 PR-activity comparison applies; a
     /// PR with no comparable activity time stays lenient so a legitimately-summoned issue is never
     /// wedged by missing metadata. Applied to FRESH pickups only.
-    /// STUDIO-1835: an explicitly queued, unread summons lifts suppression regardless of its time.
+    /// STUDIO-1835: an unread, host-proven review summons lifts suppression regardless of its time.
     pub(crate) fn pr_suppressed(&self, iss: &Issue) -> bool {
         if self.subject_parked(&iss.identifier, "author") {
             return true;
@@ -905,8 +905,8 @@ impl Orchestrator {
         if !iss.linked_pr {
             return false;
         }
-        // Time inside an author run proves neither receipt nor consumption for a between-turn
-        // harness. An explicitly queued summons remains due until a worker reads it (STUDIO-1835).
+        // Only host-proven review notes acquire mid-run dispatch authority (STUDIO-1835).
+        // Other queued comments still obey the STUDIO-1045 author-window rule below.
         if self.has_pending_summons(&iss.identifier) {
             return false;
         }
@@ -959,8 +959,8 @@ impl Orchestrator {
     /// an approved branch and invalidated its own review. The ladder has exactly one way in, and this
     /// is it: a summons strictly newer than the run's end. Releasing the hold still releases the
     /// PARK (the merge lock, and the ticket is a candidate again), it simply no longer dispatches.
-    /// STUDIO-1835 also admits an explicitly queued summons until a worker acknowledges its receipt;
-    /// unlike a released park, that row proves an instruction remains unread.
+    /// STUDIO-1835 also admits a queued host-proven review summons until a worker acknowledges its
+    /// receipt. Ordinary mid-run comments never acquire that dispatch authority (STUDIO-1045).
     pub(crate) fn review_reopen_eligible(&self, iss: &Issue, running: &HashSet<String>) -> bool {
         if self.subject_parked(&iss.identifier, "author") {
             return false;

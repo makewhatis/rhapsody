@@ -227,8 +227,8 @@ reference (the parity goldens stay byte-strict).
 
 ### Unread mid-run summons re-dispatch the ticket (STUDIO-1835)
 
-An accepted summons queued for a between-turn harness remains dispatchable after its source run
-ends, even when the comment falls inside that run's author window. Migration **41** adds a
+An accepted, host-proven review summons queued for a between-turn harness remains dispatchable after
+its source run ends, even when the comment falls inside that run's author window. Migration **41** adds a
 `summon_at` column and the `rhapsody_queued_run_messages_summon` unique index to the Rhapsody-only
 message queue. The queue retains every accepted body, deduplicates repeated observations, and
 admits one follow-up run carrying all pending blocks in its turn-1 prompt. Delivery is acknowledged
@@ -238,6 +238,17 @@ still carry no dispatch authority. Human holds, terminal states, capacity and th
 gates still apply. The pending rows survive restart and history pruning; run end wakes a poll, and
 boot's ordinary poll recovers the same obligation. Logs distinguish queued summonses from live
 delivery. No Go-owned schema, API shape, golden fixture or normalization change.
+
+The STUDIO-1045 self-reply guard still applies. Migration **42** adds `rhapsody_review_summons` and
+its `rhapsody_review_summons_identifier` index: before sending a findings completion to the posting
+task, the host records its exact comment body, origin ticket and composition time against the review
+run. Only an observed comment matching that ticket and body, no earlier than that time, receives
+mid-run dispatch authority. Matching the shared GitHub account, a template prefix or an overlapping
+review run is insufficient. Other mid-run comments retain ordinary next-turn delivery and cannot
+start another run by themselves; the host completion carries the review's verdict and supplies the
+follow-up obligation. Approval and suppressed notifications record no such authority. Provenance
+survives restart and is pruned with its review run; already-admitted pending messages survive that
+pruning. Upgrading a pre-provenance queue preserves its bodies but removes unproven dispatch authority.
 
 ### Per-owner GitHub credentials (STUDIO-1804)
 
@@ -559,7 +570,8 @@ before acceptance; unavailable persistence returns 503 `message_queue_unavailabl
 messages survive run end, restart and history pruning. The next eligible turn (including the
 ticket's next dispatch, even on another harness) prepends each message once and marks its exact row
 delivered when the harness announces that turn's session. Failed startup leaves it pending.
-Ordinary messages do not themselves dispatch tickets (unread summonses do, since STUDIO-1835).
+Ordinary messages do not themselves dispatch tickets (unread, host-proven review summonses do,
+since STUDIO-1835).
 Original and destination run pages show the history;
 the console labels queued rows pending until delivered. Claude's live `sent`/stdin behavior and
 the Go-owned schema/goldens are unchanged.
@@ -4236,22 +4248,24 @@ for.
 
 A summon-token comment created **inside** the ticket's own author-run window — at or after the run's
 start and at or before its end, i.e. while the run was live or before it handed off — is not a
-summons and does not reopen or re-dispatch the author. Both `pr_suppressed` and
-`review_reopen_eligible` now measure a summons against the last run's **END** rather than its start.
+summons and does not reopen or re-dispatch the author, except for an unread, exact host-proven review
+completion (STUDIO-1835, above). Both `pr_suppressed` and `review_reopen_eligible` measure other
+summonses against the last run's **END** rather than its start.
 
 | A summons on a ticket the daemon has worked | Go Symphony v0.4.0 | Rhapsody |
 | --- | --- | --- |
 | boundary it must beat | the last run's **start** | the last run's **end** (its live window) |
-| a comment created while that run was live | re-engages the author | **ignored** (logged once at `info`) |
+| an unproven comment created while that run was live | re-engages the author | **ignored** for dispatch (logged once at `info`) |
 | a comment created after the run ended/handed off | re-engages the author | re-engages the author (unchanged) |
-| the daemon's own review-completion comment (STUDIO-723) | — | re-engages the author (it lands after the author's run) |
+| the daemon's own review-completion comment (STUDIO-723) | — | re-engages the author; a proven unread mid-run note also admits one follow-up (STUDIO-1835) |
 
 **What still summons.** A genuine operator comment posted while no author run is live is after every
-window and reopens exactly as before; the daemon's own token-bearing review-completion comment is
-posted after the author's run has ended, so it is untouched; and a ticket nobody has ever worked
-still has no window and is never grabbed. A mid-run comment is delivered to the live run's mailbox
-as before (INF-448) — that route is unchanged — it simply no longer *also* arms a second run once
-the first ends. The suppression is not weakened the other way either: a merged or in-review ticket
+window and reopens exactly as before; the daemon's own token-bearing review-completion comment can
+also arrive while another author run is live, and STUDIO-1835 records its provenance before allowing
+an unread note to dispatch again. A ticket nobody has ever worked still has no window and is never
+grabbed. Other mid-run comments are delivered to the live run's mailbox or next-turn queue as before
+(INF-448 / STUDIO-1209), without also arming a second run once the first ends. The suppression is not
+weakened the other way either: a merged or in-review ticket
 with an old summons stays suppressed, and dispatching the ticket advances its window past the
 summons.
 

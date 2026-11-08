@@ -912,11 +912,27 @@ impl Orchestrator {
             // never waited on; the two branches above deliberately notify NOBODY — a crashed round
             // read nothing, and a truncated one is re-armed at the same head rather than reported
             // as a review the author should act on.
-            self.request_review_notify(self.plan_review_notify(
+            let completion = self.plan_review_notify(
                 run,
                 status == REVIEW_STATUS_APPROVED,
                 e.verdict_text.as_deref().unwrap_or_default(),
-            ));
+            );
+            if self.review_notify_tx.is_some()
+                && let Some(c) = &completion
+                && c.wants_summons()
+                && let Some(identifier) = crate::reviewdone::origin_ticket(&run.introduced_by)
+                && let Err(error) = self.store().record_review_summons(
+                    re.run_id,
+                    &store::SummonWatermark {
+                        identifier: identifier.into(),
+                        at: store::format_summon_at((self.now)()),
+                        body: crate::reviewnotify::re_engage_comment(c),
+                    },
+                )
+            {
+                tracing::warn!(review = %run.key(), %error, "review summons provenance could not be recorded; author-window suppression still applies");
+            }
+            self.request_review_notify(completion);
             (store::OUTCOME_COMPLETED, "")
         };
         self.persist_end_run(re, outcome, reason);
@@ -2788,6 +2804,40 @@ mod tests {
                 vec![("makewhatis/rhapsody#12".to_string(), approved)],
                 "verdict {verdict}"
             );
+        }
+    }
+
+    #[test]
+    fn only_a_host_findings_completion_records_midrun_dispatch_authority() {
+        for (state, approved) in [
+            (REVIEW_STATE_FINDINGS, false),
+            (REVIEW_STATE_APPROVED, true),
+        ] {
+            let (mut o, _) = orch_with_review(true);
+            let mut rx = o.open_review_notify_channel();
+            let at = crate::testsupport::utc(2030, 1, 1, 0, 0, 0);
+            o.now = Box::new(move || at);
+            let run = ReviewRun {
+                introduced_by: "handoff:MT-1".into(),
+                ..review_run("alice", HEAD_A)
+            };
+            o.dispatch_review(run.clone());
+            exit_review_as(&mut o, &run, false, "", true, state);
+            let completion = rx.try_recv().unwrap();
+            let mut observed = store::SummonWatermark {
+                identifier: "MT-1".into(),
+                at: store::format_summon_at(at),
+                body: crate::reviewnotify::re_engage_comment(&completion),
+            };
+            assert_eq!(
+                o.store().review_summon_exists(&observed).unwrap(),
+                !approved
+            );
+            observed.identifier = "MT-2".into();
+            assert!(!o.store().review_summon_exists(&observed).unwrap());
+            observed.identifier = "MT-1".into();
+            observed.body.push_str("\nfixed it");
+            assert!(!o.store().review_summon_exists(&observed).unwrap());
         }
     }
 

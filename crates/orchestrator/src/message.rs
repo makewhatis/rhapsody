@@ -140,8 +140,9 @@ pub struct RunMessageResult {
 }
 
 impl Orchestrator {
-    /// An accepted but unread summons outlives its source run's window (STUDIO-1835). The worker
-    /// clears it only on SESSION_STARTED, after including its exact block in the turn prompt.
+    /// An unread, authorized summons outlives its source run's window (STUDIO-1835). Mid-run
+    /// authority requires an exact host-proven review note; other comments obey STUDIO-1045.
+    /// The worker clears it on SESSION_STARTED, after including its exact block in the turn prompt.
     pub(crate) fn has_pending_summons(&self, identifier: &str) -> bool {
         match self.store().pending_run_messages(identifier) {
             Ok(rows) => rows.iter().any(|m| !m.summon_at.is_empty()),
@@ -445,6 +446,24 @@ impl Orchestrator {
             // Re-borrow the entry for the admission (both borrows shared: `re` from `running`, `&self`
             // for the method), then advance the watermark only on a successful admit.
             let admitted = match self.running.get(&iss.id) {
+                Some(re) if next_turn => {
+                    // The shared GitHub actor cannot distinguish the author's own reply. Only an
+                    // exact host-recorded review note may bypass STUDIO-1045 after this run ends.
+                    match self
+                        .store()
+                        .review_summon_exists(&rhapsody_store::SummonWatermark {
+                            identifier: identifier.clone(),
+                            at: rhapsody_store::format_summon_at(summon_at),
+                            body: iss.latest_summon_body.clone(),
+                        }) {
+                        Ok(true) => self.admit_summons(re, summon_at, &body),
+                        Ok(false) => self.deliver_to_mailbox(re, &body).1,
+                        Err(error) => {
+                            tracing::warn!(issue_identifier = %identifier, %error, "review summons provenance unreadable; admission deferred");
+                            false
+                        }
+                    }
+                }
                 Some(re) => self.admit_summons(re, summon_at, &body),
                 None => continue,
             };
@@ -752,7 +771,12 @@ mod tests {
         let re = o.running.get_mut("ID-1").unwrap();
         re.messages_next_turn = true;
         iss.latest_summon_at = Some(re.started_at + Duration::seconds(1));
-        iss.latest_summon_body = "fix the finding".into();
+        iss.latest_summon_body = crate::testsupport::recorded_review_summons(
+            o.store(),
+            "MT-1",
+            iss.latest_summon_at.unwrap(),
+            "fix the finding",
+        );
         let (_, events) = crate::testsupport::capture_events(|| {
             o.deliver_mid_run_summons(std::slice::from_ref(&iss));
         });
@@ -1490,23 +1514,27 @@ mod tests {
         );
     }
 
-    // STUDIO-1045 acceptance (the STUDIO-1002 incident, dropped-message half): the author's own
-    // token-bearing reply is routed into the LIVE run's mailbox (INF-448); opencode cannot steer a
-    // live turn (stdin is closed at start) so the runner drains it undelivered and logs `dropped=1`.
-    // When the run then ends, that undelivered self-summons must NOT re-dispatch the author: it was
-    // created inside the run's window, and the reopen ladder measures a summons against that window.
-    //
-    // MUTATION: measure the summons against the run's START (the pre-STUDIO-1045 rule) and this reds.
+    // STUDIO-1045 / STUDIO-1835 B1: unread self-replies have no dispatch authority on either
+    // harness. OpenCode retains the body for a later turn; Claude's unread mailbox expires.
     #[tokio::test]
     async fn an_undelivered_self_summons_at_run_end_does_not_re_dispatch_the_author() {
+        undelivered_self_summons(false);
+    }
+
+    #[tokio::test]
+    async fn an_opencode_self_summons_at_run_end_does_not_re_dispatch_the_author() {
+        undelivered_self_summons(true);
+    }
+
+    fn undelivered_self_summons(next_turn: bool) {
         let (mut o, base) = midrun_harness();
+        o.running.get_mut("ID-1").unwrap().messages_next_turn = next_turn;
         if let Some(eff) = o.eff.as_mut() {
             eff.review_states = set_of(&["in review"]);
             eff.review_promote_state = "In Progress".to_string();
         }
 
-        // The author's own comment lands while the run is live → the mid-run router admits it to
-        // the live run's mailbox (this is the message opencode then drops).
+        // The author's own reply lands while the run is live.
         let summon = base + Duration::seconds(30);
         let cand = Issue {
             id: "ID-1".into(),
@@ -1518,12 +1546,15 @@ mod tests {
             ..Default::default()
         };
         o.deliver_mid_run_summons(std::slice::from_ref(&cand));
-        assert!(
-            o.mailbox_try_recv("ID-1").is_some(),
-            "the self-summons must reach the live run's mailbox (then be dropped undelivered)"
-        );
+        if next_turn {
+            let pending = o.store().pending_run_messages("MT-1").unwrap();
+            assert_eq!(pending.len(), 1, "the body still reaches a later turn");
+            assert!(pending[0].prompt.contains("fixed all three findings"));
+        } else {
+            assert!(o.mailbox_try_recv("ID-1").is_some());
+        }
 
-        // The run ends an hour later, with that message still undelivered (`dropped=1`).
+        // The run ends an hour later, with that message still undelivered.
         o.now = Box::new(move || base + Duration::hours(1));
         let started_at = o.running.get("ID-1").expect("running").started_at;
         o.on_worker_exit(EvWorkerExit {
@@ -1550,6 +1581,58 @@ mod tests {
             !o.review_reopen_eligible(&review, &std::collections::HashSet::new()),
             "an undelivered self-summons created inside the run window must not re-dispatch the author"
         );
+        review.linked_pr = true;
+        assert!(
+            o.pr_suppressed(&review),
+            "linked-PR admission must also refuse the self-reply"
+        );
+        assert!(!o.has_pending_summons("MT-1"));
+    }
+
+    #[tokio::test]
+    async fn an_unread_self_reply_cannot_rearm_a_consumed_review_summons() {
+        let (mut o, base) = midrun_harness();
+        let re = o.running.get_mut("ID-1").unwrap();
+        re.messages_next_turn = true;
+        let run_id = re.run_id;
+        let review_at = base + Duration::seconds(10);
+        let mut cand = issue("ID-1", "MT-1", "In Progress");
+        cand.team_id = "team".into();
+        cand.linked_pr = true;
+        cand.latest_summon_at = Some(review_at);
+        cand.latest_summon_body = crate::testsupport::recorded_review_summons(
+            o.store(),
+            "MT-1",
+            review_at,
+            "fix the review finding",
+        );
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+        let review_message = o.store().pending_run_messages("MT-1").unwrap()[0].id;
+
+        // The author replies while a recorded review exists; neither shared actor nor similar
+        // comment text may turn this reply into another review instruction.
+        cand.latest_summon_at = Some(base + Duration::seconds(20));
+        cand.latest_summon_body
+            .push_str("\nFixed the finding; @rhapsody");
+        o.deliver_mid_run_summons(std::slice::from_ref(&cand));
+        assert!(o.has_pending_summons("MT-1"));
+        o.store()
+            .deliver_queued_run_messages(&[review_message], run_id, 2)
+            .unwrap();
+        assert_eq!(o.store().pending_run_messages("MT-1").unwrap().len(), 1);
+        assert!(
+            !o.has_pending_summons("MT-1"),
+            "only the self-reply remains unread"
+        );
+
+        let re = o.running["ID-1"].clone();
+        o.now = Box::new(move || base + Duration::minutes(1));
+        o.persist_end_run(&re, rhapsody_store::OUTCOME_COMPLETED, "");
+        o.running.clear();
+        o.claimed.clear();
+        assert!(o.pr_suppressed(&cand));
+        cand.state = "In Review".into();
+        assert!(!o.review_reopen_eligible(&cand, &Default::default()));
     }
 
     // TestDeliverToMailbox_SendsWrapsPersists: the extracted admission helper (shared by the HTTP path

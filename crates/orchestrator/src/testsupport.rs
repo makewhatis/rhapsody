@@ -139,6 +139,56 @@ impl crate::prepare::PreparationResolver for ReadyResolver {
 
 // --- issue / blocker / set builders (Go dispatch_test / select_test helpers) -----------------
 
+/// A GitHub-observed copy of a host-composed review completion, with its durable provenance.
+/// Review-exit wiring is tested separately in `review`; message/worker tests need no network.
+pub(crate) fn recorded_review_summons(
+    store: &dyn Store,
+    identifier: &str,
+    at: DateTime<Utc>,
+    verdict: &str,
+) -> String {
+    let completion = crate::reviewnotify::ReviewCompletion {
+        owner: "o".into(),
+        repo: "r".into(),
+        number: 1,
+        reviewer: "alice".into(),
+        author: "jerry".into(),
+        head_sha: "abcdef123".into(),
+        summon_token: "@rhapsody".into(),
+        verdict_text: verdict.into(),
+        ..Default::default()
+    };
+    let body = crate::reviewnotify::re_engage_comment(&completion);
+    let review = store
+        .start_run(RunStart {
+            issue_identifier: crate::review::review_key("o", "r", 1, "alice"),
+            started_at: rhapsody_store::format_summon_at(at),
+            ..Default::default()
+        })
+        .unwrap();
+    store
+        .record_review_summons(
+            review,
+            &rhapsody_store::SummonWatermark {
+                identifier: identifier.into(),
+                at: rhapsody_store::format_summon_at(at),
+                body: body.clone(),
+            },
+        )
+        .unwrap();
+    store
+        .end_run(
+            review,
+            RunEnd {
+                outcome: OUTCOME_COMPLETED.into(),
+                ended_at: rhapsody_store::format_summon_at(at),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    body
+}
+
 /// Builds a minimal candidate issue (title `"t"`). Mirrors Go `select_multi_test.go`'s `iss`.
 pub(crate) fn issue(id: &str, ident: &str, state: &str) -> Issue {
     Issue {

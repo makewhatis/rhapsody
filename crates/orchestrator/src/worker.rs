@@ -2881,6 +2881,7 @@ exit 1
         bodies: &[&str],
         restart: bool,
         next_state: &str,
+        self_reply: bool,
     ) {
         let root = TempDir::new();
         let path = store::StorePath::Disk(root.child("summons.db").into());
@@ -2940,7 +2941,12 @@ exit 1
             for (n, body) in bodies.iter().enumerate() {
                 let mut summoned = iss.clone();
                 summoned.latest_summon_at = Some(base + chrono::Duration::seconds(10 + n as i64));
-                summoned.latest_summon_body = (*body).into();
+                summoned.latest_summon_body = crate::testsupport::recorded_review_summons(
+                    store.as_ref(),
+                    "MT-1",
+                    summoned.latest_summon_at.unwrap(),
+                    body,
+                );
                 o.restore_summon_watermarks(std::iter::once(&mut summoned));
                 o.deliver_mid_run_summons(std::slice::from_ref(&summoned));
                 o.deliver_mid_run_summons(std::slice::from_ref(&summoned)); // repeated poll
@@ -2959,6 +2965,13 @@ exit 1
                     });
                 }
             }
+            if self_reply {
+                let mut reply = iss.clone();
+                reply.latest_summon_at = Some(base + chrono::Duration::seconds(30));
+                reply.latest_summon_body = "Fixed all findings; @rhapsody".into();
+                o.restore_summon_watermarks(std::iter::once(&mut reply));
+                o.deliver_mid_run_summons(std::slice::from_ref(&reply));
+            }
         };
         let (_, _, err) =
             run_agent_attempt(&mut deps, iss.clone(), None, None, &callback, None).await;
@@ -2971,11 +2984,15 @@ exit 1
         let needs_dispatch = steering == agent::Steering::BetweenTurns && turns == 1;
         assert_eq!(
             store.list_run_messages(original).unwrap().len(),
-            bodies.len()
+            bodies.len() + usize::from(self_reply)
         );
         assert_eq!(
             store.pending_run_messages("MT-1").unwrap().len(),
-            if needs_dispatch { bodies.len() } else { 0 }
+            if needs_dispatch {
+                bodies.len() + usize::from(self_reply)
+            } else {
+                0
+            }
         );
         let prompts = prompts.into_inner().unwrap();
         assert!(bodies.iter().all(|b| !prompts[0].contains(b)));
@@ -3023,6 +3040,13 @@ exit 1
                     "turn 1 must carry each body once"
                 );
             }
+            if self_reply {
+                assert_eq!(
+                    ag.last_prompt().matches("Fixed all findings;").count(),
+                    1,
+                    "the pending review must not turn the newer self-reply into another seed"
+                );
+            }
             assert!(store.pending_run_messages("MT-1").unwrap().is_empty());
             assert!(
                 store
@@ -3049,6 +3073,7 @@ exit 1
             &["fix the review finding"],
             false,
             "In Review",
+            false,
         )
         .await;
     }
@@ -3061,6 +3086,7 @@ exit 1
             &["fix the review finding"],
             false,
             "In Review",
+            false,
         )
         .await;
     }
@@ -3073,6 +3099,7 @@ exit 1
             &["fix first finding", "fix second finding"],
             false,
             "In Review",
+            false,
         )
         .await;
     }
@@ -3085,6 +3112,7 @@ exit 1
             &["fix first finding", "fix second finding"],
             true,
             "In Review",
+            false,
         )
         .await;
     }
@@ -3097,6 +3125,7 @@ exit 1
             &["fix the review finding"],
             false,
             "In Review",
+            false,
         )
         .await;
     }
@@ -3109,6 +3138,20 @@ exit 1
             &["fix the review finding"],
             true,
             "In Progress",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn midrun_summons_newer_self_reply_is_not_seeded_by_a_pending_review() {
+        midrun_summons_case(
+            agent::Steering::BetweenTurns,
+            1,
+            &["fix the review finding"],
+            true,
+            "In Review",
+            true,
         )
         .await;
     }

@@ -2004,6 +2004,16 @@ impl Orchestrator {
             };
             (tracker, eff.review_promote_state.clone())
         };
+        // A pending review note can admit this reopen even when the newest observed comment is
+        // the author's own later reply. The durable queue already carries its bodies; only a
+        // genuinely post-run summons may create an additional seed (STUDIO-1835 / STUDIO-1045).
+        let summon = iss
+            .latest_summon_at
+            .filter(|at| {
+                self.last_run_window(&iss.identifier)
+                    .is_some_and(|w| w.ended_at.is_some_and(|end| *at > end))
+            })
+            .map(|at| (at, crate::message::summon_seed_text(&iss)));
         // With no resolver, preparation is inert: promote immediately and dispatch inline, exactly
         // as before this feature existed.
         if self.prepare_resolver.is_none() {
@@ -2016,9 +2026,8 @@ impl Orchestrator {
             }
             tracing::info!(issue_id = %iss.id, issue_identifier = %iss.identifier, from_state = %iss.state, promote_state = %promote_state, "review-reopen: summoned ticket promoted and dispatched");
             iss.state = promote_state;
-            if let Some(at) = iss.latest_summon_at {
-                self.pending_reopen_summons
-                    .insert(iss.id.clone(), (at, crate::message::summon_seed_text(&iss)));
+            if let Some(summon) = summon {
+                self.pending_reopen_summons.insert(iss.id.clone(), summon);
             }
             self.dispatch_or_prepare(iss, None, route, String::new());
             return;
@@ -2030,9 +2039,6 @@ impl Orchestrator {
         // (STUDIO-988 review round 4, jimmy #3 / alice #4). STUDIO-649: the summons predates the run,
         // so it is captured here and seeded into the fresh run's mailbox by `dispatch_issue` once the
         // run is live.
-        let summon = iss
-            .latest_summon_at
-            .map(|at| (at, crate::message::summon_seed_text(&iss)));
         let id = iss.id.clone();
         let target = crate::prepare::PreparedTarget::Ticket {
             issue: iss,

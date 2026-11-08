@@ -56,7 +56,7 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 41 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 42 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
 /// ledger, then the structured review findings, then the breaker's persisted crossings, then the
@@ -66,7 +66,7 @@ use std::sync::{Mutex, MutexGuard};
 /// evidence-access log, then the manager intervention lifecycle, then the verdict ledger's durable
 /// completion sequence, STUDIO-1440) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 41;
+const SCHEMA_VERSION: i64 = 42;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -832,6 +832,19 @@ ALTER TABLE rhapsody_review_verdicts ADD COLUMN completed_seq INTEGER NOT NULL D
 ALTER TABLE rhapsody_queued_run_messages ADD COLUMN summon_at TEXT NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX rhapsody_queued_run_messages_summon
     ON rhapsody_queued_run_messages(identifier, summon_at) WHERE summon_at != '';
+"#,
+    // v41 -> v42: only a host-composed review notification may authorize a second author run
+    // from inside the first run's window (STUDIO-1835 B1). Older pending rows have no provenance;
+    // preserve their delivery, but remove their unproven dispatch authority.
+    r#"
+CREATE TABLE rhapsody_review_summons (
+    run_id INTEGER PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    identifier TEXT NOT NULL,
+    at TEXT NOT NULL,
+    body TEXT NOT NULL
+);
+CREATE INDEX rhapsody_review_summons_identifier ON rhapsody_review_summons(identifier);
+UPDATE rhapsody_queued_run_messages SET summon_at = '' WHERE delivered_run_id IS NULL;
 "#,
 ];
 
@@ -3564,6 +3577,30 @@ impl Store for Sqlite {
             created_at_ms,
             cap,
         )
+    }
+
+    fn record_review_summons(
+        &self,
+        run_id: i64,
+        summon: &SummonWatermark,
+    ) -> Result<(), StoreError> {
+        self.lock().execute(
+            "INSERT INTO rhapsody_review_summons(run_id, identifier, at, body) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(run_id) DO NOTHING",
+            params![run_id, summon.identifier, summon.at, summon.body],
+        )?;
+        Ok(())
+    }
+
+    fn review_summon_exists(&self, summon: &SummonWatermark) -> Result<bool, StoreError> {
+        self.lock()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM rhapsody_review_summons
+             WHERE identifier = ?1 AND body = ?2 AND at <= ?3)",
+                params![summon.identifier, summon.body, summon.at],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
     }
 
     fn queue_summon_message(
@@ -6939,6 +6976,91 @@ mod tests {
             Some(a)
         );
         assert_eq!(store.pending_run_messages("MT-1").unwrap().len(), 1);
+    }
+
+    #[test]
+    fn review_summons_provenance_survives_restart_and_requires_exact_ticket_body_and_time() {
+        let dir = scratch_dir();
+        let path = StorePath::Disk(dir.path.join("review-summons.db"));
+        let store = Sqlite::open(path.clone()).unwrap();
+        let run = store
+            .start_run(RunStart {
+                issue_identifier: "pr:o/r#1@alice".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut summon = SummonWatermark {
+            identifier: "MT-1".into(),
+            at: "2030-01-01T00:00:10Z".into(),
+            body: "host review notification".into(),
+        };
+        store.record_review_summons(run, &summon).unwrap();
+        drop(store);
+        let store = Sqlite::open(path).unwrap();
+        assert!(store.review_summon_exists(&summon).unwrap());
+        summon.at = "2030-01-01T00:00:09Z".into();
+        assert!(!store.review_summon_exists(&summon).unwrap());
+        summon.at = "2030-01-01T00:00:11Z".into();
+        assert!(store.review_summon_exists(&summon).unwrap());
+        summon.identifier = "MT-2".into();
+        assert!(!store.review_summon_exists(&summon).unwrap());
+        summon.identifier = "MT-1".into();
+        summon.body.push_str("\nfixed it");
+        assert!(!store.review_summon_exists(&summon).unwrap());
+        summon.body = "host review notification".into();
+        let author = store
+            .start_run(RunStart {
+                issue_identifier: "MT-1".into(),
+                ..Default::default()
+            })
+            .unwrap();
+        store
+            .queue_summon_message(author, &summon, "wrapped host note", 1, 16)
+            .unwrap();
+        store
+            .end_run(
+                run,
+                RunEnd {
+                    outcome: OUTCOME_COMPLETED.into(),
+                    ended_at: "2000-01-01T00:00:00Z".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        store.prune(1).unwrap();
+        assert!(
+            !store.review_summon_exists(&summon).unwrap(),
+            "proof follows review retention"
+        );
+        assert_eq!(
+            store.pending_run_messages("MT-1").unwrap()[0].summon_at,
+            summon.at,
+            "an admitted obligation outlives its provenance run"
+        );
+    }
+
+    #[test]
+    fn migration_preserves_unproven_summons_delivery_without_dispatch_authority() {
+        let dir = scratch_dir();
+        let path = dir.path.join("upgrade-41.db");
+        let conn = Connection::open(&path).unwrap();
+        for migration in &MIGRATIONS[..41] {
+            conn.execute_batch(migration).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 41;
+            INSERT INTO run_messages (id, run_id, body, created_at_ms, status)
+                VALUES (1, 7, 'fixed it', 1, 'queued_next_turn');
+            INSERT INTO rhapsody_queued_run_messages (message_id, identifier, prompt, summon_at)
+                VALUES (1, 'MT-1', 'wrapped fixed it', '2030-01-01T00:00:10Z');",
+        )
+        .unwrap();
+        drop(conn);
+        let store = Sqlite::open(StorePath::Disk(path)).unwrap();
+        let pending = store.pending_run_messages("MT-1").unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].prompt, "wrapped fixed it");
+        assert!(pending[0].summon_at.is_empty());
     }
 
     #[test]
@@ -10776,6 +10898,8 @@ mod tests {
                 "rhapsody_landing_project".to_string(),
                 "rhapsody_review_selection".to_string(),
                 "rhapsody_queued_run_messages_summon".to_string(),
+                "rhapsody_review_summons".to_string(),
+                "rhapsody_review_summons_identifier".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );
