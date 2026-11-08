@@ -679,6 +679,8 @@ pub struct RunMessage {
 pub struct QueuedRunMessage {
     pub id: i64,
     pub prompt: String,
+    /// Non-empty only for a summons: admission remains due until this prompt block is delivered.
+    pub summon_at: String,
 }
 
 // --- ticketless review watch set (STUDIO-703 / STUDIO-711) -----------------------------------

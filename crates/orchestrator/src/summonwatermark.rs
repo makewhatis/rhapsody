@@ -31,6 +31,10 @@
 //! advances that window past it. A merged pull request with an old summons stays suppressed exactly
 //! as before.
 //!
+//! STUDIO-1835 adds one explicit exception at admission: a host-proven review summons still pending
+//! in the durable message queue is unread, even if its timestamp is inside the previous run's window.
+//! That queue, not this newest-observed watermark, retains every pending body and dispatch obligation.
+//!
 //! Widening the lookback instead was rejected: it converts "stranded after five minutes of
 //! contention" into "stranded after N minutes of contention" and closes nothing.
 //!

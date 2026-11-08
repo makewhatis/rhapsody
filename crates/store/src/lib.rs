@@ -594,6 +594,36 @@ pub trait Store {
     fn pending_run_messages(&self, _identifier: &str) -> Result<Vec<QueuedRunMessage>, StoreError> {
         Ok(Vec::new())
     }
+    /// Records the exact host-composed findings notification before posting it (STUDIO-1835).
+    /// The review run owns its provenance; pruning that run removes this proof, not queued messages.
+    fn record_review_summons(
+        &self,
+        _run_id: i64,
+        _summon: &SummonWatermark,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+    /// Matches an observed comment to a host notification for the SAME ticket, byte-for-byte,
+    /// posted no earlier than its composition. A shared GitHub actor or a template prefix is not proof.
+    fn review_summon_exists(&self, _summon: &SummonWatermark) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    /// Queues a summons atomically with its history, deduplicated by identifier + canonical time.
+    /// A pending summons also admits the ticket's next dispatch; ordinary messages do not.
+    fn queue_summon_message(
+        &self,
+        _run_id: i64,
+        _summon: &SummonWatermark,
+        _prompt: &str,
+        _created_at_ms: i64,
+        _cap: usize,
+    ) -> Result<Option<i64>, StoreError> {
+        Err(StoreError::Disabled)
+    }
+    /// Includes delivered rows, so a dispatch-time seed cannot duplicate a block the worker just read.
+    fn queued_summon_exists(&self, _identifier: &str, _at: &str) -> Result<bool, StoreError> {
+        Ok(false)
+    }
     /// Marks only the supplied prompt blocks delivered, once the destination turn starts.
     fn deliver_queued_run_messages(
         &self,

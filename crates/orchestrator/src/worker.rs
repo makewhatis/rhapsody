@@ -2834,6 +2834,328 @@ exit 1
         assert_eq!(messages[0].delivered_turn, Some(2));
     }
 
+    fn summons_orchestrator(
+        store: Arc<dyn store::Store + Send + Sync>,
+        ag: Arc<agentfake::Fake>,
+        candidate: Issue,
+    ) -> crate::Orchestrator {
+        let mut tracker = trackerfake::Fake::new();
+        tracker.candidates = vec![candidate];
+        let mut eff = crate::testsupport::empty_effective(Arc::new(tracker));
+        eff.agent = ag;
+        eff.active_states = crate::testsupport::active_set();
+        eff.review_states = crate::testsupport::dep_review();
+        eff.review_promote_state = "In Progress".into();
+        eff.max_concurrent = 1;
+        let mut o = crate::Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.set_store(store);
+        o.spawn = Some(Box::new(|_, _, _| {}));
+        o
+    }
+
+    fn finish_summons_run(o: &mut crate::Orchestrator, last_state: &str) {
+        let re = &o.running["ID-1"];
+        o.on_worker_exit(crate::retry::EvWorkerExit {
+            issue_id: "ID-1".into(),
+            started_at: re.started_at,
+            last_state: last_state.into(),
+            declared_handoff: true,
+            failed: false,
+            err_msg: String::new(),
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
+            auth_needed: false,
+        });
+    }
+
+    // Drive a real worker turn, the mid-run router, run-end classification, and subsequent poll
+    // admission. The fake emits a notification INSIDE turn 1, where the summonses arrive. No CLI or
+    // network is involved; even the restart opens a new connection to a scratch SQLite database.
+    async fn midrun_summons_case(
+        steering: agent::Steering,
+        turns: i64,
+        bodies: &[&str],
+        restart: bool,
+        next_state: &str,
+        self_reply: bool,
+    ) {
+        let root = TempDir::new();
+        let path = store::StorePath::Disk(root.child("summons.db").into());
+        let mut store: Arc<dyn store::Store + Send + Sync> =
+            Arc::new(store::Sqlite::open(path.clone()).unwrap());
+        let mut fake = agentfake::Fake::new();
+        fake.capabilities.steering = steering;
+        if steering == agent::Steering::BetweenTurns {
+            fake.harness = agent::HarnessId::Opencode;
+        }
+        fake.turns = (0..turns)
+            .map(|n| agentfake::TurnScript {
+                events: vec![
+                    Event {
+                        event_type: agent::EVENT_SESSION_STARTED.into(),
+                        ..Default::default()
+                    },
+                    Event {
+                        event_type: agent::EVENT_NOTIFICATION.into(),
+                        message: n.to_string(),
+                        ..Default::default()
+                    },
+                ],
+                ..succeeded_turn()
+            })
+            .collect();
+        let ag = Arc::new(fake);
+        let base = crate::testsupport::utc(2030, 1, 1, 0, 0, 0);
+        let mut iss = issue("ID-1", "MT-1", "In Progress");
+        iss.team_id = "team".into();
+        iss.linked_pr = true;
+        let mut o = summons_orchestrator(store.clone(), ag.clone(), iss.clone());
+        o.now = Box::new(move || base);
+        o.dispatch_issue(iss.clone(), None, None, String::new());
+        let original = o.running["ID-1"].run_id;
+        let o = Mutex::new(o);
+        let (ws, _workspace) = test_workspace(HookScripts::default());
+        let mut deps = make_deps(
+            ws,
+            ag.clone(),
+            Arc::new(trackerfake::Fake::new()),
+            "Work",
+            turns,
+        );
+        deps.run_id = original;
+        deps.message_store = Some(store.clone());
+        let prompts = Mutex::new(Vec::new());
+        let callback = |event: Event| {
+            if event.event_type != agent::EVENT_NOTIFICATION {
+                return;
+            }
+            prompts.lock().unwrap().push(ag.last_prompt());
+            if event.message != "0" {
+                return;
+            }
+            let mut o = o.lock().unwrap();
+            for (n, body) in bodies.iter().enumerate() {
+                let mut summoned = iss.clone();
+                summoned.latest_summon_at = Some(base + chrono::Duration::seconds(10 + n as i64));
+                summoned.latest_summon_body = crate::testsupport::recorded_review_summons(
+                    store.as_ref(),
+                    "MT-1",
+                    summoned.latest_summon_at.unwrap(),
+                    body,
+                );
+                o.restore_summon_watermarks(std::iter::once(&mut summoned));
+                o.deliver_mid_run_summons(std::slice::from_ref(&summoned));
+                o.deliver_mid_run_summons(std::slice::from_ref(&summoned)); // repeated poll
+                if steering == agent::Steering::Live {
+                    // The fake Claude consumes stdin and reports the same acknowledgement the
+                    // live adapter emits. Queued OpenCode messages cannot take this path.
+                    let text = o.mailbox_try_recv("ID-1").expect("live steering message");
+                    assert!(text.contains(body));
+                    o.on_agent_update(crate::agentupdate::AgentUpdate {
+                        issue_id: "ID-1".into(),
+                        ev: Event {
+                            event_type: agent::EVENT_OPERATOR_MESSAGE.into(),
+                            turn: 1,
+                            ..Default::default()
+                        },
+                    });
+                }
+            }
+            if self_reply {
+                let mut reply = iss.clone();
+                reply.latest_summon_at = Some(base + chrono::Duration::seconds(30));
+                reply.latest_summon_body = "Fixed all findings; @rhapsody".into();
+                o.restore_summon_watermarks(std::iter::once(&mut reply));
+                o.deliver_mid_run_summons(std::slice::from_ref(&reply));
+            }
+        };
+        let (_, _, err) =
+            run_agent_attempt(&mut deps, iss.clone(), None, None, &callback, None).await;
+        assert!(err.is_none(), "{err:?}");
+        let mut o = o.into_inner().unwrap();
+        o.now = Box::new(move || base + chrono::Duration::minutes(1));
+        finish_summons_run(&mut o, "In Review");
+        assert!(o.running.is_empty());
+        assert!(o.retry_attempts.is_empty());
+        let needs_dispatch = steering == agent::Steering::BetweenTurns && turns == 1;
+        assert_eq!(
+            store.list_run_messages(original).unwrap().len(),
+            bodies.len() + usize::from(self_reply)
+        );
+        assert_eq!(
+            store.pending_run_messages("MT-1").unwrap().len(),
+            if needs_dispatch {
+                bodies.len() + usize::from(self_reply)
+            } else {
+                0
+            }
+        );
+        let prompts = prompts.into_inner().unwrap();
+        assert!(bodies.iter().all(|b| !prompts[0].contains(b)));
+        if turns > 1 {
+            for body in bodies {
+                assert_eq!(prompts[1].matches(body).count(), 1);
+            }
+        }
+
+        // The poll no longer observes either comment. Only durable state can admit this ticket.
+        iss.state = next_state.into();
+        if restart {
+            drop(o);
+            drop(deps.message_store.take());
+            drop(store);
+            store = Arc::new(store::Sqlite::open(path).unwrap());
+            o = summons_orchestrator(store.clone(), ag.clone(), iss.clone());
+            o.boot_recovery();
+        } else {
+            let mut tracker = trackerfake::Fake::new();
+            tracker.candidates = vec![iss.clone()];
+            o.eff.as_mut().unwrap().tracker = Arc::new(tracker);
+        }
+        o.now = Box::new(move || base + chrono::Duration::minutes(2));
+        o.on_tick().await;
+        assert_eq!(
+            o.running.len(),
+            usize::from(needs_dispatch),
+            "unread summons must cause one dispatch"
+        );
+        if needs_dispatch {
+            let next = o.running["ID-1"].run_id;
+            assert_ne!(next, original);
+            o.on_tick().await;
+            assert_eq!(o.running["ID-1"].run_id, next, "no overlapping dispatch");
+            deps.run_id = next;
+            deps.message_store = Some(store.clone());
+            let (_, _, err) =
+                run_agent_attempt(&mut deps, iss.clone(), None, None, &|_| {}, None).await;
+            assert!(err.is_none(), "{err:?}");
+            for body in bodies {
+                assert_eq!(
+                    ag.last_prompt().matches(body).count(),
+                    1,
+                    "turn 1 must carry each body once"
+                );
+            }
+            if self_reply {
+                assert_eq!(
+                    ag.last_prompt().matches("Fixed all findings;").count(),
+                    1,
+                    "the pending review must not turn the newer self-reply into another seed"
+                );
+            }
+            assert!(store.pending_run_messages("MT-1").unwrap().is_empty());
+            assert!(
+                store
+                    .list_run_messages(next)
+                    .unwrap()
+                    .iter()
+                    .all(|m| m.delivered_turn == Some(1))
+            );
+            finish_summons_run(&mut o, "In Review");
+            o.on_tick().await;
+            assert!(
+                o.running.is_empty(),
+                "consumed summons must not dispatch again"
+            );
+            assert_eq!(store.issue_history("MT-1", "", 10).unwrap().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn midrun_summons_opencode_one_turn_redispatches_once() {
+        midrun_summons_case(
+            agent::Steering::BetweenTurns,
+            1,
+            &["fix the review finding"],
+            false,
+            "In Review",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn midrun_summons_claude_consumed_needs_no_dispatch() {
+        midrun_summons_case(
+            agent::Steering::Live,
+            1,
+            &["fix the review finding"],
+            false,
+            "In Review",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn midrun_summons_two_bodies_share_one_dispatch() {
+        midrun_summons_case(
+            agent::Steering::BetweenTurns,
+            1,
+            &["fix first finding", "fix second finding"],
+            false,
+            "In Review",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn midrun_summons_pending_dispatch_survives_restart() {
+        midrun_summons_case(
+            agent::Steering::BetweenTurns,
+            1,
+            &["fix first finding", "fix second finding"],
+            true,
+            "In Review",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn midrun_summons_opencode_second_turn_consumes_without_dispatch() {
+        midrun_summons_case(
+            agent::Steering::BetweenTurns,
+            2,
+            &["fix the review finding"],
+            false,
+            "In Review",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn midrun_summons_active_ticket_with_linked_pr_redispatches() {
+        midrun_summons_case(
+            agent::Steering::BetweenTurns,
+            1,
+            &["fix the review finding"],
+            true,
+            "In Progress",
+            false,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn midrun_summons_newer_self_reply_is_not_seeded_by_a_pending_review() {
+        midrun_summons_case(
+            agent::Steering::BetweenTurns,
+            1,
+            &["fix the review finding"],
+            true,
+            "In Review",
+            true,
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn queued_message_survives_run_end_and_reaches_the_next_dispatch() {
         use rhapsody_store::{Sqlite, Store, StorePath};

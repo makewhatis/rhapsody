@@ -524,6 +524,13 @@ impl Orchestrator {
             tracing::error!(issue_identifier = %re.issue.identifier, error = %e, "persist end run failed");
         }
         self.persist_run_messages_expired(re);
+        if self.ctx.is_some() && self.has_pending_summons(&re.issue.identifier) {
+            tracing::info!(issue_identifier = %re.issue.identifier, run_id = re.run_id,
+                "run ended with an unread summons; queued for next dispatch");
+            // The control loop applies this after teardown/claim release. The queue itself is the
+            // durable obligation: a restart before this tick re-derives admission from the same rows.
+            let _ = self.events.send(crate::control_loop::Event::Tick);
+        }
     }
 
     /// Appends ONE best-effort timeline row to a run's own history (STUDIO-1584 AC6). This is how a
