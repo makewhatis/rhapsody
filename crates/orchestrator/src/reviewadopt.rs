@@ -54,8 +54,11 @@
 //! What is NOT free is resolving a branch to a pull-request number, which is a `gh` round trip on
 //! the off-loop task. Three bounds keep it rare:
 //!
-//! * a ticket with an own-repo origin row skips the own-repo lookup, but still probes other
-//!   configured repositories for companions; resolved coordinates already watched are skipped;
+//! * a ticket with an own-repo origin row skips the own-repo EXACT lookup; its own repository is
+//!   instead probed by `symphony/<key>*` prefix like every other configured repository, because a
+//!   run may open a second pull request on a suffixed branch (STUDIO-1839). The skip is per pull
+//!   request, not per ticket: resolved coordinates already watched are dropped before they reach
+//!   the control task, and `only_if_unwatched` refuses them again at the write;
 //! * [`REVIEW_ADOPT_PROBE_INTERVAL`] paces how often the same ticket may be asked about, so a
 //!   ticket costs at most one lookup per distinct enabled repository a quarter of an hour rather
 //!   than once per poll tick;
@@ -399,9 +402,10 @@ impl Orchestrator {
         {
             return Verdict::Skip;
         }
-        // A healthy own-repo handoff suppresses only the OWN lookup (STUDIO-1691), never
-        // discovery in another configured repo. Scope the origin to its repo too: a previously
-        // adopted companion is not evidence that the own-repo PR was introduced.
+        // A healthy own-repo handoff suppresses only the OWN exact lookup (STUDIO-1691), never
+        // prefix discovery — in another configured repo or, since STUDIO-1839, in its own. Scope
+        // the origin to its repo too: a previously adopted companion is not evidence that the
+        // own-repo PR was introduced.
         let skip_own_repo = watched.iter().any(|row| {
             (row.introduced_by == handoff_origin(&iss.identifier)
                 || row.introduced_by == adopt_origin(&iss.identifier))
@@ -410,8 +414,36 @@ impl Orchestrator {
                         && row.key.repo.eq_ignore_ascii_case(&repo)
                 })
         });
+        let watched_in = |owner: &str, repo: &str| -> Vec<i64> {
+            watched
+                .iter()
+                .filter(|row| {
+                    row.key.owner.eq_ignore_ascii_case(owner)
+                        && row.key.repo.eq_ignore_ascii_case(repo)
+                })
+                .map(|row| row.key.number)
+                .collect()
+        };
         let mut companions = Vec::new();
         if self.review_ticketless_enabled() {
+            // STUDIO-1839: an own-repo origin row proves ONE of this ticket's pull requests was
+            // introduced, not all of them — a run may also open `symphony/<key>-apple`. So the
+            // skip is per PULL REQUEST: the own repo is probed over the `symphony/<key>*` heads
+            // like any companion, with every own-repo PR already watched dropped from the answer
+            // here and refused again by `only_if_unwatched` at the write. The allowlist gates it
+            // exactly as it gates a companion: a paused own repo is not probed at all.
+            if skip_own_repo
+                && let Some((owner, repo)) = crate::ghsummons::parse_repo(&repo_url)
+                && self.review_repo_is_configured(&owner, &repo)
+            {
+                companions.push(CompanionReviewRepo {
+                    link: crate::prlink::pr_link_target(iss, &owner, &repo),
+                    watched: watched_in(&owner, &repo),
+                    owner,
+                    repo,
+                    repo_url: repo_url.clone(),
+                });
+            }
             for p in &eff.projects {
                 if p.disabled || crate::reviewintro::same_repository(&p.repo, &repo_url) {
                     continue;
@@ -428,14 +460,7 @@ impl Orchestrator {
                 }
                 companions.push(CompanionReviewRepo {
                     link: crate::prlink::pr_link_target(iss, &owner, &repo),
-                    watched: watched
-                        .iter()
-                        .filter(|row| {
-                            row.key.owner.eq_ignore_ascii_case(&owner)
-                                && row.key.repo.eq_ignore_ascii_case(&repo)
-                        })
-                        .map(|row| row.key.number)
-                        .collect(),
+                    watched: watched_in(&owner, &repo),
                     owner,
                     repo,
                     repo_url: p.repo.clone(),
@@ -1528,11 +1553,13 @@ mod tests {
         );
     }
 
-    /// Gate 7, the cheap pre-filter. A ticket whose handoff DID introduce its pull request is not
-    /// an orphan, and must cost no `gh` lookup to establish that — which is what makes a sweep that
-    /// runs every tick affordable on a healthy installation.
+    /// Gate 7, narrowed to the pull request (STUDIO-1839). A ticket whose handoff DID introduce a
+    /// pull request is no longer skipped whole: the run may have opened a second one on
+    /// `symphony/<key>-<suffix>`, which only a lookup can find. So it is probed — by prefix, with the
+    /// already-watched number carried so it is never handed back — and that probe is paced exactly
+    /// like every other, which is what keeps a sweep that runs every tick affordable.
     #[test]
-    fn a_ticket_whose_handoff_already_introduced_it_is_not_probed() {
+    fn a_ticket_whose_handoff_already_introduced_it_probes_only_its_unwatched_heads() {
         let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
         record_run(&o, "STUDIO-836", "alice");
         o.store()
@@ -1552,9 +1579,37 @@ mod tests {
             })
             .expect("seed row");
 
+        let now = Instant::now();
+        let plan = sweep(&mut o, &[parked("STUDIO-836")], now);
+        assert_eq!(plan.planned.len(), 1);
+        let req = &plan.planned[0];
+        assert!(
+            req.skip_own_repo,
+            "the canonical branch's exact lookup is still skipped"
+        );
+        assert!(req.only_if_unwatched);
+        assert_eq!(req.companions.len(), 1);
         assert_eq!(
-            sweep(&mut o, &[parked("STUDIO-836")], Instant::now()),
-            AdoptSweep::default()
+            (
+                req.companions[0].repo.as_str(),
+                req.companions[0].watched.as_slice()
+            ),
+            ("rhapsody", &[144][..]),
+            "the own repo is probed by prefix, with its watched pull request excluded"
+        );
+        assert!(
+            plan.refused.is_empty(),
+            "a watched ticket is never an orphan"
+        );
+        assert!(
+            sweep(
+                &mut o,
+                &[parked("STUDIO-836")],
+                now + Duration::from_secs(1)
+            )
+            .planned
+            .is_empty(),
+            "the probe pace is unchanged"
         );
     }
 
@@ -1585,8 +1640,11 @@ mod tests {
         let first = sweep(&mut o, &[parked("STUDIO-1621")], now);
         assert_eq!(first.planned.len(), 1, "the companion must still be probed");
         assert!(first.planned[0].skip_own_repo);
-        assert_eq!(first.planned[0].companions.len(), 1);
-        let link = first.planned[0].companions[0].link.as_ref().expect("link");
+        // The own repo first (STUDIO-1839: its sibling heads), then the companion.
+        assert_eq!(first.planned[0].companions.len(), 2);
+        assert_eq!(first.planned[0].companions[0].repo, "rhapsody");
+        assert_eq!(first.planned[0].companions[0].watched, [229]);
+        let link = first.planned[0].companions[1].link.as_ref().expect("link");
         assert_eq!(link.repo, "tally");
         assert_eq!(link.identifier, "STUDIO-1621");
         let introductions = resolve_companions(first.planned).await;
@@ -1781,6 +1839,9 @@ mod tests {
                 if args.contains(&"--head") {
                     assert!(args.contains(&"makewhatis/rhapsody"));
                     return Ok(b"[]".to_vec());
+                }
+                if args.contains(&"makewhatis/rhapsody") {
+                    return Ok(b"[]".to_vec()); // the own repo's sibling-head probe: none
                 }
                 assert_eq!(
                     args,
@@ -2131,5 +2192,274 @@ mod tests {
                 "a {kind} hold is not a blocked no-PR ticket"
             );
         }
+    }
+
+    // ---- STUDIO-1839: a ticket's SECOND pull request, on a suffixed branch or in another repo ----
+
+    /// The ticket STUDIO-1839 was filed against: web on `symphony/<key>`, Apple on
+    /// `symphony/<key>-apple`.
+    const SPLIT: &str = "STUDIO-1823";
+
+    /// A fake `gh` over the open pull requests `prs` — `(repo under makewhatis, number, head
+    /// branch)` — answering the exact `--head` lookup with the PR on that branch and a `--search`
+    /// prefix probe with EVERY open PR in the repository. Handing the prefix probe the whole
+    /// repository is deliberate: GitHub's search is only a narrowing hint, so the test proves that
+    /// the real [`crate::ghsummons::GH`] branch matcher — not the fake — keeps an unrelated head out.
+    fn fake_gh(prs: Vec<(&'static str, i64, &'static str)>) -> crate::ghsummons::GH {
+        crate::ghsummons::GH::new(
+            "@symphony",
+            Some(Box::new(move |args: &[&str]| {
+                let after = |flag: &str| {
+                    args.iter()
+                        .position(|a| *a == flag)
+                        .and_then(|i| args.get(i + 1))
+                        .copied()
+                };
+                let slug = after("--repo").unwrap_or_default();
+                let exact = after("--head");
+                let rows: Vec<String> = prs
+                    .iter()
+                    .filter(|(repo, _, branch)| {
+                        format!("makewhatis/{repo}") == slug && exact.is_none_or(|b| b == *branch)
+                    })
+                    .map(|(repo, n, branch)| {
+                        format!(
+                            r#"{{"url":"https://github.com/makewhatis/{repo}/pull/{n}","headRefName":"{branch}","headRefOid":"sha{n}","headRepositoryOwner":{{"login":"makewhatis"}}}}"#
+                        )
+                    })
+                    .collect();
+                Ok(format!("[{}]", rows.join(",")).into_bytes())
+            })),
+        )
+    }
+
+    /// Runs `requests` through the REAL off-loop introduction task against `gh`, and answers what
+    /// it handed back to the control task.
+    async fn introduce_through(
+        gh: crate::ghsummons::GH,
+        requests: Vec<ReviewIntroRequest>,
+    ) -> Vec<crate::reviewintro::IntroducedPr> {
+        #[derive(Default)]
+        struct Sink(std::sync::Mutex<Vec<crate::reviewintro::IntroducedPr>>);
+        #[async_trait::async_trait]
+        impl crate::reviewintro::ReviewIntroSink for Sink {
+            async fn introduce(
+                &self,
+                pr: crate::reviewintro::IntroducedPr,
+            ) -> crate::reviewintro::ReviewIntroOutcome {
+                self.0.lock().expect("sink").push(pr);
+                crate::reviewintro::ReviewIntroOutcome::Introduced(1)
+            }
+        }
+        let sink = Arc::new(Sink::default());
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        for req in requests {
+            tx.send(req).expect("send");
+        }
+        drop(tx);
+        let signal = crate::control_loop::CancelSignal::new();
+        crate::reviewintro::run_review_intro_task(
+            signal.wait(),
+            crate::reviewintro::ReviewIntroDeps {
+                pr_source: Some(Arc::new(gh)),
+                sink: sink.clone(),
+                linker: None,
+            },
+            rx,
+        )
+        .await;
+        sink.0.lock().expect("sink").clone()
+    }
+
+    /// Writes each handed-back introduction through the real loop-side handler.
+    fn apply(o: &mut Orchestrator, prs: &[crate::reviewintro::IntroducedPr]) {
+        for pr in prs {
+            o.handle_review_introduce(pr);
+        }
+    }
+
+    /// `(repo, number, reviewer, origin)` of every watch row, sorted.
+    fn watch_rows(o: &Orchestrator) -> Vec<(String, i64, String, String)> {
+        let mut rows: Vec<_> = o
+            .store()
+            .load_review_watch()
+            .expect("rows")
+            .into_iter()
+            .map(|r| (r.key.repo, r.key.number, r.key.reviewer, r.introduced_by))
+            .collect();
+        rows.sort();
+        rows
+    }
+
+    /// Seeds the row the HANDOFF wrote for the ticket's canonical-branch pull request — the state
+    /// STUDIO-1823's web PR (#96) was in while its Apple PR (#97) sat unwatched.
+    fn handoff_row(o: &mut Orchestrator, number: i64) {
+        let outcome = o.handle_review_introduce(&crate::reviewintro::IntroducedPr {
+            pr: crate::prstate::PrCoord::new("makewhatis", "rhapsody", number),
+            repo_url: REPO_URL.into(),
+            reviewers: vec!["bob".into()],
+            author: "alice".into(),
+            introduced_by: format!("handoff:{SPLIT}"),
+            only_if_unwatched: false,
+        });
+        assert_eq!(
+            outcome,
+            crate::reviewintro::ReviewIntroOutcome::Introduced(1)
+        );
+    }
+
+    fn row(repo: &str, number: i64, origin: &str) -> (String, i64, String, String) {
+        (repo.into(), number, "bob".into(), origin.into())
+    }
+
+    /// STUDIO-1839 acceptance 1. A ticket that opened two pull requests in its own repository — one
+    /// on `symphony/<key>`, one on `symphony/<key>-apple` — ends with a watch row for BOTH. The
+    /// first sweep repairs the canonical branch exactly as before; the next paced sweep finds the
+    /// ticket already watched in its own repo and, rather than skipping the whole ticket, probes the
+    /// `symphony/<key>*` heads and adopts the one that is missing.
+    #[tokio::test]
+    async fn both_pull_requests_on_a_tickets_suffixed_branches_get_watch_rows() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, SPLIT, "alice");
+        let gh = || {
+            fake_gh(vec![
+                ("rhapsody", 96, "symphony/STUDIO-1823"),
+                ("rhapsody", 97, "symphony/STUDIO-1823-apple"),
+            ])
+        };
+        let now = Instant::now();
+
+        let first = sweep(&mut o, &[parked(SPLIT)], now);
+        let prs = introduce_through(gh(), first.planned).await;
+        apply(&mut o, &prs);
+        assert_eq!(watch_rows(&o), [row("rhapsody", 96, "adopt:STUDIO-1823")]);
+
+        let second = sweep(&mut o, &[parked(SPLIT)], now + REVIEW_ADOPT_PROBE_INTERVAL);
+        let prs = introduce_through(gh(), second.planned).await;
+        apply(&mut o, &prs);
+        assert_eq!(
+            watch_rows(&o),
+            [
+                row("rhapsody", 96, "adopt:STUDIO-1823"),
+                row("rhapsody", 97, "adopt:STUDIO-1823"),
+            ],
+            "the ticket's second pull request must get a watch row and a reviewer"
+        );
+    }
+
+    /// STUDIO-1839 acceptance 2, on the incident's own state: the handoff watched #96, so the sweep
+    /// adopts only #97. #96 is never handed back for introduction — the sweep's per-PR snapshot
+    /// drops it — and a stale snapshot that did hand it back is still refused by the write side, so
+    /// its row is not re-armed, re-tagged or duplicated.
+    #[tokio::test]
+    async fn an_already_watched_pull_request_is_not_introduced_again() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, SPLIT, "alice");
+        handoff_row(&mut o, 96);
+        let gh = || {
+            fake_gh(vec![
+                ("rhapsody", 96, "symphony/STUDIO-1823"),
+                ("rhapsody", 97, "symphony/STUDIO-1823-apple"),
+            ])
+        };
+        let now = Instant::now();
+
+        let plan = sweep(&mut o, &[parked(SPLIT)], now);
+        let prs = introduce_through(gh(), plan.planned).await;
+        assert_eq!(
+            prs.iter().map(|p| p.pr.number).collect::<Vec<_>>(),
+            [97],
+            "only the unwatched pull request is handed back"
+        );
+        assert!(prs.iter().all(|p| p.only_if_unwatched));
+        apply(&mut o, &prs);
+
+        let stale = crate::reviewintro::IntroducedPr {
+            pr: crate::prstate::PrCoord::new("makewhatis", "rhapsody", 96),
+            ..prs[0].clone()
+        };
+        assert_eq!(
+            o.handle_review_introduce(&stale),
+            crate::reviewintro::ReviewIntroOutcome::AlreadyWatched
+        );
+        assert_eq!(
+            watch_rows(&o),
+            [
+                row("rhapsody", 96, "handoff:STUDIO-1823"),
+                row("rhapsody", 97, "adopt:STUDIO-1823"),
+            ]
+        );
+
+        let later = sweep(&mut o, &[parked(SPLIT)], now + REVIEW_ADOPT_PROBE_INTERVAL);
+        assert!(
+            introduce_through(gh(), later.planned).await.is_empty(),
+            "a fully watched ticket introduces nothing on a later probe"
+        );
+    }
+
+    /// STUDIO-1839 acceptance 3. Widening the probe to the ticket's `symphony/<key>*` heads must not
+    /// widen it to anything else: a pull request on `feature/x`, on a different ticket whose key
+    /// merely starts with this one (`symphony/<key>0`), or under a deeper path, is never adopted —
+    /// in the own repository or a companion — even when GitHub's search hands it back.
+    #[tokio::test]
+    async fn a_pull_request_on_an_unrelated_branch_is_never_adopted() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, SPLIT, "alice");
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        handoff_row(&mut o, 96);
+        let gh = fake_gh(vec![
+            ("rhapsody", 96, "symphony/STUDIO-1823"),
+            ("rhapsody", 98, "feature/x"),
+            ("rhapsody", 99, "symphony/STUDIO-18230"),
+            ("rhapsody", 100, "symphony/STUDIO-1823/apple"),
+            ("tally", 12, "feature/x"),
+        ]);
+
+        let plan = sweep(&mut o, &[parked(SPLIT)], Instant::now());
+        assert_eq!(plan.planned.len(), 1, "the ticket is probed");
+        let prs = introduce_through(gh, plan.planned).await;
+        assert!(
+            prs.is_empty(),
+            "no unrelated branch may be adopted: {:?}",
+            prs.iter().map(|p| p.pr.to_string()).collect::<Vec<_>>()
+        );
+        assert_eq!(watch_rows(&o), [row("rhapsody", 96, "handoff:STUDIO-1823")]);
+    }
+
+    /// STUDIO-1839 acceptance 4. One ticket, two watched repositories, one pull request in each:
+    /// both get a row from a single sweep, and a later sweep — which now probes the own repository
+    /// by prefix as well — introduces neither again.
+    #[tokio::test]
+    async fn pull_requests_in_two_watched_repositories_for_one_ticket_both_get_rows() {
+        let mut o = orch(teams_with(true, ReviewMode::Ticketless, &["alice", "bob"]));
+        record_run(&o, SPLIT, "alice");
+        let mut companion = empty_resolved_project("tally", Arc::new(Fake::new()));
+        companion.repo = "git@github.com:makewhatis/tally.git".into();
+        o.eff.as_mut().expect("effective").projects.push(companion);
+        let gh = || {
+            fake_gh(vec![
+                ("rhapsody", 96, "symphony/STUDIO-1823"),
+                ("tally", 12, "symphony/STUDIO-1823-apple"),
+            ])
+        };
+        let now = Instant::now();
+
+        let plan = sweep(&mut o, &[parked(SPLIT)], now);
+        let prs = introduce_through(gh(), plan.planned).await;
+        apply(&mut o, &prs);
+        assert_eq!(
+            watch_rows(&o),
+            [
+                row("rhapsody", 96, "adopt:STUDIO-1823"),
+                row("tally", 12, "adopt:STUDIO-1823"),
+            ]
+        );
+
+        let later = sweep(&mut o, &[parked(SPLIT)], now + REVIEW_ADOPT_PROBE_INTERVAL);
+        assert_eq!(later.planned.len(), 1);
+        assert!(introduce_through(gh(), later.planned).await.is_empty());
+        assert_eq!(watch_rows(&o).len(), 2);
     }
 }
