@@ -1258,7 +1258,7 @@ impl Orchestrator {
     /// gives the budget back; the dispatch-critical reads a tick makes (reconcile, completion
     /// revalidation) are never skipped, only made less often along with it. The ledger itself logs
     /// the one warning when the budget tightens and the info line when it relaxes.
-    fn paced_poll_interval(&self) -> Duration {
+    pub(crate) fn paced_poll_interval(&self) -> Duration {
         let poll = self.poll_interval();
         if self.linear_budget_tight() {
             poll.saturating_mul(2)
@@ -1392,8 +1392,8 @@ impl Orchestrator {
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
         async {
-            // One candidate read per project for the whole of retry admission and the poll
-            // (STUDIO-1896), closed before the auto-promote pass and before the next tick.
+            // One candidate read per project for the retry pass and the poll, then one more for the
+            // poll's own retry pass (STUDIO-1896). Closed before auto-promote and the next tick.
             let opened = self.open_tick_cache();
             self.dispatch_ready_retries().await;
             self.dispatch_decisions().await;
@@ -1478,6 +1478,8 @@ impl Orchestrator {
                 .collect();
             // A waiter parked against its old state may now have capacity. Reconsider it before
             // fresh selection can spend that slot; saturated waiters still make no tracker read.
+            // Its admission reads newer data than this poll did, shared across the pass.
+            self.refresh_tick_cache();
             self.dispatch_ready_retries().await;
             // Rhapsody Teams review quorum (STUDIO-659, T7): the same snapshot, for the other
             // consumer — per-identity load and each ticket's open PR / marker label, so a handoff
@@ -1583,7 +1585,8 @@ impl Orchestrator {
         };
         self.set_reads_candidates(crate::teamsprefetch::PrefetchTarget {
             issues: issues.clone(),
-            fetched_at,
+            // No later than the read this tick actually reused (STUDIO-1896).
+            fetched_at: self.tick_reads_began(fetched_at),
             // The legacy path has no project slug to name; triage fetches for itself.
             owner_slugs: Vec::new(),
         });
@@ -1632,6 +1635,7 @@ impl Orchestrator {
             .map(|re| re.identifier.clone())
             .collect();
         // The legacy ladder must give refreshed waiters the same first claim as the project path.
+        self.refresh_tick_cache();
         self.dispatch_ready_retries().await;
         self.record_quorum_state(issues.iter());
         self.observe_lead_review_departures(issues.iter().map(|iss| (iss, None)), true);
@@ -1908,7 +1912,9 @@ impl Orchestrator {
             if answered_projects == enabled_projects {
                 self.set_reads_candidates(crate::teamsprefetch::PrefetchTarget {
                     issues: tagged.iter().map(|t| t.iss.clone()).collect(),
-                    fetched_at,
+                    // No later than the oldest read this poll reused from the tick's retry pass
+                    // (STUDIO-1896): triage's written overlay trusts the stamp as a lower bound.
+                    fetched_at: self.tick_reads_began(fetched_at),
                     owner_slugs: tagged_slugs,
                 });
             }
@@ -4165,6 +4171,49 @@ mod tests {
             "a running issue's retained session directory must survive the tick sweep (B2)"
         );
         assert!(rec.exists(), "and its record must survive");
+    }
+
+    /// STUDIO-1896: a poll that reuses a read from the tick's earlier retry pass publishes the
+    /// set stamped no later than that read, not at its own start. Triage's written overlay treats
+    /// the stamp as the moment the board was read: a later stamp would let a read that predates a
+    /// label write retire that write, and the ticket would be assigned twice. MUTATION GUARD:
+    /// publish `fetched_at` instead of `tick_reads_began(fetched_at)` and both ladders fail.
+    #[tokio::test]
+    async fn a_poll_reusing_an_earlier_read_publishes_that_reads_stamp() {
+        for ladder in ["legacy", "projects"] {
+            let mut f = Fake::new();
+            f.candidates = vec![issue("1", "MT-1", "Todo")];
+            let tr = Arc::new(f);
+            let (mut o, _) = crate::testsupport::orch_for_retry(tr.clone(), 10);
+            if ladder == "projects" {
+                o.eff.as_mut().unwrap().projects = vec![proj_with_tracker("a", tr.clone(), "")];
+            }
+            let read_at = Utc::now();
+            let poll_at = read_at + chrono::Duration::seconds(5);
+            let handle = o.control();
+            assert!(o.open_tick_cache());
+            // The retry pass's read, made through the same client the poll will ask.
+            o.now = Box::new(move || read_at);
+            let client: Arc<dyn rhapsody_tracker::Tracker> = if ladder == "projects" {
+                Arc::clone(&o.eff.as_ref().unwrap().projects[0].tracker)
+            } else {
+                Arc::clone(&o.eff.as_ref().unwrap().tracker)
+            };
+            o.fetch_candidates_for_tick(&client).await.unwrap();
+            o.now = Box::new(move || poll_at);
+            o.dispatch_decisions().await;
+            o.close_tick_cache();
+            assert_eq!(
+                tr.candidate_calls(),
+                1,
+                "{ladder}: the poll reused the read"
+            );
+            assert_eq!(
+                handle.reads_candidates().expect("published").fetched_at,
+                read_at,
+                "{ladder}: stamped at the reused read, not the poll's start"
+            );
+        }
     }
 
     #[tokio::test]

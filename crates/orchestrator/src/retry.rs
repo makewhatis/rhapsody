@@ -329,7 +329,12 @@ pub(crate) fn classify_clean_exit(
 /// cannot be reused while the map is alive. A FAILED fetch is never cached, so the next reader in
 /// the tick asks again — exactly what it did before. Behind a `Mutex` only so the `&self` poll can
 /// use it; it is control-task-owned like every field there and is NOT an off-loop seam.
-pub(crate) type TickCandidates = HashMap<usize, Vec<Issue>>;
+///
+/// Each read carries the clock reading taken before it was sent. A reuser that publishes the
+/// set (the poll) must stamp it no later than the read it actually reused, because triage's
+/// written overlay trusts a board read only if that read began after a write
+/// ([`Orchestrator::tick_reads_began`]).
+pub(crate) type TickCandidates = HashMap<usize, (chrono::DateTime<chrono::Utc>, Vec<Issue>)>;
 
 /// The [`TickCandidates`] key for a client.
 fn tick_key(tracker: &Arc<dyn Tracker>) -> usize {
@@ -361,16 +366,30 @@ impl Orchestrator {
         *self.tick_cache() = None;
     }
 
+    /// Empties an open tick's cache without closing it, so the next reader fetches afresh and the
+    /// readers after it share THAT read. The poll calls this before its own retry pass. That pass's
+    /// admission must read newer data than the board poll did, so a hold or state change made since
+    /// the poll still refuses the retry (STUDIO-1896 keeps B4's rule). A no-op when no tick is open.
+    pub(crate) fn refresh_tick_cache(&self) {
+        if let Some(c) = self.tick_cache().as_mut() {
+            c.clear();
+        }
+    }
+
     /// `tracker`'s candidate set: from the open tick's cache when this tick already read it,
     /// otherwise fetched (and remembered, when a tick is open). With no tick open every call
     /// fetches, so a reader outside a tick never sees an older tick's board.
     ///
-    /// The cache needs no invalidation inside a tick: between its first fill and its last reader
-    /// (the retry pass after the poll) the control task makes no tracker WRITE — a dispatch hands
-    /// its state move to the worker, off-loop, and the pool claims and review-reopen promotions
-    /// run after the last reader. The one ticket a dispatch can change is the one just dispatched,
-    /// which every later reader already excludes as running or claimed. The lock is never held
-    /// across the fetch.
+    /// A tick has two generations of reads. The retry pass before the poll fills the first and the
+    /// poll reuses it. The retry pass after the poll starts the second ([`Self::refresh_tick_cache`]),
+    /// because its admission must see data newer than the poll's. Within a generation no invalidation
+    /// is needed, because the control task makes no tracker WRITE between a fill and its readers:
+    ///
+    /// * a dispatch hands its state move to the worker, off-loop;
+    /// * pool claims and review-reopen promotions run after the last reader.
+    ///
+    /// The one ticket a dispatch can change is the one just dispatched, and every later reader
+    /// already excludes it as running or claimed. The lock is never held across the fetch.
     pub(crate) async fn fetch_candidates_for_tick(
         &self,
         tracker: &Arc<dyn Tracker>,
@@ -379,15 +398,30 @@ impl Orchestrator {
         let hit = self
             .tick_cache()
             .as_ref()
-            .and_then(|c| c.get(&key).cloned());
+            .and_then(|c| c.get(&key).map(|(_, issues)| issues.clone()));
         if let Some(hit) = hit {
             return Ok(hit);
         }
+        let began = (self.now)();
         let fetched = tracker.fetch_candidate_issues().await?;
         if let Some(c) = self.tick_cache().as_mut() {
-            c.insert(key, fetched.clone());
+            c.insert(key, (began, fetched.clone()));
         }
         Ok(fetched)
+    }
+
+    /// The earliest of `stamp` and the start of every read in the open tick's cache. The poll
+    /// publishes its candidate set under this rather than its own start, since a project it took
+    /// from the cache was read before the poll began.
+    pub(crate) fn tick_reads_began(
+        &self,
+        stamp: chrono::DateTime<chrono::Utc>,
+    ) -> chrono::DateTime<chrono::Utc> {
+        self.tick_cache()
+            .as_ref()
+            .into_iter()
+            .flat_map(|c| c.values().map(|(began, _)| *began))
+            .fold(stamp, std::cmp::min)
     }
 
     /// Give already-started work first claim on freed slots. A capacity wait keeps its original due
