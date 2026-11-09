@@ -150,6 +150,10 @@ mod testsupport;
 #[cfg(test)]
 mod filetracker_e2e;
 
+// STUDIO-1896: the simulated-hour Linear request replay behind the PR's per-caller numbers.
+#[cfg(test)]
+mod linear_budget_replay;
+
 pub use agentupdate::AgentUpdate;
 pub use backoff::{CONTINUATION_DELAY_MS, failure_backoff_ms};
 pub use concurrency::{global_slots, state_limit};
