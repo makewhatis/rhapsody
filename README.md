@@ -254,7 +254,18 @@ revalidation is retried once the key's 429 block ends (waiting at most ten minut
 retries it is dropped with a warning.
 
 Teams triage reuses the poll's last complete candidate set, if it is at most five minutes old, rather
-than fetching every project's candidates again each cycle.
+than fetching every project's candidates again each cycle. A reused set can predate triage's own
+label writes, so triage remembers each identity it wrote. It does not decide that ticket again until
+a board read that started after the write shows the label. A failed write still stays pending and is
+retried.
+
+Within one tick, due retries and the poll share a single candidate read per project. Go's `onRetry`
+fetched the project's candidates again for each retry. The read is discarded when the tick ends.
+Retry timers that fire between ticks share one read across the retries they release.
+
+The ledger is keyed by API key, but Linear charges the allowance to the authenticated **user**,
+across all of that user's keys. The local count is accurate only when the daemon's key is the user's
+only consumer. Otherwise Linear's reported remaining count is what tightens the budget.
 
 Every existing sentinel string, API shape, schema, golden fixture and normalization rule is
 unchanged.

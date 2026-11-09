@@ -1,9 +1,18 @@
 //! The Linear request budget (STUDIO-1896) — Rhapsody-only; Symphony has no counterpart.
 //!
-//! Linear limits an API key to [`HOURLY_LIMIT`] requests per rolling hour and answers past it with
-//! HTTP 429. The daemon builds one [`linear::Client`](crate::linear::Client) per configured project,
-//! but every one of them spends the SAME key's allowance, so the ledger is shared per key
-//! ([`ledger_for`]): fourteen projects are one budget, not fourteen.
+//! Linear allows [`HOURLY_LIMIT`] requests per rolling hour and answers past it with HTTP 429. The
+//! daemon builds one [`linear::Client`](crate::linear::Client) per configured project, but every one
+//! of them spends the SAME allowance, so the ledger is shared per key ([`ledger_for`]): fourteen
+//! projects are one budget, not fourteen.
+//!
+//! **The single-key assumption.** Linear charges the allowance to the authenticated USER, not to
+//! the key: every API key that user holds, and anything else acting as them, draws on one bucket.
+//! The ledger can only count what this process sends on the keys it was configured with, so its
+//! local count is accurate only when the daemon's key is that user's sole consumer. Two keys for
+//! one user get two ledgers here, each under-counting by the other's share, and a 429 blocks only
+//! the key that received it. What covers the gap is Linear's own `X-RateLimit-Requests-Remaining`,
+//! which reports the user's bucket rather than this process's share and tightens the budget on its
+//! own. Give the daemon a Linear user of its own if anything else spends that user's requests.
 //!
 //! The ledger does three things, and decides nothing on its own:
 //!
@@ -24,7 +33,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-/// Linear's documented per-key allowance: requests per rolling hour.
+/// Linear's documented allowance per authenticated user (shared by all that user's API keys):
+/// requests per rolling hour.
 pub const HOURLY_LIMIT: u32 = 2_500;
 
 /// The share of [`HOURLY_LIMIT`] at which the budget counts as tight.
@@ -207,6 +217,10 @@ pub fn format_breakdown(per_op: &BTreeMap<&'static str, u32>) -> String {
 
 /// The ledger every client on `api_key` shares. Keyed by a hash so the registry never holds the key
 /// itself; a collision would merely merge two keys' counts.
+///
+/// Keyed by API KEY because that is all a client knows, though Linear's quota is per USER: two keys
+/// for one user are one bucket at Linear and two ledgers here. See the module doc's single-key
+/// assumption for what covers that gap.
 pub fn ledger_for(api_key: &str) -> Arc<RequestLedger> {
     static LEDGERS: OnceLock<Mutex<HashMap<u64, Arc<RequestLedger>>>> = OnceLock::new();
     let mut hasher = std::collections::hash_map::DefaultHasher::new();

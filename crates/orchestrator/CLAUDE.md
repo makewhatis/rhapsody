@@ -22,7 +22,10 @@ the `Orchestrator` struct itself. Concretely:
   `HumanHoldLedger`'s lock, taken on `&self` by every module that touches the `rhapsody:human` hold:
   `dispatch` and `select` (write it), `promote` (write it), `snapshot` (read the reported set), and
   the decision readers `quorum`, `reviewwatch` and `reviewreconcile` (read the current-label set)
-  (see the seam list below).
+  (see the seam list below). A second lock that is NOT a seam: `Orchestrator::tick_candidates`
+  (STUDIO-1896), the tick-scoped candidate cache `retry.rs` owns. It is a `std::sync::Mutex` only
+  because `poll_all_projects` takes `&self`. Only the control task touches it, never across an
+  `.await`, and it is `None` outside a tick or a retry pass.
 - Eight exceptions exist today, each `RwLock`/cloneable-handle guarded on purpose — these are the
   only sanctioned seams, not an exhaustive ceiling; if you add a new one, document it here too:
   - `reads.rs` — the Settings "connected as" identity + projects picker, served off-loop by the
@@ -439,6 +442,11 @@ the `Orchestrator` struct itself. Concretely:
   Gotcha: its `FAKE_CLAUDE_*` env knobs are injected via an `env VAR=val <cmd>` prefix per test, not
   `std::env::set_var` / `t.Setenv` — `#[tokio::test]`s in this file run in parallel (unlike Go's
   serial package tests) and a process-global env var would race across them.
+- `linear_budget_replay.rs` (STUDIO-1896) replays a simulated hour of a 14-project install against
+  real `linear::Client`s and a std-thread loopback GraphQL mock. It asserts that the ledger's
+  per-caller counts equal the requests the mock served. Its printed breakdown (`--nocapture`) is
+  where the PR's before/after numbers come from. If you change what a tick or a triage cycle reads
+  from Linear, rerun it and expect its exact-count assertions to move.
 - `snapshot_json.rs::render` is checked against the committed golden `harness/fixtures/api/state.json`
   via `harness-fixtures` (dev-dep) — same golden-parity pattern as the config crate. If you change
   the wire shape intentionally, recapture per root CLAUDE.md's fixtures instructions.
