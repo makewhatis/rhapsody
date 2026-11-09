@@ -220,6 +220,11 @@ pub struct Fake {
     /// race (lose-on-read-back).
     pub assignee_read_override: HashMap<String, String>,
 
+    /// The programmable `request_budget` answer (STUDIO-1896); `None` (the default) is a tracker
+    /// with no request budget, as the file tracker is. Lets a test drive the orchestrator's
+    /// budget-tight pacing without a Linear key.
+    pub request_budget: Option<crate::budget::BudgetStatus>,
+
     /// Stamps created claim comments; defaults to `Utc::now`. Tests can pin it (e.g. to exercise
     /// claim_ttl freshness) via [`Fake::set_clock`].
     clock: Option<Clock>,
@@ -380,6 +385,10 @@ impl Fake {
 
 #[async_trait]
 impl Tracker for Fake {
+    fn request_budget(&self) -> Option<crate::budget::BudgetStatus> {
+        self.request_budget.clone()
+    }
+
     async fn fetch_documents(
         &self,
         issue: Option<&str>,

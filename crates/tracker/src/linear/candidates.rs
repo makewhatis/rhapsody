@@ -96,7 +96,7 @@ struct MilestoneNode {
 /// issues (viewer resolved + cached first; a resolution failure fails the whole fetch), pool mode
 /// (INF-477) narrows to UNASSIGNED issues and needs no viewer here.
 pub(super) async fn fetch_candidate_issues(c: &Client) -> Result<Vec<Issue>, TrackerError> {
-    super::client::traced(crate::tracker_span!("fetch_candidates"), async move {
+    crate::traced_op!("fetch_candidates", async move {
         let pool = c.pool_mode();
         let mut extra: Vec<(&str, Value)> = Vec::new();
         if !pool {

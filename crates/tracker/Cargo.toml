@@ -41,7 +41,9 @@ tracing = "0.1"
 # cannot cross the `.await` in a `Send` async-trait future, and clippy denies await-holding-lock.
 # `tokio::sync::Mutex` is built for exactly this. tokio was anticipated as a tracker dependency by
 # the P3 plan (T1); only the `sync` feature is needed here (the runtime stays test-only). P3 T4.
-tokio = { version = "1", default-features = false, features = ["sync"] }
+# `rt` (STUDIO-1896) for `task_local!` only: `traced` scopes the running operation's name onto the
+# task so `do_graphql` can count each request under it in the request budget. No runtime is started.
+tokio = { version = "1", default-features = false, features = ["sync", "rt"] }
 
 [dev-dependencies]
 # tokio (test-only): a current-thread runtime for `#[tokio::test]`, which drives the async

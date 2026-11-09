@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rhapsody_config::room::{Message, RoomLog};
 use rhapsody_config::teams::{ManagerMode, Teams};
 use rhapsody_core::Issue;
@@ -171,6 +171,11 @@ const IDLE_HEARTBEAT_CYCLES: u32 = 15;
 /// the pre-STUDIO-669 behaviour of dispatching identity-less rather than stalling.
 const MAX_PENDING_ASSIGNMENTS: usize = 256;
 
+/// The most recent label writes [`TriageHandle`] remembers. A healthy daemon retires each one
+/// within a poll or two; the cap only stops a board that never refreshes from growing the map
+/// without bound, and it evicts the OLDEST write first — the one a fresh read is likeliest to show.
+const MAX_WRITTEN_ASSIGNMENTS: usize = 1024;
+
 /// The two-way seam between the **control task** and the **triage task** (STUDIO-669; design record
 /// `~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.3.2 and §A.3.4).
 ///
@@ -199,6 +204,14 @@ pub struct TriageHandle {
     /// `tokio`'s because every critical section is a map lookup with no `await` inside it, and the
     /// control task must be able to read it from a synchronous `fn`.
     pending: std::sync::Mutex<HashMap<String, String>>,
+    /// Issue id → when triage (or the ears pass) WROTE its identity label (STUDIO-1896). Triage-task
+    /// only; the control task never reads it. A cycle that reuses the poll's published candidates
+    /// can be looking at a board read BEFORE that write, where the ticket still looks unclaimed,
+    /// and the label write is additive — so without this a second cycle asked the model again and
+    /// a different answer put a SECOND identity label on an assigned ticket. An entry stands until
+    /// a board read that STARTED after the write has had its say. See
+    /// [`TriageHandle::retire_written`].
+    written: std::sync::Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl TriageHandle {
@@ -214,6 +227,47 @@ impl TriageHandle {
     /// whole valve exists to avoid. `unwrap()` is also simply not available here (non-test code).
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Locks the written map, treating a poisoned lock as readable (see [`Self::map`]).
+    fn written_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, DateTime<Utc>>> {
+        self.written.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records that `issue_id`'s identity label was written at `at` (STUDIO-1896).
+    pub(crate) fn record_written(&self, issue_id: &str, at: DateTime<Utc>) {
+        let mut map = self.written_map();
+        if !map.contains_key(issue_id) && map.len() >= MAX_WRITTEN_ASSIGNMENTS {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = oldest {
+                map.remove(&id);
+            }
+        }
+        map.insert(issue_id.to_string(), at);
+    }
+
+    /// Forgets every write a board read stamped `fetched_at` can be trusted to show: those made
+    /// strictly before it. Both stamps are taken BEFORE their fetch starts (the poll's
+    /// `PrefetchTarget::fetched_at`, and the cycle's own `board_at`), so a read stamped after a
+    /// write began after it. Such a read is authoritative: if it shows the ticket unlabelled, the
+    /// label was removed after the write (by a human, or the reconcile), and deciding it again is
+    /// exactly the behaviour before STUDIO-1896.
+    pub(crate) fn retire_written(&self, fetched_at: DateTime<Utc>) {
+        self.written_map().retain(|_, at| *at >= fetched_at);
+    }
+
+    /// Whether `issue_id` has a label write the current board read cannot be trusted to show yet.
+    /// Call after [`Self::retire_written`] for that read.
+    pub(crate) fn written_unseen(&self, issue_id: &str) -> bool {
+        self.written_map().contains_key(issue_id)
+    }
+
+    /// Drops a written entry — the board read now shows an identity label on the ticket.
+    pub(crate) fn clear_written(&self, issue_id: &str) {
+        self.written_map().remove(issue_id);
     }
 
     /// Asks the triage task to run a cycle NOW (§A.3.2). Cheap, non-blocking, and idempotent
@@ -534,6 +588,46 @@ pub struct TriageTarget {
     /// from here ([`crate::teamsears::EarsCycle`]) so `file_review` drops an impossible reviewer
     /// rather than filing a review ticket `spawn_worker` then refuses.
     pub reviewer_exclusions: crate::quorum::ReviewerExclusions,
+    /// The poll loop's last COMPLETE candidate set (STUDIO-1896), read under the same lock as the
+    /// trackers. When it is fresh and every issue in it names a project in [`Self::slugs`], the
+    /// cycle sweeps it instead of fetching every project's candidates a second time — the
+    /// duplicate that was about a quarter of the daemon's Linear budget. `None` (no complete poll
+    /// yet, a reload since, or a test) makes the cycle fetch for itself exactly as before.
+    pub candidates: Option<crate::teamsprefetch::PrefetchTarget>,
+}
+
+/// How old the poll's published candidate set may be for triage to sweep it instead of fetching
+/// (STUDIO-1896). Comfortably above the poll interval — doubled while the Linear budget is tight —
+/// so a healthy daemon always reuses it, and well below the cycle's own backoff ceiling.
+pub const PUBLISHED_CANDIDATES_MAX_AGE: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
+/// The poll's published candidates as the cycle's `(issues, owner)` pair, or `None` when they
+/// cannot stand in for a fetch: too old, misaligned, or naming a project this target does not hold.
+fn published_candidates(
+    published: &crate::teamsprefetch::PrefetchTarget,
+    slugs: &[String],
+    trackers: usize,
+    now: chrono::DateTime<Utc>,
+) -> Option<(Vec<Issue>, HashMap<String, usize>)> {
+    if slugs.len() != trackers || published.owner_slugs.len() != published.issues.len() {
+        return None;
+    }
+    let age = now.signed_duration_since(published.fetched_at);
+    if age > PUBLISHED_CANDIDATES_MAX_AGE || age < -PUBLISHED_CANDIDATES_MAX_AGE {
+        return None;
+    }
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    let mut issues: Vec<Issue> = Vec::with_capacity(published.issues.len());
+    for (iss, slug) in published.issues.iter().zip(&published.owner_slugs) {
+        // First matching index, the same first-project-wins rule as the poll's own dedup.
+        let idx = slugs.iter().position(|s| s == slug)?;
+        if owner.contains_key(&iss.id) {
+            continue;
+        }
+        owner.insert(iss.id.clone(), idx);
+        issues.push(iss.clone());
+    }
+    Some((issues, owner))
 }
 
 impl TriageTarget {
@@ -555,7 +649,18 @@ impl TriageTarget {
             summon_token: snapshot.summon_token,
             slugs,
             reviewer_exclusions: snapshot.reviewer_exclusions,
+            candidates: None,
         }
+    }
+
+    /// Attaches the poll's published candidate set (STUDIO-1896), read under the same lock as the
+    /// snapshot this target was built from.
+    pub fn with_candidates(
+        mut self,
+        candidates: Option<crate::teamsprefetch::PrefetchTarget>,
+    ) -> TriageTarget {
+        self.candidates = candidates;
+        self
     }
 }
 
@@ -1047,15 +1152,45 @@ where
         return CycleReport::stalled(CycleOutcome::Idle, false, 0);
     };
     let trackers = target.trackers;
+    // Reuse the poll's last complete candidate fetch when it is fresh (STUDIO-1896): it is the
+    // same query over the same clients, de-duplicated by the same first-project-wins rule, so
+    // fetching it again here only spent Linear quota — about 640 requests an hour on a 14-project
+    // install, a quarter of the key's budget.
+    let published = target
+        .candidates
+        .as_ref()
+        .and_then(|c| published_candidates(c, &target.slugs, trackers.len(), Utc::now()));
+    let reused = published.is_some();
+    // When the board this cycle reads was fetched: the poll's timestamp for a reused set, now for
+    // the cycle's own fetch (which starts below). The written overlay is judged against it.
+    let board_at = match target.candidates.as_ref() {
+        Some(c) if reused => c.fetched_at,
+        _ => Utc::now(),
+    };
     // Fan the candidate fetch out over every enabled project, exactly as the poll loop does, and
     // de-duplicate on issue id with FIRST PROJECT WINS — the same rule `on_tick` uses, so a ticket
     // reachable through two configured slugs is triaged by the same client that would dispatch it.
     // `owner` remembers which tracker each kept issue arrived through, so the label is written back
     // through that project's own client rather than through an arbitrary one.
-    let mut issues: Vec<Issue> = Vec::new();
-    let mut owner: HashMap<String, usize> = HashMap::new();
+    let (mut issues, mut owner) = published.unwrap_or_default();
     let mut fetch_failed = false;
-    for (idx, tracker) in trackers.iter().enumerate() {
+    // With no published set to reuse and the key's Linear budget tight, the sweep waits rather
+    // than spending what the dispatch-critical reads need; reporting it as a failed fetch backs
+    // the schedule off and skips the one-time reconcile, exactly like an unreachable tracker.
+    if !reused
+        && trackers
+            .iter()
+            .any(|t| t.request_budget().is_some_and(|b| b.tight))
+    {
+        tracing::info!("teams triage skipped its own candidate fetch: the Linear budget is tight");
+        fetch_failed = true;
+    }
+    let to_fetch: &[Arc<dyn Tracker>] = if reused || fetch_failed {
+        &[]
+    } else {
+        &trackers
+    };
+    for (idx, tracker) in to_fetch.iter().enumerate() {
         match tracker.fetch_candidate_issues().await {
             Ok(v) => {
                 for iss in v {
@@ -1083,8 +1218,12 @@ where
     for iss in &issues {
         if has_any_identity_label(iss) {
             deps.handle.clear_pending(&iss.id);
+            deps.handle.clear_written(&iss.id);
         }
     }
+    // A write this board read was fetched late enough to show is retired by it; one it may predate
+    // stays, and keeps its ticket out of the assignment pass below (STUDIO-1896).
+    deps.handle.retire_written(board_at);
     let fetched = issues.len();
     // The one-time cleanup, BEFORE the assignment pass and over the whole fetch rather than the
     // candidate list: the labels it removes are precisely what keeps those tickets OUT of the
@@ -1167,6 +1306,10 @@ where
         let heard =
             crate::teamsears::ears_pass(&deps.teams, room.as_ref(), ears.as_ref(), &cycle).await;
         ears_labelled.extend(heard.wrote.labelled_ids().map(str::to_string));
+        let at = Utc::now();
+        for id in heard.wrote.labelled_ids() {
+            deps.handle.record_written(id, at);
+        }
         if !heard.is_quiet() {
             tracing::info!(
                 answered = heard.answered,
@@ -1208,6 +1351,11 @@ where
     // retry of an older, unwritten decision is the point, not a leak: the next cycle's fetch shows
     // the label the ears pass wrote, and the sweep at the top of this function retires the entry.
     candidates.retain(|iss| !ears_labelled.contains(&iss.id));
+    // And a ticket an EARLIER cycle labelled stays claimed while this cycle's board read may
+    // predate that write (STUDIO-1896): a reused poll snapshot is older than the cycle, and the
+    // label is additive, so deciding it again would add a second identity. A pending (unwritten)
+    // decision is not in this set, so its write is still retried below.
+    candidates.retain(|iss| !deps.handle.written_unseen(&iss.id));
     if candidates.is_empty() {
         return report(failed_outcome(CycleOutcome::Idle), 0);
     }
@@ -1286,6 +1434,7 @@ where
             match write_label(tracker.as_ref(), iss, &identity).await {
                 Ok(()) => {
                     deps.handle.clear_pending(&iss.id);
+                    deps.handle.record_written(&iss.id, Utc::now());
                     tracing::info!(
                         issue = %iss.identifier,
                         %identity,
@@ -1418,6 +1567,8 @@ where
                 );
                 continue;
             }
+        } else {
+            deps.handle.record_written(&iss.id, Utc::now());
         }
         // §0.11.1: "the decision's durable record is a manager post in the room log". The
         // `teams.route` events row is the per-run TIMELINE copy and is pruned with its run
@@ -2701,6 +2852,7 @@ mod tests {
                     summon_token: "@symphony".to_string(),
                     slugs: Vec::new(),
                     reviewer_exclusions: Default::default(),
+                    candidates: None,
                 })
             },
             arbiter: FakeArbiter::answering(Vec::new()),
@@ -2844,6 +2996,7 @@ mod tests {
                     summon_token: "@symphony".to_string(),
                     slugs: vec!["proj".to_string()],
                     reviewer_exclusions: Default::default(),
+                    candidates: None,
                 })
             },
             arbiter: FakeArbiter::answering(Vec::new()),
@@ -4981,6 +5134,260 @@ mod tests {
             .map(|c| c.issue_id.clone())
             .collect();
         assert_eq!(seconds, vec!["i2".to_string()]);
+    }
+
+    /// Deps whose target carries the poll's published candidate set (STUDIO-1896).
+    fn deps_published(
+        teams: Teams,
+        trackers: Vec<Arc<dyn Tracker>>,
+        slugs: Vec<String>,
+        published: crate::teamsprefetch::PrefetchTarget,
+        arbiter: Arc<dyn TriageArbiter>,
+    ) -> TriageDeps<impl Fn() -> Option<TriageTarget>> {
+        TriageDeps {
+            teams: Arc::new(teams),
+            target: move || {
+                Some(TriageTarget {
+                    trackers: trackers.clone(),
+                    states: states(),
+                    slugs: slugs.clone(),
+                    candidates: Some(published.clone()),
+                    ..TriageTarget::default()
+                })
+            },
+            arbiter,
+            agent_command: "claude".to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            interval: Duration::from_millis(5),
+            max_backoff_ms: 20,
+            handle: Arc::new(TriageHandle::new()),
+            room: None,
+            history: None,
+            reconcile_marker: None,
+            ears: None,
+            knowledge: None,
+        }
+    }
+
+    /// STUDIO-1896. MUTATION GUARD: ignore the published set and triage refetches every project's
+    /// candidates each cycle — a quarter of the Linear budget — and this test reds on the call count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cycle_reuses_the_polls_published_candidates_instead_of_refetching() {
+        // The trackers' own candidate lists are EMPTY: a cycle that fetched would find nothing.
+        let first = Arc::new(Fake::new());
+        let second = Arc::new(Fake::new());
+        let published = crate::teamsprefetch::PrefetchTarget {
+            issues: vec![labelled("i1", &["rust"]), labelled("i2", &["docs"])],
+            fetched_at: Utc::now(),
+            owner_slugs: vec!["alpha".to_string(), "beta".to_string()],
+        };
+        let d = deps_published(
+            teams_model(vec![ident("alice", &[])]),
+            vec![
+                Arc::clone(&first) as Arc<dyn Tracker>,
+                Arc::clone(&second) as Arc<dyn Tracker>,
+            ],
+            vec!["alpha".to_string(), "beta".to_string()],
+            published,
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice"), FakeArbiter::ok("alice")])
+                as Arc<dyn TriageArbiter>,
+        );
+        let outcome = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(outcome, CycleOutcome::Labelled(2));
+        assert_eq!(first.candidate_calls(), 0, "no second candidate fetch");
+        assert_eq!(second.candidate_calls(), 0, "no second candidate fetch");
+        let firsts: Vec<String> = first
+            .add_label_calls()
+            .iter()
+            .map(|c| c.issue_id.clone())
+            .collect();
+        let seconds: Vec<String> = second
+            .add_label_calls()
+            .iter()
+            .map(|c| c.issue_id.clone())
+            .collect();
+        assert_eq!(
+            firsts,
+            vec!["i1".to_string()],
+            "written through the owning project"
+        );
+        assert_eq!(
+            seconds,
+            vec!["i2".to_string()],
+            "written through the owning project"
+        );
+    }
+
+    /// The labels a cycle wrote through `tr`, in order.
+    fn written_labels(tr: &Fake) -> Vec<String> {
+        tr.add_label_calls()
+            .iter()
+            .map(|c| format!("{}={}", c.issue_id, c.label_name))
+            .collect()
+    }
+
+    /// STUDIO-1896 review B1. Triage runs every minute but the poll republishes every two (four
+    /// while the budget is tight), so consecutive cycles reuse ONE snapshot taken before the first
+    /// cycle's label write. The write is additive: re-deciding the still-unlabelled-looking ticket
+    /// put a second identity on it. MUTATION GUARD: drop the `written_unseen` filter and the second
+    /// cycle asks the model again and writes `rhapsody:@bob` too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_published_snapshot_never_assigns_the_same_ticket_twice() {
+        let tr = Arc::new(Fake::new());
+        let published = crate::teamsprefetch::PrefetchTarget {
+            issues: vec![labelled("i1", &[])],
+            fetched_at: Utc::now(),
+            owner_slugs: vec!["alpha".to_string()],
+        };
+        let arbiter =
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice"), FakeArbiter::ok("bob")]);
+        let d = deps_published(
+            teams_model(vec![ident("alice", &[]), ident("bob", &[])]),
+            vec![Arc::clone(&tr) as Arc<dyn Tracker>],
+            vec!["alpha".to_string()],
+            published,
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+        );
+        let first = triage_cycle(&CancelWait::default(), &d, true).await;
+        let second = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(first, CycleOutcome::Labelled(1));
+        assert_eq!(second, CycleOutcome::Idle, "nothing left to decide");
+        assert_eq!(written_labels(&tr), vec!["i1=rhapsody:@alice".to_string()]);
+        assert_eq!(arbiter.prompts().len(), 1, "the model is asked once");
+    }
+
+    /// The pending-write valve still works on a reused snapshot (STUDIO-1896 review B1): a refused
+    /// write is retried on the next cycle, and once it lands the ticket is not decided again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_write_is_retried_on_a_reused_snapshot_and_then_left_alone() {
+        let mut f = Fake::new();
+        f.add_label_fail_first = 1;
+        let tr = Arc::new(f);
+        let published = crate::teamsprefetch::PrefetchTarget {
+            issues: vec![labelled("i1", &[])],
+            fetched_at: Utc::now(),
+            owner_slugs: vec!["alpha".to_string()],
+        };
+        let arbiter =
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice"), FakeArbiter::ok("bob")]);
+        let d = deps_published(
+            teams_model(vec![ident("alice", &[]), ident("bob", &[])]),
+            vec![Arc::clone(&tr) as Arc<dyn Tracker>],
+            vec!["alpha".to_string()],
+            published,
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+        );
+        let first = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(first, CycleOutcome::TrackerFailure, "the write was refused");
+        assert_eq!(d.handle.pending_identity("i1").as_deref(), Some("alice"));
+        let second = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(
+            second,
+            CycleOutcome::Labelled(1),
+            "the pending write landed"
+        );
+        assert_eq!(d.handle.pending_identity("i1"), None);
+        let third = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(third, CycleOutcome::Idle);
+        assert_eq!(
+            written_labels(&tr),
+            vec![
+                "i1=rhapsody:@alice".to_string(),
+                "i1=rhapsody:@alice".to_string()
+            ],
+            "the refused write, its retry, and nothing after"
+        );
+        assert_eq!(arbiter.prompts().len(), 1, "decided once");
+    }
+
+    /// The overlay only bridges a board read that may predate the write. A read started after it
+    /// is authoritative: if it shows the ticket unlabelled, the label was removed since, and the
+    /// ticket is triaged again exactly as before STUDIO-1896.
+    #[test]
+    fn a_board_read_after_the_write_settles_retires_it() {
+        let h = TriageHandle::new();
+        let at = Utc::now();
+        h.record_written("i1", at);
+        h.retire_written(at - chrono::TimeDelta::minutes(2));
+        assert!(
+            h.written_unseen("i1"),
+            "a read that started before the write"
+        );
+        h.retire_written(at);
+        assert!(
+            h.written_unseen("i1"),
+            "a read that may have raced the write"
+        );
+        h.retire_written(at + chrono::TimeDelta::milliseconds(1));
+        assert!(
+            !h.written_unseen("i1"),
+            "a read that started after the write"
+        );
+    }
+
+    /// The overlay is bounded, and full it evicts the OLDEST write rather than refusing the newest.
+    #[test]
+    fn the_written_overlay_is_bounded_and_evicts_the_oldest() {
+        let h = TriageHandle::new();
+        let base = Utc::now();
+        for i in 0..MAX_WRITTEN_ASSIGNMENTS {
+            h.record_written(
+                &format!("i{i}"),
+                base + chrono::TimeDelta::seconds(i as i64),
+            );
+        }
+        h.record_written("new", base + chrono::TimeDelta::hours(1));
+        assert!(h.written_unseen("new"));
+        assert!(!h.written_unseen("i0"), "the oldest went");
+        assert!(h.written_unseen("i1"));
+        assert_eq!(h.written_map().len(), MAX_WRITTEN_ASSIGNMENTS);
+    }
+
+    /// A published set too old to stand in for a fetch — or one naming a project this target does
+    /// not hold — is ignored, and the cycle fetches for itself exactly as before STUDIO-1896.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_or_unmappable_published_set_falls_back_to_fetching() {
+        for (fetched_at, slug) in [
+            (
+                Utc::now() - PUBLISHED_CANDIDATES_MAX_AGE - chrono::TimeDelta::seconds(1),
+                "alpha",
+            ),
+            (Utc::now(), "gone"),
+        ] {
+            let mut tr = Fake::new();
+            tr.candidates = vec![labelled("i1", &["rust"])];
+            let tr = Arc::new(tr);
+            let published = crate::teamsprefetch::PrefetchTarget {
+                issues: vec![labelled("old", &[])],
+                fetched_at,
+                owner_slugs: vec![slug.to_string()],
+            };
+            let d = deps_published(
+                teams_model(vec![ident("alice", &[])]),
+                vec![Arc::clone(&tr) as Arc<dyn Tracker>],
+                vec!["alpha".to_string()],
+                published,
+                FakeArbiter::answering(vec![FakeArbiter::ok("alice")]) as Arc<dyn TriageArbiter>,
+            );
+            let outcome = triage_cycle(&CancelWait::default(), &d, true).await;
+            assert_eq!(
+                tr.candidate_calls(),
+                1,
+                "the cycle fetched for itself ({slug})"
+            );
+            assert_eq!(outcome, CycleOutcome::Labelled(1), "{slug}");
+            let ids: Vec<String> = tr
+                .add_label_calls()
+                .iter()
+                .map(|c| c.issue_id.clone())
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["i1".to_string()],
+                "the fetched set, not the published one"
+            );
+        }
     }
 
     /// One unreachable project must not blind triage to the rest: the reachable project's ticket is

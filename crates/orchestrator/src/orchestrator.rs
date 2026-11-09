@@ -1149,6 +1149,14 @@ pub struct Orchestrator {
     pub(crate) prepare_generation: u64,
     /// The per-preparation timeout. A field (not a const) so tests can shrink it.
     pub(crate) prepare_timeout: std::time::Duration,
+    /// How long a completion whose revalidation could not read the tracker waits before it is
+    /// re-checked, when the tracker names no rate-limit reset of its own (STUDIO-1896). A field
+    /// (not a const) so tests can shrink it.
+    pub(crate) revalidation_retry_delay: std::time::Duration,
+    /// The open tick's candidate reads, shared by its retries and its poll (STUDIO-1896); `None`
+    /// outside a tick, so nothing read in one tick is ever served in another. See
+    /// [`crate::retry::TickCandidates`].
+    pub(crate) tick_candidates: std::sync::Mutex<Option<crate::retry::TickCandidates>>,
     /// The daemon-wide bound on concurrent resolver tasks. Shared with each spawned task, which holds
     /// its permit for the task's whole lifetime.
     pub(crate) prepare_semaphore: Arc<tokio::sync::Semaphore>,
@@ -1424,6 +1432,8 @@ impl Orchestrator {
             prepare_resolver: None,
             prepare_generation: 0,
             prepare_timeout: crate::prepare::DEFAULT_PREPARATION_TIMEOUT,
+            revalidation_retry_delay: crate::prepare::DEFAULT_REVALIDATION_RETRY_DELAY,
+            tick_candidates: std::sync::Mutex::new(None),
             prepare_semaphore: Arc::new(tokio::sync::Semaphore::new(
                 crate::prepare::MAX_PREPARATION_CONCURRENCY,
             )),

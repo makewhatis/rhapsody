@@ -9,7 +9,6 @@
 //! A team with no matching state is [`TrackerError::StateNotFound`] (the `ErrLinearStateNotFound`
 //! mirror); a `success: false` response is [`MoveRejected`](LinearErrorKind::MoveRejected).
 
-use super::client::traced;
 use super::{Client, LinearError, LinearErrorKind, query};
 use crate::TrackerError;
 use rhapsody_core::normalize_state;
@@ -70,7 +69,7 @@ pub(super) async fn move_issue_state(
     team_id: &str,
     state_name: &str,
 ) -> Result<(), TrackerError> {
-    traced(crate::tracker_span!("move_issue_state"), async move {
+    crate::traced_op!("move_issue_state", async move {
         if issue_id.is_empty() || team_id.is_empty() || state_name.is_empty() {
             return Err(LinearError::new(
                 LinearErrorKind::ApiRequest,

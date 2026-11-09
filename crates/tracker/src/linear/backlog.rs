@@ -10,7 +10,7 @@
 //! a missing issue returns `("", 0)`, never an error).
 
 use super::candidates::{IssuesPage, MAX_PAGES, resolve_milestone_id};
-use super::client::{resolve_viewer, traced};
+use super::client::resolve_viewer;
 use super::{Client, LinearError, LinearErrorKind, query};
 use crate::TrackerError;
 use rhapsody_core::Issue;
@@ -20,7 +20,7 @@ use serde_json::Value;
 /// for the configured project, assigned to the API key owner, following pagination
 /// (backlog.go's `FetchBlockedBacklogIssues`).
 pub(super) async fn fetch_blocked_backlog_issues(c: &Client) -> Result<Vec<Issue>, TrackerError> {
-    traced(crate::tracker_span!("fetch_blocked_backlog"), async move {
+    crate::traced_op!("fetch_blocked_backlog", async move {
         // Like the candidate fetch, narrow to the API key owner's assigned issues. Resolve (and
         // cache) the viewer first; a resolution failure fails the whole fetch.
         let viewer = resolve_viewer(c).await?;
@@ -82,7 +82,7 @@ pub(super) async fn fetch_issue_branch_by_id(
     if !super::issue_id::valid(id) {
         return Ok((String::new(), 0));
     }
-    traced(crate::tracker_span!("fetch_issue_branch"), async move {
+    crate::traced_op!("fetch_issue_branch", async move {
         let vars = serde_json::json!({ "ids": [id], "first": 1 });
         let page: super::by_ids::IdsPage =
             c.do_graphql(query::QUERY_BRANCH_BY_ID, Some(vars)).await?;

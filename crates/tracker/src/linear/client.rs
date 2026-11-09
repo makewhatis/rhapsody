@@ -13,7 +13,8 @@ use rhapsody_core::Viewer;
 use serde::de::DeserializeOwned;
 use std::collections::HashMap;
 use std::future::Future;
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tracing::{Instrument, Span};
 
 /// The default HTTP timeout Go applies in `New` (upstream §11.2: 30s).
@@ -85,7 +86,22 @@ pub struct Client {
     /// across the lookup so a fan-out's several creates issue one project query between them.
     /// Written by `resolve_project_id` in the sibling `create` module.
     pub(in crate::linear) project_id: tokio::sync::Mutex<String>,
+    /// The request budget this client's API key shares with every other client on the same key
+    /// (STUDIO-1896): `do_graphql` counts each request in it under the calling operation, and a 429
+    /// blocks the whole key until Linear's reset.
+    ledger: Arc<crate::budget::RequestLedger>,
 }
+
+tokio::task_local! {
+    /// The tracker operation a request belongs to — set by [`traced`] for the operation's whole
+    /// duration and read by [`Client::do_graphql`] to count the request under it. A task-local
+    /// rather than the span's name because a span can be disabled by the subscriber's filter, and
+    /// the budget's attribution must not depend on the log level.
+    static OPERATION: &'static str;
+}
+
+/// How long a 429 blocks the key when Linear sent no usable reset header.
+const DEFAULT_RATE_LIMIT_BLOCK: Duration = Duration::from_secs(60);
 
 /// Builds a linear [`Client`] from its [`Config`], applying Go `New`'s defaults (30s timeout,
 /// `@symphony` summon token). The token is compiled with
@@ -102,7 +118,9 @@ pub fn new(config: Config) -> Client {
         .timeout(HTTP_TIMEOUT)
         .build()
         .ok();
+    let ledger = crate::budget::ledger_for(&config.api_key);
     Client {
+        ledger,
         config,
         http,
         summon_re,
@@ -131,6 +149,11 @@ impl Client {
         self.config.claim_mode == "pool"
     }
 
+    /// The request ledger this client's API key shares (STUDIO-1896).
+    pub fn request_ledger(&self) -> &Arc<crate::budget::RequestLedger> {
+        &self.ledger
+    }
+
     /// Executes one GraphQL operation and decodes `response.data` into `T` (client.go's
     /// `doGraphQL`). Sends the `Authorization` (raw API key) + `Content-Type: application/json`
     /// headers to the configured endpoint, and maps failures to the matching sentinel:
@@ -153,6 +176,23 @@ impl Client {
         let http = self.http.as_ref().ok_or_else(|| {
             LinearError::new(LinearErrorKind::ApiRequest, "http client unavailable")
         })?;
+        // A 429 still blocking the key: sending would only spend another refused request, so fail
+        // the call now with the same transient error the 429 itself produced (STUDIO-1896).
+        if let Some(left) = self.ledger.blocked_for(Instant::now()) {
+            return Err(LinearError::new(
+                LinearErrorKind::RateLimited,
+                format!(
+                    "rate limit resets in {}s; request not sent",
+                    left.as_secs().max(1)
+                ),
+            )
+            .into());
+        }
+        let op = OPERATION
+            .try_with(|op| *op)
+            .unwrap_or(crate::budget::UNTAGGED);
+        self.ledger.record(op, Instant::now());
+        tracing::debug!(op, "linear request");
         let payload = serde_json::json!({ "query": query, "variables": variables });
         let body = serde_json::to_vec(&payload)
             .map_err(|e| LinearError::new(LinearErrorKind::ApiRequest, format!("marshal: {e}")))?;
@@ -167,11 +207,45 @@ impl Client {
             .map_err(|e| LinearError::new(LinearErrorKind::ApiRequest, e.to_string()))?;
 
         let status = resp.status();
+        let limits = RateLimitHeaders::read(resp.headers());
+        if let (Some(remaining), Some(limit)) = (limits.remaining, limits.limit) {
+            self.ledger.observe_remote(remaining, limit, Instant::now());
+        }
         let raw = resp.bytes().await.map_err(|e| {
             LinearError::new(LinearErrorKind::ApiRequest, format!("read body: {e}"))
         })?;
 
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let wait = self.rate_limited(op, &limits);
+            return Err(LinearError::new(
+                LinearErrorKind::RateLimited,
+                format!(
+                    "status 429, retry in {}s: {}",
+                    wait.as_secs(),
+                    body_snippet(&raw, 512)
+                ),
+            )
+            .into());
+        }
         if status != reqwest::StatusCode::OK {
+            // Linear can also answer a rate-limit refusal as a non-429 carrying a `RATELIMITED`
+            // GraphQL error; honour its reset the same way.
+            if let Ok(env) = serde_json::from_slice::<GqlResponse>(&raw)
+                && super::errors::classify_graphql_errors(&env.errors)
+                    == LinearErrorKind::RateLimited
+            {
+                let wait = self.rate_limited(op, &limits);
+                return Err(LinearError::new(
+                    LinearErrorKind::RateLimited,
+                    format!(
+                        "status {}, retry in {}s: {}",
+                        status.as_u16(),
+                        wait.as_secs(),
+                        body_snippet(&raw, 512)
+                    ),
+                )
+                .into());
+            }
             // Include a bounded snippet of the body: on a 400 Linear returns the actionable
             // GraphQL parse/validation error here, which the status code alone hides. Bounded so a
             // large/HTML error page can't flood logs.
@@ -185,11 +259,11 @@ impl Client {
         let env: GqlResponse = serde_json::from_slice(&raw)
             .map_err(|e| LinearError::new(LinearErrorKind::UnknownPayload, e.to_string()))?;
         if !env.errors.is_empty() {
-            return Err(LinearError::new(
-                super::errors::classify_graphql_errors(&env.errors),
-                format!("{:?}", env.errors),
-            )
-            .into());
+            let kind = super::errors::classify_graphql_errors(&env.errors);
+            if kind == LinearErrorKind::RateLimited {
+                self.rate_limited(op, &limits);
+            }
+            return Err(LinearError::new(kind, format!("{:?}", env.errors)).into());
         }
         let data = env
             .data
@@ -200,6 +274,71 @@ impl Client {
                 format!("decode data: {e}"),
             ))
         })
+    }
+}
+
+impl Client {
+    /// Blocks the shared key until Linear's reset and logs the refusal; returns the block length.
+    fn rate_limited(&self, op: &'static str, limits: &RateLimitHeaders) -> Duration {
+        let wait = limits.reset_after(SystemTime::now());
+        let now = Instant::now();
+        self.ledger.block_until(now + wait, now);
+        tracing::warn!(
+            op,
+            retry_in_secs = wait.as_secs(),
+            "Linear rate limit hit; holding every request on this key until the reset"
+        );
+        wait
+    }
+}
+
+/// The rate-limit headers Linear sends with a response. Every field is optional: a header that is
+/// missing or unparseable is simply not known.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct RateLimitHeaders {
+    /// `Retry-After`, in seconds.
+    retry_after: Option<u64>,
+    /// `X-RateLimit-Requests-Reset`: when the window reopens, as UTC epoch milliseconds.
+    reset_epoch_ms: Option<u64>,
+    /// `X-RateLimit-Requests-Remaining`.
+    remaining: Option<u32>,
+    /// `X-RateLimit-Requests-Limit`.
+    limit: Option<u32>,
+}
+
+impl RateLimitHeaders {
+    pub(super) fn read(headers: &reqwest::header::HeaderMap) -> RateLimitHeaders {
+        fn num<T: std::str::FromStr>(h: &reqwest::header::HeaderMap, name: &str) -> Option<T> {
+            h.get(name)?.to_str().ok()?.trim().parse().ok()
+        }
+        RateLimitHeaders {
+            retry_after: num(headers, "retry-after"),
+            reset_epoch_ms: num(headers, "x-ratelimit-requests-reset"),
+            remaining: num(headers, "x-ratelimit-requests-remaining"),
+            limit: num(headers, "x-ratelimit-requests-limit"),
+        }
+    }
+
+    /// How long to hold off from `now`: `Retry-After` when present, else the time until the
+    /// requests window resets, else [`DEFAULT_RATE_LIMIT_BLOCK`]. Never zero — a reset already in
+    /// the past still waits a second rather than re-sending into the same refusal.
+    pub(super) fn reset_after(&self, now: SystemTime) -> Duration {
+        if let Some(secs) = self.retry_after {
+            return Duration::from_secs(secs.max(1));
+        }
+        if let Some(reset) = self.reset_epoch_ms {
+            // Linear documents milliseconds; a value too small to be one is read as seconds.
+            let reset_ms = if reset < 100_000_000_000 {
+                reset.saturating_mul(1000)
+            } else {
+                reset
+            };
+            let now_ms = now
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
+            return Duration::from_millis(reset_ms.saturating_sub(now_ms).max(1000));
+        }
+        DEFAULT_RATE_LIMIT_BLOCK
     }
 }
 
@@ -263,11 +402,15 @@ pub(super) async fn resolve_viewer(c: &Client) -> Result<Viewer, TrackerError> {
 /// Runs a tracker operation `fut` under `span` for the call's whole duration, recording the
 /// operation's error onto the span before it ends — the async mirror of tracing.go's
 /// `startTrackerSpan`/`endTrackerSpan` pairing (`tracker_span!` supplies the span).
-pub(super) async fn traced<T, F>(span: Span, fut: F) -> Result<T, TrackerError>
+///
+/// `op` is the operation's name (the span's suffix) and is also scoped onto the task for the call,
+/// so every Linear request the operation sends is counted under it in the request budget
+/// (STUDIO-1896) whatever the subscriber's filter does with the span.
+pub(crate) async fn traced<T, F>(op: &'static str, span: Span, fut: F) -> Result<T, TrackerError>
 where
     F: Future<Output = Result<T, TrackerError>>,
 {
-    let result = fut.instrument(span.clone()).await;
+    let result = OPERATION.scope(op, fut.instrument(span.clone())).await;
     if let Err(e) = &result {
         span.record("error", e.to_string().as_str());
     }

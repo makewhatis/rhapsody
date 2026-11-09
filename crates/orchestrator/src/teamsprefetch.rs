@@ -388,6 +388,12 @@ pub struct PrefetchTarget {
     /// Start of the candidate fetch, not publication time, so slow polls cannot
     /// make old candidates look newly fetched.
     pub fetched_at: DateTime<Utc>,
+    /// The slug of the project each entry of `issues` arrived through, positionally
+    /// (STUDIO-1896), so Teams triage can reuse this set — writing back through the
+    /// owning project's client — instead of fetching every project's candidates again.
+    /// Empty when the publisher cannot name them (the legacy single-tracker path);
+    /// triage then fetches for itself.
+    pub owner_slugs: Vec<String>,
 }
 
 /// Everything [`run_prefetch_schedule`] runs against. The absence of an
@@ -833,6 +839,7 @@ mod tests {
         o.set_reads_candidates(PrefetchTarget {
             issues: tracker.candidates.clone(),
             fetched_at: at(now),
+            owner_slugs: Vec::new(),
         });
         let handle = o.control();
         PrefetchDeps {
@@ -1116,6 +1123,7 @@ mod tests {
         o.set_reads_candidates(PrefetchTarget {
             issues: vec![issue("1", "MT-1", &["rust"]), issue("2", "MT-2", &["rust"])],
             fetched_at: at(0),
+            owner_slugs: Vec::new(),
         });
         let handle = o.control();
         let d = PrefetchDeps {
@@ -1165,6 +1173,7 @@ mod tests {
                     fetched_at.map(|fetched_at| PrefetchTarget {
                         issues: tracker.candidates.clone(),
                         fetched_at,
+                        owner_slugs: Vec::new(),
                     })
                 },
                 backend: bank.clone() as Arc<dyn MemoryBackend>,
@@ -1223,6 +1232,7 @@ mod tests {
                 .cloned()
                 .collect(),
             fetched_at: at(0),
+            owner_slugs: Vec::new(),
         });
         let handle = o.control();
         let d = PrefetchDeps {
@@ -1582,6 +1592,7 @@ mod tests {
                 Some(PrefetchTarget {
                     issues: vec![issue("1", "MT-1", &["rust"]), issue("2", "MT-2", &["rust"])],
                     fetched_at: at(0),
+                    owner_slugs: Vec::new(),
                 })
             },
             backend: Arc::new(FlakyBank {

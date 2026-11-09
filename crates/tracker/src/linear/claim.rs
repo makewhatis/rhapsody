@@ -10,7 +10,6 @@
 //! [`MissingCursor`](LinearErrorKind::MissingCursor).
 
 use super::candidates::{MAX_PAGES, PageInfo};
-use super::client::traced;
 use super::normalize::parse_time;
 use super::{Client, LinearError, LinearErrorKind, query};
 use crate::TrackerError;
@@ -129,7 +128,7 @@ pub(super) async fn assign_issue(
     issue_id: &str,
     assignee_id: &str,
 ) -> Result<(), TrackerError> {
-    traced(crate::tracker_span!("assign_issue"), async move {
+    crate::traced_op!("assign_issue", async move {
         if issue_id.is_empty() || assignee_id.is_empty() {
             return Err(LinearError::new(
                 LinearErrorKind::ApiRequest,
@@ -162,7 +161,7 @@ pub(super) async fn fetch_issue_assignee(
     c: &Client,
     issue_id: &str,
 ) -> Result<String, TrackerError> {
-    traced(crate::tracker_span!("fetch_issue_assignee"), async move {
+    crate::traced_op!("fetch_issue_assignee", async move {
         if !super::issue_id::valid(issue_id) {
             return Ok(String::new());
         }
@@ -187,7 +186,7 @@ pub(super) async fn create_comment(
     issue_id: &str,
     body: &str,
 ) -> Result<String, TrackerError> {
-    traced(crate::tracker_span!("create_comment"), async move {
+    crate::traced_op!("create_comment", async move {
         if issue_id.is_empty() || body.is_empty() {
             return Err(LinearError::new(
                 LinearErrorKind::ApiRequest,
@@ -227,7 +226,7 @@ pub(super) async fn list_comments(
     c: &Client,
     issue_id: &str,
 ) -> Result<Vec<Comment>, TrackerError> {
-    traced(crate::tracker_span!("list_comments"), async move {
+    crate::traced_op!("list_comments", async move {
         if !super::issue_id::valid(issue_id) {
             return Ok(Vec::new());
         }
@@ -277,7 +276,7 @@ pub(super) async fn list_comments(
 /// DeleteComment removes a comment by id (claim-comment cleanup; claim.go's `DeleteComment`). A
 /// `success: false` response is [`MoveRejected`](LinearErrorKind::MoveRejected).
 pub(super) async fn delete_comment(c: &Client, comment_id: &str) -> Result<(), TrackerError> {
-    traced(crate::tracker_span!("delete_comment"), async move {
+    crate::traced_op!("delete_comment", async move {
         if comment_id.is_empty() {
             return Err(
                 LinearError::new(LinearErrorKind::ApiRequest, "delete requires commentID").into(),

@@ -41,6 +41,7 @@ impl GqlReq {
 pub(super) struct MockResp {
     status: u16,
     body: String,
+    headers: Vec<(String, String)>,
 }
 
 impl MockResp {
@@ -49,6 +50,7 @@ impl MockResp {
         Self {
             status: 200,
             body: body.into(),
+            headers: Vec::new(),
         }
     }
 
@@ -57,7 +59,14 @@ impl MockResp {
         Self {
             status: code,
             body: body.into(),
+            headers: Vec::new(),
         }
+    }
+
+    /// Adds a response header (e.g. Linear's `X-RateLimit-*` headers).
+    pub(super) fn header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
     }
 }
 
@@ -179,11 +188,17 @@ fn header_value(head: &str, name: &str) -> Option<String> {
 
 /// Writes an HTTP/1.1 response with the reply's status + body and `Connection: close`.
 async fn write_response(stream: &mut TcpStream, resp: &MockResp) {
+    let extra: String = resp
+        .headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
     let payload = format!(
-        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {} {}\r\nContent-Length: {}\r\n{}Connection: close\r\n\r\n{}",
         resp.status,
         reason_phrase(resp.status),
         resp.body.len(),
+        extra,
         resp.body
     );
     let _ = stream.write_all(payload.as_bytes()).await;

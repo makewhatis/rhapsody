@@ -1204,7 +1204,7 @@ where
             // triage assigned identities to In-Review tickets — parked design records and work
             // already under human review — that the gate could never have held.
             target: move || {
-                let snap = triage_handle.reads_triage_target()?;
+                let (snap, candidates) = triage_handle.reads_triage_target_with_candidates()?;
                 // Triage sweeps every project, so it takes the clients and drops the slug each is
                 // bound to (STUDIO-677 keeps those beside them for the WRITERS — the quorum picks
                 // exactly one project to create through). `facts` stays positionally aligned with the
@@ -1212,9 +1212,12 @@ where
                 // snapshot in the SAME order: the manager's answer scope (STUDIO-731) is exactly the
                 // set of projects this cycle swept, so it cannot drift from what triage saw.
                 let slugs = snap.trackers.iter().map(|p| p.slug.clone()).collect();
-                Some(rhapsody_orchestrator::TriageTarget::from_snapshot(
-                    snap, slugs,
-                ))
+                // The poll's last complete candidate set rides along from the SAME lock, so the
+                // cycle sweeps it instead of fetching every project again (STUDIO-1896).
+                Some(
+                    rhapsody_orchestrator::TriageTarget::from_snapshot(snap, slugs)
+                        .with_candidates(candidates),
+                )
             },
             // The manager's model turn now runs through its OWN resolved tuple and the shared
             // provider-preparation path (STUDIO-989, P8) instead of the hardcoded Claude subprocess.
@@ -4714,6 +4717,7 @@ mod tests {
                 ..Default::default()
             }],
             fetched_at,
+            owner_slugs: Vec::new(),
         });
         let target = prefetch_target(&handle).unwrap();
         assert_eq!(target.issues[0].identifier, "MT-1");

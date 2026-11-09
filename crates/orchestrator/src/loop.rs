@@ -1240,6 +1240,33 @@ impl Orchestrator {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// Whether any configured tracker reports its Linear request budget tight (STUDIO-1896): at or
+    /// above 80% of the key's hourly limit, Linear's own remaining count nearly spent, or the key
+    /// blocked by a 429. Every client on one key shares one budget, so this asks each distinct
+    /// client once. The file and fake trackers report no budget and are never tight.
+    pub(crate) fn linear_budget_tight(&self) -> bool {
+        let Some(eff) = self.eff.as_ref() else {
+            return false;
+        };
+        let tight =
+            |t: &Arc<dyn rhapsody_tracker::Tracker>| t.request_budget().is_some_and(|b| b.tight);
+        tight(&eff.tracker) || eff.projects.iter().any(|p| tight(&p.tracker))
+    }
+
+    /// The delay before the next poll: the configured interval, DOUBLED while the Linear budget is
+    /// tight (STUDIO-1896). The poll is the daemon's largest steady consumer, so slowing it is what
+    /// gives the budget back; the dispatch-critical reads a tick makes (reconcile, completion
+    /// revalidation) are never skipped, only made less often along with it. The ledger itself logs
+    /// the one warning when the budget tightens and the info line when it relaxes.
+    pub(crate) fn paced_poll_interval(&self) -> Duration {
+        let poll = self.poll_interval();
+        if self.linear_budget_tight() {
+            poll.saturating_mul(2)
+        } else {
+            poll
+        }
+    }
+
     /// The github-summons `since` watermark for this tick: now minus the sliding lookback window (Go
     /// `o.now().Add(-o.ghLookback)`).
     fn gh_since(&self) -> DateTime<Utc> {
@@ -1285,7 +1312,7 @@ impl Orchestrator {
     /// onTick: reconcile → preflight validate → fetch candidates → dispatch (upstream §8.1, §16.2),
     /// re-arming the poll timer at the end (Go's `defer scheduleTick`). Mirrors Go `onTick`.
     pub(crate) async fn on_tick(&mut self) {
-        let poll = self.poll_interval();
+        let poll = self.paced_poll_interval();
         // STUDIO-1043: the retained-session retention sweep. ABOVE every early return below, for the
         // same reason as the review reconciliation sweep: a daemon held by a bad config, an armed
         // drain or a dead credential is exactly one whose kept opencode sessions would otherwise
@@ -1365,8 +1392,14 @@ impl Orchestrator {
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
         async {
+            // One candidate read per project for the retry pass and the poll, then one more for the
+            // poll's own retry pass (STUDIO-1896). Closed before auto-promote and the next tick.
+            let opened = self.open_tick_cache();
             self.dispatch_ready_retries().await;
             self.dispatch_decisions().await;
+            if opened {
+                self.close_tick_cache();
+            }
             // DAG auto-promote (INF-318): AFTER the normal dispatch decisions, flip any enabled-mode
             // Backlog dependent whose blockers are cleared Backlog→Todo (O6 `promote.rs`). A no-op for
             // disabled-mode projects; runs for BOTH the multi-project and legacy paths.
@@ -1445,6 +1478,8 @@ impl Orchestrator {
                 .collect();
             // A waiter parked against its old state may now have capacity. Reconsider it before
             // fresh selection can spend that slot; saturated waiters still make no tracker read.
+            // Its admission reads newer data than this poll did, shared across the pass.
+            self.refresh_tick_cache();
             self.dispatch_ready_retries().await;
             // Rhapsody Teams review quorum (STUDIO-659, T7): the same snapshot, for the other
             // consumer — per-identity load and each ticket's open PR / marker label, so a handoff
@@ -1537,8 +1572,8 @@ impl Orchestrator {
             return;
         };
         let fetched_at = (self.now)();
-        let issues = match tracker
-            .fetch_candidate_issues()
+        let issues = match self
+            .fetch_candidates_for_tick(&tracker)
             .instrument(tracing::info_span!("symphony.fetch_candidates"))
             .await
         {
@@ -1550,7 +1585,10 @@ impl Orchestrator {
         };
         self.set_reads_candidates(crate::teamsprefetch::PrefetchTarget {
             issues: issues.clone(),
-            fetched_at,
+            // No later than the read this tick actually reused (STUDIO-1896).
+            fetched_at: self.tick_reads_began(fetched_at),
+            // The legacy path has no project slug to name; triage fetches for itself.
+            owner_slugs: Vec::new(),
         });
         // github-summons enrichment (AIE-299): advance latest_summon_at from unmerged linked-PR summon
         // comments before eligibility selection. Gated on the legacy flag AND a non-nil source, so the
@@ -1597,6 +1635,7 @@ impl Orchestrator {
             .map(|re| re.identifier.clone())
             .collect();
         // The legacy ladder must give refreshed waiters the same first claim as the project path.
+        self.refresh_tick_cache();
         self.dispatch_ready_retries().await;
         self.record_quorum_state(issues.iter());
         self.observe_lead_review_departures(issues.iter().map(|iss| (iss, None)), true);
@@ -1804,6 +1843,8 @@ impl Orchestrator {
 
             // --- Pass 1: candidates + dedup. No GitHub I/O at all. -------------------------------
             let mut tagged: Vec<TaggedIssue> = Vec::new();
+            // The owning project's slug per entry of `tagged`, for the published set (STUDIO-1896).
+            let mut tagged_slugs: Vec<String> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             // How many ENABLED projects there are to poll, and how many actually answered — the
             // human-hold ledger's prime/no-prime verdict (STUDIO-949 rounds 13-15). See
@@ -1816,7 +1857,9 @@ impl Orchestrator {
             let mut wanted: Vec<(String, String, String)> = Vec::new();
             let fetched_at = (self.now)();
             for p in projs {
-                let issues = match p.tracker.fetch_candidate_issues().await {
+                // Shared with this tick's retries (STUDIO-1896): a project a due retry already
+                // read is not read again.
+                let issues = match self.fetch_candidates_for_tick(&p.tracker).await {
                     Ok(i) => {
                         // Recovered (or never broken): drop any streak so the warning clears.
                         warnings.clear_fetch_failures(&p.group);
@@ -1845,6 +1888,7 @@ impl Orchestrator {
                         iss,
                         proj: Some(p.idx),
                     });
+                    tagged_slugs.push(p.slug.clone());
                 }
             }
             // "ALL enabled projects answered", not "at least one" (STUDIO-949 round 15). The ledger's
@@ -1868,7 +1912,10 @@ impl Orchestrator {
             if answered_projects == enabled_projects {
                 self.set_reads_candidates(crate::teamsprefetch::PrefetchTarget {
                     issues: tagged.iter().map(|t| t.iss.clone()).collect(),
-                    fetched_at,
+                    // No later than the oldest read this poll reused from the tick's retry pass
+                    // (STUDIO-1896): triage's written overlay trusts the stamp as a lower bound.
+                    fetched_at: self.tick_reads_began(fetched_at),
+                    owner_slugs: tagged_slugs,
                 });
             }
 
@@ -2915,6 +2962,48 @@ impl Orchestrator {
 
 #[cfg(test)]
 mod tests {
+    /// STUDIO-1896: the poll waits twice its configured interval while ANY configured tracker —
+    /// the top-level one or a project's — reports its Linear budget tight, and the configured
+    /// interval otherwise. A tracker with no budget (file, fake) never slows it.
+    ///
+    /// MUTATION: return `poll` unconditionally from `paced_poll_interval` and the tight cases fail;
+    /// drop the projects half of `linear_budget_tight` and the project case fails.
+    #[test]
+    fn the_poll_slows_while_any_linear_budget_is_tight() {
+        use crate::testsupport::{empty_effective, empty_resolved_project};
+        use rhapsody_tracker::Tracker;
+        use rhapsody_tracker::budget::BudgetStatus;
+        use rhapsody_tracker::fake::Fake;
+        let fake = |tight: Option<bool>| -> Arc<dyn Tracker> {
+            let mut f = Fake::new();
+            f.request_budget = tight.map(|tight| BudgetStatus {
+                used: 2100,
+                limit: 2500,
+                tight,
+                blocked_for: None,
+            });
+            Arc::new(f)
+        };
+        let poll = Duration::from_secs(120);
+        for (top, project, want) in [
+            (None, None, poll),
+            (Some(false), Some(false), poll),
+            (Some(true), None, poll * 2),
+            (None, Some(true), poll * 2),
+        ] {
+            let mut eff = empty_effective(fake(top));
+            eff.poll_interval = poll;
+            eff.projects = vec![empty_resolved_project("a", fake(project))];
+            let mut o = crate::Orchestrator::new("not-read.md");
+            o.eff = Some(eff);
+            assert_eq!(
+                o.paced_poll_interval(),
+                want,
+                "top={top:?} project={project:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_releases_account_activity_with_store_off() {
         let mut o = crate::Orchestrator::new("not-read.md");
@@ -4082,6 +4171,49 @@ mod tests {
             "a running issue's retained session directory must survive the tick sweep (B2)"
         );
         assert!(rec.exists(), "and its record must survive");
+    }
+
+    /// STUDIO-1896: a poll that reuses a read from the tick's earlier retry pass publishes the
+    /// set stamped no later than that read, not at its own start. Triage's written overlay treats
+    /// the stamp as the moment the board was read: a later stamp would let a read that predates a
+    /// label write retire that write, and the ticket would be assigned twice. MUTATION GUARD:
+    /// publish `fetched_at` instead of `tick_reads_began(fetched_at)` and both ladders fail.
+    #[tokio::test]
+    async fn a_poll_reusing_an_earlier_read_publishes_that_reads_stamp() {
+        for ladder in ["legacy", "projects"] {
+            let mut f = Fake::new();
+            f.candidates = vec![issue("1", "MT-1", "Todo")];
+            let tr = Arc::new(f);
+            let (mut o, _) = crate::testsupport::orch_for_retry(tr.clone(), 10);
+            if ladder == "projects" {
+                o.eff.as_mut().unwrap().projects = vec![proj_with_tracker("a", tr.clone(), "")];
+            }
+            let read_at = Utc::now();
+            let poll_at = read_at + chrono::Duration::seconds(5);
+            let handle = o.control();
+            assert!(o.open_tick_cache());
+            // The retry pass's read, made through the same client the poll will ask.
+            o.now = Box::new(move || read_at);
+            let client: Arc<dyn rhapsody_tracker::Tracker> = if ladder == "projects" {
+                Arc::clone(&o.eff.as_ref().unwrap().projects[0].tracker)
+            } else {
+                Arc::clone(&o.eff.as_ref().unwrap().tracker)
+            };
+            o.fetch_candidates_for_tick(&client).await.unwrap();
+            o.now = Box::new(move || poll_at);
+            o.dispatch_decisions().await;
+            o.close_tick_cache();
+            assert_eq!(
+                tr.candidate_calls(),
+                1,
+                "{ladder}: the poll reused the read"
+            );
+            assert_eq!(
+                handle.reads_candidates().expect("published").fetched_at,
+                read_at,
+                "{ladder}: stamped at the reused read, not the poll's start"
+            );
+        }
     }
 
     #[tokio::test]
