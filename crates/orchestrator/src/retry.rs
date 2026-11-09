@@ -318,11 +318,94 @@ pub(crate) fn classify_clean_exit(
     )
 }
 
+/// One tick's successful candidate fetches, keyed by the tracker client that made them
+/// (STUDIO-1896). [`Orchestrator::dispatch_ready_retries`] runs before AND after the poll, and every
+/// due retry used to fetch its project's complete candidate set for itself — the same query the
+/// poll then sent again, so two due retries on one project cost three identical reads in one tick.
+///
+/// Keyed by the `Arc`'s address: every reader resolves the client from the same `Effective`
+/// (`ResolvedProject::tracker`, or `Effective::tracker` on the legacy ladder), which is never
+/// swapped mid-tick (a reload is its own control event), so one client is one key and an address
+/// cannot be reused while the map is alive. A FAILED fetch is never cached, so the next reader in
+/// the tick asks again — exactly what it did before. Behind a `Mutex` only so the `&self` poll can
+/// use it; it is control-task-owned like every field there and is NOT an off-loop seam.
+pub(crate) type TickCandidates = HashMap<usize, Vec<Issue>>;
+
+/// The [`TickCandidates`] key for a client.
+fn tick_key(tracker: &Arc<dyn Tracker>) -> usize {
+    Arc::as_ptr(tracker).cast::<()>() as usize
+}
+
 impl Orchestrator {
+    /// Locks this tick's candidate cache, treating a poisoned lock as readable: it holds plain
+    /// copies of fetched issues, so a panic elsewhere cannot leave it inconsistent.
+    fn tick_cache(&self) -> std::sync::MutexGuard<'_, Option<TickCandidates>> {
+        self.tick_candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Opens a tick's candidate cache. Returns whether THIS call opened it, so a nested caller
+    /// (a retry pass inside the tick) leaves the tick's cache alone when it is done.
+    pub(crate) fn open_tick_cache(&self) -> bool {
+        let mut c = self.tick_cache();
+        if c.is_some() {
+            return false;
+        }
+        *c = Some(TickCandidates::new());
+        true
+    }
+
+    /// Closes the tick's candidate cache, dropping everything it read.
+    pub(crate) fn close_tick_cache(&self) {
+        *self.tick_cache() = None;
+    }
+
+    /// `tracker`'s candidate set: from the open tick's cache when this tick already read it,
+    /// otherwise fetched (and remembered, when a tick is open). With no tick open every call
+    /// fetches, so a reader outside a tick never sees an older tick's board.
+    ///
+    /// The cache needs no invalidation inside a tick: between its first fill and its last reader
+    /// (the retry pass after the poll) the control task makes no tracker WRITE — a dispatch hands
+    /// its state move to the worker, off-loop, and the pool claims and review-reopen promotions
+    /// run after the last reader. The one ticket a dispatch can change is the one just dispatched,
+    /// which every later reader already excludes as running or claimed. The lock is never held
+    /// across the fetch.
+    pub(crate) async fn fetch_candidates_for_tick(
+        &self,
+        tracker: &Arc<dyn Tracker>,
+    ) -> Result<Vec<Issue>, TrackerError> {
+        let key = tick_key(tracker);
+        let hit = self
+            .tick_cache()
+            .as_ref()
+            .and_then(|c| c.get(&key).cloned());
+        if let Some(hit) = hit {
+            return Ok(hit);
+        }
+        let fetched = tracker.fetch_candidate_issues().await?;
+        if let Some(c) = self.tick_cache().as_mut() {
+            c.insert(key, fetched.clone());
+        }
+        Ok(fetched)
+    }
+
     /// Give already-started work first claim on freed slots. A capacity wait keeps its original due
     /// time, so repeated parking cannot send the oldest retry to the back of the queue. Future
     /// failure backoffs and account-limit waits retain their own deadlines/handlers.
+    ///
+    /// Every retry this call admits shares one candidate read per project (STUDIO-1896): inside a
+    /// tick through the tick's own cache, and from a bare retry timer through a cache scoped to
+    /// this call.
     pub(crate) async fn dispatch_ready_retries(&mut self) {
+        let scoped = self.open_tick_cache();
+        self.dispatch_ready_retries_inner().await;
+        if scoped {
+            self.close_tick_cache();
+        }
+    }
+
+    async fn dispatch_ready_retries_inner(&mut self) {
         let now = (self.now)();
         let mut ready: Vec<_> = self
             .retry_attempts
@@ -1628,7 +1711,7 @@ impl Orchestrator {
             return;
         }
 
-        let candidates = match cfg.tracker.fetch_candidate_issues().await {
+        let candidates = match self.fetch_candidates_for_tick(&cfg.tracker).await {
             Ok(c) => c,
             Err(_) => {
                 // Keep the claim + requeue across a transient poll failure (§3.7) rather than abandon
@@ -3644,6 +3727,79 @@ mod tests {
             assert_eq!(o.running["old"].retry_attempt, 3);
             assert!(!o.running.contains_key("fresh"));
         }
+    }
+
+    /// STUDIO-1896: one tick reads a project's candidate set ONCE, however many of its retries are
+    /// due — the retry pass before the poll, the poll itself and the retry pass after it share the
+    /// read. Covers both ladders. MUTATION GUARD: fetch directly in `on_retry` (or in the poll) and
+    /// this reds at 3 calls; open no tick cache in `on_tick` and it reds at 2.
+    #[tokio::test]
+    async fn a_tick_reads_each_projects_candidates_once_across_retries_and_the_poll() {
+        for case in ["legacy", "projects"] {
+            let base = utc(2026, 11, 9, 15, 0, 0);
+            let one = issue("one", "A-1", "In Progress");
+            let two = issue("two", "A-2", "In Progress");
+            let mut f = Fake::new();
+            f.candidates = vec![one.clone(), two.clone()];
+            let tr = Arc::new(f);
+            let (mut o, dispatched) = orch_for_retry(tr.clone(), 10);
+            if case != "legacy" {
+                o.eff.as_mut().unwrap().projects = vec![proj_with_tracker("a", tr.clone(), "")];
+            }
+            o.now = Box::new(move || base);
+            for iss in [&one, &two] {
+                let mut re = retry_entry(&iss.id, &iss.identifier, 1);
+                re.issue = iss.clone();
+                re.due_at = base;
+                re.due_at_ms = base.timestamp_millis();
+                if case != "legacy" {
+                    re.project_slug = "a".into();
+                }
+                o.claimed.insert(iss.id.clone());
+                o.retry_attempts.insert(iss.id.clone(), re);
+            }
+            o.on_tick().await;
+            let mut got = dispatched.lock().unwrap().clone();
+            got.sort();
+            assert_eq!(got, vec!["one", "two"], "{case}: both retries dispatched");
+            assert_eq!(
+                tr.candidate_calls(),
+                1,
+                "{case}: a tick fetches the project candidate set only once"
+            );
+            // The cache is the TICK's: the next tick reads the board afresh.
+            o.on_tick().await;
+            assert_eq!(tr.candidate_calls(), 2, "{case}: a new tick reads again");
+        }
+    }
+
+    /// STUDIO-1896: retry timers that fire outside a tick still share one read per project across
+    /// the retries that one pass admits, and never reuse a read from an earlier pass.
+    #[tokio::test]
+    async fn a_retry_pass_outside_a_tick_shares_one_read_and_keeps_none() {
+        let base = utc(2026, 11, 9, 15, 0, 0);
+        let one = issue("one", "A-1", "In Progress");
+        let two = issue("two", "A-2", "In Progress");
+        let mut f = Fake::new();
+        f.candidates = vec![one.clone(), two.clone()];
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = orch_for_retry(tr.clone(), 10);
+        o.now = Box::new(move || base);
+        for iss in [&one, &two] {
+            let mut re = retry_entry(&iss.id, &iss.identifier, 1);
+            re.issue = iss.clone();
+            re.due_at = base;
+            re.due_at_ms = base.timestamp_millis();
+            o.claimed.insert(iss.id.clone());
+            o.retry_attempts.insert(iss.id.clone(), re);
+        }
+        o.dispatch_ready_retries().await;
+        assert_eq!(dispatched.lock().unwrap().len(), 2);
+        assert_eq!(tr.candidate_calls(), 1, "one read for the whole pass");
+        assert!(
+            o.tick_candidates.lock().unwrap().is_none(),
+            "the pass closed the cache it opened"
+        );
     }
 
     #[tokio::test(start_paused = true)]

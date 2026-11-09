@@ -1392,8 +1392,14 @@ impl Orchestrator {
         // span; reconcile is its own root). fetch_candidates + dispatch nest under it. O7 owns these
         // control-loop spans; the reconcile/dispatch/run spans + OTel export are P6 (see the module docs).
         async {
+            // One candidate read per project for the whole of retry admission and the poll
+            // (STUDIO-1896), closed before the auto-promote pass and before the next tick.
+            let opened = self.open_tick_cache();
             self.dispatch_ready_retries().await;
             self.dispatch_decisions().await;
+            if opened {
+                self.close_tick_cache();
+            }
             // DAG auto-promote (INF-318): AFTER the normal dispatch decisions, flip any enabled-mode
             // Backlog dependent whose blockers are cleared Backlog→Todo (O6 `promote.rs`). A no-op for
             // disabled-mode projects; runs for BOTH the multi-project and legacy paths.
@@ -1564,8 +1570,8 @@ impl Orchestrator {
             return;
         };
         let fetched_at = (self.now)();
-        let issues = match tracker
-            .fetch_candidate_issues()
+        let issues = match self
+            .fetch_candidates_for_tick(&tracker)
             .instrument(tracing::info_span!("symphony.fetch_candidates"))
             .await
         {
@@ -1847,7 +1853,9 @@ impl Orchestrator {
             let mut wanted: Vec<(String, String, String)> = Vec::new();
             let fetched_at = (self.now)();
             for p in projs {
-                let issues = match p.tracker.fetch_candidate_issues().await {
+                // Shared with this tick's retries (STUDIO-1896): a project a due retry already
+                // read is not read again.
+                let issues = match self.fetch_candidates_for_tick(&p.tracker).await {
                     Ok(i) => {
                         // Recovered (or never broken): drop any streak so the warning clears.
                         warnings.clear_fetch_failures(&p.group);
