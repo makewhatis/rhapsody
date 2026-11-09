@@ -1240,6 +1240,33 @@ impl Orchestrator {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// Whether any configured tracker reports its Linear request budget tight (STUDIO-1896): at or
+    /// above 80% of the key's hourly limit, Linear's own remaining count nearly spent, or the key
+    /// blocked by a 429. Every client on one key shares one budget, so this asks each distinct
+    /// client once. The file and fake trackers report no budget and are never tight.
+    pub(crate) fn linear_budget_tight(&self) -> bool {
+        let Some(eff) = self.eff.as_ref() else {
+            return false;
+        };
+        let tight =
+            |t: &Arc<dyn rhapsody_tracker::Tracker>| t.request_budget().is_some_and(|b| b.tight);
+        tight(&eff.tracker) || eff.projects.iter().any(|p| tight(&p.tracker))
+    }
+
+    /// The delay before the next poll: the configured interval, DOUBLED while the Linear budget is
+    /// tight (STUDIO-1896). The poll is the daemon's largest steady consumer, so slowing it is what
+    /// gives the budget back; the dispatch-critical reads a tick makes (reconcile, completion
+    /// revalidation) are never skipped, only made less often along with it. The ledger itself logs
+    /// the one warning when the budget tightens and the info line when it relaxes.
+    fn paced_poll_interval(&self) -> Duration {
+        let poll = self.poll_interval();
+        if self.linear_budget_tight() {
+            poll.saturating_mul(2)
+        } else {
+            poll
+        }
+    }
+
     /// The github-summons `since` watermark for this tick: now minus the sliding lookback window (Go
     /// `o.now().Add(-o.ghLookback)`).
     fn gh_since(&self) -> DateTime<Utc> {
@@ -1285,7 +1312,7 @@ impl Orchestrator {
     /// onTick: reconcile → preflight validate → fetch candidates → dispatch (upstream §8.1, §16.2),
     /// re-arming the poll timer at the end (Go's `defer scheduleTick`). Mirrors Go `onTick`.
     pub(crate) async fn on_tick(&mut self) {
-        let poll = self.poll_interval();
+        let poll = self.paced_poll_interval();
         // STUDIO-1043: the retained-session retention sweep. ABOVE every early return below, for the
         // same reason as the review reconciliation sweep: a daemon held by a bad config, an armed
         // drain or a dead credential is exactly one whose kept opencode sessions would otherwise
@@ -1551,6 +1578,8 @@ impl Orchestrator {
         self.set_reads_candidates(crate::teamsprefetch::PrefetchTarget {
             issues: issues.clone(),
             fetched_at,
+            // The legacy path has no project slug to name; triage fetches for itself.
+            owner_slugs: Vec::new(),
         });
         // github-summons enrichment (AIE-299): advance latest_summon_at from unmerged linked-PR summon
         // comments before eligibility selection. Gated on the legacy flag AND a non-nil source, so the
@@ -1804,6 +1833,8 @@ impl Orchestrator {
 
             // --- Pass 1: candidates + dedup. No GitHub I/O at all. -------------------------------
             let mut tagged: Vec<TaggedIssue> = Vec::new();
+            // The owning project's slug per entry of `tagged`, for the published set (STUDIO-1896).
+            let mut tagged_slugs: Vec<String> = Vec::new();
             let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
             // How many ENABLED projects there are to poll, and how many actually answered — the
             // human-hold ledger's prime/no-prime verdict (STUDIO-949 rounds 13-15). See
@@ -1845,6 +1876,7 @@ impl Orchestrator {
                         iss,
                         proj: Some(p.idx),
                     });
+                    tagged_slugs.push(p.slug.clone());
                 }
             }
             // "ALL enabled projects answered", not "at least one" (STUDIO-949 round 15). The ledger's
@@ -1869,6 +1901,7 @@ impl Orchestrator {
                 self.set_reads_candidates(crate::teamsprefetch::PrefetchTarget {
                     issues: tagged.iter().map(|t| t.iss.clone()).collect(),
                     fetched_at,
+                    owner_slugs: tagged_slugs,
                 });
             }
 
@@ -2915,6 +2948,48 @@ impl Orchestrator {
 
 #[cfg(test)]
 mod tests {
+    /// STUDIO-1896: the poll waits twice its configured interval while ANY configured tracker —
+    /// the top-level one or a project's — reports its Linear budget tight, and the configured
+    /// interval otherwise. A tracker with no budget (file, fake) never slows it.
+    ///
+    /// MUTATION: return `poll` unconditionally from `paced_poll_interval` and the tight cases fail;
+    /// drop the projects half of `linear_budget_tight` and the project case fails.
+    #[test]
+    fn the_poll_slows_while_any_linear_budget_is_tight() {
+        use crate::testsupport::{empty_effective, empty_resolved_project};
+        use rhapsody_tracker::Tracker;
+        use rhapsody_tracker::budget::BudgetStatus;
+        use rhapsody_tracker::fake::Fake;
+        let fake = |tight: Option<bool>| -> Arc<dyn Tracker> {
+            let mut f = Fake::new();
+            f.request_budget = tight.map(|tight| BudgetStatus {
+                used: 2100,
+                limit: 2500,
+                tight,
+                blocked_for: None,
+            });
+            Arc::new(f)
+        };
+        let poll = Duration::from_secs(120);
+        for (top, project, want) in [
+            (None, None, poll),
+            (Some(false), Some(false), poll),
+            (Some(true), None, poll * 2),
+            (None, Some(true), poll * 2),
+        ] {
+            let mut eff = empty_effective(fake(top));
+            eff.poll_interval = poll;
+            eff.projects = vec![empty_resolved_project("a", fake(project))];
+            let mut o = crate::Orchestrator::new("not-read.md");
+            o.eff = Some(eff);
+            assert_eq!(
+                o.paced_poll_interval(),
+                want,
+                "top={top:?} project={project:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_releases_account_activity_with_store_off() {
         let mut o = crate::Orchestrator::new("not-read.md");

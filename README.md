@@ -225,6 +225,40 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Linear request budget, 429 handling and completion retry (STUDIO-1896)
+
+Go Symphony sends Linear requests without counting them and treats a 429 like any other non-200
+status. Rhapsody keeps one rolling-hour request ledger per Linear API key, shared by every client on
+that key. Each request is counted under the tracker operation that sent it, so the per-caller counts
+always add up to the total. The budget is **tight** at 80% of Linear's 2,500 requests/hour, when
+Linear's `X-RateLimit-Requests-Remaining` reports 20% or less left, or while a 429 blocks the key.
+Entering that state logs one `warn!` with the per-operation breakdown; leaving it logs one `info!`.
+
+While the budget is tight:
+
+- the poll waits twice its configured `polling.interval_ms`;
+- auto-promote's backlog read and the periodic terminal-workspace cleanup skip that project;
+- teams triage skips its own candidate fetch.
+
+The dispatch-critical reads (reconcile, completion revalidation) are never skipped.
+
+A 429, or a GraphQL `extensions.code: "RATELIMITED"` on a 200, now fails with the new
+`linear_rate_limited` sentinel instead of the generic status error. It blocks the whole key until
+Linear's reset: `Retry-After`, else `X-RateLimit-Requests-Reset`, else 60 seconds, capped at an
+hour. While the key is blocked, calls fail with that sentinel without sending a request.
+
+A prepared dispatch whose state or labels revalidation read **fails** is no longer dropped as stale.
+It keeps its preparation reservation, including any reopening summons and manager wake, and its
+revalidation is retried once the key's 429 block ends (waiting at most ten minutes), or after
+30 seconds for any other failure. After six failed
+retries it is dropped with a warning.
+
+Teams triage reuses the poll's last complete candidate set, if it is at most five minutes old, rather
+than fetching every project's candidates again each cycle.
+
+Every existing sentinel string, API shape, schema, golden fixture and normalization rule is
+unchanged.
+
 ### Unread mid-run summons re-dispatch the ticket (STUDIO-1835)
 
 An accepted, host-proven review summons queued for a between-turn harness remains dispatchable after

@@ -16,7 +16,6 @@
 //! workspace, types do not.
 
 use super::candidates::{MAX_PAGES, PageInfo};
-use super::client::traced;
 use super::{Client, LinearError, LinearErrorKind, query};
 use crate::TrackerError;
 use rhapsody_core::{Issue, normalize_state};
@@ -157,7 +156,7 @@ pub(super) async fn add_issue_label(
     team_id: &str,
     label_name: &str,
 ) -> Result<(), TrackerError> {
-    traced(crate::tracker_span!("add_issue_label"), async move {
+    crate::traced_op!("add_issue_label", async move {
         if issue_id.is_empty() || team_id.is_empty() || label_name.is_empty() {
             return Err(LinearError::new(
                 LinearErrorKind::ApiRequest,
@@ -202,7 +201,7 @@ pub(super) async fn remove_issue_label(
     team_id: &str,
     label_name: &str,
 ) -> Result<(), TrackerError> {
-    traced(crate::tracker_span!("remove_issue_label"), async move {
+    crate::traced_op!("remove_issue_label", async move {
         if issue_id.is_empty() || team_id.is_empty() || label_name.is_empty() {
             return Err(LinearError::new(
                 LinearErrorKind::ApiRequest,
@@ -314,43 +313,40 @@ pub(super) async fn fetch_open_issues_by_labels(
     if label_names.is_empty() {
         return Ok(Vec::new());
     }
-    traced(
-        crate::tracker_span!("fetch_open_issues_by_labels"),
-        async move {
-            let mut out: Vec<Issue> = Vec::new();
-            let mut after: Option<String> = None;
-            let mut pages: u32 = 0;
-            loop {
-                pages += 1;
-                if pages > MAX_PAGES {
-                    return Err(LinearError::new(
-                        LinearErrorKind::MissingCursor,
-                        format!("exceeded {MAX_PAGES} pages without completing pagination"),
-                    )
-                    .into());
-                }
-                let vars = json!({
-                    "projectSlug": c.config.project_slug.clone(),
-                    "names": label_names.to_vec(),
-                    "first": c.page_size,
-                    "after": Value::from(after.clone()),
-                });
-                let page: LabelledIssuesResp = c
-                    .do_graphql(query::QUERY_OPEN_ISSUES_BY_LABELS, Some(vars))
-                    .await?;
-                for n in page.issues.nodes {
-                    out.push(to_issue(n));
-                }
-                if !page.issues.page_info.has_next_page {
-                    return Ok(out);
-                }
-                if page.issues.page_info.end_cursor.is_empty() {
-                    return Err(LinearError::bare(LinearErrorKind::MissingCursor).into());
-                }
-                after = Some(page.issues.page_info.end_cursor);
+    crate::traced_op!("fetch_open_issues_by_labels", async move {
+        let mut out: Vec<Issue> = Vec::new();
+        let mut after: Option<String> = None;
+        let mut pages: u32 = 0;
+        loop {
+            pages += 1;
+            if pages > MAX_PAGES {
+                return Err(LinearError::new(
+                    LinearErrorKind::MissingCursor,
+                    format!("exceeded {MAX_PAGES} pages without completing pagination"),
+                )
+                .into());
             }
-        },
-    )
+            let vars = json!({
+                "projectSlug": c.config.project_slug.clone(),
+                "names": label_names.to_vec(),
+                "first": c.page_size,
+                "after": Value::from(after.clone()),
+            });
+            let page: LabelledIssuesResp = c
+                .do_graphql(query::QUERY_OPEN_ISSUES_BY_LABELS, Some(vars))
+                .await?;
+            for n in page.issues.nodes {
+                out.push(to_issue(n));
+            }
+            if !page.issues.page_info.has_next_page {
+                return Ok(out);
+            }
+            if page.issues.page_info.end_cursor.is_empty() {
+                return Err(LinearError::bare(LinearErrorKind::MissingCursor).into());
+            }
+            after = Some(page.issues.page_info.end_cursor);
+        }
+    },)
     .await
 }
 

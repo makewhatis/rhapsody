@@ -99,7 +99,7 @@ pub(super) async fn fetch_issue_states_by_ids(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    super::client::traced(crate::tracker_span!("fetch_issue_states"), async move {
+    crate::traced_op!("fetch_issue_states", async move {
         let vars = serde_json::json!({ "ids": ids, "first": ids.len() });
         let page: IdsPage = c.do_graphql(query::QUERY_BY_IDS, Some(vars)).await?;
         page.issues.nodes.warn_dropped("fetch issue states by id");
@@ -128,7 +128,7 @@ pub(super) async fn fetch_issue_labels_by_ids(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    super::client::traced(crate::tracker_span!("fetch_issue_labels"), async move {
+    crate::traced_op!("fetch_issue_labels", async move {
         let vars = serde_json::json!({ "ids": ids, "first": ids.len() });
         let page: IdsPage = c
             .do_graphql(query::QUERY_ISSUE_LABELS_BY_IDS, Some(vars))
@@ -185,20 +185,17 @@ pub(super) async fn fetch_issue_description_by_identifier(
     if !super::issue_id::valid(identifier) {
         return Ok(None);
     }
-    super::client::traced(
-        crate::tracker_span!("fetch_issue_description"),
-        async move {
-            let vars = serde_json::json!({ "id": identifier });
-            let page: IssueByIdentifierPage = c
-                .do_graphql(query::QUERY_ISSUE_DESCRIPTION_BY_IDENTIFIER, Some(vars))
-                .await?;
-            Ok(page
-                .issue
-                .filter(|n| n.identifier.eq_ignore_ascii_case(identifier))
-                .and_then(|n| n.description)
-                .filter(|d| !d.trim().is_empty()))
-        },
-    )
+    crate::traced_op!("fetch_issue_description", async move {
+        let vars = serde_json::json!({ "id": identifier });
+        let page: IssueByIdentifierPage = c
+            .do_graphql(query::QUERY_ISSUE_DESCRIPTION_BY_IDENTIFIER, Some(vars))
+            .await?;
+        Ok(page
+            .issue
+            .filter(|n| n.identifier.eq_ignore_ascii_case(identifier))
+            .and_then(|n| n.description)
+            .filter(|d| !d.trim().is_empty()))
+    },)
     .await
 }
 

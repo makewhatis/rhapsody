@@ -534,6 +534,46 @@ pub struct TriageTarget {
     /// from here ([`crate::teamsears::EarsCycle`]) so `file_review` drops an impossible reviewer
     /// rather than filing a review ticket `spawn_worker` then refuses.
     pub reviewer_exclusions: crate::quorum::ReviewerExclusions,
+    /// The poll loop's last COMPLETE candidate set (STUDIO-1896), read under the same lock as the
+    /// trackers. When it is fresh and every issue in it names a project in [`Self::slugs`], the
+    /// cycle sweeps it instead of fetching every project's candidates a second time — the
+    /// duplicate that was about a quarter of the daemon's Linear budget. `None` (no complete poll
+    /// yet, a reload since, or a test) makes the cycle fetch for itself exactly as before.
+    pub candidates: Option<crate::teamsprefetch::PrefetchTarget>,
+}
+
+/// How old the poll's published candidate set may be for triage to sweep it instead of fetching
+/// (STUDIO-1896). Comfortably above the poll interval — doubled while the Linear budget is tight —
+/// so a healthy daemon always reuses it, and well below the cycle's own backoff ceiling.
+pub const PUBLISHED_CANDIDATES_MAX_AGE: chrono::TimeDelta = chrono::TimeDelta::minutes(5);
+
+/// The poll's published candidates as the cycle's `(issues, owner)` pair, or `None` when they
+/// cannot stand in for a fetch: too old, misaligned, or naming a project this target does not hold.
+fn published_candidates(
+    published: &crate::teamsprefetch::PrefetchTarget,
+    slugs: &[String],
+    trackers: usize,
+    now: chrono::DateTime<Utc>,
+) -> Option<(Vec<Issue>, HashMap<String, usize>)> {
+    if slugs.len() != trackers || published.owner_slugs.len() != published.issues.len() {
+        return None;
+    }
+    let age = now.signed_duration_since(published.fetched_at);
+    if age > PUBLISHED_CANDIDATES_MAX_AGE || age < -PUBLISHED_CANDIDATES_MAX_AGE {
+        return None;
+    }
+    let mut owner: HashMap<String, usize> = HashMap::new();
+    let mut issues: Vec<Issue> = Vec::with_capacity(published.issues.len());
+    for (iss, slug) in published.issues.iter().zip(&published.owner_slugs) {
+        // First matching index, the same first-project-wins rule as the poll's own dedup.
+        let idx = slugs.iter().position(|s| s == slug)?;
+        if owner.contains_key(&iss.id) {
+            continue;
+        }
+        owner.insert(iss.id.clone(), idx);
+        issues.push(iss.clone());
+    }
+    Some((issues, owner))
 }
 
 impl TriageTarget {
@@ -555,7 +595,18 @@ impl TriageTarget {
             summon_token: snapshot.summon_token,
             slugs,
             reviewer_exclusions: snapshot.reviewer_exclusions,
+            candidates: None,
         }
+    }
+
+    /// Attaches the poll's published candidate set (STUDIO-1896), read under the same lock as the
+    /// snapshot this target was built from.
+    pub fn with_candidates(
+        mut self,
+        candidates: Option<crate::teamsprefetch::PrefetchTarget>,
+    ) -> TriageTarget {
+        self.candidates = candidates;
+        self
     }
 }
 
@@ -1047,15 +1098,39 @@ where
         return CycleReport::stalled(CycleOutcome::Idle, false, 0);
     };
     let trackers = target.trackers;
+    // Reuse the poll's last complete candidate fetch when it is fresh (STUDIO-1896): it is the
+    // same query over the same clients, de-duplicated by the same first-project-wins rule, so
+    // fetching it again here only spent Linear quota — about 640 requests an hour on a 14-project
+    // install, a quarter of the key's budget.
+    let published = target
+        .candidates
+        .as_ref()
+        .and_then(|c| published_candidates(c, &target.slugs, trackers.len(), Utc::now()));
+    let reused = published.is_some();
     // Fan the candidate fetch out over every enabled project, exactly as the poll loop does, and
     // de-duplicate on issue id with FIRST PROJECT WINS — the same rule `on_tick` uses, so a ticket
     // reachable through two configured slugs is triaged by the same client that would dispatch it.
     // `owner` remembers which tracker each kept issue arrived through, so the label is written back
     // through that project's own client rather than through an arbitrary one.
-    let mut issues: Vec<Issue> = Vec::new();
-    let mut owner: HashMap<String, usize> = HashMap::new();
+    let (mut issues, mut owner) = published.unwrap_or_default();
     let mut fetch_failed = false;
-    for (idx, tracker) in trackers.iter().enumerate() {
+    // With no published set to reuse and the key's Linear budget tight, the sweep waits rather
+    // than spending what the dispatch-critical reads need; reporting it as a failed fetch backs
+    // the schedule off and skips the one-time reconcile, exactly like an unreachable tracker.
+    if !reused
+        && trackers
+            .iter()
+            .any(|t| t.request_budget().is_some_and(|b| b.tight))
+    {
+        tracing::info!("teams triage skipped its own candidate fetch: the Linear budget is tight");
+        fetch_failed = true;
+    }
+    let to_fetch: &[Arc<dyn Tracker>] = if reused || fetch_failed {
+        &[]
+    } else {
+        &trackers
+    };
+    for (idx, tracker) in to_fetch.iter().enumerate() {
         match tracker.fetch_candidate_issues().await {
             Ok(v) => {
                 for iss in v {
@@ -2701,6 +2776,7 @@ mod tests {
                     summon_token: "@symphony".to_string(),
                     slugs: Vec::new(),
                     reviewer_exclusions: Default::default(),
+                    candidates: None,
                 })
             },
             arbiter: FakeArbiter::answering(Vec::new()),
@@ -2844,6 +2920,7 @@ mod tests {
                     summon_token: "@symphony".to_string(),
                     slugs: vec!["proj".to_string()],
                     reviewer_exclusions: Default::default(),
+                    candidates: None,
                 })
             },
             arbiter: FakeArbiter::answering(Vec::new()),
@@ -4981,6 +5058,135 @@ mod tests {
             .map(|c| c.issue_id.clone())
             .collect();
         assert_eq!(seconds, vec!["i2".to_string()]);
+    }
+
+    /// Deps whose target carries the poll's published candidate set (STUDIO-1896).
+    fn deps_published(
+        teams: Teams,
+        trackers: Vec<Arc<dyn Tracker>>,
+        slugs: Vec<String>,
+        published: crate::teamsprefetch::PrefetchTarget,
+        arbiter: Arc<dyn TriageArbiter>,
+    ) -> TriageDeps<impl Fn() -> Option<TriageTarget>> {
+        TriageDeps {
+            teams: Arc::new(teams),
+            target: move || {
+                Some(TriageTarget {
+                    trackers: trackers.clone(),
+                    states: states(),
+                    slugs: slugs.clone(),
+                    candidates: Some(published.clone()),
+                    ..TriageTarget::default()
+                })
+            },
+            arbiter,
+            agent_command: "claude".to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            interval: Duration::from_millis(5),
+            max_backoff_ms: 20,
+            handle: Arc::new(TriageHandle::new()),
+            room: None,
+            history: None,
+            reconcile_marker: None,
+            ears: None,
+            knowledge: None,
+        }
+    }
+
+    /// STUDIO-1896. MUTATION GUARD: ignore the published set and triage refetches every project's
+    /// candidates each cycle — a quarter of the Linear budget — and this test reds on the call count.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cycle_reuses_the_polls_published_candidates_instead_of_refetching() {
+        // The trackers' own candidate lists are EMPTY: a cycle that fetched would find nothing.
+        let first = Arc::new(Fake::new());
+        let second = Arc::new(Fake::new());
+        let published = crate::teamsprefetch::PrefetchTarget {
+            issues: vec![labelled("i1", &["rust"]), labelled("i2", &["docs"])],
+            fetched_at: Utc::now(),
+            owner_slugs: vec!["alpha".to_string(), "beta".to_string()],
+        };
+        let d = deps_published(
+            teams_model(vec![ident("alice", &[])]),
+            vec![
+                Arc::clone(&first) as Arc<dyn Tracker>,
+                Arc::clone(&second) as Arc<dyn Tracker>,
+            ],
+            vec!["alpha".to_string(), "beta".to_string()],
+            published,
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice"), FakeArbiter::ok("alice")])
+                as Arc<dyn TriageArbiter>,
+        );
+        let outcome = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(outcome, CycleOutcome::Labelled(2));
+        assert_eq!(first.candidate_calls(), 0, "no second candidate fetch");
+        assert_eq!(second.candidate_calls(), 0, "no second candidate fetch");
+        let firsts: Vec<String> = first
+            .add_label_calls()
+            .iter()
+            .map(|c| c.issue_id.clone())
+            .collect();
+        let seconds: Vec<String> = second
+            .add_label_calls()
+            .iter()
+            .map(|c| c.issue_id.clone())
+            .collect();
+        assert_eq!(
+            firsts,
+            vec!["i1".to_string()],
+            "written through the owning project"
+        );
+        assert_eq!(
+            seconds,
+            vec!["i2".to_string()],
+            "written through the owning project"
+        );
+    }
+
+    /// A published set too old to stand in for a fetch — or one naming a project this target does
+    /// not hold — is ignored, and the cycle fetches for itself exactly as before STUDIO-1896.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stale_or_unmappable_published_set_falls_back_to_fetching() {
+        for (fetched_at, slug) in [
+            (
+                Utc::now() - PUBLISHED_CANDIDATES_MAX_AGE - chrono::TimeDelta::seconds(1),
+                "alpha",
+            ),
+            (Utc::now(), "gone"),
+        ] {
+            let mut tr = Fake::new();
+            tr.candidates = vec![labelled("i1", &["rust"])];
+            let tr = Arc::new(tr);
+            let published = crate::teamsprefetch::PrefetchTarget {
+                issues: vec![labelled("old", &[])],
+                fetched_at,
+                owner_slugs: vec![slug.to_string()],
+            };
+            let d = deps_published(
+                teams_model(vec![ident("alice", &[])]),
+                vec![Arc::clone(&tr) as Arc<dyn Tracker>],
+                vec!["alpha".to_string()],
+                published,
+                FakeArbiter::answering(vec![FakeArbiter::ok("alice")]) as Arc<dyn TriageArbiter>,
+            );
+            let outcome = triage_cycle(&CancelWait::default(), &d, true).await;
+            assert_eq!(
+                tr.candidate_calls(),
+                1,
+                "the cycle fetched for itself ({slug})"
+            );
+            assert_eq!(outcome, CycleOutcome::Labelled(1), "{slug}");
+            let ids: Vec<String> = tr
+                .add_label_calls()
+                .iter()
+                .map(|c| c.issue_id.clone())
+                .collect();
+            assert_eq!(
+                ids,
+                vec!["i1".to_string()],
+                "the fetched set, not the published one"
+            );
+        }
     }
 
     /// One unreachable project must not blind triage to the rest: the reachable project's ticket is

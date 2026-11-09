@@ -35,7 +35,6 @@
 //! for the same PR are two legitimate issues. The once-per-parent guard is the caller's; the
 //! quorum's is the `rhapsody:quorum-requested` marker label on the parent.
 
-use super::client::traced;
 use super::{Client, LinearError, LinearErrorKind, labels, move_state, query};
 use crate::{NewIssue, TrackerError};
 use serde::Deserialize;
@@ -93,7 +92,7 @@ const PROJECT_LOOKUP_PAGE: i64 = 5;
 /// identifier (STUDIO-659, design §0.12). See the module docs for the resolution order and why a
 /// partial create is refused.
 pub(super) async fn create_issue(c: &Client, spec: &NewIssue) -> Result<String, TrackerError> {
-    traced(crate::tracker_span!("create_issue"), async move {
+    crate::traced_op!("create_issue", async move {
         if spec.team_id.is_empty() || spec.title.is_empty() {
             return Err(LinearError::new(
                 LinearErrorKind::ApiRequest,

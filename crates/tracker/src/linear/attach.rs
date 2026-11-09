@@ -84,7 +84,6 @@
 //! `linked_prs` at all (see this module's opening section) — so the ticket's own first write goes
 //! on to be retried by the next run, and this is the answer to that retry.
 
-use super::client::traced;
 use super::{Client, LinearError, LinearErrorKind, query};
 use crate::TrackerError;
 use serde::Deserialize;
@@ -133,7 +132,7 @@ pub(super) async fn link_pull_request(
     issue_id: &str,
     url: &str,
 ) -> Result<(), TrackerError> {
-    traced(crate::tracker_span!("link_pull_request"), async move {
+    crate::traced_op!("link_pull_request", async move {
         if issue_id.is_empty() || url.is_empty() {
             return Err(LinearError::new(
                 LinearErrorKind::ApiRequest,

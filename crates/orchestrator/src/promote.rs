@@ -111,6 +111,12 @@ impl Orchestrator {
 
     /// Runs the auto-promote pass for one project scope. Mirrors Go `promoteUnblockedScope`.
     async fn promote_unblocked_scope(&mut self, scope: PromoteScope) {
+        // A background sweep: it waits while the key's Linear budget is tight rather than spending
+        // what dispatch needs (STUDIO-1896). A blocked ticket promotes on a later tick instead.
+        if scope.tracker.request_budget().is_some_and(|b| b.tight) {
+            tracing::debug!(project_slug = %scope.slug, "auto-promote: skipped while the Linear budget is tight");
+            return;
+        }
         let backlog = match scope.tracker.fetch_blocked_backlog_issues().await {
             Ok(b) => b,
             Err(e) => {
@@ -485,6 +491,28 @@ mod tests {
             );
             assert_eq!(tr.move_to_type_calls().len(), 0, "mode={mode:?}");
             assert_eq!(dispatched_len(&dispatched), 0, "mode={mode:?}");
+        }
+    }
+
+    // STUDIO-1896: auto-promote is a background sweep, so while the key's Linear budget is tight it
+    // skips its backlog read (the blocked ticket promotes on a later tick); a relaxed budget reads.
+    //
+    // MUTATION: drop the budget gate in `promote_unblocked_scope` and the tight pass fetches.
+    #[tokio::test]
+    async fn promote_unblocked_waits_while_the_linear_budget_is_tight() {
+        for (tight, want) in [(true, 0), (false, 1)] {
+            let mut f = Fake::new();
+            f.blocked_backlog = vec![backlog_dep("Done")];
+            f.request_budget = Some(rhapsody_tracker::budget::BudgetStatus {
+                used: 2100,
+                limit: 2500,
+                tight,
+                blocked_for: None,
+            });
+            let tr = Arc::new(f);
+            let (mut o, _) = new_promote_orch(Arc::clone(&tr), "graphite");
+            o.promote_unblocked().await;
+            assert_eq!(tr.blocked_backlog_calls(), want, "tight={tight}");
         }
     }
 

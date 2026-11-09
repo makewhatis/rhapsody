@@ -317,15 +317,29 @@ impl ControlHandle {
     ///
     /// Cloning the values out releases the lock immediately — it is never held across an `await`.
     pub fn reads_triage_target(&self) -> Option<TriageSnapshot> {
+        self.reads_triage_target_with_candidates()
+            .map(|(snap, _)| snap)
+    }
+
+    /// [`Self::reads_triage_target`] plus the poll's last complete candidate set, under the SAME
+    /// lock (STUDIO-1896). Triage reuses that set instead of fetching every project's candidates a
+    /// second time; reading it beside the trackers means a reload — which clears the set — can
+    /// never pair one config's clients with another config's candidates.
+    pub fn reads_triage_target_with_candidates(
+        &self,
+    ) -> Option<(TriageSnapshot, Option<crate::teamsprefetch::PrefetchTarget>)> {
         let r = self.reads.read().unwrap_or_else(PoisonError::into_inner);
         r.tracker.as_ref()?;
-        Some(TriageSnapshot {
-            trackers: r.project_trackers.clone(),
-            states: r.states.clone(),
-            facts: r.project_facts.clone(),
-            summon_token: r.summon_token.clone(),
-            reviewer_exclusions: r.reviewer_exclusions.clone(),
-        })
+        Some((
+            TriageSnapshot {
+                trackers: r.project_trackers.clone(),
+                states: r.states.clone(),
+                facts: r.project_facts.clone(),
+                summon_token: r.summon_token.clone(),
+                reviewer_exclusions: r.reviewer_exclusions.clone(),
+            },
+            r.candidates.clone(),
+        ))
     }
 }
 

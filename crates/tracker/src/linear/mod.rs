@@ -27,6 +27,7 @@ pub mod query;
 #[cfg(test)]
 mod testutil;
 
+pub(crate) use client::traced;
 pub use client::{Client, Config, new};
 pub use errors::{LinearError, LinearErrorKind};
 pub use normalize::RawIssue;
@@ -51,6 +52,16 @@ macro_rules! tracker_span {
     };
 }
 
+/// Runs one tracker operation under its `symphony.tracker.<op>` span AND counts every Linear
+/// request it sends under `<op>` in the key's request budget (STUDIO-1896) — one name, so the span
+/// and the budget's attribution cannot drift apart. Expands to [`client::traced`].
+#[macro_export]
+macro_rules! traced_op {
+    ($op:literal, $fut:expr $(,)?) => {
+        $crate::linear::traced($op, $crate::tracker_span!($op), $fut)
+    };
+}
+
 #[async_trait]
 impl crate::Tracker for Client {
     async fn fetch_documents(
@@ -59,13 +70,21 @@ impl crate::Tracker for Client {
         query: &str,
         excerpt: bool,
     ) -> Result<crate::Documents, TrackerError> {
-        documents::fetch_documents(self, issue, query, excerpt).await
+        crate::traced_op!(
+            "fetch_documents",
+            documents::fetch_documents(self, issue, query, excerpt)
+        )
+        .await
     }
     async fn fetch_issue_by_identifier(
         &self,
         identifier: &str,
     ) -> Result<Option<Issue>, TrackerError> {
-        by_ids::fetch_issue_by_identifier(self, identifier).await
+        crate::traced_op!(
+            "fetch_issue_by_identifier",
+            by_ids::fetch_issue_by_identifier(self, identifier)
+        )
+        .await
     }
     async fn update_issue_description(
         &self,
@@ -73,16 +92,28 @@ impl crate::Tracker for Client {
         description: &str,
     ) -> Result<(), TrackerError> {
         issue_id::require(id)?;
-        by_ids::update_issue_description(self, id, description).await
+        crate::traced_op!(
+            "update_issue_description",
+            by_ids::update_issue_description(self, id, description)
+        )
+        .await
     }
     async fn fetch_parked_issue(&self, id: &str) -> Result<Option<Issue>, TrackerError> {
-        candidates::fetch_parked_issue(self, id).await
+        crate::traced_op!(
+            "fetch_parked_issue",
+            candidates::fetch_parked_issue(self, id)
+        )
+        .await
     }
     async fn fetch_candidate_issues(&self) -> Result<Vec<Issue>, TrackerError> {
         candidates::fetch_candidate_issues(self).await
     }
     async fn fetch_issues_by_states(&self, states: &[String]) -> Result<Vec<Issue>, TrackerError> {
-        by_states::fetch_issues_by_states(self, states).await
+        crate::traced_op!(
+            "fetch_issues_by_states",
+            by_states::fetch_issues_by_states(self, states)
+        )
+        .await
     }
     async fn fetch_issue_states_by_ids(&self, ids: &[String]) -> Result<Vec<Issue>, TrackerError> {
         by_ids::fetch_issue_states_by_ids(self, ids).await
@@ -118,13 +149,17 @@ impl crate::Tracker for Client {
         state_type: &str,
     ) -> Result<String, TrackerError> {
         issue_id::require(issue_id)?;
-        move_state::move_issue_to_type(self, issue_id, team_id, state_type).await
+        crate::traced_op!(
+            "move_issue_to_type",
+            move_state::move_issue_to_type(self, issue_id, team_id, state_type)
+        )
+        .await
     }
     async fn resolve_viewer(&self) -> Result<Viewer, TrackerError> {
-        client::resolve_viewer(self).await
+        crate::traced_op!("resolve_viewer", client::resolve_viewer(self)).await
     }
     async fn list_projects(&self) -> Result<Vec<Project>, TrackerError> {
-        projects::list_projects(self).await
+        crate::traced_op!("list_projects", projects::list_projects(self)).await
     }
     async fn assign_issue(&self, issue_id: &str, assignee_id: &str) -> Result<(), TrackerError> {
         issue_id::require(issue_id)?;
@@ -174,6 +209,9 @@ impl crate::Tracker for Client {
         issue_id::require(issue_id)?;
         attach::link_pull_request(self, issue_id, url).await
     }
+    fn request_budget(&self) -> Option<crate::budget::BudgetStatus> {
+        Some(self.request_ledger().status(std::time::Instant::now()))
+    }
 }
 
 #[cfg(test)]
@@ -222,5 +260,170 @@ mod tracing_tests {
                 .any(|n| n == "symphony.tracker.fetch_issue_states"),
             "expected a symphony.tracker.fetch_issue_states span; got {recorded:?}"
         );
+    }
+}
+
+/// STUDIO-1896: every Linear request is attributed to the tracker operation that sent it, so a
+/// per-caller count adds up to the total the server saw, and a 429 blocks the whole API key until
+/// Linear's reset rather than letting every caller hammer it again.
+#[cfg(test)]
+mod budget_tests {
+    use super::testutil::{MockResp, MockServer, TEST_VIEWER_RESP};
+    use super::{Config, LinearErrorKind, new};
+    use crate::{NewIssue, Tracker, TrackerError};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Instant;
+
+    const ID: &str = "11111111-2222-3333-4444-555555555555";
+
+    fn client(url: String, key: &str) -> super::Client {
+        new(Config {
+            endpoint: url,
+            api_key: key.into(),
+            project_slug: "proj".into(),
+            ..Config::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn every_tracker_method_is_attributed_and_the_counts_add_up() {
+        let served = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&served);
+        let server = MockServer::start(move |req| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            if req.query.contains("viewer {") {
+                MockResp::ok(TEST_VIEWER_RESP)
+            } else {
+                // Most decoders reject an empty payload; the request still went out, which is
+                // all this test counts.
+                MockResp::ok(r#"{"data":{}}"#)
+            }
+        })
+        .await;
+        let c = client(server.url(), "budget-attribution-key");
+        let ids = vec![ID.to_string()];
+        let names = vec!["Todo".to_string()];
+        let spec = NewIssue {
+            team_id: "team".into(),
+            title: "t".into(),
+            state_name: "Todo".into(),
+            labels: vec!["l".into()],
+            ..NewIssue::default()
+        };
+        let _ = c.fetch_documents(Some(ID), "q", false).await;
+        let _ = c.fetch_issue_by_identifier("ABC-1").await;
+        let _ = c.update_issue_description(ID, "d").await;
+        let _ = c.fetch_candidate_issues().await;
+        let _ = c.fetch_parked_issue(ID).await;
+        let _ = c.fetch_issues_by_states(&names).await;
+        let _ = c.fetch_issue_states_by_ids(&ids).await;
+        let _ = c.fetch_issue_labels_by_ids(&ids).await;
+        let _ = c.fetch_issue_description_by_identifier("ABC-1").await;
+        let _ = c.fetch_blocked_backlog_issues().await;
+        let _ = c.fetch_issue_branch_by_id(ID).await;
+        let _ = c.move_issue_state(ID, "team", "Todo").await;
+        let _ = c.move_issue_to_type(ID, "team", "backlog").await;
+        let _ = c.resolve_viewer().await;
+        let _ = c.list_projects().await;
+        let _ = c.assign_issue(ID, "user").await;
+        let _ = c.fetch_issue_assignee(ID).await;
+        let _ = c.create_comment(ID, "b").await;
+        let _ = c.list_comments(ID).await;
+        let _ = c.delete_comment(ID).await;
+        let _ = c.add_issue_label(ID, "team", "l").await;
+        let _ = c.remove_issue_label(ID, "team", "l").await;
+        let _ = c.fetch_open_issues_by_labels(&names).await;
+        let _ = c.create_issue(&spec).await;
+        let _ = c
+            .link_pull_request(ID, "https://github.com/o/r/pull/1")
+            .await;
+
+        let per_op = c.request_ledger().per_op(Instant::now());
+        let total: u32 = per_op.values().sum();
+        // The same breakdown the tight warning logs, so `--nocapture` shows the attribution.
+        eprintln!(
+            "per-caller: total={total} {}",
+            crate::budget::format_breakdown(&per_op)
+        );
+        assert!(
+            !per_op.contains_key(crate::budget::UNTAGGED),
+            "a request went out with no caller: {per_op:?}"
+        );
+        assert_eq!(
+            total,
+            served.load(Ordering::SeqCst),
+            "per-caller counts must add up to what the server saw: {per_op:?}"
+        );
+        assert!(
+            total >= 20,
+            "most methods should have reached the server: {per_op:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_429_blocks_the_key_until_linears_reset_and_sends_nothing_meanwhile() {
+        let served = Arc::new(AtomicU32::new(0));
+        let seen = Arc::clone(&served);
+        let server = MockServer::start(move |_req| {
+            seen.fetch_add(1, Ordering::SeqCst);
+            MockResp::status(429, r#"{"errors":[{"message":"rate limited"}]}"#)
+                .header("Retry-After", "120")
+                .header("X-RateLimit-Requests-Limit", "2500")
+                .header("X-RateLimit-Requests-Remaining", "0")
+        })
+        .await;
+        let key = "budget-429-key";
+        let c = client(server.url(), key);
+        let ids = vec![ID.to_string()];
+
+        let err = c
+            .fetch_issue_labels_by_ids(&ids)
+            .await
+            .expect_err("a 429 is an error");
+        assert!(err.is_rate_limited(), "got {err:?}");
+        assert!(
+            matches!(&err, TrackerError::Linear(e) if e.kind == LinearErrorKind::RateLimited),
+            "got {err:?}"
+        );
+        assert_eq!(served.load(Ordering::SeqCst), 1);
+
+        // A second client on the SAME key (another project) is blocked too, without a request.
+        let sibling = client(server.url(), key);
+        let err = sibling
+            .fetch_issue_states_by_ids(&ids)
+            .await
+            .expect_err("the key is blocked");
+        assert!(err.is_rate_limited(), "got {err:?}");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "nothing sent while blocked"
+        );
+
+        let status = sibling.request_budget().expect("linear reports a budget");
+        assert!(status.tight, "a blocked key is a tight budget: {status:?}");
+        let wait = status.blocked_for.expect("blocked");
+        assert!(
+            wait.as_secs() > 100 && wait.as_secs() <= 120,
+            "Retry-After is honored: {wait:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_ratelimited_graphql_error_on_a_200_blocks_the_key_too() {
+        let server = MockServer::start(|_req| {
+            MockResp::ok(
+                r#"{"errors":[{"message":"Rate limit exceeded","extensions":{"code":"RATELIMITED"}}]}"#,
+            )
+        })
+        .await;
+        let c = client(server.url(), "budget-ratelimited-200-key");
+        let err = c
+            .fetch_issue_states_by_ids(&[ID.to_string()])
+            .await
+            .expect_err("rate limited");
+        assert!(err.is_rate_limited(), "got {err:?}");
+        assert!(c.request_ledger().blocked_for(Instant::now()).is_some());
     }
 }

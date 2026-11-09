@@ -45,6 +45,12 @@ pub enum LinearErrorKind {
     /// the caller cares about is "the ticket links this pull request", and a duplicate refusal
     /// proves it. See [`classify_graphql_errors`].
     DuplicateAttachment,
+    /// `linear_rate_limited` — Linear refused the request for the key's rate limit (HTTP 429, or a
+    /// `RATELIMITED` GraphQL error), or a previous refusal's reset has not passed yet so the
+    /// request was not sent at all. **Rhapsody-only** (STUDIO-1896): Go reports a 429 as
+    /// `linear_api_status`. It is transient by definition — a caller that would drop work on a
+    /// tracker failure should retry it later instead ([`crate::TrackerError::is_rate_limited`]).
+    RateLimited,
 }
 
 impl LinearErrorKind {
@@ -60,6 +66,7 @@ impl LinearErrorKind {
             LinearErrorKind::MilestoneNotFound => "linear_milestone_not_found",
             LinearErrorKind::ViewerUnresolved => "linear_viewer_unresolved",
             LinearErrorKind::DuplicateAttachment => "linear_duplicate_attachment",
+            LinearErrorKind::RateLimited => "linear_rate_limited",
         }
     }
 }
@@ -91,11 +98,24 @@ const DUPLICATE_ATTACHMENT_MESSAGE: &str = "Duplicate attachment for duplicate u
 /// One `errors` array classifies as a unit: if any entry is the duplicate, the array is the
 /// duplicate. A single-mutation request carries one error, so a mixed array is not reachable today.
 pub(crate) fn classify_graphql_errors(errors: &[serde_json::Value]) -> LinearErrorKind {
+    if errors.iter().any(is_rate_limited) {
+        return LinearErrorKind::RateLimited;
+    }
     if errors.iter().any(is_duplicate_attachment) {
         LinearErrorKind::DuplicateAttachment
     } else {
         LinearErrorKind::GraphqlErrors
     }
+}
+
+/// Whether one GraphQL error entry is Linear's rate-limit refusal (`extensions.code: RATELIMITED`,
+/// which Linear can send with a non-429 status). Keyed on the machine-readable code, never the
+/// prose, for the reason [`classify_graphql_errors`] gives.
+fn is_rate_limited(error: &serde_json::Value) -> bool {
+    error
+        .pointer("/extensions/code")
+        .and_then(serde_json::Value::as_str)
+        == Some("RATELIMITED")
 }
 
 /// Whether one GraphQL error entry is Linear refusing a duplicate pull-request attachment.
@@ -202,6 +222,7 @@ mod tests {
             LinearErrorKind::DuplicateAttachment.as_str(),
             "linear_duplicate_attachment"
         );
+        assert_eq!(LinearErrorKind::RateLimited.as_str(), "linear_rate_limited");
     }
 
     /// The payload is the one the live tracker answered STUDIO-902's second run with, verbatim
@@ -236,6 +257,16 @@ mod tests {
         assert_eq!(
             classify_graphql_errors(&errors(r#"[{"message":"bad query"}]"#)),
             LinearErrorKind::GraphqlErrors
+        );
+    }
+
+    #[test]
+    fn a_ratelimited_error_is_classified_by_its_code() {
+        assert_eq!(
+            classify_graphql_errors(&errors(
+                r#"[{"message":"Rate limit exceeded","extensions":{"code":"RATELIMITED"}}]"#
+            )),
+            LinearErrorKind::RateLimited
         );
     }
 

@@ -9,6 +9,7 @@
 //! by the tokio orchestrator); Go's bare `error` returns become a typed [`TrackerError`]; Go
 //! pointer/`nil`-slice fields on the returned `core` types stay `Option<…>` (see `rhapsody-core`).
 
+pub mod budget;
 mod factory;
 pub mod fake;
 pub mod file;
@@ -66,6 +67,14 @@ impl std::fmt::Display for TrackerError {
 }
 
 impl std::error::Error for TrackerError {}
+
+impl TrackerError {
+    /// Whether this failure is Linear's rate limit (STUDIO-1896): transient by definition, so a
+    /// caller that would otherwise drop work on a tracker failure should retry it on a later tick.
+    pub fn is_rate_limited(&self) -> bool {
+        matches!(self, TrackerError::Linear(e) if e.kind == linear::LinearErrorKind::RateLimited)
+    }
+}
 
 impl From<linear::LinearError> for TrackerError {
     fn from(err: linear::LinearError) -> Self {
@@ -411,4 +420,12 @@ pub trait Tracker: Any + Send + Sync {
     /// An adapter with no attachment surface returns an error rather than a silent success — the
     /// caller treats the link as best-effort, but "best-effort" must never mean "told it worked".
     async fn link_pull_request(&self, issue_id: &str, url: &str) -> Result<(), TrackerError>;
+
+    /// The request budget of the API key this tracker spends (STUDIO-1896): how much of Linear's
+    /// hourly allowance the daemon has used, whether it is tight, and whether a 429 is blocking the
+    /// key. `None` for an adapter with no request budget (file, fake). Callers use it to slow the
+    /// poll and the background sweeps; it never gates a dispatch-critical read.
+    fn request_budget(&self) -> Option<budget::BudgetStatus> {
+        None
+    }
 }

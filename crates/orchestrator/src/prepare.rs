@@ -42,6 +42,19 @@ use crate::retry::DispatchRoute;
 /// its concurrency permit until it really exits.
 pub const DEFAULT_PREPARATION_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long a completion waits to be re-checked when its revalidation could not READ the tracker
+/// and the tracker named no reset of its own (STUDIO-1896). A rate-limited key waits for Linear's
+/// own reset instead, clamped to [`MAX_REVALIDATION_RETRY_DELAY`].
+pub const DEFAULT_REVALIDATION_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// The longest a single revalidation retry waits, however far away Linear says its reset is.
+pub const MAX_REVALIDATION_RETRY_DELAY: Duration = Duration::from_secs(600);
+
+/// How many times one completion is re-checked after a failed tracker read before it is dropped as
+/// before STUDIO-1896. Bounded so a tracker that never answers cannot hold a reservation (and its
+/// slot) forever; at the maximum delay this rides out a full rate-limit hour.
+pub const MAX_REVALIDATION_RETRIES: u32 = 6;
+
 /// The daemon-wide bound on concurrent off-loop resolver tasks. The permit is held by the spawned
 /// task for its whole lifetime — including after a loop-side timeout — so retries and backoff cannot
 /// accumulate an unbounded resolver-task pileup even when the underlying work cannot be cancelled.
@@ -555,6 +568,9 @@ pub(crate) struct PreparingEntry {
     pub planned_identity: Option<String>,
     /// When this reservation began, for bounded-age logging.
     pub started_at: DateTime<Utc>,
+    /// How many times this completion's revalidation has been re-scheduled because a tracker read
+    /// failed (STUDIO-1896), bounded by [`MAX_REVALIDATION_RETRIES`].
+    pub revalidation_retries: u32,
 }
 
 impl PreparingEntry {
@@ -721,9 +737,21 @@ impl PreparingReservations {
                 claim_already_held: init.claim_already_held,
                 planned_identity: init.planned_identity,
                 started_at: init.started_at,
+                revalidation_retries: 0,
             },
         );
         Ok(token)
+    }
+
+    /// Puts a reservation back after its completion could not be revalidated, so it keeps its
+    /// slot, its token and the duplicate-dispatch guard while the re-check waits (STUDIO-1896).
+    /// Returns the entry (boxed: it is large) when another reservation has taken the id meanwhile.
+    fn restore(&mut self, entry: PreparingEntry) -> Result<(), Box<PreparingEntry>> {
+        if self.entries.contains_key(entry.id()) {
+            return Err(Box::new(entry));
+        }
+        self.entries.insert(entry.id().to_string(), entry);
+        Ok(())
     }
 
     /// Removes and returns the reservation for `id` (a completion or an explicit cancel), if any.
@@ -1245,14 +1273,32 @@ impl Orchestrator {
         // sol #2). A refused completion must not arm a gate or write a zero-turn row for a ticket
         // that has since gone terminal, disappeared, changed selection or gained `rhapsody:human`,
         // exactly as a success must not dispatch it. A stale completion is dropped either way.
-        if self.prepared_target_still_current(&entry).await == PreparedValidity::Stale {
-            tracing::info!(
-                id = %id,
-                "prepared completion is stale: the target changed since preparation began; \
-                 dropping it without dispatching or refusing"
-            );
-            self.abandon_prepared(entry, AbandonCause::Superseded);
-            return;
+        match self.prepared_target_still_current(&entry).await {
+            PreparedValidity::Current => {}
+            PreparedValidity::Stale => {
+                tracing::info!(
+                    id = %id,
+                    "prepared completion is stale: the target changed since preparation began; \
+                     dropping it without dispatching or refusing"
+                );
+                self.abandon_prepared(entry, AbandonCause::Superseded);
+                return;
+            }
+            // The tracker could not ANSWER (a 429, a timeout): that says nothing about the target,
+            // so the completion is kept and re-checked rather than dropped (STUDIO-1896).
+            PreparedValidity::Unverified { retry_in } => {
+                if entry.revalidation_retries >= MAX_REVALIDATION_RETRIES {
+                    tracing::warn!(
+                        id = %id,
+                        retries = entry.revalidation_retries,
+                        "completion revalidation: the tracker never answered; dropping the completion"
+                    );
+                    self.abandon_prepared(entry, AbandonCause::Superseded);
+                    return;
+                }
+                self.retry_revalidation(entry, completion, retry_in);
+                return;
+            }
         }
         match completion.outcome {
             PreparationOutcome::Ready(prepared) => {
@@ -1385,9 +1431,11 @@ impl Orchestrator {
     /// compared against the last observed pull-request head/open state, since the review watcher —
     /// not the control task — is the only thing that may read GitHub.
     ///
-    /// Fails CLOSED: any tracker read that cannot answer is [`PreparedValidity::Stale`], because an
-    /// unverifiable completion is exactly the stale work this guard exists to refuse. The work is
-    /// re-offered on the next tick.
+    /// Fails CLOSED: a tracker read that cannot answer never dispatches. It is
+    /// [`PreparedValidity::Unverified`], not `Stale`, because a failed read says nothing about the
+    /// target: the completion is kept and re-checked once the tracker can answer, rather than
+    /// dropped along with the summons that asked for it (STUDIO-1896 — under a rate limit every
+    /// re-offer hit the same 429, so dropping meant the work was never done).
     async fn prepared_target_still_current(&self, entry: &PreparingEntry) -> PreparedValidity {
         match &entry.target {
             PreparedTarget::Ticket {
@@ -1417,9 +1465,9 @@ impl Orchestrator {
                         tracing::warn!(
                             issue_identifier = %issue.identifier,
                             error = %e,
-                            "completion revalidation: state read failed; dropping the completion"
+                            "completion revalidation: state read failed; retrying the completion"
                         );
-                        return PreparedValidity::Stale;
+                        return self.unverified(tracker.as_ref(), &e);
                     }
                 };
                 let Some(cur_state) = states.into_iter().find(|i| i.id == issue.id) else {
@@ -1438,9 +1486,9 @@ impl Orchestrator {
                         tracing::warn!(
                             issue_identifier = %issue.identifier,
                             error = %e,
-                            "completion revalidation: labels read failed; dropping the completion"
+                            "completion revalidation: labels read failed; retrying the completion"
                         );
-                        return PreparedValidity::Stale;
+                        return self.unverified(tracker.as_ref(), &e);
                     }
                 };
                 let mut cur = issue.clone();
@@ -1932,6 +1980,71 @@ impl Orchestrator {
     /// generation, cancellation, a departed issue, or a stale completion) uses a short delay so the
     /// ticket is re-examined promptly under the new state, where `on_retry` can release it if it is
     /// genuinely gone. A fresh dispatch holds no claim and this is a no-op.
+    /// The [`PreparedValidity::Unverified`] verdict for a failed revalidation read: wait for the
+    /// tracker's own rate-limit reset when it names one, else the configured retry delay.
+    fn unverified(
+        &self,
+        tracker: &dyn rhapsody_tracker::Tracker,
+        err: &rhapsody_tracker::TrackerError,
+    ) -> PreparedValidity {
+        let reset = err
+            .is_rate_limited()
+            .then(|| tracker.request_budget().and_then(|b| b.blocked_for))
+            .flatten();
+        let retry_in = reset
+            .unwrap_or(self.revalidation_retry_delay)
+            .min(MAX_REVALIDATION_RETRY_DELAY);
+        PreparedValidity::Unverified { retry_in }
+    }
+
+    /// Keeps a completion whose revalidation could not read the tracker: the reservation goes back
+    /// (same token, so the slot and the duplicate guard hold), and the completion is re-sent to the
+    /// control task after `retry_in` to be revalidated again. Nothing else is touched — in
+    /// particular a reopen's summons and a manager wake stay pending, which `abandon_prepared`
+    /// would have cleared (STUDIO-1896). A reload or cancellation in the meantime fires the
+    /// reservation's cancel signal (dropping the re-send) or replaces its token (so the re-sent
+    /// completion is ignored), exactly like any late completion.
+    fn retry_revalidation(
+        &mut self,
+        mut entry: PreparingEntry,
+        completion: PreparationCompletion,
+        retry_in: Duration,
+    ) {
+        entry.revalidation_retries += 1;
+        let id = entry.id().to_string();
+        let token = entry.token;
+        let cancel = entry.cancel.clone();
+        tracing::warn!(
+            id = %id,
+            attempt = entry.revalidation_retries,
+            retry_in_ms = u64::try_from(retry_in.as_millis()).unwrap_or(u64::MAX),
+            "completion revalidation could not read the tracker; keeping the completion and \
+             re-checking it later"
+        );
+        if let Err(entry) = self.preparing.restore(entry) {
+            // Unreachable in practice (the id was just taken on this same task), but never strand
+            // a claim: release it as any supersession would.
+            self.abandon_prepared(*entry, AbandonCause::Superseded);
+            return;
+        }
+        let events = self.events.clone();
+        let wg = self.wg.add();
+        tokio::spawn(async move {
+            let _guard = wg;
+            let mut cancelled = cancel.wait();
+            tokio::select! {
+                _ = cancelled.cancelled() => {}
+                () = tokio::time::sleep(retry_in) => {
+                    let _ = events.send(Event::DispatchPrepared {
+                        id,
+                        token,
+                        completion: Box::new(completion),
+                    });
+                }
+            }
+        });
+    }
+
     fn abandon_prepared(&mut self, entry: PreparingEntry, cause: AbandonCause) {
         // A preparation that ended without dispatching must not leave a reopening summons behind for
         // an unrelated later run to inherit — nor a held manager wake obligation (STUDIO-1017), whose
@@ -2244,6 +2357,9 @@ enum PreparedValidity {
     Current,
     /// Something the reservation captured has changed; the completion must not dispatch.
     Stale,
+    /// The tracker could not answer (rate limited, unreachable); nothing is known to have changed.
+    /// The completion must not dispatch YET, and is re-checked after `retry_in` (STUDIO-1896).
+    Unverified { retry_in: Duration },
 }
 
 /// Why a claim-held preparation ended without dispatching. Both causes RE-PARK the retry (keep the
@@ -4376,6 +4492,151 @@ mod tests {
             "a ticket that gained a human hold must not dispatch"
         );
         assert!(o.preparing.is_empty());
+    }
+
+    /// Receives the next `DispatchPrepared` off `rx`, skipping any other control event.
+    async fn next_prepared(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) -> (String, PreparationToken, PreparationCompletion) {
+        loop {
+            let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("a completion arrives")
+                .expect("channel open");
+            if let Event::DispatchPrepared {
+                id,
+                token,
+                completion,
+            } = ev
+            {
+                return (id, token, *completion);
+            }
+        }
+    }
+
+    // STUDIO-1896 acceptance. MUTATION GUARD: treat a failed revalidation read as `Stale` again and
+    // a completion that hit Linear's rate limit is dropped (with its summons) instead of being
+    // re-checked — this test reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completion_whose_revalidation_hits_a_429_is_retried_not_dropped() {
+        use std::sync::atomic::AtomicBool;
+        let rate_limited = Arc::new(AtomicBool::new(true));
+        let mut tr = Fake::new();
+        let iss = issue("1", "MT-1", "Todo");
+        tr.candidates = vec![iss.clone()];
+        tr.by_id.insert("1".to_string(), iss);
+        {
+            let rate_limited = Arc::clone(&rate_limited);
+            tr.labels_by_ids_func = Some(Box::new(move |ids: &[String]| {
+                if rate_limited.load(Ordering::SeqCst) {
+                    return Err(rhapsody_tracker::TrackerError::Linear(
+                        rhapsody_tracker::linear::LinearError::new(
+                            rhapsody_tracker::linear::LinearErrorKind::RateLimited,
+                            "status 429, retry in 60s",
+                        ),
+                    ));
+                }
+                Ok(ids
+                    .iter()
+                    .map(|id| Issue {
+                        id: id.clone(),
+                        labels: Some(Vec::new()),
+                        ..Issue::default()
+                    })
+                    .collect())
+            }));
+        }
+        let tr = Arc::new(tr);
+        let mut eff = empty_effective(Arc::clone(&tr) as Arc<dyn rhapsody_tracker::Tracker>);
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.max_concurrent = 10;
+        eff.poll_interval = Duration::from_secs(3600);
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.prepare_resolver = Some(Arc::new(FakeResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Mutex::new(Scripted::Ready),
+        }));
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+        o.revalidation_retry_delay = Duration::from_millis(20);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        o.events = tx;
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+
+        // The resolver's completion arrives while Linear answers 429.
+        let (id, token, completion) = next_prepared(&mut rx).await;
+        o.handle_dispatch_prepared(id, token, completion).await;
+        assert!(
+            sink.lock().expect("dispatch sink").is_empty(),
+            "an unverified completion must not dispatch"
+        );
+        let kept = o
+            .preparing
+            .get("1")
+            .expect("the completion is kept, not dropped");
+        assert_eq!(kept.token, token, "the reservation keeps its token");
+        assert_eq!(kept.revalidation_retries, 1);
+        assert_eq!(tr.labels_by_id_calls(), 1);
+
+        // Linear recovers; the re-sent completion revalidates and dispatches.
+        rate_limited.store(false, Ordering::SeqCst);
+        let (id, again, completion) = next_prepared(&mut rx).await;
+        assert_eq!(again, token, "the same completion is re-sent");
+        o.handle_dispatch_prepared(id, again, completion).await;
+        assert_eq!(
+            sink.lock().expect("dispatch sink").len(),
+            1,
+            "the retried completion dispatches once the tracker answers"
+        );
+        assert!(o.preparing.is_empty());
+        assert_eq!(tr.labels_by_id_calls(), 2);
+    }
+
+    // A tracker that never answers cannot hold a reservation forever: after the bounded retries
+    // the completion is dropped exactly as before STUDIO-1896.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_completion_is_dropped_once_its_revalidation_retries_are_spent() {
+        let mut tr = Fake::new();
+        let iss = issue("1", "MT-1", "Todo");
+        tr.candidates = vec![iss.clone()];
+        tr.by_id.insert("1".to_string(), iss);
+        tr.labels_by_id_err = Some(rhapsody_tracker::TrackerError::Other("down".to_string()));
+        let tr = Arc::new(tr);
+        let mut eff = empty_effective(Arc::clone(&tr) as Arc<dyn rhapsody_tracker::Tracker>);
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.terminal_states = set_of(&["done"]);
+        eff.max_concurrent = 10;
+        eff.poll_interval = Duration::from_secs(3600);
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.prepare_resolver = Some(Arc::new(FakeResolver {
+            calls: Arc::new(AtomicUsize::new(0)),
+            outcome: Mutex::new(Scripted::Ready),
+        }));
+        let sink: DispatchedEntries = Arc::new(Mutex::new(Vec::new()));
+        o.spawn = Some(record_entries(&sink));
+        o.revalidation_retry_delay = Duration::from_millis(5);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        o.events = tx;
+        assert!(matches!(
+            o.begin_preparation(ticket_target("Todo"), false),
+            BeginPreparation::Started(_)
+        ));
+        for _ in 0..=MAX_REVALIDATION_RETRIES {
+            let (id, token, completion) = next_prepared(&mut rx).await;
+            o.handle_dispatch_prepared(id, token, completion).await;
+        }
+        assert!(o.preparing.is_empty(), "the spent reservation is released");
+        assert!(sink.lock().expect("dispatch sink").is_empty());
+        assert_eq!(
+            tr.labels_by_id_calls(),
+            usize::try_from(MAX_REVALIDATION_RETRIES).expect("small") + 1
+        );
     }
 
     // MUTATION GUARD: accept a completion without re-reading existence and a vanished ticket

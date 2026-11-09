@@ -98,6 +98,12 @@ pub(crate) async fn run_terminal_sweep(plan: &TerminalCleanupPlan) -> TerminalCl
     let started = std::time::Instant::now();
     let mut summary = TerminalCleanupSummary::default();
     for g in &plan.projects {
+        // A background sweep: it waits while the key's Linear budget is tight rather than spending
+        // what dispatch needs (STUDIO-1896). The worktrees stay until the next pass.
+        if g.tracker.request_budget().is_some_and(|b| b.tight) {
+            tracing::info!(project_slug = %g.slug, "terminal cleanup skipped while the Linear budget is tight");
+            continue;
+        }
         // 1. The worktrees that actually exist on disk, one key each.
         let keys = g.workspace.worktree_keys(&g.repo);
         summary.worktrees += keys.len();
@@ -401,6 +407,11 @@ mod tests {
     ) -> (Orchestrator, Arc<Fake>, Arc<Manager>, TempDir) {
         let mut tr = Fake::new();
         tr.by_id = by_id;
+        orch_for_cleanup_with(tr)
+    }
+
+    /// [`orch_for_cleanup`] over a caller-built fake, so a test can program more than `by_id`.
+    fn orch_for_cleanup_with(tr: Fake) -> (Orchestrator, Arc<Fake>, Arc<Manager>, TempDir) {
         let tr = Arc::new(tr);
         let dir = TempDir::new();
         let ws = mk_workspace(&dir.path);
@@ -583,6 +594,47 @@ mod tests {
             tr.by_id_calls(),
             0,
             "a protected worktree is skipped before the state read"
+        );
+    }
+
+    // STUDIO-1896: the terminal sweep is a background sweep, so while the project's Linear budget is
+    // tight it makes no tracker read at all and leaves the worktree for the next pass.
+    //
+    // MUTATION: drop the budget gate in `run_terminal_sweep` and the worktree is fetched, found
+    // terminal and removed.
+    #[tokio::test]
+    async fn sweep_skips_a_project_whose_linear_budget_is_tight() {
+        let mut tr = Fake::new();
+        tr.by_id = HashMap::from([("a1".to_string(), issue("a1", "A-1", "Done"))]);
+        tr.request_budget = Some(rhapsody_tracker::budget::BudgetStatus {
+            used: 2100,
+            limit: 2500,
+            tight: true,
+            blocked_for: None,
+        });
+        let (o, tr, ws, _dir) = orch_for_cleanup_with(tr);
+        seed_run(&o, "A-1", "a1", "a");
+        let w = ws.create_for_issue("", "A-1").await.expect("create ws");
+
+        let plan = o.build_terminal_cleanup_plan(true);
+        let summary = run_terminal_sweep(&plan).await;
+
+        assert_eq!(
+            summary.removed, 0,
+            "nothing is removed while the budget is tight"
+        );
+        assert!(
+            std::fs::metadata(&w.path).is_ok(),
+            "the worktree waits for the next pass"
+        );
+        assert_eq!(
+            tr.by_id_calls(),
+            0,
+            "a tight budget spends no state read on the sweep"
+        );
+        assert!(
+            tr.by_identifier_calls().is_empty(),
+            "nor an identifier fallback"
         );
     }
 
