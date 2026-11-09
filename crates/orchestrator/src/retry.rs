@@ -3764,8 +3764,9 @@ mod tests {
     }
 
     /// STUDIO-1896: one tick reads a project's candidate set ONCE, however many of its retries are
-    /// due — the retry pass before the poll, the poll itself and the retry pass after it share the
-    /// read. Covers both ladders. MUTATION GUARD: fetch directly in `on_retry` (or in the poll) and
+    /// due — the retry pass before the poll and the poll itself share the read. (The retry pass
+    /// after the poll starts a fresh generation, but reads only when it has a retry due; here both
+    /// retries went out before the poll, so it reads nothing.) Covers both ladders. MUTATION GUARD: fetch directly in `on_retry` (or in the poll) and
     /// this reds at 3 calls; open no tick cache in `on_tick` and it reds at 2.
     #[tokio::test]
     async fn a_tick_reads_each_projects_candidates_once_across_retries_and_the_poll() {
