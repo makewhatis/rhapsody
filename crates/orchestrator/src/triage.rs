@@ -65,7 +65,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rhapsody_config::room::{Message, RoomLog};
 use rhapsody_config::teams::{ManagerMode, Teams};
 use rhapsody_core::Issue;
@@ -171,6 +171,11 @@ const IDLE_HEARTBEAT_CYCLES: u32 = 15;
 /// the pre-STUDIO-669 behaviour of dispatching identity-less rather than stalling.
 const MAX_PENDING_ASSIGNMENTS: usize = 256;
 
+/// The most recent label writes [`TriageHandle`] remembers. A healthy daemon retires each one
+/// within a poll or two; the cap only stops a board that never refreshes from growing the map
+/// without bound, and it evicts the OLDEST write first — the one a fresh read is likeliest to show.
+const MAX_WRITTEN_ASSIGNMENTS: usize = 1024;
+
 /// The two-way seam between the **control task** and the **triage task** (STUDIO-669; design record
 /// `~/.rhapsody/docs/STUDIO-668-multi-team.md` §A.3.2 and §A.3.4).
 ///
@@ -199,6 +204,14 @@ pub struct TriageHandle {
     /// `tokio`'s because every critical section is a map lookup with no `await` inside it, and the
     /// control task must be able to read it from a synchronous `fn`.
     pending: std::sync::Mutex<HashMap<String, String>>,
+    /// Issue id → when triage (or the ears pass) WROTE its identity label (STUDIO-1896). Triage-task
+    /// only; the control task never reads it. A cycle that reuses the poll's published candidates
+    /// can be looking at a board read BEFORE that write, where the ticket still looks unclaimed,
+    /// and the label write is additive — so without this a second cycle asked the model again and
+    /// a different answer put a SECOND identity label on an assigned ticket. An entry stands until
+    /// a board read that STARTED after the write has had its say. See
+    /// [`TriageHandle::retire_written`].
+    written: std::sync::Mutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl TriageHandle {
@@ -214,6 +227,47 @@ impl TriageHandle {
     /// whole valve exists to avoid. `unwrap()` is also simply not available here (non-test code).
     fn map(&self) -> std::sync::MutexGuard<'_, HashMap<String, String>> {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Locks the written map, treating a poisoned lock as readable (see [`Self::map`]).
+    fn written_map(&self) -> std::sync::MutexGuard<'_, HashMap<String, DateTime<Utc>>> {
+        self.written.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Records that `issue_id`'s identity label was written at `at` (STUDIO-1896).
+    pub(crate) fn record_written(&self, issue_id: &str, at: DateTime<Utc>) {
+        let mut map = self.written_map();
+        if !map.contains_key(issue_id) && map.len() >= MAX_WRITTEN_ASSIGNMENTS {
+            let oldest = map
+                .iter()
+                .min_by_key(|(_, t)| **t)
+                .map(|(id, _)| id.clone());
+            if let Some(id) = oldest {
+                map.remove(&id);
+            }
+        }
+        map.insert(issue_id.to_string(), at);
+    }
+
+    /// Forgets every write a board read stamped `fetched_at` can be trusted to show: those made
+    /// strictly before it. Both stamps are taken BEFORE their fetch starts (the poll's
+    /// `PrefetchTarget::fetched_at`, and the cycle's own `board_at`), so a read stamped after a
+    /// write began after it. Such a read is authoritative: if it shows the ticket unlabelled, the
+    /// label was removed after the write (by a human, or the reconcile), and deciding it again is
+    /// exactly the behaviour before STUDIO-1896.
+    pub(crate) fn retire_written(&self, fetched_at: DateTime<Utc>) {
+        self.written_map().retain(|_, at| *at >= fetched_at);
+    }
+
+    /// Whether `issue_id` has a label write the current board read cannot be trusted to show yet.
+    /// Call after [`Self::retire_written`] for that read.
+    pub(crate) fn written_unseen(&self, issue_id: &str) -> bool {
+        self.written_map().contains_key(issue_id)
+    }
+
+    /// Drops a written entry — the board read now shows an identity label on the ticket.
+    pub(crate) fn clear_written(&self, issue_id: &str) {
+        self.written_map().remove(issue_id);
     }
 
     /// Asks the triage task to run a cycle NOW (§A.3.2). Cheap, non-blocking, and idempotent
@@ -1107,6 +1161,12 @@ where
         .as_ref()
         .and_then(|c| published_candidates(c, &target.slugs, trackers.len(), Utc::now()));
     let reused = published.is_some();
+    // When the board this cycle reads was fetched: the poll's timestamp for a reused set, now for
+    // the cycle's own fetch (which starts below). The written overlay is judged against it.
+    let board_at = match target.candidates.as_ref() {
+        Some(c) if reused => c.fetched_at,
+        _ => Utc::now(),
+    };
     // Fan the candidate fetch out over every enabled project, exactly as the poll loop does, and
     // de-duplicate on issue id with FIRST PROJECT WINS — the same rule `on_tick` uses, so a ticket
     // reachable through two configured slugs is triaged by the same client that would dispatch it.
@@ -1158,8 +1218,12 @@ where
     for iss in &issues {
         if has_any_identity_label(iss) {
             deps.handle.clear_pending(&iss.id);
+            deps.handle.clear_written(&iss.id);
         }
     }
+    // A write this board read was fetched late enough to show is retired by it; one it may predate
+    // stays, and keeps its ticket out of the assignment pass below (STUDIO-1896).
+    deps.handle.retire_written(board_at);
     let fetched = issues.len();
     // The one-time cleanup, BEFORE the assignment pass and over the whole fetch rather than the
     // candidate list: the labels it removes are precisely what keeps those tickets OUT of the
@@ -1242,6 +1306,10 @@ where
         let heard =
             crate::teamsears::ears_pass(&deps.teams, room.as_ref(), ears.as_ref(), &cycle).await;
         ears_labelled.extend(heard.wrote.labelled_ids().map(str::to_string));
+        let at = Utc::now();
+        for id in heard.wrote.labelled_ids() {
+            deps.handle.record_written(id, at);
+        }
         if !heard.is_quiet() {
             tracing::info!(
                 answered = heard.answered,
@@ -1283,6 +1351,11 @@ where
     // retry of an older, unwritten decision is the point, not a leak: the next cycle's fetch shows
     // the label the ears pass wrote, and the sweep at the top of this function retires the entry.
     candidates.retain(|iss| !ears_labelled.contains(&iss.id));
+    // And a ticket an EARLIER cycle labelled stays claimed while this cycle's board read may
+    // predate that write (STUDIO-1896): a reused poll snapshot is older than the cycle, and the
+    // label is additive, so deciding it again would add a second identity. A pending (unwritten)
+    // decision is not in this set, so its write is still retried below.
+    candidates.retain(|iss| !deps.handle.written_unseen(&iss.id));
     if candidates.is_empty() {
         return report(failed_outcome(CycleOutcome::Idle), 0);
     }
@@ -1361,6 +1434,7 @@ where
             match write_label(tracker.as_ref(), iss, &identity).await {
                 Ok(()) => {
                     deps.handle.clear_pending(&iss.id);
+                    deps.handle.record_written(&iss.id, Utc::now());
                     tracing::info!(
                         issue = %iss.identifier,
                         %identity,
@@ -1493,6 +1567,8 @@ where
                 );
                 continue;
             }
+        } else {
+            deps.handle.record_written(&iss.id, Utc::now());
         }
         // §0.11.1: "the decision's durable record is a manager post in the room log". The
         // `teams.route` events row is the per-run TIMELINE copy and is pruned with its run
@@ -5141,6 +5217,131 @@ mod tests {
             vec!["i2".to_string()],
             "written through the owning project"
         );
+    }
+
+    /// The labels a cycle wrote through `tr`, in order.
+    fn written_labels(tr: &Fake) -> Vec<String> {
+        tr.add_label_calls()
+            .iter()
+            .map(|c| format!("{}={}", c.issue_id, c.label_name))
+            .collect()
+    }
+
+    /// STUDIO-1896 review B1. Triage runs every minute but the poll republishes every two (four
+    /// while the budget is tight), so consecutive cycles reuse ONE snapshot taken before the first
+    /// cycle's label write. The write is additive: re-deciding the still-unlabelled-looking ticket
+    /// put a second identity on it. MUTATION GUARD: drop the `written_unseen` filter and the second
+    /// cycle asks the model again and writes `rhapsody:@bob` too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_published_snapshot_never_assigns_the_same_ticket_twice() {
+        let tr = Arc::new(Fake::new());
+        let published = crate::teamsprefetch::PrefetchTarget {
+            issues: vec![labelled("i1", &[])],
+            fetched_at: Utc::now(),
+            owner_slugs: vec!["alpha".to_string()],
+        };
+        let arbiter =
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice"), FakeArbiter::ok("bob")]);
+        let d = deps_published(
+            teams_model(vec![ident("alice", &[]), ident("bob", &[])]),
+            vec![Arc::clone(&tr) as Arc<dyn Tracker>],
+            vec!["alpha".to_string()],
+            published,
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+        );
+        let first = triage_cycle(&CancelWait::default(), &d, true).await;
+        let second = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(first, CycleOutcome::Labelled(1));
+        assert_eq!(second, CycleOutcome::Idle, "nothing left to decide");
+        assert_eq!(written_labels(&tr), vec!["i1=rhapsody:@alice".to_string()]);
+        assert_eq!(arbiter.prompts().len(), 1, "the model is asked once");
+    }
+
+    /// The pending-write valve still works on a reused snapshot (STUDIO-1896 review B1): a refused
+    /// write is retried on the next cycle, and once it lands the ticket is not decided again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pending_write_is_retried_on_a_reused_snapshot_and_then_left_alone() {
+        let mut f = Fake::new();
+        f.add_label_fail_first = 1;
+        let tr = Arc::new(f);
+        let published = crate::teamsprefetch::PrefetchTarget {
+            issues: vec![labelled("i1", &[])],
+            fetched_at: Utc::now(),
+            owner_slugs: vec!["alpha".to_string()],
+        };
+        let arbiter =
+            FakeArbiter::answering(vec![FakeArbiter::ok("alice"), FakeArbiter::ok("bob")]);
+        let d = deps_published(
+            teams_model(vec![ident("alice", &[]), ident("bob", &[])]),
+            vec![Arc::clone(&tr) as Arc<dyn Tracker>],
+            vec!["alpha".to_string()],
+            published,
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+        );
+        let first = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(first, CycleOutcome::TrackerFailure, "the write was refused");
+        assert_eq!(d.handle.pending_identity("i1").as_deref(), Some("alice"));
+        let second = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(
+            second,
+            CycleOutcome::Labelled(1),
+            "the pending write landed"
+        );
+        assert_eq!(d.handle.pending_identity("i1"), None);
+        let third = triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(third, CycleOutcome::Idle);
+        assert_eq!(
+            written_labels(&tr),
+            vec![
+                "i1=rhapsody:@alice".to_string(),
+                "i1=rhapsody:@alice".to_string()
+            ],
+            "the refused write, its retry, and nothing after"
+        );
+        assert_eq!(arbiter.prompts().len(), 1, "decided once");
+    }
+
+    /// The overlay only bridges a board read that may predate the write. A read started after it
+    /// is authoritative: if it shows the ticket unlabelled, the label was removed since, and the
+    /// ticket is triaged again exactly as before STUDIO-1896.
+    #[test]
+    fn a_board_read_after_the_write_settles_retires_it() {
+        let h = TriageHandle::new();
+        let at = Utc::now();
+        h.record_written("i1", at);
+        h.retire_written(at - chrono::TimeDelta::minutes(2));
+        assert!(
+            h.written_unseen("i1"),
+            "a read that started before the write"
+        );
+        h.retire_written(at);
+        assert!(
+            h.written_unseen("i1"),
+            "a read that may have raced the write"
+        );
+        h.retire_written(at + chrono::TimeDelta::milliseconds(1));
+        assert!(
+            !h.written_unseen("i1"),
+            "a read that started after the write"
+        );
+    }
+
+    /// The overlay is bounded, and full it evicts the OLDEST write rather than refusing the newest.
+    #[test]
+    fn the_written_overlay_is_bounded_and_evicts_the_oldest() {
+        let h = TriageHandle::new();
+        let base = Utc::now();
+        for i in 0..MAX_WRITTEN_ASSIGNMENTS {
+            h.record_written(
+                &format!("i{i}"),
+                base + chrono::TimeDelta::seconds(i as i64),
+            );
+        }
+        h.record_written("new", base + chrono::TimeDelta::hours(1));
+        assert!(h.written_unseen("new"));
+        assert!(!h.written_unseen("i0"), "the oldest went");
+        assert!(h.written_unseen("i1"));
+        assert_eq!(h.written_map().len(), MAX_WRITTEN_ASSIGNMENTS);
     }
 
     /// A published set too old to stand in for a fetch — or one naming a project this target does
