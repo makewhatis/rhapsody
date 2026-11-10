@@ -74,6 +74,12 @@ use crate::{
 const MAX_STDOUT_LINE: usize = 10 * 1024 * 1024;
 const MAX_STDERR_CAPTURE: usize = 256 * 1024;
 const READ_CHUNK: usize = 64 * 1024;
+/// How many times one turn may start its executor. The runner reserves a free port and RELEASES it
+/// for the executor to bind, so anything else (in the daemon: another turn's executor) can take it
+/// in between; the losing executor then cannot serve this turn. Nothing has reached any session
+/// before the listener is proven this turn's own, so a lost port is relaunched on a fresh one —
+/// bounded, so an executor that never claims its port still fails the turn (STUDIO-1913).
+const MAX_EXECUTOR_LAUNCHES: usize = 3;
 const MAX_STDERR_MESSAGE: usize = 2048;
 /// Bounds the final result text (the `HANDOFF:` marker is at the END, so the TAIL is kept).
 const MAX_RESULT_TEXT: usize = 4096;
@@ -1400,11 +1406,6 @@ impl OpencodeSession {
         api_redactor.add_control(&control.password, &control.url);
         let err_redactor = stderr_redactor.get_or_insert_with(|| CapabilityRedactor::new("", ""));
         err_redactor.add_control(&control.password, &control.url);
-        let mut cmd = Command::new(&self.cmd_name);
-        cmd.args(&self.cmd_args)
-            .args(control.args())
-            .args(&request.server_flags);
-        cmd.current_dir(&self.ws_path);
 
         // Env: withhold the tracker credential by name AND by value (always), then add the "me"
         // identity so the injected MCP server can default its tools to this run. No billing scrub —
@@ -1516,78 +1517,196 @@ impl OpencodeSession {
                 )),
             );
         }
-        cmd.env_clear();
-        for kv in &env {
-            if let Some((k, v)) = kv.split_once('=') {
-                if matches!(k, "OPENCODE_SERVER_PASSWORD" | "OPENCODE_SERVER_USERNAME") {
-                    continue;
+        let server_flags = request.server_flags.clone();
+        // One executor command per launch: only the reserved port differs between launches.
+        let executor = |control: &super::server::Control| {
+            let mut cmd = Command::new(&self.cmd_name);
+            cmd.args(&self.cmd_args)
+                .args(control.args())
+                .args(&server_flags);
+            cmd.current_dir(&self.ws_path);
+            cmd.env_clear();
+            for kv in &env {
+                if let Some((k, v)) = kv.split_once('=') {
+                    if matches!(k, "OPENCODE_SERVER_PASSWORD" | "OPENCODE_SERVER_USERNAME") {
+                        continue;
+                    }
+                    cmd.env(k, v);
                 }
-                cmd.env(k, v);
             }
-        }
-        cmd.env("OPENCODE_SERVER_PASSWORD", &control.password);
-        cmd.env("OPENCODE_SERVER_USERNAME", "opencode");
+            cmd.env("OPENCODE_SERVER_PASSWORD", &control.password);
+            cmd.env("OPENCODE_SERVER_USERNAME", "opencode");
 
-        // Own process group so a deadline kill can signal it. Necessary but NOT sufficient: the
-        // spike measured opencode's tool shell escaping into a group of its own (2 survivors of 3
-        // descendants, `harness/harness-spike/opencode/killtest.txt`), which is why every kill below
-        // is `kill_tree` (STUDIO-871) and never a bare group kill.
-        cmd.process_group(0);
-        cmd.stdin(std::process::Stdio::piped());
-        cmd.stdout(std::process::Stdio::piped());
-        cmd.stderr(std::process::Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(e) => {
-                on_event(Event {
-                    event_type: EVENT_STARTUP_FAILED.to_string(),
-                    timestamp: Some(Utc::now()),
-                    message: e.to_string(),
-                    ..Default::default()
-                });
-                let err = if e.kind() == std::io::ErrorKind::NotFound {
-                    AgentError::AgentNotFound
-                } else {
-                    AgentError::StartupFailed
-                };
-                return (failed(Usage::default()), Some(err));
-            }
+            // Own process group so a deadline kill can signal it. Necessary but NOT sufficient: the
+            // spike measured opencode's tool shell escaping into a group of its own (2 survivors of
+            // 3 descendants, `harness/harness-spike/opencode/killtest.txt`), which is why every kill
+            // below is `kill_tree` (STUDIO-871) and never a bare group kill.
+            cmd.process_group(0);
+            cmd.stdin(std::process::Stdio::piped());
+            cmd.stdout(std::process::Stdio::piped());
+            cmd.stderr(std::process::Stdio::piped());
+            cmd
         };
-        let pid = child.id().unwrap_or(0);
-        // Arm immediately after spawn, before any error-path await. Capability
-        // revocation precedes tree teardown even if pipe acquisition fails.
+
+        // Armed before the first spawn, and re-pointed at each launch's leader right after its
+        // spawn, before any error-path await. Capability revocation precedes tree teardown even if
+        // pipe acquisition fails.
         let mut teardown = TurnTeardown {
             access: BrokerTurnGuard {
                 access: brokered_access.take(),
             },
-            tree: KillTreeOnDrop::new(pid),
+            tree: KillTreeOnDrop::new(0),
         };
-        let (stdin, mut server_stdout, mut stderr) =
-            match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
-                (Some(i), Some(o), Some(e)) => (i, o, e),
-                _ => {
-                    teardown.revoke();
-                    kill_tree(pid);
-                    if child.wait().await.is_ok() {
-                        teardown.disarm_tree();
-                    }
-                    return (failed(Usage::default()), Some(AgentError::StartupFailed));
+        let mut stderr_buf = CappedBuffer::new(MAX_STDERR_CAPTURE);
+        let mut err_chunk = vec![0u8; READ_CHUNK];
+        let mut timed_out = false;
+        let deadline = tokio::time::sleep_until(turn_deadline);
+        tokio::pin!(deadline);
+        let mut control = control;
+        let mut launch = 0;
+        let (mut child, pid, mut stderr, mut stderr_open, _stdout_drain, connected) = loop {
+            launch += 1;
+            let mut child = match executor(&control).spawn() {
+                Ok(c) => c,
+                Err(e) => {
+                    on_event(Event {
+                        event_type: EVENT_STARTUP_FAILED.to_string(),
+                        timestamp: Some(Utc::now()),
+                        message: e.to_string(),
+                        ..Default::default()
+                    });
+                    let err = if e.kind() == std::io::ErrorKind::NotFound {
+                        AgentError::AgentNotFound
+                    } else {
+                        AgentError::StartupFailed
+                    };
+                    return (failed(Usage::default()), Some(err));
                 }
             };
-        // CLOSED AT START (`StdinPolicy::ClosedAtStart`). The prompt goes over HTTP; a
-        // held-open stdin is claude's mailbox, not this harness's contract.
-        drop(stdin);
+            let pid = child.id().unwrap_or(0);
+            teardown.tree = KillTreeOnDrop::new(pid);
+            let (stdin, mut server_stdout, mut stderr) =
+                match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+                    (Some(i), Some(o), Some(e)) => (i, o, e),
+                    _ => {
+                        teardown.revoke();
+                        kill_tree(pid);
+                        if child.wait().await.is_ok() {
+                            teardown.disarm_tree();
+                        }
+                        return (failed(Usage::default()), Some(AgentError::StartupFailed));
+                    }
+                };
+            // CLOSED AT START (`StdinPolicy::ClosedAtStart`). The prompt goes over HTTP; a
+            // held-open stdin is claude's mailbox, not this harness's contract.
+            drop(stdin);
 
-        let _stdout_drain = super::server::Task(tokio::spawn(async move {
-            let mut buf = [0u8; READ_CHUNK];
-            while let Ok(n) = server_stdout.read(&mut buf).await {
-                if n == 0 {
-                    break;
+            let stdout_drain = super::server::Task(tokio::spawn(async move {
+                let mut buf = [0u8; READ_CHUNK];
+                while let Ok(n) = server_stdout.read(&mut buf).await {
+                    if n == 0 {
+                        break;
+                    }
                 }
+            }));
+
+            // Prove the listener is this launch's own before anything is sent, draining stderr
+            // meanwhile. An executor that exits first never bound its port (a server that loses
+            // the bind exits); with launches left that is relaunched at once rather than waiting
+            // out the startup timeout. The last launch keeps the original startup behaviour.
+            let relaunchable = launch < MAX_EXECUTOR_LAUNCHES;
+            let mut stderr_open = true;
+            // Set once `child.wait()` has REAPED this launch: its pid may then be reused, so it
+            // must never be signalled again.
+            let mut reaped = false;
+            let outcome = {
+                let connect = super::server::connect(
+                    control.clone(),
+                    request.directory.clone(),
+                    &api_redactor,
+                );
+                tokio::pin!(connect);
+                loop {
+                    tokio::select! {
+                        _ = &mut deadline => break None,
+                        result = &mut connect => break Some(result),
+                        _ = child.wait(), if relaunchable => {
+                            reaped = true;
+                            break Some(Err(super::server::Unproven {
+                                error: AgentError::Other(
+                                    "opencode_control_failed: executor exited before its listener was ready".into(),
+                                ),
+                                port_lost: true,
+                            }));
+                        }
+                        r = stderr.read(&mut err_chunk), if stderr_open => {
+                            match r {
+                                // Not `finish`ed here: a relaunch keeps using the redactor.
+                                Ok(0) | Err(_) => stderr_open = false,
+                                Ok(n) => {
+                                    let redacted = match stderr_redactor.as_mut() {
+                                        Some(redactor) => redactor.push(&err_chunk[..n]),
+                                        None => err_chunk[..n].to_vec(),
+                                    };
+                                    stderr_buf.write(&redacted);
+                                    self.tee_stderr(&redacted);
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            let connected = match outcome {
+                None => {
+                    // The deadline passed before the listener was ready: a timed-out turn.
+                    teardown.revoke();
+                    kill_tree(pid);
+                    timed_out = true;
+                    Err(AgentError::Other(
+                        "opencode_control_failed: turn deadline before listener readiness".into(),
+                    ))
+                }
+                Some(Ok(listener)) => Ok(listener),
+                Some(Err(unproven)) if unproven.port_lost && relaunchable => {
+                    tracing::warn!(
+                        launch,
+                        reason = %unproven.error,
+                        "opencode: the executor did not claim its reserved port; relaunching it on a fresh one"
+                    );
+                    if !reaped {
+                        kill_tree(pid);
+                        reaped = child.wait().await.is_ok();
+                    }
+                    if reaped {
+                        teardown.disarm_tree();
+                    }
+                    // A fresh password as well as a fresh port: `connect` sent the old one to
+                    // whatever answered on the lost port.
+                    control = match super::server::Control::new() {
+                        Ok(control) => control,
+                        Err(e) => return (failed(Usage::default()), Some(e)),
+                    };
+                    api_redactor.add_control(&control.password, &control.url);
+                    if let Some(redactor) = stderr_redactor.as_mut() {
+                        redactor.add_control(&control.password, &control.url);
+                    }
+                    continue;
+                }
+                Some(Err(unproven)) => Err(unproven.error),
+            };
+            break (child, pid, stderr, stderr_open, stdout_drain, connected);
+        };
+        if !stderr_open {
+            // The final launch's stderr ended before its listener was ready. Its redactor could
+            // not be finished then (a relaunch would have needed it), so flush its tail now.
+            if let Some(redactor) = stderr_redactor.as_mut() {
+                let tail = redactor.finish();
+                stderr_buf.write(&tail);
+                self.tee_stderr(&tail);
             }
-        }));
-        let (mut stdout, _observer) = super::server::stream(control, request, api_redactor);
+        }
+        let (mut stdout, _observer) =
+            super::server::stream_connected(connected, request, api_redactor);
 
         let mut usage = Usage::default();
         let mut cost_usd = Some(0.0);
@@ -1604,8 +1723,6 @@ impl OpencodeSession {
         // run history would show each provider failure twice.
         let mut failure_surfaced = false;
         let mut scan_err: Option<String> = None;
-        let mut timed_out = false;
-        let mut stderr_open = true;
         // ⚠️ Per TURN, not per session — always starting `false`. The consumer counts turns off this
         // event: `agentupdate.rs` does `re.turn_count += 1` and rebuilds `re.session_id` on every
         // `EVENT_SESSION_STARTED` (design §1.5's "session_id is derived from the turn counter").
@@ -1623,13 +1740,8 @@ impl OpencodeSession {
         // writes the digest into its record. Without that evidence the held digest is left alone:
         // eliding a prompt that never landed would leave the agent without one.
         let mut prompt_landed = false;
-        let mut stderr_buf = CappedBuffer::new(MAX_STDERR_CAPTURE);
         let mut acc: Vec<u8> = Vec::with_capacity(READ_CHUNK);
         let mut out_chunk = vec![0u8; READ_CHUNK];
-        let mut err_chunk = vec![0u8; READ_CHUNK];
-
-        let deadline = tokio::time::sleep_until(turn_deadline);
-        tokio::pin!(deadline);
 
         // Extracted so it can run both on every stdout chunk AND once more after the redactor's
         // `finish()` flushes its retained prefix on EOF. A macro (not a closure) so it can mutate
@@ -1738,7 +1850,7 @@ impl OpencodeSession {
             }};
         }
 
-        'outer: loop {
+        'outer: while !timed_out {
             tokio::select! {
                 _ = &mut deadline => {
                     teardown.revoke();
@@ -3937,6 +4049,13 @@ printf '%s\n' '{{"type":"step_finish","sessionID":"ses_loop","part":{{"reason":"
         for n in 1..=6 {
             let (tr, err) = one_attempt(&runner, &ws, "STUDIO-1374", &prompt).await;
             assert_eq!(tr.status, TURN_FAILED, "attempt {n} must fail: {err:?}");
+            // Failing for the fake's OWN reason: an attempt that failed before reaching it would
+            // leave the fake's fail/fail/…/succeed sequence one step behind (STUDIO-1913).
+            assert_eq!(
+                invocations(&scripts),
+                n,
+                "attempt {n} must reach the fake: {err:?}"
+            );
             assert!(
                 record_file(&sr, "STUDIO-1374").is_file(),
                 "attempt {n} must retain the session"
@@ -3975,6 +4094,144 @@ printf '%s\n' '{{"type":"step_finish","sessionID":"ses_loop","part":{{"reason":"
             session_dirs(state_root.path()).is_empty(),
             "the successful resume still releases the session"
         );
+    }
+
+    /// How the first `serve` launches of a [`port_lost_fake`] lose their listener port.
+    #[derive(Clone, Copy)]
+    enum LostPort {
+        /// Another turn's executor — the same fake server under a different control password — is
+        /// already listening on the port, so this launch's health check is answered `401` by a
+        /// stranger. The launch itself stays alive, as a wedged executor would.
+        ToAnotherExecutor,
+        /// The launch exits at once, as a server that failed to bind does, and nothing listens on
+        /// the port at all.
+        Exited,
+    }
+
+    /// Wraps `script` so its first `lost` `serve` launches lose the port the runner reserved for
+    /// them (STUDIO-1913), exactly as a turn does when another turn or process takes that port in
+    /// the window between the runner releasing its reservation and the executor binding it. Every
+    /// launch appends one byte to `serves`; every stranger's pid is appended to `strangers`.
+    fn port_lost_fake(scripts: &TempDir, script: &str, lost: u32, how: LostPort) -> String {
+        let bridge = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../harness/stubs/fake-opencode-server.py");
+        let lose = match how {
+            LostPort::ToAnotherExecutor => format!(
+                r#"  OPENCODE_SERVER_PASSWORD=another-turns-password python3 '{bridge}' "$0" "$@" </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" >> '{strangers}'
+  until (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; do sleep 0.02; done
+  printf 'OSError: [Errno 48] Address already in use\n' >&2
+  exec sleep 30"#,
+                bridge = bridge.display(),
+                strangers = scripts.path().join("strangers").display(),
+            ),
+            LostPort::Exited => {
+                "  printf 'OSError: [Errno 48] Address already in use\\n' >&2\n  exit 1".to_string()
+            }
+        };
+        let body = std::fs::read_to_string(script).expect("read fake opencode");
+        let serves = scripts.path().join("serves");
+        let wrapped = format!(
+            r#"if [ "$1" = serve ]; then
+  printf x >> '{serves}'
+  if [ "$(wc -c < '{serves}')" -le {lost} ]; then
+    port=; prev=; for a; do [ "$prev" = --port ] && port=$a; prev=$a; done
+{lose}
+  fi
+fi
+{body}"#,
+            serves = serves.display(),
+        );
+        std::fs::write(script, wrapped).expect("write port-lost fake");
+        script.to_string()
+    }
+
+    fn serve_launches(scripts: &TempDir) -> usize {
+        std::fs::read(scripts.path().join("serves")).map_or(0, |b| b.len())
+    }
+
+    /// Every stranger a [`port_lost_fake`] started must be gone once the turn is over: it ran in
+    /// the lost launch's process group, so that launch's teardown has to have taken it down.
+    async fn assert_strangers_reaped(scripts: &TempDir) {
+        let pids = std::fs::read_to_string(scripts.path().join("strangers")).unwrap_or_default();
+        for pid in pids.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
+            let gone = async {
+                // SAFETY: signal 0 only probes for the process's existence.
+                while unsafe { libc::kill(pid, 0) } == 0 {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                }
+            };
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), gone)
+                    .await
+                    .is_ok(),
+                "the stranger {pid} on the lost port outlived the turn"
+            );
+        }
+    }
+
+    /// ⚠️ THE STUDIO-1913 REGRESSION GUARD. The runner reserves a free port, RELEASES it, and only
+    /// then starts the executor on it; a concurrent turn (or anything else) can take the port in
+    /// between. Before this, that turn failed outright (`listener ownership rejected`) without its
+    /// prompt ever being sent — the CI flake where one of
+    /// `resumes_of_failed_attempts_do_not_resend_an_unchanged_prompt`'s failing attempts never
+    /// reached the fake, so the "succeeding" last resume got the fake's last 503. Nothing has been
+    /// sent to any session before the listener is proven ours, so the runner relaunches the
+    /// executor on a fresh port instead, and the prompt still reaches exactly one session.
+    #[tokio::test]
+    async fn a_listener_port_lost_before_startup_relaunches_on_a_fresh_port() {
+        let _env = ENV_GUARD.read().await;
+        for how in [LostPort::ToAnotherExecutor, LostPort::Exited] {
+            let scripts = TempDir::new();
+            let (fake, prompts) = growth_fake(&scripts, 0);
+            let fake = port_lost_fake(&scripts, &fake, 1, how);
+            let auth = seeded_auth(&scripts);
+            let state_root = TempDir::new();
+            let root = TempDir::new();
+            let ws = make_ws(&root, "w");
+            let sr = state_root.path().to_string_lossy().into_owned();
+            let runner = runner_with(&fake, &root, &auth, &sr, "m", 30);
+
+            let (tr, err) = one_attempt(&runner, &ws, "STUDIO-1913", "the prompt").await;
+
+            assert_eq!(
+                tr.status, TURN_SUCCEEDED,
+                "the relaunch runs the turn: {err:?}"
+            );
+            assert_eq!(serve_launches(&scripts), 2, "one lost launch, one relaunch");
+            assert_eq!(
+                invocations(&scripts),
+                1,
+                "the prompt reached exactly one session"
+            );
+            assert_eq!(sent_prompt(&prompts, 1), "the prompt");
+            assert_strangers_reaped(&scripts).await;
+        }
+    }
+
+    /// The relaunch is bounded: an executor that can never claim its port fails the turn after a
+    /// fixed number of launches, with the startup reason, and never sends the prompt anywhere.
+    #[tokio::test]
+    async fn an_executor_that_never_claims_its_port_fails_after_bounded_relaunches() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let (fake, _prompts) = growth_fake(&scripts, 0);
+        let fake = port_lost_fake(&scripts, &fake, u32::MAX, LostPort::ToAnotherExecutor);
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+        let runner = runner_with(&fake, &root, &auth, &sr, "m", 30);
+
+        let (tr, err) = one_attempt(&runner, &ws, "STUDIO-1913", "the prompt").await;
+
+        assert_eq!(tr.status, TURN_FAILED);
+        let err = err.expect("a startup failure").to_string();
+        assert!(err.contains("listener ownership rejected"), "{err}");
+        assert_eq!(serve_launches(&scripts), MAX_EXECUTOR_LAUNCHES);
+        assert_eq!(invocations(&scripts), 0, "the prompt was never sent");
+        assert_strangers_reaped(&scripts).await;
     }
 
     /// The other half of STUDIO-1374: a prompt that CHANGED since the session last received one (a
