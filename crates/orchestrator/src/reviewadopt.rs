@@ -54,7 +54,8 @@
 //! What is NOT free is resolving a branch to a pull-request number, which is a `gh` round trip on
 //! the off-loop task. Three bounds keep it rare:
 //!
-//! * a ticket with an own-repo origin row skips the own-repo EXACT lookup; its own repository is
+//! * a ticket with an OPEN own-repo origin row skips the own-repo EXACT lookup (a row retired when
+//!   its pull request merged or closed does not count, STUDIO-1912); its own repository is
 //!   instead probed by `symphony/<key>*` prefix like every other configured repository, because a
 //!   run may open a second pull request on a suffixed branch (STUDIO-1839). The skip is per pull
 //!   request, not per ticket: resolved coordinates already watched are dropped before they reach
@@ -405,10 +406,13 @@ impl Orchestrator {
         // A healthy own-repo handoff suppresses only the OWN exact lookup (STUDIO-1691), never
         // prefix discovery — in another configured repo or, since STUDIO-1839, in its own. Scope
         // the origin to its repo too: a previously adopted companion is not evidence that the
-        // own-repo PR was introduced.
+        // own-repo PR was introduced. And count only an OPEN row (STUDIO-1912): a row retired
+        // when its pull request merged or closed proves nothing about the pull request the ticket
+        // has open now, so a ticket whose rows are all closed resolves its own branch again.
         let skip_own_repo = watched.iter().any(|row| {
-            (row.introduced_by == handoff_origin(&iss.identifier)
-                || row.introduced_by == adopt_origin(&iss.identifier))
+            row.open
+                && (row.introduced_by == handoff_origin(&iss.identifier)
+                    || row.introduced_by == adopt_origin(&iss.identifier))
                 && crate::ghsummons::parse_repo(&repo_url).is_some_and(|(owner, repo)| {
                     row.key.owner.eq_ignore_ascii_case(&owner)
                         && row.key.repo.eq_ignore_ascii_case(&repo)
@@ -2461,5 +2465,209 @@ mod tests {
         assert_eq!(later.planned.len(), 1);
         assert!(introduce_through(gh(), later.planned).await.is_empty());
         assert_eq!(watch_rows(&o).len(), 2);
+    }
+
+    // ---- STUDIO-1912: a ticket's SECOND pull request on the SAME branch, after the first merged ----
+
+    /// The ticket STUDIO-1912 was filed against. Its first pull request (#307) merged; the reopened
+    /// run opened #312 on the same `symphony/<key>` branch.
+    const REOPENED: &str = "STUDIO-1886";
+
+    /// A fake `gh` that keeps MERGED pull requests too, the way GitHub does, and answers a
+    /// `--state open` query with the open ones only. `prs` is `(number, head branch, state)` in
+    /// `makewhatis/rhapsody`, listed in the order GitHub would return them. Each call's arguments
+    /// are recorded in `calls`, so a test can count the lookups a sweep cost.
+    fn fake_gh_with_states(
+        prs: Vec<(i64, &'static str, &'static str)>,
+        calls: Arc<std::sync::Mutex<Vec<String>>>,
+    ) -> crate::ghsummons::GH {
+        crate::ghsummons::GH::new(
+            "@symphony",
+            Some(Box::new(move |args: &[&str]| {
+                calls.lock().expect("calls").push(args.join(" "));
+                let after = |flag: &str| {
+                    args.iter()
+                        .position(|a| *a == flag)
+                        .and_then(|i| args.get(i + 1))
+                        .copied()
+                };
+                if after("--repo") != Some("makewhatis/rhapsody") {
+                    return Ok(b"[]".to_vec());
+                }
+                let exact = after("--head");
+                let state = after("--state");
+                let rows: Vec<String> = prs
+                    .iter()
+                    .filter(|(_, branch, st)| {
+                        exact.is_none_or(|b| b == *branch)
+                            && state.is_none_or(|s| s.eq_ignore_ascii_case(st))
+                    })
+                    .map(|(n, branch, _)| {
+                        format!(
+                            r#"{{"url":"https://github.com/makewhatis/rhapsody/pull/{n}","headRefName":"{branch}","headRefOid":"sha{n}","headRepositoryOwner":{{"login":"makewhatis"}}}}"#
+                        )
+                    })
+                    .collect();
+                Ok(format!("[{}]", rows.join(",")).into_bytes())
+            })),
+        )
+    }
+
+    /// Seeds one watch row for `number` in the ticket's own repository.
+    fn seed_row(o: &Orchestrator, number: i64, reviewer: &str, origin: &str, open: bool) {
+        o.store()
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                author: "alice".into(),
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "makewhatis".into(),
+                    repo: "rhapsody".into(),
+                    number,
+                    reviewer: reviewer.into(),
+                },
+                introduced_by: origin.into(),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: if open {
+                    rhapsody_store::REVIEW_STATUS_REQUESTED.into()
+                } else {
+                    rhapsody_store::REVIEW_STATUS_DROPPED.into()
+                },
+                open,
+            })
+            .expect("seed row");
+    }
+
+    /// The two retired rows the incident's first pull request left behind: adopted, then dropped
+    /// when it merged.
+    fn seed_merged_first_pr(o: &Orchestrator) {
+        let origin = format!("adopt:{REOPENED}");
+        seed_row(o, 307, "bob", &origin, false);
+        seed_row(o, 307, "carol", &origin, false);
+    }
+
+    /// STUDIO-1912 acceptance 1, on the incident's own state. The ticket's only watch rows are for
+    /// a pull request that has MERGED, so they are not evidence that anything open was introduced.
+    /// The sweep must treat the ticket as unintroduced: it resolves the ticket's own branch with the
+    /// exact `--state open` lookup, which finds the new open pull request, and that pull request
+    /// gets a watch row. The merged pull request's rows are left as they were.
+    #[tokio::test]
+    async fn a_ticket_whose_only_watch_rows_are_closed_is_adopted_again() {
+        let mut o = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            &["alice", "bob", "carol"],
+        ));
+        record_run(&o, REOPENED, "alice");
+        seed_merged_first_pr(&o);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gh = fake_gh_with_states(
+            vec![
+                (307, "symphony/STUDIO-1886", "MERGED"),
+                (312, "symphony/STUDIO-1886", "OPEN"),
+            ],
+            Arc::clone(&calls),
+        );
+
+        let plan = sweep(&mut o, &[parked(REOPENED)], Instant::now());
+        assert_eq!(plan.planned.len(), 1, "the ticket is a candidate again");
+        let req = &plan.planned[0];
+        assert!(
+            !req.skip_own_repo,
+            "a ticket whose only rows are for a closed pull request has nothing open introduced, \
+             so its own branch must be resolved"
+        );
+        assert!(
+            req.only_if_unwatched,
+            "an adoption still never re-arms a row"
+        );
+        assert!(plan.refused.is_empty());
+
+        let prs = introduce_through(gh, plan.planned).await;
+        assert_eq!(
+            prs.iter().map(|p| p.pr.number).collect::<Vec<_>>(),
+            [312],
+            "the branch resolves to the OPEN pull request, never the merged one"
+        );
+        assert!(
+            calls
+                .lock()
+                .expect("calls")
+                .iter()
+                .any(|c| c.contains("--head symphony/STUDIO-1886") && c.contains("--state open")),
+            "the own branch is resolved by the exact open-PR lookup: {:?}",
+            calls.lock().expect("calls")
+        );
+        apply(&mut o, &prs);
+        let rows = watch_rows(&o);
+        assert!(
+            rows.iter()
+                .any(|(_, n, _, origin)| *n == 312 && *origin == format!("adopt:{REOPENED}")),
+            "the new pull request must get a watch row: {rows:?}"
+        );
+        let retired: Vec<_> = o
+            .store()
+            .load_review_watch()
+            .expect("rows")
+            .into_iter()
+            .filter(|r| r.key.number == 307)
+            .map(|r| (r.key.reviewer, r.status, r.open))
+            .collect();
+        assert_eq!(
+            retired,
+            [
+                ("bob".to_string(), "dropped".to_string(), false),
+                ("carol".to_string(), "dropped".to_string(), false),
+            ],
+            "the merged pull request's rows are not touched"
+        );
+    }
+
+    /// STUDIO-1912 acceptance 3. A ticket with an OPEN, watched pull request is still treated as
+    /// introduced — even when older rows for a merged pull request sit beside it. The own branch's
+    /// exact lookup stays skipped, so the sweep costs exactly what it did before this change: the
+    /// one paced `symphony/<key>*` prefix probe STUDIO-1839 added, and no other `gh` call.
+    #[tokio::test]
+    async fn a_ticket_with_an_open_watched_pull_request_costs_no_extra_lookup() {
+        let mut o = orch(teams_with(
+            true,
+            ReviewMode::Ticketless,
+            &["alice", "bob", "carol"],
+        ));
+        record_run(&o, REOPENED, "alice");
+        seed_merged_first_pr(&o);
+        seed_row(&o, 312, "bob", &format!("handoff:{REOPENED}"), true);
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let gh = fake_gh_with_states(
+            vec![
+                (307, "symphony/STUDIO-1886", "MERGED"),
+                (312, "symphony/STUDIO-1886", "OPEN"),
+            ],
+            Arc::clone(&calls),
+        );
+
+        let plan = sweep(&mut o, &[parked(REOPENED)], Instant::now());
+        assert_eq!(plan.planned.len(), 1);
+        let req = &plan.planned[0];
+        assert!(
+            req.skip_own_repo,
+            "an open watched pull request means the own branch was introduced"
+        );
+        assert!(
+            plan.refused.is_empty(),
+            "a watched ticket is never an orphan"
+        );
+
+        let prs = introduce_through(gh, plan.planned).await;
+        assert!(prs.is_empty(), "nothing new to introduce");
+        let calls = calls.lock().expect("calls").clone();
+        assert_eq!(
+            calls.len(),
+            1,
+            "only the paced prefix probe, no extra lookup: {calls:?}"
+        );
+        assert!(
+            calls[0].contains("--search") && !calls[0].contains("--head"),
+            "the exact own-branch lookup is skipped: {calls:?}"
+        );
     }
 }
