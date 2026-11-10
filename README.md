@@ -4120,6 +4120,31 @@ ticket is one line, refreshed rather than duplicated, capped at
 `warnings::ORPHANED_REVIEW_WARN_CAP`. The endpoint's shape is unchanged and the two ported producers
 keep their golden ordering ahead of the additions.
 
+### A declared `HANDOFF:` puts its pull request in the watch set at run exit (STUDIO-1915)
+
+Rhapsody-only, like everything above it. A run that ends with a `HANDOFF:` line but never calls
+`symphony_handoff` is parked by the worker's auto-park (TRA-240), which only moved the ticket. The
+watch-set introduction lived at `handle_handoff_run` alone, so such a ticket sat in review with an
+open pull request and no reviewer until the adoption sweep found it. That happened to run 6250
+(makewhatis/flux#152) and run 6255 (studio49dev/carini#139), both draft pull requests. The park
+also logged nothing when it succeeded or when it skipped, so neither run left a line saying what
+the handoff had done.
+
+| A run ending `HANDOFF:` with an open pull request | before | after |
+| --- | --- | --- |
+| the agent did not move the ticket | parked silently; no watch row | parked, logged; introduced at exit |
+| the agent moved the ticket itself | no watch row | introduced at exit |
+| the pull request is a draft, or linked only after the run | no watch row | introduced, by branch; draftpoke then pokes a draft's author |
+| the park cannot act (no review state, no team id, not active) | silence | one INFO line naming why |
+
+`on_worker_exit` plans the handoff's own introduction (`plan_review_intro`) when a declared
+handoff's clean exit leaves the ticket in a configured review state, whoever moved it, and sends it
+with `only_if_unwatched` set. That makes it a repair in STUDIO-838's sense. A run that also called
+`symphony_handoff` has already queued its arming introduction on the same serial task, so this one
+finds the row and writes nothing. Every other declared outcome logs one INFO line saying why no
+review was introduced. The ticket-mode quorum is not fired from this path; it remains
+`symphony_handoff`'s.
+
 ### Cross-repository companion pull requests enter the review watch set (STUDIO-1691)
 
 Adoption also discovers companions in each OTHER distinct enabled configured repository, even when

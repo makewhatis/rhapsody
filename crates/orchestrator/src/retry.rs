@@ -1612,6 +1612,38 @@ impl Orchestrator {
                     );
                 }
             }
+            // STUDIO-1915: a declared handoff that ended parked in review hands its pull request to
+            // the watch set — whether the worker's auto-park moved the ticket or the agent did, and
+            // whether or not it also called `symphony_handoff` (the request is a repair, so an
+            // armed row is left alone). Every other declared outcome says why nothing was done.
+            if e.declared_handoff {
+                let (w_st, s_st) = (
+                    normalize_state(&e.last_state),
+                    normalize_state(&re.issue.state),
+                );
+                match (
+                    release,
+                    parked_review_state(&review, &terminal, &w_st, &s_st),
+                ) {
+                    (true, Some(st)) => self.introduce_declared_handoff(&re, st),
+                    (true, None) => tracing::info!(
+                        issue_identifier = %re.issue.identifier,
+                        state = %e.last_state,
+                        "handoff: {} ended in {:?}, which is not a review state; no review is \
+                         introduced",
+                        re.issue.identifier,
+                        e.last_state
+                    ),
+                    (false, _) => tracing::info!(
+                        issue_identifier = %re.issue.identifier,
+                        state = %e.last_state,
+                        "handoff: {} is still in an active state ({:?}) at run exit, so it was not \
+                         handed off for review; no review is introduced",
+                        re.issue.identifier,
+                        e.last_state
+                    ),
+                }
+            }
             if release {
                 self.limit_policy.pinned_engines.remove(&e.issue_id);
                 // Left the active set: declared hand-off (completed), external non-terminal move
