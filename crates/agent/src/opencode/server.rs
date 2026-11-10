@@ -29,15 +29,6 @@ impl Control {
         })
     }
 
-    /// The same control password on a newly reserved port, for relaunching an executor whose
-    /// reserved port was taken before it could bind it (STUDIO-1913).
-    pub fn with_fresh_port(&self) -> Result<Self, AgentError> {
-        Ok(Self {
-            url: reserve_url()?,
-            password: self.password.clone(),
-        })
-    }
-
     pub fn args(&self) -> Vec<String> {
         vec![
             "serve".into(),
@@ -53,7 +44,8 @@ impl Control {
 
 /// Reserve a free loopback port and RELEASE it, for the executor to bind. Releasing is unavoidable
 /// (the executor must bind the port itself) and leaves a window in which anything else can take
-/// it, which is why [`connect`] proves ownership and the runner relaunches on a lost port.
+/// it, which is why [`connect`] proves ownership and the runner relaunches on a lost port — with a
+/// whole new [`Control`]: whatever answered on the lost port has seen the old password.
 fn reserve_url() -> Result<String, AgentError> {
     // Do NOT pass port 0: the pinned binary tries 4096 before an ephemeral port.
     let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))

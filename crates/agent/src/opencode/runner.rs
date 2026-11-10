@@ -1680,7 +1680,9 @@ impl OpencodeSession {
                     if reaped {
                         teardown.disarm_tree();
                     }
-                    control = match control.with_fresh_port() {
+                    // A fresh password as well as a fresh port: `connect` sent the old one to
+                    // whatever answered on the lost port.
+                    control = match super::server::Control::new() {
                         Ok(control) => control,
                         Err(e) => return (failed(Usage::default()), Some(e)),
                     };
