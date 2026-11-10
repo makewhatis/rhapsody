@@ -1973,6 +1973,122 @@ mod tests {
         let _ = intro.await;
     }
 
+    /// **STUDIO-1912.** A handoff on a branch whose EARLIER pull request has merged introduces the
+    /// pull request the run actually opened: the OPEN one on that branch, never the merged one —
+    /// even though the merged one is still on GitHub under the same head branch and its retired
+    /// watch rows are still in the set.
+    ///
+    /// `gh` is faked at the exec seam with the real [`GH`](crate::ghsummons::GH) parser over it, and
+    /// the fake lists the merged pull request FIRST and honours `--state`, so a lookup that stopped
+    /// asking for open pull requests only would resolve the branch to #307 and fail here.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_handoff_after_the_branchs_first_pr_merged_introduces_the_new_open_pr() {
+        let tr = Arc::new(Fake::new());
+        let parent = issue_team("ID-1", "MT-1", "In Progress", "TEAM-1");
+
+        let (mut o, env) = handoff_orch(Arc::clone(&tr), &["In Review"]);
+        if let Some(eff) = o.eff.as_mut() {
+            let mut p = crate::testsupport::empty_resolved_project("proj-a", Arc::clone(&tr) as _);
+            p.repo = "git@github.com:o/r.git".to_string();
+            eff.projects = vec![p];
+        }
+        o.teams = Some(ticketless_teams(&["alice", "bob"]));
+        let rx = o.open_review_intro_channel();
+        let store = Arc::clone(&o.store);
+        // What the first pull request left behind: adopted, then dropped when it merged.
+        store
+            .save_review_watch(rhapsody_store::ReviewWatchRow {
+                author: "alice".into(),
+                key: rhapsody_store::ReviewWatchKey {
+                    owner: "o".into(),
+                    repo: "r".into(),
+                    number: 307,
+                    reviewer: "bob".into(),
+                },
+                introduced_by: "adopt:MT-1".into(),
+                requested_sha: String::new(),
+                last_reviewed_sha: String::new(),
+                status: rhapsody_store::REVIEW_STATUS_DROPPED.into(),
+                open: false,
+            })
+            .expect("seed the merged pull request's row");
+        let id = parent.id.clone();
+        o.dispatch_issue(parent, None, None, String::new());
+        if let Some(re) = o.running.get_mut(&id) {
+            re.identity = "alice".to_string();
+            re.project_repo = "git@github.com:o/r.git".to_string();
+        }
+        let run_id = o.running[&id].run_id;
+        let (task, handle) = start(o, &env.signal);
+        let gh = crate::ghsummons::GH::new(
+            "@symphony",
+            Some(Box::new(|args: &[&str]| {
+                let after = |flag: &str| {
+                    args.iter()
+                        .position(|a| *a == flag)
+                        .and_then(|i| args.get(i + 1))
+                        .copied()
+                };
+                let state = after("--state");
+                let rows: Vec<String> = [(307, "MERGED"), (312, "OPEN")]
+                    .iter()
+                    .filter(|(_, st)| {
+                        after("--head") == Some("symphony/MT-1")
+                            && state.is_none_or(|s| s.eq_ignore_ascii_case(st))
+                    })
+                    .map(|(n, _)| {
+                        format!(
+                            r#"{{"url":"https://github.com/o/r/pull/{n}","headRefOid":"sha{n}","headRepositoryOwner":{{"login":"o"}}}}"#
+                        )
+                    })
+                    .collect();
+                Ok(format!("[{}]", rows.join(",")).into_bytes())
+            })),
+        );
+        let intro = tokio::spawn(crate::reviewintro::run_review_intro_task(
+            env.signal.wait(),
+            crate::reviewintro::ReviewIntroDeps {
+                pr_source: Some(Arc::new(gh)),
+                sink: Arc::new(crate::reviewintro::ControlIntroSink::new(handle.clone())),
+                linker: None,
+            },
+            rx,
+        ));
+
+        let res = handle
+            .handoff_run(CancelWait::default(), run_id)
+            .await
+            .expect("handoff_run");
+        assert_eq!(res.moved_to, "In Review");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let rows = loop {
+            let rows = store.load_review_watch().expect("read");
+            if rows.iter().any(|r| r.open) {
+                break rows;
+            }
+            if tokio::time::Instant::now() > deadline {
+                env.signal.cancel();
+                panic!("the handoff introduced no open pull request: {rows:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        let mut seen: Vec<_> = rows
+            .iter()
+            .map(|r| (r.key.number, r.introduced_by.as_str(), r.open))
+            .collect();
+        seen.sort();
+        assert_eq!(
+            seen,
+            [(307, "adopt:MT-1", false), (312, "handoff:MT-1", true)],
+            "the new open pull request is introduced; the merged one's row is left retired"
+        );
+
+        env.signal.cancel();
+        let _ = task.await;
+        let _ = intro.await;
+    }
+
     /// An [`OpenPrSource`](crate::ghsummons::OpenPrSource) that always answers the same open pull
     /// request — the one hop a test cannot really make.
     struct OnePr(&'static str);
