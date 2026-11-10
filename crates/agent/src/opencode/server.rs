@@ -14,6 +14,7 @@ use tokio::io::AsyncWriteExt;
 const MAX_FRAME: usize = 10 * 1024 * 1024;
 const MAX_PARTS: usize = 65536;
 
+#[derive(Clone)]
 pub(super) struct Control {
     pub url: String,
     pub password: String,
@@ -21,17 +22,19 @@ pub(super) struct Control {
 
 impl Control {
     pub fn new() -> Result<Self, AgentError> {
-        // Do NOT pass port 0: the pinned binary tries 4096 before an ephemeral port.
-        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
-            .map_err(|_| error("private listener allocation failed"))?;
-        let port = listener
-            .local_addr()
-            .map_err(|_| error("private listener address failed"))?
-            .port();
         let password = InternalProviderId::generate()?.as_str().to_owned();
         Ok(Self {
-            url: format!("http://127.0.0.1:{port}"),
+            url: reserve_url()?,
             password,
+        })
+    }
+
+    /// The same control password on a newly reserved port, for relaunching an executor whose
+    /// reserved port was taken before it could bind it (STUDIO-1913).
+    pub fn with_fresh_port(&self) -> Result<Self, AgentError> {
+        Ok(Self {
+            url: reserve_url()?,
+            password: self.password.clone(),
         })
     }
 
@@ -46,6 +49,20 @@ impl Control {
             "--mdns=false".into(),
         ]
     }
+}
+
+/// Reserve a free loopback port and RELEASE it, for the executor to bind. Releasing is unavoidable
+/// (the executor must bind the port itself) and leaves a window in which anything else can take
+/// it, which is why [`connect`] proves ownership and the runner relaunches on a lost port.
+fn reserve_url() -> Result<String, AgentError> {
+    // Do NOT pass port 0: the pinned binary tries 4096 before an ephemeral port.
+    let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|_| error("private listener allocation failed"))?;
+    let port = listener
+        .local_addr()
+        .map_err(|_| error("private listener address failed"))?
+        .port();
+    Ok(format!("http://127.0.0.1:{port}"))
 }
 
 fn error(message: &str) -> AgentError {
@@ -374,14 +391,163 @@ impl Drop for Task {
     }
 }
 
+/// Why an executor could not be proven to be this turn's own listener. Nothing has been sent to any
+/// session yet when this is returned, so the turn may safely relaunch its executor.
+#[derive(Debug)]
+pub(super) struct Unproven {
+    pub error: AgentError,
+    /// The executor lost its reserved port in the reserve/release window (STUDIO-1913):
+    /// something other than this turn's executor answered on it.
+    pub port_lost: bool,
+}
+
+impl Unproven {
+    fn port_lost(message: &str) -> Self {
+        Self {
+            error: error(message),
+            port_lost: true,
+        }
+    }
+}
+
+impl From<AgentError> for Unproven {
+    fn from(error: AgentError) -> Self {
+        Self {
+            error,
+            port_lost: false,
+        }
+    }
+}
+
+/// This turn's own executor: healthy, streaming events, and enforcing this turn's password.
+pub(super) struct Listener {
+    http: Http,
+    sse: Sse,
+}
+
+/// Connect to the executor at `control` and prove it is this turn's own before anything is sent.
+pub(super) async fn connect(
+    control: Control,
+    directory: String,
+    redactor: &CapabilityRedactor,
+) -> Result<Listener, Unproven> {
+    let http = Http::new(control, directory)?;
+    // Connection refusals are startup, but an authenticated rejection is NOT our
+    // listener. Never adopt a pre-existing server after the reserve/release race.
+    let started = tokio::time::Instant::now();
+    loop {
+        match tokio::time::timeout(
+            Duration::from_secs(2),
+            http.request(reqwest::Method::GET, "/global/health").send(),
+        )
+        .await
+        {
+            Ok(Ok(response)) if response.status().is_success() => {
+                drop(response);
+                break;
+            }
+            Ok(Ok(_)) => return Err(Unproven::port_lost("listener ownership rejected")),
+            _ if started.elapsed() < Duration::from_secs(10) => {
+                tokio::time::sleep(Duration::from_millis(25)).await
+            }
+            _ => return Err(error("listener startup failed").into()),
+        }
+    }
+    let mut sse = loop {
+        match tokio::time::timeout(
+            Duration::from_secs(20),
+            http.request(reqwest::Method::GET, "/event").send(),
+        )
+        .await
+        .map_err(|_| error("listener readiness headers timed out"))?
+        {
+            Ok(response) if response.status().is_success() => {
+                if response
+                    .headers()
+                    .get("content-type")
+                    .and_then(|h| h.to_str().ok())
+                    .is_none_or(|s| s.split(';').next() != Some("text/event-stream"))
+                {
+                    return Err(error("listener did not provide an event stream").into());
+                }
+                break Sse {
+                    response,
+                    buffer: Vec::new(),
+                };
+            }
+            Ok(_) => return Err(Unproven::port_lost("listener ownership rejected")),
+            Err(_) if started.elapsed() < Duration::from_secs(10) => {
+                tokio::time::sleep(Duration::from_millis(25)).await
+            }
+            Err(_) => return Err(error("listener startup failed").into()),
+        }
+    };
+    if sse.next(redactor).await?["type"] != "server.connected" {
+        return Err(error("missing event readiness").into());
+    }
+    // An unsecured pre-existing listener accepts ANY Basic password. Positive
+    // readiness is not ownership unless authentication is actually enforced.
+    let unauthorized = http
+        .client
+        .get(format!("{}/session", http.control.url))
+        .header("x-opencode-directory", &http.directory)
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|_| error("listener authentication check failed"))?;
+    if unauthorized.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Err(Unproven::port_lost(
+            "listener does not enforce authentication",
+        ));
+    }
+    drop(unauthorized);
+    Ok(Listener { http, sse })
+}
+
+#[cfg(test)]
 pub(super) fn stream(
     control: Control,
     request: Request,
     redactor: CapabilityRedactor,
 ) -> (tokio::io::DuplexStream, Task) {
+    spawn_stream(Start::Unproven(control), request, redactor)
+}
+
+/// [`stream`] over an executor already [`connect`]ed — or the reason it could not be, which is
+/// reported exactly as [`stream`] reports it.
+pub(super) fn stream_connected(
+    listener: Result<Listener, AgentError>,
+    request: Request,
+    redactor: CapabilityRedactor,
+) -> (tokio::io::DuplexStream, Task) {
+    spawn_stream(Start::Connected(listener), request, redactor)
+}
+
+enum Start {
+    #[cfg(test)]
+    Unproven(Control),
+    Connected(Result<Listener, AgentError>),
+}
+
+fn spawn_stream(
+    start: Start,
+    request: Request,
+    redactor: CapabilityRedactor,
+) -> (tokio::io::DuplexStream, Task) {
     let (reader, mut writer) = tokio::io::duplex(64 * 1024);
     let task = tokio::spawn(async move {
-        if let Err(e) = execute(control, request, redactor, &mut writer).await {
+        let result = async {
+            let listener = match start {
+                #[cfg(test)]
+                Start::Unproven(control) => connect(control, request.directory.clone(), &redactor)
+                    .await
+                    .map_err(|e| e.error)?,
+                Start::Connected(listener) => listener?,
+            };
+            execute(listener, request, &redactor, &mut writer).await
+        }
+        .await;
+        if let Err(e) = result {
             let name = if e == AgentError::ResumeUnavailable {
                 "ResumeUnavailable"
             } else {
@@ -405,82 +571,15 @@ async fn write(writer: &mut tokio::io::DuplexStream, event: &Value) -> Result<()
 }
 
 async fn execute(
-    control: Control,
+    listener: Listener,
     mut request: Request,
-    redactor: CapabilityRedactor,
+    redactor: &CapabilityRedactor,
     writer: &mut tokio::io::DuplexStream,
 ) -> Result<(), AgentError> {
-    let http = Http::new(control, request.directory.clone())?;
-    // Connection refusals are startup, but an authenticated rejection is NOT our
-    // listener. Never adopt a pre-existing server after the reserve/release race.
-    let started = tokio::time::Instant::now();
-    loop {
-        match tokio::time::timeout(
-            Duration::from_secs(2),
-            http.request(reqwest::Method::GET, "/global/health").send(),
-        )
-        .await
-        {
-            Ok(Ok(response)) if response.status().is_success() => {
-                drop(response);
-                break;
-            }
-            Ok(Ok(_)) => return Err(error("listener ownership rejected")),
-            _ if started.elapsed() < Duration::from_secs(10) => {
-                tokio::time::sleep(Duration::from_millis(25)).await
-            }
-            _ => return Err(error("listener startup failed")),
-        }
-    }
-    let mut sse = loop {
-        match tokio::time::timeout(
-            Duration::from_secs(20),
-            http.request(reqwest::Method::GET, "/event").send(),
-        )
-        .await
-        .map_err(|_| error("listener readiness headers timed out"))?
-        {
-            Ok(response) if response.status().is_success() => {
-                if response
-                    .headers()
-                    .get("content-type")
-                    .and_then(|h| h.to_str().ok())
-                    .is_none_or(|s| s.split(';').next() != Some("text/event-stream"))
-                {
-                    return Err(error("listener did not provide an event stream"));
-                }
-                break Sse {
-                    response,
-                    buffer: Vec::new(),
-                };
-            }
-            Ok(_) => return Err(error("listener ownership rejected")),
-            Err(_) if started.elapsed() < Duration::from_secs(10) => {
-                tokio::time::sleep(Duration::from_millis(25)).await
-            }
-            Err(_) => return Err(error("listener startup failed")),
-        }
-    };
-    if sse.next(&redactor).await?["type"] != "server.connected" {
-        return Err(error("missing event readiness"));
-    }
-    // An unsecured pre-existing listener accepts ANY Basic password. Positive
-    // readiness is not ownership unless authentication is actually enforced.
-    let unauthorized = http
-        .client
-        .get(format!("{}/session", http.control.url))
-        .header("x-opencode-directory", &http.directory)
-        .timeout(Duration::from_secs(10))
-        .send()
-        .await
-        .map_err(|_| error("listener authentication check failed"))?;
-    if unauthorized.status() != reqwest::StatusCode::UNAUTHORIZED {
-        return Err(error("listener does not enforce authentication"));
-    }
-    drop(unauthorized);
+    let Listener { http, mut sse } = listener;
     if request.session.is_empty() && request.continuing {
         let sessions = http
-            .json(reqwest::Method::GET, "/session", None, &redactor)
+            .json(reqwest::Method::GET, "/session", None, redactor)
             .await?;
         request.session = sessions
             .as_array()
@@ -499,7 +598,7 @@ async fn execute(
             {"permission":"question","action":"deny","pattern":"*"},
             {"permission":"plan_enter","action":"deny","pattern":"*"},
             {"permission":"plan_exit","action":"deny","pattern":"*"}]})),
-            &redactor,
+            redactor,
         )
         .await?
     } else {
@@ -512,7 +611,7 @@ async fn execute(
         }
         let path = format!("/session/{}", request.session);
         let current = http
-            .json(reqwest::Method::GET, &path, None, &redactor)
+            .json(reqwest::Method::GET, &path, None, redactor)
             .await?;
         if current["id"] != request.session {
             return Err(error("retained session identity mismatch"));
@@ -522,7 +621,7 @@ async fn execute(
                 reqwest::Method::POST,
                 &format!("{path}/fork"),
                 Some(json!({})),
-                &redactor,
+                redactor,
             )
             .await?
         } else {
@@ -542,7 +641,7 @@ async fn execute(
     // CLI pickAgent falls back for unknown/subagent entries.
     if !request.agent.is_empty() {
         let agents = http
-            .json(reqwest::Method::GET, "/agent", None, &redactor)
+            .json(reqwest::Method::GET, "/agent", None, redactor)
             .await?;
         if !agents
             .as_array()
@@ -555,7 +654,7 @@ async fn execute(
     }
     if request.inherit_share {
         let config = http
-            .json(reqwest::Method::GET, "/config", None, &redactor)
+            .json(reqwest::Method::GET, "/config", None, redactor)
             .await?;
         request.share |= config["share"] == "auto";
     }
@@ -565,7 +664,7 @@ async fn execute(
                 reqwest::Method::POST,
                 &format!("/session/{id}/share"),
                 None,
-                &redactor,
+                redactor,
             )
             .await
             .is_err()
@@ -585,7 +684,7 @@ async fn execute(
         reqwest::Method::POST,
         &path,
         Some(request.prompt_body()?),
-        &redactor,
+        redactor,
     );
     tokio::pin!(prompt);
     let mut prompt_done = false;
@@ -594,7 +693,7 @@ async fn execute(
     loop {
         tokio::select! {
             result = &mut prompt, if !prompt_done => { result?; prompt_done = true; },
-            result = sse.next(&redactor), if !idle => {
+            result = sse.next(redactor), if !idle => {
                 let event = result?;
                 let props = &event["properties"];
                 let sid = props["sessionID"].as_str().unwrap_or("");
@@ -608,7 +707,7 @@ async fn execute(
                 if event["type"] == "permission.asked" && scoped.sessions.contains(sid) {
                     let permission = props["id"].as_str().ok_or_else(|| error("invalid permission ID"))?;
                     if !permission.bytes().all(|c|c.is_ascii_alphanumeric() || c == b'_') { return Err(error("invalid permission ID")); }
-                    http.json(reqwest::Method::POST, &format!("/permission/{permission}/reply"), Some(json!({"reply":if request.auto {"once"} else {"reject"}})), &redactor).await?;
+                    http.json(reqwest::Method::POST, &format!("/permission/{permission}/reply"), Some(json!({"reply":if request.auto {"once"} else {"reject"}})), redactor).await?;
                 }
                 if event["type"] == "session.status" && sid == scoped.root && props["status"]["type"] == "idle" { idle = true; }
                 if let Some(line) = scoped.normalize(&event)? { write(writer, &line).await?; }
