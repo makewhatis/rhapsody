@@ -541,6 +541,38 @@ pub(crate) fn has_handoff_marker(result_text: &str) -> bool {
         .any(|ln| ln.trim().starts_with("HANDOFF:"))
 }
 
+/// Why the handoff auto-park (TRA-240) cannot act on a DECLARED handoff, or `None` when it can.
+///
+/// These are exactly the auto-park's entry gates other than the marker itself, in its order, kept
+/// beside it so the log line that names the reason can never disagree with the gate that applied
+/// (STUDIO-1915: each one used to fall through without a word).
+fn auto_park_inert_reason(
+    review_handoff_state: Option<&str>,
+    active_states: &HashSet<String>,
+    issue: &Issue,
+) -> Option<String> {
+    if review_handoff_state.is_none() {
+        return Some(
+            "no review state is configured for this project (`review_states` is empty), so the \
+             daemon has nowhere to park it"
+                .to_string(),
+        );
+    }
+    if !active_states.contains(&normalize_state(&issue.state)) {
+        return Some(format!(
+            "its state {:?} is not an active state, so it has already left the queue",
+            issue.state
+        ));
+    }
+    if issue.team_id.is_empty() {
+        return Some(
+            "the ticket carries no team id, and the tracker resolves a state name per team"
+                .to_string(),
+        );
+    }
+    None
+}
+
 /// Performs one MANAGER attempt (STUDIO-1049; design `manager-agent-design.md` §4.2–§4.3). Split out
 /// of [`run_agent_attempt`] because it shares none of its provisioning: there is no repository, no
 /// worktree, no `before_run`/`after_run` hook and no prompt file — only an empty daemon-owned
@@ -2014,6 +2046,25 @@ impl WorkerDeps {
             // behalf (dispatched agents have no Linear-write MCP) and ENDS the loop here — otherwise
             // the ticket never leaves the active set and the loop spins fresh turns until max_turns.
             // `None` review_handoff_state ⇒ this whole block is inert, i.e. Go-identical.
+            //
+            // STUDIO-1915: a DECLARED handoff the park cannot act on says why. Every one of these
+            // used to fall through silently, as did a successful move, so an operator reading the
+            // log after a handoff that went nowhere could not tell which had happened.
+            if has_handoff_marker(&last_result)
+                && let Some(reason) = auto_park_inert_reason(
+                    self.review_handoff_state.as_deref(),
+                    &self.active_states,
+                    &issue,
+                )
+            {
+                tracing::info!(
+                    issue_identifier = %issue.identifier,
+                    state = %issue.state,
+                    "handoff auto-park: not moving {} — {}",
+                    issue.identifier,
+                    reason
+                );
+            }
             if let Some(state) = self.review_handoff_state.as_deref()
                 && has_handoff_marker(&last_result)
                 && self.active_states.contains(&normalize_state(&issue.state))
@@ -2073,7 +2124,19 @@ impl WorkerDeps {
                     .move_issue_state(&issue.id, &issue.team_id, state)
                     .await
                 {
-                    Ok(()) => issue.state = state.to_string(),
+                    Ok(()) => {
+                        // STUDIO-1915: the park's ordinary outcome, which used to log nothing.
+                        // The watch-set introduction happens at the exit, on the control task.
+                        tracing::info!(
+                            issue_identifier = %issue.identifier,
+                            from_state = %issue.state,
+                            review_state = %state,
+                            "handoff auto-park: moved {} to {} for review",
+                            issue.identifier,
+                            state
+                        );
+                        issue.state = state.to_string();
+                    }
                     Err(e) => tracing::warn!(
                         issue_identifier = %issue.identifier,
                         error = %e,
@@ -5645,6 +5708,154 @@ exit 1
             );
             assert_eq!(tr.move_calls().len(), 1, "unknown parks as before");
             assert_eq!(last, "in review");
+        }
+    }
+
+    /// Runs one declaring-handoff attempt over `d` with a recording subscriber installed, returning
+    /// the attempt's result beside every event it logged. The caller holds
+    /// [`TRACING_TEST_LOCK`](crate::testsupport::TRACING_TEST_LOCK).
+    ///
+    /// A throwaway warm-up attempt runs first, for `worker_logs_carry_issue_identifier`'s reason
+    /// (TRA-243): the auto-park's log callsites are shared with the many park tests that run with
+    /// no subscriber, and whichever thread registers a callsite first pins its cached Interest.
+    async fn captured_attempt(
+        warm: (WorkerDeps, Issue),
+        mut d: WorkerDeps,
+        iss: Issue,
+    ) -> (
+        String,
+        WorkerDeclaration,
+        Vec<crate::testsupport::CapturedEvent>,
+    ) {
+        let (logs, subscriber) = recording_subscriber();
+        let guard = tracing::subscriber::set_default(subscriber);
+        {
+            let (mut warm_deps, warm_issue) = warm;
+            let _ = run_agent_attempt(&mut warm_deps, warm_issue, None, None, &noop_event(), None)
+                .await;
+        }
+        tracing::callsite::rebuild_interest_cache();
+        logs.lock().expect("log buffer lock").clear();
+        let (last, declared, err) =
+            run_agent_attempt(&mut d, iss, None, None, &noop_event(), None).await;
+        drop(guard);
+        assert!(err.is_none(), "expected normal exit, got {err:?}");
+        let captured = logs.lock().expect("log buffer lock").clone();
+        (last, declared, captured)
+    }
+
+    /// The INFO lines the handoff auto-park logged.
+    fn park_lines(logs: &[crate::testsupport::CapturedEvent]) -> Vec<String> {
+        logs.iter()
+            .filter(|e| e.level == "INFO" && e.message.starts_with("handoff auto-park:"))
+            .map(|e| e.message.clone())
+            .collect()
+    }
+
+    // STUDIO-1915 (run 6250, makewhatis/flux#152; run 6255, studio49dev/carini#139): the agent
+    // declared the handoff but never moved its ticket, and its pull request is a DRAFT. The daemon
+    // parks the ticket in review — and says so. Before this ticket the successful park logged
+    // nothing at all, so the two incidents left no line to say a handoff had happened.
+    //
+    // A draft is open to the lookup: `gh pr list --state open` includes drafts, and the source
+    // states no draft flag, which is why the stub needs none.
+    //
+    // MUTATION: drop the success `info!` in `run_turns` and this reds (no "moved" line).
+    #[tokio::test]
+    async fn a_park_the_agent_never_made_moves_a_draft_handoff_to_review_and_logs_it() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
+        let draft = || {
+            Some(Arc::new(StubPr(Some("https://github.com/o/r/pull/152")))
+                as Arc<dyn crate::ghsummons::OpenPrSource>)
+        };
+        let todo = || Issue {
+            team_id: "team-1".to_string(),
+            ..issue("1", "MT-1", "Todo")
+        };
+        let (warm, _wtr, _wroot) = handoff_deps(vec![declaring_turn()], draft());
+        let (d, tr, _root) = handoff_deps(vec![declaring_turn()], draft());
+        let (last, declared, logs) = captured_attempt((warm, todo()), d, todo()).await;
+
+        assert!(declared.declared_handoff, "the agent declared a handoff");
+        let moves = tr.move_calls();
+        assert_eq!(
+            moves.len(),
+            1,
+            "the daemon parks the ticket the agent never moved"
+        );
+        assert_eq!(moves[0].state_name, "in review");
+        assert_eq!(last, "in review", "the exit classifies on the parked state");
+        let lines = park_lines(&logs);
+        assert_eq!(
+            lines.len(),
+            1,
+            "exactly one INFO line for the park's outcome: {lines:?}"
+        );
+        assert!(
+            lines[0].starts_with("handoff auto-park: moved MT-1 to in review"),
+            "the successful park is logged: {lines:?}"
+        );
+    }
+
+    // STUDIO-1915: every declared handoff the park cannot act on says WHY, at INFO. Each of these
+    // returned silently before, which is the half of the incident nobody could diagnose afterwards:
+    // "no line" was consistent with every one of them and with a successful move.
+    //
+    // MUTATION: drop the skip `info!` ahead of the park in `run_turns` and every case reds.
+    #[tokio::test]
+    async fn a_declared_handoff_the_park_cannot_act_on_logs_why() {
+        let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await; // TRA-243
+        let pr = || {
+            Some(Arc::new(StubPr(Some("https://github.com/o/r/pull/7")))
+                as Arc<dyn crate::ghsummons::OpenPrSource>)
+        };
+        let with_team = |state: &str| Issue {
+            team_id: "team-1".to_string(),
+            ..issue("1", "MT-1", state)
+        };
+        type Case = (&'static str, fn(&mut WorkerDeps), Issue, &'static str);
+        let cases: Vec<Case> = vec![
+            (
+                "no review state configured",
+                |d| d.review_handoff_state = None,
+                with_team("In Progress"),
+                "no review state is configured",
+            ),
+            (
+                "ticket has no team",
+                |_| {},
+                issue("1", "MT-1", "In Progress"),
+                "no team id",
+            ),
+            (
+                "ticket already out of the active set",
+                |_| {},
+                with_team("In Review"),
+                "not an active state",
+            ),
+        ];
+        for (name, tweak, iss, reason) in cases {
+            let (mut warm, _wtr, _wroot) = handoff_deps(vec![declaring_turn()], pr());
+            tweak(&mut warm);
+            // A skipped park falls through to the per-turn refresh, which keeps the ticket
+            // active; one turn is the whole run, so it cannot go on to log a second line.
+            warm.max_turns = 1;
+            let (mut d, tr, _root) = handoff_deps(vec![declaring_turn()], pr());
+            tweak(&mut d);
+            d.max_turns = 1;
+            let (_last, declared, logs) = captured_attempt((warm, iss.clone()), d, iss).await;
+            assert!(
+                declared.declared_handoff,
+                "{name}: the agent declared a handoff"
+            );
+            assert!(tr.move_calls().is_empty(), "{name}: the park cannot act");
+            let lines = park_lines(&logs);
+            assert_eq!(lines.len(), 1, "{name}: one INFO line, got {lines:?}");
+            assert!(
+                lines[0].starts_with("handoff auto-park: not moving MT-1")
+                    && lines[0].contains(reason),
+                "{name}: the line names the reason ({reason:?}): {lines:?}"
+            );
         }
     }
 

@@ -1973,6 +1973,225 @@ mod tests {
         let _ = intro.await;
     }
 
+    // ── a declared HANDOFF that never called `symphony_handoff` (STUDIO-1915) ───────────────────
+
+    /// The incident shape: the run of `MT-1`, dispatched in `Todo` and never moved by its agent,
+    /// bound to `o/r`, worn by `alice` under ticketless review. Hands back the started-at its exit
+    /// report must carry and the introduction channel's receiver.
+    fn marker_handoff_orch(
+        tr: &Arc<Fake>,
+    ) -> (
+        Orchestrator,
+        Env,
+        tokio::sync::mpsc::UnboundedReceiver<crate::reviewintro::ReviewIntroRequest>,
+        chrono::DateTime<chrono::Utc>,
+    ) {
+        let (mut o, env) = handoff_orch(Arc::clone(tr), &["In Review"]);
+        if let Some(eff) = o.eff.as_mut() {
+            let mut p = crate::testsupport::empty_resolved_project("proj-a", Arc::clone(tr) as _);
+            p.repo = "git@github.com:o/r.git".to_string();
+            // The exit classifies on the run's OWN project's states, as production does — and,
+            // as production stores them, normalized (`handoff_orch` keeps the set as given).
+            p.active_states = eff.active_states.clone();
+            p.review_states = set_of(&["in review"]);
+            eff.projects = vec![p];
+        }
+        o.teams = Some(ticketless_teams(&["alice", "bob"]));
+        let rx = o.open_review_intro_channel();
+        o.dispatch_issue(
+            issue_team("ID-1", "MT-1", "Todo", "TEAM-1"),
+            None,
+            None,
+            String::new(),
+        );
+        let re = o.running.get_mut("ID-1").expect("dispatched");
+        re.identity = "alice".to_string();
+        re.project_repo = "git@github.com:o/r.git".to_string();
+        re.project_slug = "proj-a".to_string();
+        let started_at = re.started_at;
+        (o, env, rx, started_at)
+    }
+
+    /// The worker's report for a clean run whose agent declared `HANDOFF:` and whose ticket the
+    /// worker's per-turn refresh (or its auto-park) last saw in `last_state`.
+    fn declared_exit(
+        started_at: chrono::DateTime<chrono::Utc>,
+        last_state: &str,
+    ) -> crate::EvWorkerExit {
+        crate::EvWorkerExit {
+            issue_id: "ID-1".into(),
+            failed: false,
+            started_at,
+            err_msg: String::new(),
+            last_state: last_state.into(),
+            declared_handoff: true,
+            review_verdict: None,
+            verdict_text: None,
+            refused: false,
+            onepassword_hold: None,
+            onepassword_auth_failure: None,
+            auth_needed: false,
+        }
+    }
+
+    /// Polls the watch set until it holds a row, bounded so a lost introduction fails the test
+    /// instead of hanging the suite.
+    async fn first_watch_rows(
+        store: &Arc<dyn Store + Send + Sync>,
+        signal: &CancelSignal,
+        what: &str,
+    ) -> Vec<rhapsody_store::ReviewWatchRow> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let rows = store.load_review_watch().expect("read");
+            if !rows.is_empty() {
+                return rows;
+            }
+            if tokio::time::Instant::now() > deadline {
+                signal.cancel();
+                panic!("{what}: no watch row was ever written");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// **STUDIO-1915, the acceptance path.** Run 6250 (makewhatis/flux#152) and run 6255
+    /// (studio49dev/carini#139): the agent declared `HANDOFF: in-review` WITHOUT calling
+    /// `symphony_handoff`, never moved its ticket, and left its pull request a DRAFT. The worker's
+    /// auto-park moved the ticket — `worker.rs`'s
+    /// `a_park_the_agent_never_made_moves_a_draft_handoff_to_review_and_logs_it` pins that half —
+    /// and this pins the half that was missing: the exit puts the pull request into the watch set.
+    /// Before this ticket the marker path wrote no row at all, and only the paced adoption sweep
+    /// (`adopt:<key>`) ever found either pull request.
+    ///
+    /// The draft is real to the lookup: `gh pr list --state open` lists drafts, and the source
+    /// carries no draft flag, so nothing between the request and the row can refuse one. Once
+    /// watched, a draft is draftpoke's (STUDIO-962) — which pokes its author because the row's
+    /// origin names the ticket.
+    ///
+    /// MUTATION: drop the introduction from `on_worker_exit`'s releasing branch and this reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_handoff_the_agent_never_moved_puts_its_draft_pr_in_the_watch_set() {
+        let tr = Arc::new(Fake::new());
+        let (mut o, env, mut rx, started_at) = marker_handoff_orch(&tr);
+        let store = Arc::clone(&o.store);
+
+        // The auto-park moved the ticket, so the worker's sample is the review state while the
+        // reconcile snapshot still says `Todo`.
+        o.on_worker_exit(declared_exit(started_at, "in review"));
+
+        let req = rx.try_recv().expect("the exit requested an introduction");
+        assert_eq!(
+            req.head_branch, "symphony/MT-1",
+            "resolved by branch, not by link"
+        );
+        assert_eq!(
+            req.introduced_by, "handoff:MT-1",
+            "a handoff origin, which names the ticket draftpoke reopens"
+        );
+        assert_eq!(req.reviewers, vec!["bob".to_string()], "never the author");
+        assert!(
+            req.only_if_unwatched,
+            "a repair: it may never re-arm a row a `symphony_handoff` already armed"
+        );
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        tx.send(req).expect("requeue the observed request");
+
+        let (task, handle) = start(o, &env.signal);
+        let intro = tokio::spawn(crate::reviewintro::run_review_intro_task(
+            env.signal.wait(),
+            crate::reviewintro::ReviewIntroDeps {
+                pr_source: Some(Arc::new(OnePr("https://github.com/o/r/pull/152"))),
+                sink: Arc::new(crate::reviewintro::ControlIntroSink::new(handle.clone())),
+                linker: None,
+            },
+            rx,
+        ));
+
+        let rows = first_watch_rows(&store, &env.signal, "the draft handoff").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].key.number, 152);
+        assert_eq!(rows[0].key.reviewer, "bob");
+        assert_eq!(rows[0].introduced_by, "handoff:MT-1");
+
+        env.signal.cancel();
+        let _ = task.await;
+        let _ = intro.await;
+    }
+
+    /// **STUDIO-1915, run 6255's other half.** prlink attached studio49dev/carini#139 to its ticket
+    /// only at 14:34:51Z, after the run had ended, so at exit the ticket links NO pull request. The
+    /// introduction must not wait on the link: it resolves the run's own `symphony/<key>` branch,
+    /// and attaches what it found as it goes.
+    ///
+    /// MUTATION: drop the introduction from `on_worker_exit`'s releasing branch and this reds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_pr_linked_only_after_the_run_ended_is_still_introduced() {
+        let tr = Arc::new(Fake::new());
+        let (mut o, env, rx, started_at) = marker_handoff_orch(&tr);
+        let linked = &o.running["ID-1"].issue;
+        assert!(
+            !linked.linked_pr && linked.linked_prs.is_none(),
+            "precondition: the ticket links no pull request when the run ends"
+        );
+        let store = Arc::clone(&o.store);
+
+        o.on_worker_exit(declared_exit(started_at, "in review"));
+
+        let (task, handle) = start(o, &env.signal);
+        let intro = tokio::spawn(crate::reviewintro::run_review_intro_task(
+            env.signal.wait(),
+            crate::reviewintro::ReviewIntroDeps {
+                pr_source: Some(Arc::new(OnePr("https://github.com/o/r/pull/139"))),
+                sink: Arc::new(crate::reviewintro::ControlIntroSink::new(handle.clone())),
+                linker: Some(Arc::new(crate::prlink::TrackerLinker(
+                    Arc::clone(&tr) as Arc<dyn rhapsody_tracker::Tracker>
+                ))),
+            },
+            rx,
+        ));
+
+        let rows = first_watch_rows(&store, &env.signal, "the late-linked handoff").await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].key.number, 139);
+        assert_eq!(rows[0].introduced_by, "handoff:MT-1");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tr.link_pr_calls().is_empty() && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let links = tr.link_pr_calls();
+        assert_eq!(links.len(), 1, "{links:?}");
+        assert_eq!(links[0].issue_id, "ID-1");
+        assert_eq!(links[0].url, "https://github.com/o/r/pull/139");
+
+        env.signal.cancel();
+        let _ = task.await;
+        let _ = intro.await;
+    }
+
+    /// STUDIO-1915's boundaries. A declared handoff whose ticket is still ACTIVE at exit (the park's
+    /// move failed, or it declined for want of a pull request) is a continuation, not a review: it
+    /// introduces nothing, and the continuation retries the park. And an installation without the
+    /// ticketless path is untouched.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_declared_handoff_that_did_not_park_in_review_introduces_nothing() {
+        let tr = Arc::new(Fake::new());
+        let (mut o, _env, mut rx, started_at) = marker_handoff_orch(&tr);
+        o.on_worker_exit(declared_exit(started_at, "Todo"));
+        assert!(
+            rx.try_recv().is_err(),
+            "a still-active ticket was never handed off for review"
+        );
+
+        let (mut o, _env, mut rx, started_at) = marker_handoff_orch(&tr);
+        o.teams = Some(quorum_teams(&["alice", "bob"])); // ticket mode: no watch set
+        o.on_worker_exit(declared_exit(started_at, "in review"));
+        assert!(
+            rx.try_recv().is_err(),
+            "the watch set is the ticketless path's alone"
+        );
+    }
+
     /// **STUDIO-1912.** A handoff on a branch whose EARLIER pull request has merged introduces the
     /// pull request the run actually opened: the OPEN one on that branch, never the merged one —
     /// even though the merged one is still on GitHub under the same head branch and its retired

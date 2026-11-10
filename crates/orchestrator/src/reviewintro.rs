@@ -432,7 +432,7 @@ async fn introduce_resolved_pr(deps: &ReviewIntroDeps, req: &ReviewIntroRequest,
         ReviewIntroOutcome::AlreadyWatched => tracing::debug!(
             pr = %pr, origin = %req.introduced_by,
             "ticketless review: this pull request is already in the watch set, so the \
-             adoption had nothing to repair"
+             repair (an adoption, or a declared handoff's exit introduction) had nothing to do"
         ),
         ReviewIntroOutcome::Dormant => tracing::debug!(
             pr = %pr,
@@ -599,6 +599,79 @@ impl Orchestrator {
             skip_own_repo: false,
             companions: Vec::new(),
         })
+    }
+
+    /// Puts a DECLARED handoff's pull request into the watch set at run exit (STUDIO-1915).
+    ///
+    /// A run that ends `HANDOFF: in-review` without calling `symphony_handoff` is parked by the
+    /// worker's auto-park (TRA-240), which moves the ticket and nothing else. `plan_review_intro`
+    /// was reached only from `handle_handoff_run`, so that ticket sat in review with an open pull
+    /// request and no watch row until the paced adoption sweep found it — run 6250
+    /// (makewhatis/flux#152) and run 6255 (studio49dev/carini#139). Called from
+    /// `on_worker_exit`'s releasing branch when the exit is a declared handoff parked in
+    /// `review_state`, whoever moved the ticket.
+    ///
+    /// The request is the handoff's own plan with one change: `only_if_unwatched`. That makes it a
+    /// REPAIR. A run that DID call `symphony_handoff` has already queued an arming introduction on
+    /// the same serial task, which writes its row before this request is read, so this one finds
+    /// the pull request watched and writes nothing; a re-run's re-review stays the handoff's to
+    /// arm. The branch lookup includes drafts, and does not need the ticket to link the pull
+    /// request yet. A watched draft is then draftpoke's (STUDIO-962) to poke the author about.
+    ///
+    /// Logs exactly one INFO line for whichever outcome it reached, including doing nothing.
+    pub(crate) fn introduce_declared_handoff(
+        &self,
+        re: &crate::orchestrator::RunningEntry,
+        review_state: &str,
+    ) {
+        let key = &re.issue.identifier;
+        if !self.review_ticketless_enabled() {
+            tracing::info!(
+                issue_identifier = %key,
+                review_state = %review_state,
+                "handoff: {key} ended parked in {review_state}; ticketless review is off, so no \
+                 pull request is introduced into the review watch set"
+            );
+            return;
+        }
+        let Some(tx) = self.review_intro_tx.as_ref() else {
+            tracing::info!(
+                issue_identifier = %key,
+                review_state = %review_state,
+                "handoff: {key} ended parked in {review_state}; no review introduction task is \
+                 running, so its pull request is not introduced"
+            );
+            return;
+        };
+        let Some(mut req) = self.plan_review_intro(re) else {
+            tracing::info!(
+                issue_identifier = %key,
+                review_state = %review_state,
+                "handoff: {key} ended parked in {review_state}; no introduction was planned (the \
+                 run's repository is not a configured GitHub repository, or the roster holds no \
+                 reviewer but the author)"
+            );
+            return;
+        };
+        req.only_if_unwatched = true;
+        let branch = req.head_branch.clone();
+        let reviewers = req.reviewers.join(",");
+        if tx.send(req).is_err() {
+            tracing::warn!(
+                issue_identifier = %key,
+                "handoff: {key} ended parked in {review_state}, but the review introduction task \
+                 is gone; its pull request is not introduced"
+            );
+            return;
+        }
+        tracing::info!(
+            issue_identifier = %key,
+            review_state = %review_state,
+            head_branch = %branch,
+            reviewers = %reviewers,
+            "handoff: {key} ended parked in {review_state}; introducing the open pull request on \
+             {branch} (draft or not) into the review watch set unless it is already watched"
+        );
     }
 
     /// Writes a trusted introduction into the watch set. **The only introduction site in the
