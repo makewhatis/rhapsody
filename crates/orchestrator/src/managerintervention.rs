@@ -77,7 +77,8 @@ pub fn stall_kind_for(kind: DivergenceKind) -> Option<&'static str> {
         | DivergenceKind::ReviewInfrastructure
         | DivergenceKind::CredentialInfrastructure
         // STUDIO-1993: a disk-pressure hold is a daemon-side admission gate, not a manager stall.
-        | DivergenceKind::ScratchPressure => None,
+        | DivergenceKind::ScratchPressure
+        | DivergenceKind::CiFailureNoRun => None,
     }
 }
 

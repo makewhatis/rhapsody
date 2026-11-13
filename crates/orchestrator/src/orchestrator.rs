@@ -788,6 +788,8 @@ pub struct Orchestrator {
     /// progress — without that silence outliving the transition: a route-back the author never
     /// answers stops being progress once it is itself stale.
     pub(crate) conflict_routed: HashMap<crate::prstate::PrCoord, crate::reviewwatch::ConflictRoute>,
+    /// Head-scoped CI rerun/summons ledger, confined to the control task.
+    pub(crate) ci_routed: HashMap<crate::prstate::PrCoord, crate::reviewci::CiState>,
     /// Per-pull-request draft-poke bookkeeping (STUDIO-962), keyed by
     /// [`churn_key`](crate::reviewwatch::churn_key) exactly as the two above are, and dropped with
     /// them when the pull request leaves the watch set. Written and read only by the watcher's
@@ -1385,6 +1387,7 @@ impl Orchestrator {
             author_rounds_pending: HashMap::new(),
             auto_merge_announced: HashMap::new(),
             conflict_routed: HashMap::new(),
+            ci_routed: HashMap::new(),
             draft_pokes: HashMap::new(),
             review_deferred_by_author: HashMap::new(),
             review_unassignable: HashMap::new(),

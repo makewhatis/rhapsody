@@ -320,6 +320,27 @@ impl ConditionalPrState {
 
 #[async_trait]
 impl PrStateSource for ConditionalPrState {
+    async fn review_ci(
+        &self,
+        pr: &PrCoord,
+        head: &str,
+        previous: Option<&crate::reviewci::CiSnapshot>,
+    ) -> Result<Option<crate::reviewci::CiSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        match &self.fallback {
+            Some(source) => source.review_ci(pr, head, previous).await,
+            None => Ok(None),
+        }
+    }
+    async fn rerun_ci(
+        &self,
+        pr: &PrCoord,
+        ci: &crate::reviewci::CiSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match &self.fallback {
+            Some(source) => source.rerun_ci(pr, ci).await,
+            None => Err("CI rerun is unavailable".into()),
+        }
+    }
     async fn pr_state(
         &self,
         owner: &str,

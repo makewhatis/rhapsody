@@ -249,6 +249,17 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Failed required CI routes back to the author (STUDIO-1994)
+
+Ticketless review watches required checks at the current PR head and routes concluded failures
+through the same author summons/state-move path as conflicts, independently of approval. WORKFLOW.md
+`review.ci_failure_routing` defaults on and hot-reloads; `review.ci_failure_escalation_hours` defaults
+to two hours before an unanswered summons is reported as needing a human. Pending checks, live
+author runs and human-held tickets do not summon. File-evidenced unrelated Actions failures get
+one failed-jobs rerun per head first. Like conflict routing, dedupe is process-local. This extends
+the Rhapsody-only review subsystem; Go-owned config/API goldens, schemas and normalization are
+unchanged. See the plugin's operating guide for bounds and escalation behavior.
+
 ### Daemon-owned per-run scratch directories, a janitor and a disk guard (STUDIO-1993)
 
 The Go daemon lets each coding agent choose its own `$TMPDIR` paths and never removes them, so build

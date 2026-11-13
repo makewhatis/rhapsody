@@ -304,6 +304,8 @@ pub enum DivergenceKind {
     /// janitor reclaims enough space (STUDIO-1993). Reported from the same guard that holds the
     /// dispatch gate, so an operator sees WHY nothing is being admitted instead of an idle board.
     ScratchPressure,
+    /// Required CI went red and the author has not answered the head's summons (STUDIO-1994).
+    CiFailureNoRun,
 }
 
 impl DivergenceKind {
@@ -326,6 +328,7 @@ impl DivergenceKind {
             DivergenceKind::ReviewInfrastructure => "review_infrastructure",
             DivergenceKind::CredentialInfrastructure => "credential_infrastructure",
             DivergenceKind::ScratchPressure => "scratch_pressure",
+            DivergenceKind::CiFailureNoRun => "ci_failure_no_run",
         }
     }
     /// The operator-facing sentence: what was expected to happen, and what did not. Phrased as an
@@ -387,6 +390,9 @@ impl DivergenceKind {
             DivergenceKind::ScratchPressure => {
                 "the scratch volume is under its free-space floor, so new dispatches are held; see \
                  the reason"
+            }
+            DivergenceKind::CiFailureNoRun => {
+                "required CI failed and the author has not answered the summons; needs a human"
             }
         }
     }
@@ -1405,6 +1411,29 @@ impl Orchestrator {
             })
             .collect();
         let mut found = found;
+        // A fresh CI route-back is author-owned progress, independently of review approval.
+        // Once its configurable horizon expires, the explicit CI divergence replaces the generic
+        // approved-still-open signal. An answered summons produces no CI escalation.
+        let ci = self.ci_divergences(now);
+        if self
+            .eff
+            .as_ref()
+            .is_some_and(|e| e.cfg.review.ci_failure_routing)
+        {
+            found.retain(|d| {
+                d.kind != DivergenceKind::ApprovedStillOpen
+                    || !self.ci_routed.iter().any(|(pr, s)| {
+                        pr.to_string() == d.pr
+                            && s.red
+                            && s.summoned_at.is_some()
+                            && self
+                                .review_observed_head
+                                .get(pr)
+                                .is_some_and(|o| o.open && o.head == s.head)
+                    })
+            });
+        }
+        found.extend(ci);
         // The merged-but-not-terminal divergences read above (STUDIO-1007) come from a DIFFERENT
         // source than every rule in the loop: a merged pull request's watch rows are retired, so it
         // is not in the live set the loop walked and nothing there could derive it. The durable

@@ -520,6 +520,11 @@ pub enum Event {
         head: String,
         surface: Option<crate::ghsummons::ReviewSurface>,
     },
+    ReviewCi {
+        pr: crate::prstate::PrCoord,
+        ci: crate::reviewci::CiSnapshot,
+        reply: tokio::sync::oneshot::Sender<crate::reviewci::CiAction>,
+    },
     /// The operator taking a pull request out of the watch set from the authenticated console
     /// (STUDIO-722; NEW beyond Go v0.4.0). The same terminal a merge or a close reaches.
     ///
@@ -1148,6 +1153,10 @@ impl Orchestrator {
                 reply,
             } => {
                 let _ = reply.send(self.handle_review_rerun_named(&pr, reviewer.as_deref()));
+            }
+            Event::ReviewCi { pr, ci, reply } => {
+                let action = self.observe_review_ci(&pr, &ci);
+                let _ = reply.send(action);
             }
             Event::ReviewSurface { pr, head, surface } => {
                 self.review_surfaces.remove(&pr);

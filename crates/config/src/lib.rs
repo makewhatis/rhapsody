@@ -72,5 +72,6 @@ pub use providers::{
 };
 pub use resolve::{Resolved, resolve};
 pub use scratch::Scratch;
+pub mod review_ci;
 pub use validate::{ValidationError, validate, validate_providers_only};
 pub use warnings::{LegacyWarning, legacy_warnings};
