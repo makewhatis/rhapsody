@@ -152,8 +152,12 @@ fn usd_gate_with_reported_price(
         return Ok(());
     }
     if !cfg.prices.contains_key(model) && !harness_priced {
+        // STUDIO-1998 point 3: the harness's own catalogue (opencode's `models.json`) is not used as
+        // a USD source — the gate and the accounting (`run_cost_usd`) must agree, and only `prices:`
+        // does. Say that here so a brand-new model's refusal is not read as an unexplained gate bug.
         return Err(format!(
-            "no price for {model}; add it under prices: or daily_usd for {provider} cannot be enforced"
+            "no price for {model}; add it under prices: (the harness's model catalogue is not used \
+             for USD pricing)"
         ));
     }
     if !spent_usd.is_finite() {
@@ -167,6 +171,22 @@ fn usd_gate_with_reported_price(
         ));
     }
     Ok(())
+}
+
+/// The visible reason a provider's "model not found" refusal produces (STUDIO-1998): what failed,
+/// who refused it, and the one key an operator can change. `<id>` drops the provider prefix the
+/// priced key carries, because the sentence already names the provider.
+pub(crate) fn model_not_served_reason(model: &str, provider: &str) -> String {
+    let provider = if provider.is_empty() {
+        "the provider"
+    } else {
+        provider
+    };
+    let id = model
+        .strip_prefix(&format!("{provider}/"))
+        .unwrap_or(model)
+        .trim();
+    format!("the model {id} isn't served by {provider}: check the profile or opencode.model")
 }
 
 /// Dispatch-time billing identity and price snapshot, immune to a later config reload.
@@ -335,6 +355,13 @@ struct LedgerState {
     holds: BTreeMap<String, Entry>,
     /// Subjects whose refusal has already been logged, so a refusal repeated every tick is one line.
     announced: std::collections::HashSet<String>,
+    /// Subjects whose last dispatch failed because the provider does not serve the resolved model
+    /// (STUDIO-1998), mapped to the model that failed. Kept beside the holds because both answer
+    /// "why is this ticket not being dispatched?" from `&self`, and it OUTLIVES an individual hold:
+    /// a model that is not served will still not be served five minutes later, so the ticket must
+    /// not be retried on the hold's TTL. Cleared when the resolved model changes and on an operator
+    /// refresh (`Orchestrator::clear_model_refusals`).
+    model_refusals: BTreeMap<String, String>,
     /// The cached provider→spend map and the instant it was fetched.
     spend: Option<(Instant, HashMap<String, i64>)>,
 }
@@ -361,6 +388,25 @@ impl BudgetLedger {
         let mut st = self.lock();
         st.holds.remove(subject);
         st.announced.remove(subject);
+    }
+
+    /// The resolved model whose dispatch the provider refused for this subject, if one is recorded.
+    fn model_refusal(&self, subject: &str) -> Option<String> {
+        self.lock().model_refusals.get(subject).cloned()
+    }
+
+    fn set_model_refusal(&self, subject: &str, model: &str) {
+        self.lock()
+            .model_refusals
+            .insert(subject.to_string(), model.to_string());
+    }
+
+    fn clear_model_refusal(&self, subject: &str) {
+        self.lock().model_refusals.remove(subject);
+    }
+
+    fn clear_all_model_refusals(&self) {
+        self.lock().model_refusals.clear();
     }
 
     /// The hold recorded for a subject, if any and still fresh under `ttl` — the lookup the
@@ -529,6 +575,21 @@ impl crate::orchestrator::Orchestrator {
         let first = self.budget_ledger.hold(&held.subject, held.clone());
         if first {
             tracing::warn!(subject = %held.subject, provider = %held.provider, reason = %held.reason, "skipping dispatch: USD budget refusal");
+        }
+    }
+
+    /// Records a refusal whose cause is not a USD budget — an account limit or a rejected
+    /// credential — so a retry entry can carry its own reason instead of the generic
+    /// `"waiting: account limit"` (STUDIO-1998). The ledger is the one place
+    /// [`Self::dispatch_wait_reason`] reads.
+    pub(crate) fn note_dispatch_hold(&self, held: BudgetHeld) {
+        if self.budget_ledger.hold(&held.subject, held.clone()) {
+            tracing::warn!(
+                subject = %held.subject,
+                provider = %held.provider,
+                reason = %held.reason,
+                "skipping dispatch: dispatch held"
+            );
         }
     }
 
@@ -709,6 +770,72 @@ impl crate::orchestrator::Orchestrator {
         self.budget_ledger.release(subject);
     }
 
+    /// Whether this subject's last run failed on a model its provider does not serve (STUDIO-1998).
+    pub(crate) fn has_model_refusal(&self, subject: &str) -> bool {
+        self.budget_ledger.model_refusal(subject).is_some()
+    }
+
+    /// Whether the model-not-found refusal still stands for the model dispatch would use NOW.
+    ///
+    /// A refusal is bound to the model that produced it, not to the ticket: the whole point of
+    /// STUDIO-1998's second half is that fixing the profile, label or WORKFLOW — which changes the
+    /// resolved model — re-dispatches the ticket without an operator having to clear anything. When
+    /// the resolved model differs, the refusal and its console hold are dropped here.
+    pub(crate) fn model_refusal_stands(&self, subject: &str, resolved_model: &str) -> bool {
+        let Some(recorded) = self.budget_ledger.model_refusal(subject) else {
+            return false;
+        };
+        if recorded == resolved_model {
+            return true;
+        }
+        self.budget_ledger.clear_model_refusal(subject);
+        self.release_budget_hold(subject);
+        false
+    }
+
+    /// Records a model-not-found refusal and its visible hold. Keyed by the RESOLVED model so a
+    /// changed resolution releases it on the next pass.
+    pub(crate) fn record_model_refusal(&self, held: BudgetHeld, resolved_model: &str) {
+        self.budget_ledger
+            .set_model_refusal(&held.subject, resolved_model);
+        if self.budget_ledger.hold(&held.subject, held.clone()) {
+            tracing::warn!(
+                subject = %held.subject,
+                model = %resolved_model,
+                reason = %held.reason,
+                "skipping dispatch: the provider does not serve the resolved model; no retry until \
+                 the model changes or an operator refreshes"
+            );
+        }
+    }
+
+    /// Drops every model-not-found refusal. Called on an explicit operator refresh
+    /// (`POST /api/v1/refresh`), the "operator retries" half of STUDIO-1998.
+    pub(crate) fn clear_model_refusals(&self) {
+        self.budget_ledger.clear_all_model_refusals();
+    }
+
+    /// The reason a dispatch for `subject` was last refused, as the gate recorded it, rendered for a
+    /// retry entry (`/api/v1/state.retrying[].error`). `None` when nothing recorded a refusal.
+    ///
+    /// The budget ledger is the single writer: every refusal path that can schedule a retry records
+    /// there (the USD and credential gates, the account/limit fallthrough, 1Password, and the
+    /// model-not-found hold). Before STUDIO-1998 the retry entry always said
+    /// `"waiting: account limit"`, which is how a missing `prices:` entry was read for weeks as a
+    /// limit park.
+    pub(crate) fn dispatch_wait_reason(&self, subject: &str) -> Option<String> {
+        let reason = self
+            .budget_ledger
+            .get(subject, self.budget_hold_ttl())
+            .map(|h| h.reason)
+            .filter(|r| !r.trim().is_empty())?;
+        Some(if reason.starts_with("waiting:") {
+            reason
+        } else {
+            format!("waiting: {reason}")
+        })
+    }
+
     /// The budget hold that explains a reported divergence, if one exists — looked up under the
     /// pull request's coordinate (a deferred review round) and, failing that, under the origin
     /// ticket (a ticket whose re-run is budget-held). The reconciliation sweep calls this so a
@@ -854,12 +981,45 @@ mod tests {
             .expect("visible hold");
         assert_eq!(
             held.reason,
-            "no price for fireworks-ai/m; add it under prices: or daily_usd for fireworks-ai cannot be enforced"
+            "no price for fireworks-ai/m; add it under prices: (the harness's model catalogue is not used for USD pricing)"
         );
         assert!(!o.claimed.contains("1"));
         let snapshot = crate::snapshot_json::render(&o.build_snapshot());
         assert_eq!(snapshot["budget_held"][0]["reason"], held.reason);
         assert_eq!(snapshot["budget_held"][0]["daily_usd"], 10.0);
+    }
+
+    /// STUDIO-1998: a dispatch refused by the USD gate must put the GATE's reason on the retry row
+    /// (`/api/v1/state.retrying[].error`) instead of the generic "waiting: account limit". In the
+    /// incident a missing `prices:` entry was reported for weeks as a limit park. Mutation: restore
+    /// the hard-coded string in `dispatch_issue_on_engine` and this reds on the first assert.
+    #[test]
+    fn a_usd_refusal_surfaces_its_own_reason_on_the_retry_row() {
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).expect("store"));
+        let (mut o, dispatched) = orch_with_budgets(store, &[]);
+        o.eff.as_mut().unwrap().cfg = usd_config(
+            "agent: {backend: opencode}\nopencode: {model: fireworks-ai/m}\nbudgets:\n  fireworks-ai: {daily_usd: 10}\n",
+        );
+
+        o.dispatch_issue(issue("1", "MT-1", "Todo"), Some(1), None, String::new());
+
+        assert!(
+            dispatched.lock().unwrap().is_empty(),
+            "the unpriced model must be refused"
+        );
+        let retry = o.retry_attempts.get("1").expect("retry entry");
+        assert_eq!(
+            retry.err,
+            "waiting: no price for fireworks-ai/m; add it under prices: (the harness's model \
+             catalogue is not used for USD pricing)"
+        );
+        assert!(
+            !retry.err.contains("account limit"),
+            "a missing price is not an account limit"
+        );
+        let snapshot = crate::snapshot_json::render(&o.build_snapshot());
+        assert_eq!(snapshot["retrying"][0]["error"], retry.err);
     }
 
     #[test]

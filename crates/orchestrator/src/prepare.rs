@@ -4498,7 +4498,7 @@ mod tests {
         assert_eq!(held.provider, "fireworks");
         assert_eq!(
             held.reason,
-            "no price for fireworks/accounts/fireworks/models/x; add it under prices: or daily_usd for fireworks cannot be enforced"
+            "no price for fireworks/accounts/fireworks/models/x; add it under prices: (the harness's model catalogue is not used for USD pricing)"
         );
     }
 

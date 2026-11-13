@@ -2333,7 +2333,7 @@ mod tests {
         run.number = 13;
         let key = run.key();
         assert_eq!(o.dispatch_manager(run.clone()), ManagerDispatchOutcome::Refused(
-            "no price for openai/gpt-6.1-sol; add it under prices: or daily_usd for openai cannot be enforced".into()
+            "no price for openai/gpt-6.1-sol; add it under prices: (the harness's model catalogue is not used for USD pricing)".into()
         ));
         assert_eq!(dispatched.lock().expect("lock").len(), 1);
         assert!(!o.claimed.contains(&key) && !o.manager_attempts.contains_key(&key));

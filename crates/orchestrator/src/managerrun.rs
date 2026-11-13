@@ -1735,7 +1735,7 @@ mod tests {
                 let reason = if priced {
                     "daily_usd for anthropic is spent ($1.000000 of $1.000000)"
                 } else {
-                    "no price for anthropic/manager-model; add it under prices: or daily_usd for anthropic cannot be enforced"
+                    "no price for anthropic/manager-model; add it under prices: (the harness's model catalogue is not used for USD pricing)"
                 };
                 assert_eq!(
                     o.dispatch_manager(manager_run()),

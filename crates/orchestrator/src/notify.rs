@@ -14,7 +14,7 @@
 //!
 //! # What is sent, and what is not
 //!
-//! Four events warrant a human. [`NotifyKind`] is a CLOSED enum covering three of them, so widening
+//! Five events warrant a human. [`NotifyKind`] is a CLOSED enum covering four of them, so widening
 //! what reaches a phone requires editing it and shows in a diff:
 //!
 //! * [`NotifyKind::AdviceUnapplied`] — an `advise`-mode recommendation the daemon deliberately did
@@ -23,8 +23,11 @@
 //!   has no reply surface and nothing will move it.
 //! * [`NotifyKind::HumanHold`] — a ticket held by the `rhapsody:human` refusal, the first time it
 //!   becomes a candidate (once per ticket, never per tick).
+//! * [`NotifyKind::ModelNotFound`] — a run's provider refused the resolved model with a 404
+//!   (STUDIO-1998). The daemon holds the ticket instead of burning the retry ladder, so the operator
+//!   must be told which model to fix; deduped per ticket and model.
 //!
-//! The fourth, a manager **escalation** that names a human, is delivered by the breaker's own path
+//! The fifth, a manager **escalation** that names a human, is delivered by the breaker's own path
 //! ([`crate::breaker`]) because that path already carries the room line the escalation owns; routing
 //! it here too would page twice. [`divergence_notify_kind`] records the split in one place.
 //!
@@ -73,6 +76,8 @@ pub enum NotifyKind {
     BlockedNoPr,
     /// A ticket held by the `rhapsody:human` refusal.
     HumanHold,
+    /// A provider 404 refusing the run's model (STUDIO-1998).
+    ModelNotFound,
 }
 
 impl NotifyKind {
@@ -82,6 +87,7 @@ impl NotifyKind {
             NotifyKind::AdviceUnapplied => "advice-unapplied",
             NotifyKind::BlockedNoPr => "blocked-no-pr",
             NotifyKind::HumanHold => "human-hold",
+            NotifyKind::ModelNotFound => "model-not-found",
         }
     }
 
@@ -91,6 +97,7 @@ impl NotifyKind {
             NotifyKind::AdviceUnapplied => format!("Advice not applied: {ticket}"),
             NotifyKind::BlockedNoPr => format!("Blocked, no pull request: {ticket}"),
             NotifyKind::HumanHold => format!("Held for a human: {ticket}"),
+            NotifyKind::ModelNotFound => format!("Model not served: {ticket}"),
         }
     }
 }
@@ -388,6 +395,24 @@ impl Orchestrator {
             answer = answer_hint(ticket),
         );
         self.request_notify(NotifyKind::HumanHold, ticket, ticket, body, String::new())
+    }
+
+    /// Fires the notification for a run whose provider refused the resolved model with a 404
+    /// (STUDIO-1998). Deduped per ticket AND model, so repeated failures of one broken model page
+    /// once while a different model (after a profile/label/WORKFLOW edit) pages again.
+    pub(crate) fn notify_model_not_found(&self, ticket: &str, model: &str, reason: &str) -> bool {
+        let body = format!(
+            "**{ticket}** ran on a model its provider does not serve, so the daemon is not \
+             retrying it: {reason}\n\n{answer}",
+            answer = answer_hint(ticket),
+        );
+        self.request_notify(
+            NotifyKind::ModelNotFound,
+            ticket,
+            &format!("{ticket}:{model}"),
+            body,
+            String::new(),
+        )
     }
 
     /// Reserves the once-per-occurrence marker and enqueues a notification.
@@ -699,6 +724,7 @@ mod tests {
             NotifyKind::AdviceUnapplied,
             NotifyKind::BlockedNoPr,
             NotifyKind::HumanHold,
+            NotifyKind::ModelNotFound,
         ] {
             assert!(kind.title("STUDIO-9").contains("STUDIO-9"));
         }
