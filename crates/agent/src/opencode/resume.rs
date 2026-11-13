@@ -56,6 +56,10 @@ pub struct ResumeRecord {
     pub session_id: String,
     /// The private `XDG_DATA_HOME` directory the session's history lives in.
     pub dir: String,
+    /// The run's scratch directory (STUDIO-1993), so the resumed run adopts the SAME scratch tree and
+    /// removes it when it ends. Empty when the record predates the field or scratch was off.
+    #[serde(default)]
+    pub scratch_dir: String,
     /// When the record was written, in Unix milliseconds — the retention clock.
     pub saved_at_ms: i64,
     /// The SHA-256 (hex) of the last prompt this session received IN FULL, or empty when no full
@@ -386,6 +390,7 @@ mod tests {
             workspace: "/ws".to_string(),
             session_id: "ses_keep".to_string(),
             dir: dir.to_string_lossy().into_owned(),
+            scratch_dir: String::new(),
             saved_at_ms: 1_000_000,
             prompt_sha256: String::new(),
         }

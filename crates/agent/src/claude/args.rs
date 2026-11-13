@@ -74,6 +74,9 @@ pub struct Config {
     /// Passed as `symphony mcp <workflow_path>` so the child resolves the SAME workflow (and thus
     /// the daemon's server port).
     pub workflow_path: String,
+    /// The daemon-owned root per-run scratch directories live under (STUDIO-1993). Empty disables
+    /// the feature, leaving the child's `TMPDIR`/`CARGO_TARGET_DIR` untouched. Rhapsody-only.
+    pub scratch_root: String,
 }
 
 impl fmt::Debug for Config {
@@ -99,6 +102,7 @@ impl fmt::Debug for Config {
             .field("inject_mcp", &self.inject_mcp)
             .field("daemon_bin", &self.daemon_bin)
             .field("workflow_path", &self.workflow_path)
+            .field("scratch_root", &self.scratch_root)
             .finish()
     }
 }

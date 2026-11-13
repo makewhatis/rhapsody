@@ -84,6 +84,9 @@ pub struct Config {
     /// Empty ⇒ resolved from the daemon's environment (see
     /// [`crate::opencode::state::default_auth_source`]).
     pub auth_source: String,
+    /// The daemon-owned root per-run scratch directories live under (STUDIO-1993). Empty disables
+    /// the feature, leaving the child's `TMPDIR`/`CARGO_TARGET_DIR` untouched. Rhapsody-only.
+    pub scratch_root: String,
 }
 
 impl fmt::Debug for Config {
@@ -103,6 +106,7 @@ impl fmt::Debug for Config {
             .field("workflow_path", &self.workflow_path)
             .field("state_root", &self.state_root)
             .field("auth_source", &self.auth_source)
+            .field("scratch_root", &self.scratch_root)
             .finish()
     }
 }

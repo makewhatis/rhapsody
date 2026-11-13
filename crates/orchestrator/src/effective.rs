@@ -361,6 +361,7 @@ fn opencode_config_from_cfg(cfg: &Config) -> opencode::Config {
         workflow_path: cfg.workflow_path.clone(),
         state_root: cfg.opencode.state_root.clone(),
         auth_source: cfg.opencode.auth_source.clone(),
+        scratch_root: cfg.scratch.root.clone(),
     }
 }
 
@@ -395,6 +396,7 @@ fn claude_config_from_cfg(cfg: &Config) -> claude::Config {
         inject_mcp: cfg.mcp.enabled,
         daemon_bin: daemon_bin_path(),
         workflow_path: cfg.workflow_path.clone(),
+        scratch_root: cfg.scratch.root.clone(),
     }
 }
 
