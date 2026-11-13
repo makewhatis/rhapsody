@@ -755,6 +755,22 @@ impl Orchestrator {
             // The routed teammate's harness (STUDIO-902). Empty for every profile that names none,
             // so the worker keeps the configured backend's runner and the dispatch is unchanged.
             re.harness = td.harness.clone();
+            // STUDIO-1976 review B6: the roster identity's OWN routing fields are the identity tier,
+            // folded under the profile (profile wins). The prepared path folds them into
+            // `selection_inputs`; the INLINE path (no provider configured) has no selection, so the
+            // fallback is applied here. A run already in flight keeps the tuple it captured above.
+            if let Some(id) = self
+                .teams
+                .as_ref()
+                .and_then(|t| t.roster.iter().find(|i| i.name == td.identity))
+            {
+                if re.harness.is_empty() {
+                    re.harness = id.harness.clone();
+                }
+                if re.model_override.model.is_empty() {
+                    re.model_override.model = id.model.clone();
+                }
+            }
         }
         // PB7 (STUDIO-1002, STUDIO-1602): a prepared dispatch runs on the harness/model the pure
         // SELECTION resolved, not the routed profile's — the spec owns the real adapter. Recording

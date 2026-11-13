@@ -96,8 +96,21 @@ describe("ModelsTab", () => {
     });
   });
 
-  it("move-all then undo sends the previous tuples back", async () => {
+  // B7: the model field suggests the harness's OWN known models with no provider configured — the
+  // native-login case — instead of asking the provider catalog for the literal harness id.
+  it("suggests harness-known models when no provider is set", async () => {
     renderTab();
+    await screen.findByText("jerry");
+    const values = Array.from(document.querySelectorAll("datalist option")).map(
+      (o) => (o as HTMLOptionElement).value,
+    );
+    expect(values).toContain("openai/gpt-6.1-sol");
+    expect(values).toContain("anthropic/claude-sonnet-4-6");
+    // No provider is selected on any default row, so no catalog request is made.
+    expect(h.fetchProviderCatalog).not.toHaveBeenCalled();
+  });
+
+  it("move-all then undo sends the previous tuples back", async () => {    renderTab();
     const moveAll = await screen.findByRole("button", { name: "Move all workers" });
     // A move-all needs a harness or model; the default draft is empty so the button is disabled.
     expect((moveAll as HTMLButtonElement).disabled).toBe(true);

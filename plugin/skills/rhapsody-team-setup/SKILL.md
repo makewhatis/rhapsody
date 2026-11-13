@@ -129,15 +129,20 @@ but does not yet gate anything — do not rely on it to restrict a teammate.)
   use it, so do not set `provider` on a `claude` teammate — Claude uses its native login.
 
 The same `harness`/`provider`/`model`/`effort` fields may also be set directly on a **roster
-identity**, but they are **not yet applied to a run**: a dispatched run resolves its tuple from the
-profile tier and below, and `rhapsodyd teams show <name>` lists any identity routing fields as
-*configured but not applied*. The `manager:` block has its own tuple
+identity**, and they **are applied to a run** as the identity tier — folded between the profile and
+the project/global defaults, so a profile's own field still wins for that field and the identity's
+answers wherever the profile is silent. `rhapsodyd teams show <name>` folds them into the resolved
+tuple and names their origin `identity`. The `manager:` block has its own tuple
 (`manager.harness`/`manager.provider`/`manager.model`) that never borrows a teammate's — an absent
 `manager.harness` means `claude` — and the manager tuple **is** applied.
 
-**When each source takes effect — don't tell anyone all three need a restart.** `teams.yaml`
-(roster, identity routing fields, manager tuple, review overrides) is **boot-loaded**: it is read
-once at daemon start, so an edit costs a restart. `WORKFLOW.md`'s `providers:` definitions
+**When each source takes effect — don't tell anyone all three need a restart.** `teams.yaml`'s
+ROUTING fields (the identity routing fields, the manager tuple, the review overrides) are now
+**hot-applied** (STUDIO-1976): a watcher re-reads the file, validates it the same way as at boot, and
+folds only those fields into the live config, so the next dispatch/review/manager turn uses them
+while runs already in flight keep what they started with; an invalid edit is refused and the last
+good value kept. Everything ELSE in `teams.yaml` (roster membership, labels, quorum, review mode,
+memory) is **boot-loaded** and needs a restart. `WORKFLOW.md`'s `providers:` definitions
 **hot-reload** with the workflow. Profile files are **resolved from disk at dispatch**, so editing a
 profile body needs no restart — just the next run. `rhapsodyd teams show <name>` prints the resolved
 harness/provider/model and the origin tier each field came from, plus the manager's tuple.

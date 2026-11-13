@@ -212,6 +212,21 @@ pub struct TriageHandle {
     /// a board read that STARTED after the write has had its say. See
     /// [`TriageHandle::retire_written`].
     written: std::sync::Mutex<HashMap<String, DateTime<Utc>>>,
+    /// The manager's LIVE routing (STUDIO-1976): the tuple the last `teams.yaml` reload applied, or
+    /// `None` before any reload. The control task writes it on `on_teams_reload`; the off-loop
+    /// triage task reads it per cycle so a live edit takes effect on the next manager turn. The
+    /// boot `Teams` remains the fallback while this is `None`.
+    manager: std::sync::RwLock<Option<ManagerRouting>>,
+}
+
+/// The manager's live routing fields (STUDIO-1976) — the harness/provider/model the last
+/// `teams.yaml` reload applied. Read per turn by the off-loop manager consumers so a live edit
+/// lands on the next turn while an in-flight turn keeps the tuple it started with.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ManagerRouting {
+    pub harness: String,
+    pub provider: String,
+    pub model: String,
 }
 
 impl TriageHandle {
@@ -268,6 +283,21 @@ impl TriageHandle {
     /// Drops a written entry — the board read now shows an identity label on the ticket.
     pub(crate) fn clear_written(&self, issue_id: &str) {
         self.written_map().remove(issue_id);
+    }
+
+    /// Records the manager routing the last `teams.yaml` reload applied (STUDIO-1976). Called on
+    /// the control task; a short lock write with no `await`.
+    pub(crate) fn set_manager_routing(&self, routing: &ManagerRouting) {
+        *self.manager.write().unwrap_or_else(|e| e.into_inner()) = Some(routing.clone());
+    }
+
+    /// The live manager routing, or `None` before any reload. The off-loop manager turn reads the
+    /// model from here so a live edit lands on the next turn.
+    pub fn manager_routing(&self) -> Option<ManagerRouting> {
+        self.manager
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Asks the triage task to run a cycle NOW (§A.3.2). Cheap, non-blocking, and idempotent
@@ -1152,6 +1182,15 @@ where
         return CycleReport::stalled(CycleOutcome::Idle, false, 0);
     };
     let trackers = target.trackers;
+    // The manager's LIVE routing (STUDIO-1976): the tuple the last `teams.yaml` reload applied, or
+    // the boot tuple before any reload. Snapshotted ONCE per cycle so every manager turn this cycle
+    // spends uses the same tuple, and an edit landing mid-cycle takes effect on the NEXT one. The
+    // `Some` arm is taken verbatim — a reload that CLEARED `manager.model` must not fall back to the
+    // boot value it replaced.
+    let manager_model: String = match deps.handle.manager_routing() {
+        Some(r) => r.model,
+        None => deps.teams.manager.model.clone(),
+    };
     // Reuse the poll's last complete candidate fetch when it is fresh (STUDIO-1896): it is the
     // same query over the same clients, de-duplicated by the same first-project-wins rule, so
     // fetching it again here only spent Linear quota — about 640 requests an hour on a 14-project
@@ -1297,6 +1336,7 @@ where
             summon_token: &target.summon_token,
             load: &ears_load,
             model: ask_model && deps.teams.manager.mode == ManagerMode::LabelsModel,
+            manager_model: &manager_model,
             agent_command: &deps.agent_command,
             billing_guard: deps.billing_guard,
             tracker_api_key: &deps.tracker_api_key,
@@ -1474,7 +1514,7 @@ where
                 command: deps.agent_command.clone(),
                 billing_guard: deps.billing_guard,
                 tracker_api_key: deps.tracker_api_key.clone(),
-                model: deps.teams.manager.model.clone(),
+                model: manager_model.clone(),
                 timeout: turn_timeout(deps.teams.manager.timeout_ms),
                 prompt: build_prompt(&deps.teams, iss, &load),
             };
@@ -2352,6 +2392,9 @@ mod tests {
     struct FakeArbiter {
         answers: Mutex<Vec<Result<TriageDecision, String>>>,
         prompts: Mutex<Vec<String>>,
+        /// Every `req.model` the arbiter was asked under, so a test can prove which manager model a
+        /// live reload put on the next turn (STUDIO-1976).
+        models: Mutex<Vec<String>>,
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
         /// When set, every turn parks on this gate — the "model API is down / hung" simulation.
@@ -2363,6 +2406,7 @@ mod tests {
             Arc::new(FakeArbiter {
                 answers: Mutex::new(answers),
                 prompts: Mutex::new(Vec::new()),
+                models: Mutex::new(Vec::new()),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
                 park: None,
@@ -2373,6 +2417,7 @@ mod tests {
             Arc::new(FakeArbiter {
                 answers: Mutex::new(Vec::new()),
                 prompts: Mutex::new(Vec::new()),
+                models: Mutex::new(Vec::new()),
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
                 park: Some(gate),
@@ -2398,6 +2443,10 @@ mod tests {
         fn prompts(&self) -> Vec<String> {
             self.prompts.lock().expect("prompts").clone()
         }
+
+        fn models(&self) -> Vec<String> {
+            self.models.lock().expect("models").clone()
+        }
     }
 
     #[async_trait]
@@ -2409,6 +2458,7 @@ mod tests {
                 .lock()
                 .expect("prompts")
                 .push(req.prompt.clone());
+            self.models.lock().expect("models").push(req.model.clone());
             if let Some(gate) = &self.park {
                 let mut gate = gate.clone();
                 while !*gate.borrow() {
@@ -2809,8 +2859,44 @@ mod tests {
         );
     }
 
-    // ── the ears pass and the assignment pass share one snapshot (STUDIO-678, §0.13) ────────────
+    // ── STUDIO-1976 review B1/B5: the manager's LIVE model at the triage boundary ───────────────
 
+    /// The manager model a triage turn actually spends comes from the LIVE routing the reload
+    /// handle carries, not the boot-captured `Teams` — the exact B1 reproduction. A turn in flight
+    /// keeps the model it started with; the next cycle picks up the live one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_manager_model_edit_reaches_the_next_triage_turn() {
+        let mut tr = Fake::new();
+        tr.candidates = vec![labelled("i1", &["rust"])];
+        let tr = Arc::new(tr);
+        let handle = Arc::new(TriageHandle::new());
+        let arbiter = FakeArbiter::answering(vec![FakeArbiter::ok("alice")]);
+        let d = deps_with_handle(
+            teams_model(vec![ident("alice", &["rust"])]),
+            Arc::clone(&tr),
+            Arc::clone(&arbiter) as Arc<dyn TriageArbiter>,
+            Arc::clone(&handle),
+        );
+
+        // No reload yet: the boot tuple (empty model) is what the turn runs under.
+        triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(arbiter.models(), vec![String::new()]);
+
+        // A live reload publishes the new manager model onto the handle.
+        handle.set_manager_routing(&ManagerRouting {
+            harness: String::new(),
+            provider: String::new(),
+            model: "new-model".into(),
+        });
+        triage_cycle(&CancelWait::default(), &d, true).await;
+        assert_eq!(
+            arbiter.models(),
+            vec![String::new(), "new-model".to_string()],
+            "the next turn must spend the live manager model"
+        );
+    }
+
+    // ── the ears pass and the assignment pass share one snapshot (STUDIO-678, §0.13) ────────────
     /// **The operator's answer stands for the rest of the cycle.** `issues` is fetched once, at the
     /// top of the cycle, and the ears pass writes its identity label to the TRACKER — so the
     /// assignment pass a few lines later still sees an unlabelled ticket in that snapshot and used

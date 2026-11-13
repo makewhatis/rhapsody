@@ -1022,18 +1022,63 @@ impl Orchestrator {
         });
         // The routed teammate's resolved profile contributes the profile tier (harness/provider/
         // model), from the SAME resolve the dispatch uses, so the two cannot disagree.
-        let profile_tier = self
-            .route_teams(issue)
+        let teams_dispatch = self.route_teams(issue);
+        let profile_tier = teams_dispatch
+            .as_ref()
             .map_or_else(FieldSelection::default, |td| FieldSelection {
-                harness: td.harness,
-                provider: td.provider,
-                model: td.model_override.model,
+                harness: td.harness.clone(),
+                provider: td.provider.clone(),
+                model: td.model_override.model.clone(),
             });
+        // The routed identity's OWN roster routing fields are the identity tier (STUDIO-1976 review
+        // B6): the resolver folds them between the profile and the project, so a roster model change
+        // reaches the next dispatch. Membership/labels stay boot-loaded.
+        let identity_tier = teams_dispatch
+            .as_ref()
+            .and_then(|td| {
+                self.teams
+                    .as_ref()
+                    .and_then(|t| t.roster.iter().find(|i| i.name == td.identity))
+            })
+            .map(|i| FieldSelection {
+                harness: i.harness.clone(),
+                provider: i.provider.clone(),
+                model: i.model.clone(),
+            })
+            .unwrap_or_default();
+        // A REVIEW run's per-harness override (`review.model`/`review.provider`/`review.effort`) is
+        // the review tier (STUDIO-1976): the resolver slots it between the ticket and the profile, so
+        // a live `review.provider` change reaches the NEXT round's prepared selection. The reviewer's
+        // harness is the profile's (or the configured backend), the same value `review_harness_for`
+        // resolves and `dispatch_review` refuses against.
+        let review_tier = if matches!(target, PreparedTarget::Review { .. }) {
+            self.teams.as_ref().filter(|t| t.enabled).map(|teams| {
+                let harness = self.effective_harness(
+                    teams_dispatch.as_ref().map_or("", |td| td.harness.as_str()),
+                );
+                let fallback = self.configured_backend();
+                let provider = match teams.review_provider_for(&harness, &fallback) {
+                    rhapsody_config::teams::ReviewModelChoice::Use(v) => v.to_string(),
+                    _ => String::new(),
+                };
+                let model = match teams.review_model_for(&harness, &fallback) {
+                    rhapsody_config::teams::ReviewModelChoice::Use(v) => v.to_string(),
+                    _ => String::new(),
+                };
+                crate::selection::ReviewOverride {
+                    harness,
+                    provider,
+                    model,
+                }
+            })
+        } else {
+            None
+        };
         let tiers = SelectionTiers {
             ticket: FieldSelection::default(),
-            review: None,
+            review: review_tier,
             profile: profile_tier,
-            identity: FieldSelection::default(),
+            identity: identity_tier,
             project: project_tier,
             global: FieldSelection::from_agent(&eff.cfg.agent),
         };
@@ -2576,6 +2621,47 @@ mod tests {
             labels: Some(labels),
             ..issue("1", "MT-1", "Todo")
         }
+    }
+
+    /// STUDIO-1976 review B6: a roster identity's OWN routing fields are fed to dispatch as the
+    /// identity tier, so a profile silent on `model` still resolves to the identity's model.
+    #[test]
+    fn selection_inputs_folds_the_roster_identity_tier() {
+        let dir = crate::testsupport::TempDir::new();
+        let profiles = std::path::PathBuf::from(dir.child("profiles"));
+        std::fs::create_dir_all(&profiles).expect("profiles dir");
+        std::fs::write(
+            profiles.join("silent.md"),
+            "---\nextends: swe\nharness: opencode\nprovider: testprovider\n---\nSilent.\n",
+        )
+        .expect("write profile");
+        let candidate = routed_candidate(&[]);
+        let mut tr = Fake::new();
+        tr.candidates = vec![candidate.clone()];
+        let mut eff = empty_effective(Arc::new(tr));
+        eff.active_states = set_of(&["todo", "in progress"]);
+        eff.max_concurrent = 10;
+        let mut o = Orchestrator::new("WORKFLOW.md");
+        o.eff = Some(eff);
+        o.teams = Some(rhapsody_config::teams::Teams {
+            enabled: true,
+            roster: vec![rhapsody_config::teams::Identity {
+                name: "jerry".to_string(),
+                profile: "silent".to_string(),
+                labels: vec!["rust".to_string()],
+                model: "identity-model".to_string(),
+                ..Default::default()
+            }],
+            ..rhapsody_config::teams::Teams::disabled()
+        });
+        o.teams_profiles_dir = Some(profiles);
+
+        let (_labels, tiers, _providers, _deadline) =
+            o.selection_inputs(&ticket_target_issue(candidate));
+        assert_eq!(tiers.profile.harness, "opencode");
+        assert_eq!(tiers.profile.model, "", "the profile is silent on model");
+        assert_eq!(tiers.identity.model, "identity-model");
+        assert_eq!(tiers.identity.harness, "");
     }
 
     /// STUDIO-1602 acceptance #1: a ticket labeled `rhapsody:harness/claude` + `rhapsody:model/m`

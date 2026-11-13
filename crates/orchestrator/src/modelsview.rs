@@ -12,6 +12,7 @@
 
 use std::path::Path;
 
+use rhapsody_agent::harness::{ProviderProtocol, harness_id_for_name, harness_supports_protocol};
 use rhapsody_config::Config;
 use rhapsody_config::profiles::ResolvedProfile;
 use rhapsody_config::providers::provider_turn_deadline_ms;
@@ -62,7 +63,8 @@ pub struct IdentityModelsRow {
     pub resolved: TupleView,
     /// The profile front matter this row edits (empty means inherit).
     pub configured: RoutingView,
-    /// The roster entry's own routing fields, shown for reference (dispatch does not feed them yet).
+    /// The roster entry's own routing fields — the identity tier the resolver folds between the
+    /// profile and the installation-wide `agent.*` default.
     pub identity: RoutingView,
     pub code_reviewer: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,8 +163,14 @@ impl std::fmt::Display for TeamsModelsError {
     }
 }
 
-/// The resolved tuple for a teammate wearing `profile`, with origins.
-pub fn identity_tuple(cfg: &Config, profile: &ResolvedProfile) -> TupleView {
+/// The resolved tuple for a teammate wearing `profile`, with origins. `identity` is the roster
+/// entry's OWN routing fields — the identity tier the resolver folds between the profile and the
+/// installation-wide `agent.*` default (STUDIO-1976).
+pub fn identity_tuple(
+    cfg: &Config,
+    profile: &ResolvedProfile,
+    identity: &RoutingView,
+) -> TupleView {
     let tiers = SelectionTiers {
         ticket: FieldSelection::default(),
         review: None,
@@ -171,7 +179,11 @@ pub fn identity_tuple(cfg: &Config, profile: &ResolvedProfile) -> TupleView {
             provider: profile.provider.clone(),
             model: profile.model.clone(),
         },
-        identity: FieldSelection::default(),
+        identity: FieldSelection {
+            harness: identity.harness.clone(),
+            provider: identity.provider.clone(),
+            model: identity.model.clone(),
+        },
         project: FieldSelection::default(),
         global: FieldSelection::from_agent(&cfg.agent),
     };
@@ -194,6 +206,148 @@ pub fn manager_tuple(cfg: &Config, teams: &Teams) -> TupleView {
         &cfg.providers,
         provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms),
     ))
+}
+
+/// The first non-empty value, or `""`. Field-wise inheritance for the fields a write validates,
+/// mirroring the resolver's precedence across the tiers a write can name.
+fn first_non_empty<'a>(candidates: impl IntoIterator<Item = &'a str>) -> &'a str {
+    candidates.into_iter().find(|v| !v.is_empty()).unwrap_or("")
+}
+
+/// Refuse a candidate provider this build cannot run on `harness`: not a canonical provider id, not
+/// defined in WORKFLOW.md, an unknown protocol, or a protocol the harness adapter cannot consume —
+/// `claude` with `openai-compatible` is the "a provider on `claude`" case. `harness` is the
+/// EFFECTIVE harness the candidate resolves to (inherited fields included), so a blank harness that
+/// inherits `claude` still refuses a provider.
+fn validate_provider(cfg: &Config, harness: &str, provider: &str) -> Result<(), String> {
+    if provider.is_empty() {
+        return Ok(());
+    }
+    rhapsody_config::providers::canonical_provider_id(provider).map_err(|reason| {
+        format!("provider {provider:?} is not a canonical provider id: {reason}")
+    })?;
+    let def = cfg
+        .providers
+        .get(provider)
+        .ok_or_else(|| format!("provider {provider:?} is not defined in WORKFLOW.md"))?;
+    let id = harness_id_for_name(harness)
+        .ok_or_else(|| format!("harness {harness:?} is not one this build can run"))?;
+    let protocol = ProviderProtocol::from_name(&def.protocol).ok_or_else(|| {
+        format!(
+            "provider {provider:?} names an unknown protocol {:?}",
+            def.protocol
+        )
+    })?;
+    if !harness_supports_protocol(id, protocol) {
+        return Err(format!(
+            "harness {harness:?} cannot consume provider protocol {:?}",
+            def.protocol
+        ));
+    }
+    Ok(())
+}
+
+/// A harness this build can run, or `""` (which the resolver reads as "inherit").
+fn validate_harness(harness: &str) -> Result<(), String> {
+    if harness.is_empty() || RUNNABLE_HARNESSES.contains(&harness) {
+        Ok(())
+    } else {
+        Err(format!("harness {harness:?} is not one this build can run"))
+    }
+}
+
+/// Refuse a candidate teammate tuple BEFORE it replaces a last-good one. `profile` is the front
+/// matter the write would leave; `identity` is the roster entry's own fields. The effective harness
+/// and provider are resolved field-wise (profile > identity > global), exactly as the dispatch
+/// resolver does, so a blank harness that inherits `claude` refuses a provider.
+pub fn validate_identity_routing(
+    cfg: &Config,
+    profile: &RoutingView,
+    identity: &RoutingView,
+) -> Result<(), String> {
+    let harness = first_non_empty([
+        profile.harness.as_str(),
+        identity.harness.as_str(),
+        cfg.agent.backend.as_str(),
+    ]);
+    validate_harness(harness)?;
+    let provider = first_non_empty([
+        profile.provider.as_str(),
+        identity.provider.as_str(),
+        cfg.agent.provider.as_str(),
+    ]);
+    validate_provider(cfg, harness, provider)
+}
+
+/// Refuse a candidate review override. The row is per-harness, so the harness is explicit and only
+/// the provider needs the effective-harness check.
+pub fn validate_review_routing(cfg: &Config, harness: &str, provider: &str) -> Result<(), String> {
+    validate_harness(harness)?;
+    validate_provider(cfg, harness, provider)
+}
+
+/// Refuse a candidate manager tuple. The manager's tuple borrows no teammate's, so the dispatch
+/// resolver is the exact oracle.
+pub fn validate_manager_routing(cfg: &Config, candidate: &RoutingView) -> Result<(), String> {
+    resolve_manager_selection(
+        &FieldSelection {
+            harness: candidate.harness.clone(),
+            provider: candidate.provider.clone(),
+            model: candidate.model.clone(),
+        },
+        &cfg.providers,
+        provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms),
+    )
+    .map(|_| ())
+    .map_err(|e| e.to_string())
+}
+
+/// Refuse a reloaded `teams.yaml` whose routing fields name a tuple this build could not run: an
+/// unknown/non-canonical/undefined provider, a provider on `claude`, or an unrunnable harness. The
+/// SAME oracle the Settings write uses, applied to every routing field the reload touches, so a bad
+/// edit is refused at the reload and the last-good routing is kept.
+pub fn validate_teams_routing(
+    cfg: &Config,
+    teams: &Teams,
+    profiles_dir: Option<&Path>,
+) -> Result<(), String> {
+    let fallback = cfg.agent.backend.as_str();
+    for harness in RUNNABLE_HARNESSES {
+        let provider = teams
+            .review
+            .provider
+            .for_harness(harness, fallback)
+            .unwrap_or_default();
+        validate_review_routing(cfg, harness, provider)?;
+    }
+    validate_manager_routing(
+        cfg,
+        &RoutingView {
+            harness: teams.manager.harness.clone(),
+            provider: teams.manager.provider.clone(),
+            model: teams.manager.model.clone(),
+            effort: teams.manager.effort.clone(),
+        },
+    )?;
+    for id in &teams.roster {
+        let profile = profiles_dir
+            .and_then(|dir| rhapsody_config::profiles::resolve(dir, &id.profile).ok())
+            .map(|p| RoutingView {
+                harness: p.harness,
+                provider: p.provider,
+                model: p.model,
+                effort: p.effort,
+            })
+            .unwrap_or_default();
+        let identity = RoutingView {
+            harness: id.harness.clone(),
+            provider: id.provider.clone(),
+            model: id.model.clone(),
+            effort: id.effort.clone(),
+        };
+        validate_identity_routing(cfg, &profile, &identity)?;
+    }
+    Ok(())
 }
 
 fn tuple_from(result: Result<ResolvedSelection, SelectionRefusal>) -> TupleView {
@@ -227,10 +381,16 @@ fn tuple_from(result: Result<ResolvedSelection, SelectionRefusal>) -> TupleView 
 pub fn build_view(cfg: &Config, teams: &Teams, profiles_dir: &Path) -> TeamsModelsView {
     let mut identities = Vec::with_capacity(teams.roster.len());
     for id in &teams.roster {
+        let identity = RoutingView {
+            harness: id.harness.clone(),
+            provider: id.provider.clone(),
+            model: id.model.clone(),
+            effort: id.effort.clone(),
+        };
         let (resolved, configured, profile_error) =
             match rhapsody_config::profiles::resolve(profiles_dir, &id.profile) {
                 Ok(p) => (
-                    identity_tuple(cfg, &p),
+                    identity_tuple(cfg, &p, &identity),
                     RoutingView {
                         harness: p.harness.clone(),
                         provider: p.provider.clone(),
@@ -250,12 +410,7 @@ pub fn build_view(cfg: &Config, teams: &Teams, profiles_dir: &Path) -> TeamsMode
             profile: id.profile.clone(),
             resolved,
             configured,
-            identity: RoutingView {
-                harness: id.harness.clone(),
-                provider: id.provider.clone(),
-                model: id.model.clone(),
-                effort: id.effort.clone(),
-            },
+            identity,
             code_reviewer: teams.review.is_code_reviewer(id),
             profile_error,
         });
@@ -320,5 +475,122 @@ fn read_profile_routing(dir: &Path, profile: &str) -> RoutingView {
         provider: r.provider,
         model: r.model,
         effort: r.effort,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    use crate::testsupport::TempDir;
+
+    /// A config whose `agent.backend` is `claude` and which defines one `openai-compatible`
+    /// provider (`testprovider`) — the exact shape that separates "a provider on claude" from a
+    /// legal provider on opencode.
+    fn cfg() -> Config {
+        crate::testsupport::empty_effective(Arc::new(rhapsody_tracker::fake::Fake::default())).cfg
+    }
+
+    fn routing(harness: &str, provider: &str, model: &str) -> RoutingView {
+        RoutingView {
+            harness: harness.into(),
+            provider: provider.into(),
+            model: model.into(),
+            effort: String::new(),
+        }
+    }
+
+    fn teams(text: &str) -> (TempDir, Teams) {
+        let dir = TempDir::new();
+        let path = dir.child("teams.yaml");
+        std::fs::write(&path, text).expect("write teams");
+        let teams = Teams::try_load(std::path::Path::new(&path)).expect("load teams");
+        (dir, teams)
+    }
+
+    /// A provider on `claude` is refused even when the candidate names NO harness: a blank harness
+    /// inherits the configured backend (`claude` here), so `provider: testprovider` is still a
+    /// provider on Claude and must not be written.
+    #[test]
+    fn a_provider_on_an_inherited_claude_is_refused() {
+        let cfg = cfg();
+        let profile = routing("", "testprovider", "m");
+        let err = validate_identity_routing(&cfg, &profile, &RoutingView::default())
+            .expect_err("provider on claude must be refused");
+        assert!(err.contains("cannot consume"), "{err}");
+    }
+
+    /// The same provider is legal on opencode, so the effective-harness check must not over-refuse.
+    #[test]
+    fn the_same_provider_is_accepted_on_opencode() {
+        let cfg = cfg();
+        assert!(
+            validate_identity_routing(
+                &cfg,
+                &routing("opencode", "testprovider", "m"),
+                &RoutingView::default()
+            )
+            .is_ok()
+        );
+    }
+
+    /// A canonical-but-undefined provider is refused, and so is a non-canonical one.
+    #[test]
+    fn an_undefined_or_noncanonical_provider_is_refused() {
+        let cfg = cfg();
+        assert!(
+            validate_identity_routing(
+                &cfg,
+                &routing("opencode", "not-defined", "m"),
+                &RoutingView::default()
+            )
+            .is_err()
+        );
+        assert!(
+            validate_review_routing(&cfg, "opencode", "not a provider!").is_err(),
+            "a non-canonical provider id must be refused"
+        );
+    }
+
+    /// `validate_teams_routing` refuses a reload whose review row names a canonical but UNDEFINED
+    /// provider — the exact B2 reload probe — while accepting a defined one.
+    #[test]
+    fn a_reload_with_an_undefined_review_provider_is_refused() {
+        let cfg = cfg();
+        let (_d, bad) = teams(
+            "enabled: true\nreview:\n  mode: ticketless\n  provider:\n    opencode: not-defined\n  model:\n    opencode: new-model\nmanager:\n  mode: labels\n  model: m\nroster:\n  - name: a\n    profile: swe\n",
+        );
+        let err = validate_teams_routing(&cfg, &bad, None).expect_err("must refuse");
+        assert!(err.contains("not defined"), "{err}");
+
+        let (_d, good) = teams(
+            "enabled: true\nreview:\n  mode: ticketless\n  provider:\n    opencode: testprovider\n  model:\n    opencode: new-model\nmanager:\n  mode: labels\n  model: m\nroster:\n  - name: a\n    profile: swe\n",
+        );
+        assert!(validate_teams_routing(&cfg, &good, None).is_ok());
+    }
+
+    /// The identity tier participates in the resolved tuple: a roster entry's own model fills the
+    /// gap a silent profile leaves, and the reported origin names the identity.
+    #[test]
+    fn the_identity_tier_supplies_a_silent_profiles_model() {
+        let cfg = cfg();
+        let dir = TempDir::new();
+        let profiles = dir.child("profiles");
+        std::fs::create_dir_all(&profiles).expect("profiles dir");
+        std::fs::write(
+            std::path::Path::new(&profiles).join("swe.md"),
+            "---\nextends: swe\nharness: opencode\nprovider: testprovider\n---\nbody\n",
+        )
+        .expect("write profile");
+        let (_d, teams) = teams(
+            "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  mode: labels\n  model: m\nroster:\n  - name: a\n    profile: swe\n    model: identity-model\n",
+        );
+        let view = build_view(&cfg, &teams, std::path::Path::new(&profiles));
+        let row = &view.identities[0];
+        assert_eq!(row.resolved.model, "identity-model");
+        assert_eq!(row.resolved.model_origin, "identity");
+        assert_eq!(row.resolved.harness, "opencode");
+        assert_eq!(row.resolved.provider, "testprovider");
     }
 }

@@ -2069,11 +2069,12 @@ manager's `harness`/`provider`/`model`/`effort`, and each roster identity's rout
 membership, labels, quorum, review mode and memory are deliberately NOT overlaid: those stay
 boot-loaded. An invalid file is refused, logged at `warn!`, and the last-good routing kept, so a bad
 edit never degrades Teams to off. A run already in flight keeps the tuple it started with; the next
-dispatch/review/manager turn reads the new one. The control-task consumers — review dispatch and the
-isolated MANAGER RUN — read the live config directly. The off-loop triage task's one-shot
-assignment turn still reads the config it was booted with; a `TeamsRoutingSink` seam (the
-`ProviderReloadSink` pattern) is provided to hand it the same routing, and wiring it is the
-remaining follow-up.
+dispatch/review/manager turn reads the new one. Every consumer is live: the control-task consumers
+(review dispatch and the isolated MANAGER RUN) read the live config directly; the off-loop triage
+task's one-shot manager turn reads the live `manager.model` through the shared `TriageHandle`, and
+the manager arbiter is re-resolved by a `TeamsRoutingSink` the composition root installs (the
+`ProviderReloadSink` pattern), so both the assignment turn and the room/adjudication turns spend the
+live manager tuple on their next turn.
 
 **The Settings → Models page** (the same React build in the dashboard and the desktop app) is the
 operator surface. It adds one endpoint, `GET`/`POST /api/v1/teams/models` (operator-guarded like
@@ -2086,11 +2087,12 @@ manager edit rewrites the `teams.yaml` field in place with comments preserved. *
 to…** applies one tuple to every non-reviewer teammate and returns an undo payload that restores each
 one's previous tuple. Every change posts one operator line to the room (`models: jerry → opencode/deepseek-v4p1-flash`).
 
-One honest gap, carried from before this ticket: a roster identity's own `harness`/`provider`/
-`model`/`effort` are still parsed and hot-applied but **not fed to dispatch** — `prepare.rs`'s
-identity tier is empty, so a run resolves from the profile tier and below. The Models page edits the
-PROFILE for a teammate for exactly that reason. The manager's tuple and the review overrides ARE
-applied.
+A roster identity's own `harness`/`provider`/`model`/`effort` are fed to dispatch as the **identity
+tier** — the resolver folds them between the routed profile and the project/global defaults
+(`prepare.rs`'s selection tiers, and the inline no-provider path), so a roster-level model change
+reaches the next run. A profile's own field still wins for that field (the documented profile >
+identity precedence); the Models page edits the PROFILE for a teammate, and a roster edit is the
+fallback for a teammate whose profile is silent.
 
 **Two cross-process contracts stay on the Go spelling and are not divergences:** the git branch
 prefix is `symphony/<key>` and the agent env vars are `SYMPHONY_*`. Both are read by things outside

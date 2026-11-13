@@ -581,7 +581,16 @@ impl Orchestrator {
             .as_ref()
             .filter(|t| t.review_ticketless())
             .and_then(|teams| {
-                match teams.review_model_for(&self.review_harness_for(&iss), &fallback) {
+                let harness = self.review_harness_for(&iss);
+                // A `review.provider` scoped to another harness is the provider-half of the model
+                // refusal below (STUDIO-1976 wires the provider into the selection; before that it
+                // was inert, so a wrong-harness value was silently dropped rather than refused).
+                if let rhapsody_config::teams::ReviewModelChoice::Refuse(why) =
+                    teams.review_provider_for(&harness, &fallback)
+                {
+                    return Some(why);
+                }
+                match teams.review_model_for(&harness, &fallback) {
                     rhapsody_config::teams::ReviewModelChoice::Refuse(why) => Some(why),
                     _ => None,
                 }
@@ -2083,8 +2092,49 @@ mod tests {
         );
     }
 
-    /// **jimmy round-1 finding 1 on PR #168, mutation-checked.** The `teams.route` events row is
-    /// the durable per-run record of the model an operator reads back to see what a run cost
+    /// **STUDIO-1976 review B5: the review dispatch boundary.** A live `teams.yaml` edit applies to
+    /// the NEXT review round through the production `on_teams_reload` handler, while the review
+    /// already in flight keeps the model it started with.
+    #[test]
+    fn a_live_review_model_edit_applies_to_the_next_round_and_not_the_in_flight_one() {
+        let dir = TempDir::new();
+        let teams_path = dir.child("teams.yaml");
+        let yaml = |model: &str| {
+            format!(
+                "enabled: true\nreview:\n  mode: ticketless\n  model:\n    claude: {model}\nmanager:\n  mode: labels\n  model: m\nroster:\n  - name: alice\n    profile: swe\n"
+            )
+        };
+        std::fs::write(&teams_path, yaml("old-model")).expect("write teams");
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_config_path = Some(std::path::PathBuf::from(&teams_path));
+        o.teams = Some(Teams::try_load(std::path::Path::new(&teams_path)).expect("boot teams"));
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id_a = review_run("alice", HEAD_A).key();
+        assert_eq!(o.running[&id_a].model_override.model, "old-model");
+
+        // The operator edits `review.model.claude` and the watcher's handler runs.
+        std::fs::write(&teams_path, yaml("new-model")).expect("write teams");
+        o.on_teams_reload();
+
+        // The in-flight review keeps the model it started with...
+        assert_eq!(o.running[&id_a].model_override.model, "old-model");
+        // ...and the next review round (a different pull request, so its slot is free) picks up the
+        // live one.
+        let mut next = review_run("alice", HEAD_B);
+        next.number = 13;
+        assert_eq!(
+            o.dispatch_review(next.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id_b = next.key();
+        assert_eq!(o.running[&id_b].model_override.model, "new-model");
+    }
+
+    /// **jimmy round-1 finding 1 on PR #168, mutation-checked.** The `teams.route` events row is    /// the durable per-run record of the model an operator reads back to see what a run cost
     /// (`RunningEntry::model_override`'s own doc, `route_teams`'s own doc). It must name what
     /// `review.model`/`review.effort` overrode to, not the reviewer's own profile — the exact
     /// mismatch a cost-allocation feature cannot afford. Reverting `record_route_event` to compose

@@ -2270,7 +2270,10 @@ fn yaml_mapping_key(content: &str) -> Option<(&str, Option<&str>)> {
         return None;
     }
     let rest = rest.trim_start();
-    if rest.is_empty() {
+    // A value that begins with `#` is an inline comment, not a scalar, so the key still opens a
+    // block (`review: # keep this comment` with its children below). Treating it as a scalar made
+    // the editor fail to find the existing ancestor and append a duplicate top-level block.
+    if rest.is_empty() || rest.starts_with('#') {
         Some((key, None))
     } else {
         Some((key, Some(rest)))
@@ -4979,6 +4982,29 @@ roster:
         .expect("create");
         assert!(
             edited.ends_with("review:\n  model:\n    opencode: m\n"),
+            "{edited}"
+        );
+    }
+
+    /// A block opener carrying an inline comment (`review: # keep this comment`) is still a block:
+    /// the editor must insert the new child under it and preserve the comment, not mistake the
+    /// comment for a scalar value and append a second top-level `review:`.
+    #[test]
+    fn set_nested_scalar_inserts_under_a_commented_block_opener() {
+        let edited = set_nested_scalar(
+            "enabled: true\nreview: # keep this comment\nmanager: # and this one\n  mode: labels\n",
+            &["review", "model", "opencode"],
+            "m",
+        )
+        .expect("create");
+        assert!(edited.contains("review: # keep this comment\n"), "{edited}");
+        assert!(
+            edited.contains("review: # keep this comment\n  model:\n    opencode: m\n"),
+            "{edited}"
+        );
+        assert_eq!(edited.matches("review:").count(), 1, "{edited}");
+        assert!(
+            edited.contains("manager: # and this one\n  mode: labels\n"),
             "{edited}"
         );
     }

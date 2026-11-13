@@ -230,19 +230,36 @@ fn manager_timeout_reason(timeout: Duration) -> String {
 /// It implements BOTH manager-facing seams the triage task uses (assignment and the room reader) so
 /// the two can never drift onto different execution paths.
 pub struct ManagerArbiter {
-    /// The manager's fully owned resolved selection, or the typed reason it could not be resolved.
-    /// `Err` refuses every turn (deterministic assignment still runs) rather than ever borrowing a
-    /// teammate's tuple.
-    selection: Result<ResolvedSelection, String>,
+    /// The manager's live resolved selection + knobs, behind a lock the routing sink rewrites on a
+    /// `teams.yaml` reload (STUDIO-1976). Read once per turn and cloned out, so a live edit lands on
+    /// the NEXT turn while an in-flight turn keeps the tuple it started with.
+    live: std::sync::RwLock<ManagerLive>,
+    /// The inputs to re-resolve `live` on a reload. `None` for a test-constructed arbiter, which
+    /// sets `live` directly and never re-resolves.
+    reconfig: Option<ManagerReconfig>,
     /// The off-loop credential/broker source, the same one PB7 installs for ticket dispatch. `None`
     /// only in tests/embedding builds; an explicit provider then refuses rather than falling back.
     source: Option<Arc<dyn crate::providerprep::PreparedProviderSource>>,
     /// The harness execution seam. Production is [`HarnessManagerTurn`]; tests inject a fake.
     turn: Arc<dyn ManagerTurnRunner>,
-    /// The per-harness knobs for [`Self::selection`]'s harness, built once from the boot config.
-    knobs: Option<HarnessKnobs>,
     /// Where the harness child runs (the manager has no worktree).
     workspace: String,
+}
+
+/// The manager's resolved selection and the harness knobs it runs under — the pair a routing reload
+/// replaces wholesale.
+struct ManagerLive {
+    selection: Result<ResolvedSelection, String>,
+    knobs: Option<HarnessKnobs>,
+}
+
+/// What a live manager-routing reload re-resolves against: the provider registry, the turn deadline
+/// and the boot config the harness knobs are built from. All boot-loaded (a `teams.yaml` reload does
+/// not change `WORKFLOW.md`), so they are captured once.
+struct ManagerReconfig {
+    providers: std::collections::BTreeMap<String, ProviderDefinition>,
+    turn_deadline_ms: u64,
+    cfg: Arc<rhapsody_config::Config>,
 }
 
 impl ManagerArbiter {
@@ -256,10 +273,13 @@ impl ManagerArbiter {
         workspace: String,
     ) -> Self {
         Self {
-            selection: selection.map_err(|e| e.to_string()),
+            live: std::sync::RwLock::new(ManagerLive {
+                selection: selection.map_err(|e| e.to_string()),
+                knobs,
+            }),
+            reconfig: None,
             source,
             turn: Arc::new(HarnessManagerTurn),
-            knobs,
             workspace,
         }
     }
@@ -278,7 +298,32 @@ impl ManagerArbiter {
             .as_ref()
             .ok()
             .map(|s| crate::effective::knobs_for_harness(cfg, s.harness));
-        Self::new(selection, source, knobs, cfg.workspace.root.clone())
+        let mut arbiter = Self::new(selection, source, knobs, cfg.workspace.root.clone());
+        arbiter.reconfig = Some(ManagerReconfig {
+            providers: providers.clone(),
+            turn_deadline_ms,
+            cfg: Arc::new(cfg.clone()),
+        });
+        arbiter
+    }
+
+    /// Re-resolves the manager tuple from `manager` and replaces the live selection + knobs
+    /// (STUDIO-1976). Called by the composition root's routing sink on a `teams.yaml` reload; a
+    /// no-op for a test-constructed arbiter that never carried the re-resolution inputs.
+    pub fn set_manager_fields(&self, manager: &FieldSelection) {
+        let Some(reconfig) = self.reconfig.as_ref() else {
+            return;
+        };
+        let selection =
+            resolve_manager_selection(manager, &reconfig.providers, reconfig.turn_deadline_ms);
+        let knobs = selection
+            .as_ref()
+            .ok()
+            .map(|s| crate::effective::knobs_for_harness(&reconfig.cfg, s.harness));
+        *self.live.write().unwrap_or_else(|e| e.into_inner()) = ManagerLive {
+            selection: selection.map_err(|e| e.to_string()),
+            knobs,
+        };
     }
 
     /// Overrides the harness execution seam (tests only; production keeps [`HarnessManagerTurn`]).
@@ -291,10 +336,17 @@ impl ManagerArbiter {
     /// Runs one manager turn and returns the model's text. The single place both manager-facing
     /// seams funnel through, so assignment and the room reader cannot diverge.
     async fn turn_text(&self, req: &TriageRequest) -> Result<String, String> {
-        let selection = self
-            .selection
-            .as_ref()
-            .map_err(|e| format!("manager_selection_refused: {e}"))?;
+        // Clone the live pair out and drop the lock BEFORE any `.await`: a routing reload must never
+        // block behind a manager turn's provider session.
+        let (selection, knobs) = {
+            let live = self.live.read().unwrap_or_else(|e| e.into_inner());
+            let selection = live
+                .selection
+                .as_ref()
+                .map_err(|e| format!("manager_selection_refused: {e}"))?
+                .clone();
+            (selection, live.knobs.clone())
+        };
 
         let Some(plan) = &selection.provider else {
             // The legacy/native-login lane. The request already carries the command, model, timeout
@@ -309,7 +361,7 @@ impl ManagerArbiter {
              source is installed"
                 .to_string()
         })?;
-        let knobs = self.knobs.clone().ok_or_else(|| {
+        let knobs = knobs.ok_or_else(|| {
             "manager_prepare_unavailable: the manager harness has no prepared knobs".to_string()
         })?;
 
@@ -794,6 +846,47 @@ mod tests {
         assert_eq!(
             plans[0].limits.forwarded_requests_per_turn,
             provider_def().broker_limits.forwarded_requests_per_turn
+        );
+    }
+
+    /// STUDIO-1976 review B1: the arbiter's live re-resolution. A `teams.yaml` reload that changes
+    /// the manager tuple re-resolves the arbiter's selection, so the NEXT turn spends the new model
+    /// — the exact gap the boot-resolved arbiter left.
+    #[tokio::test]
+    async fn a_live_manager_reload_re_resolves_the_arbiter_selection() {
+        let cfg =
+            crate::testsupport::empty_effective(Arc::new(rhapsody_tracker::fake::Fake::default()))
+                .cfg;
+        let plan = explicit_manager().provider.clone().expect("a plan");
+        let (opened, _broker) = opened_custody(&plan);
+        let source = Arc::new(ScriptedSource::answering(opened));
+        let turn = Arc::new(FakeTurn::answering(
+            r#"{"identity":"jimmy","reason":"fits"}"#,
+        ));
+        let arbiter = ManagerArbiter::from_config(
+            &field("opencode", "fireworks", "accounts/fireworks/models/x"),
+            &registry(),
+            DEADLINE,
+            Some(source),
+            &cfg,
+        )
+        .with_turn_runner(turn.clone());
+
+        // A live reload changes the manager model BEFORE the turn.
+        arbiter.set_manager_fields(&field(
+            "opencode",
+            "fireworks",
+            "accounts/fireworks/models/y",
+        ));
+        arbiter
+            .arbitrate(&request("assign"))
+            .await
+            .expect("the manager turn answers");
+        let seen = turn.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(
+            seen[0].model, "accounts/fireworks/models/y",
+            "the live manager model must be spent, not the boot one"
         );
     }
 

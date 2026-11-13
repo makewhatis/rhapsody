@@ -368,6 +368,10 @@ pub(crate) struct EarsCycle<'a> {
     pub(crate) load: &'a HashMap<String, i64>,
     /// Whether a model turn may be spent this cycle — `labels+model` AND no back-off running.
     pub(crate) model: bool,
+    /// The manager's LIVE `manager.model` (STUDIO-1976), snapshotted once per cycle from the reload
+    /// handle so the room turn runs the tuple the last `teams.yaml` reload applied. The boot value
+    /// remains the fallback before any reload.
+    pub(crate) manager_model: &'a str,
     /// The claude command / billing guard / tracker key the room turn runs under, straight from
     /// [`TriageDeps`](crate::triage::TriageDeps): the turn authenticates through the SAME scrubbed
     /// environment the dispatched children and the assignment turn do, and withholds the tracker
@@ -1072,7 +1076,7 @@ async fn plan_targets(
         command: cycle.agent_command.to_string(),
         billing_guard: cycle.billing_guard,
         tracker_api_key: cycle.tracker_api_key.to_string(),
-        model: teams.manager.model.clone(),
+        model: cycle.manager_model.to_string(),
         timeout: Duration::from_millis(teams.manager.timeout_ms.max(0) as u64),
         prompt: prompt.text,
     };
@@ -2655,6 +2659,7 @@ mod tests {
             summon_token: "@symphony",
             load,
             model,
+            manager_model: "",
             agent_command: "claude",
             billing_guard: false,
             tracker_api_key: String::new().leak(),

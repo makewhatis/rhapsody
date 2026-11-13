@@ -21,6 +21,19 @@ const MODELS_QUERY_KEY = ["teams-models"] as const;
 
 const EMPTY_ROUTING: ModelsRoutingView = { harness: "", provider: "", model: "", effort: "" };
 
+// The models each runnable harness's own CLI knows, independent of any WORKFLOW.md provider — the
+// native-login case (a Claude teammate with no explicit provider) has no provider catalog to ask,
+// and asking for a catalog under the literal harness id (`claude`) only 404s. Suggested alongside
+// the provider catalog when one is selected; a free-text field still accepts anything.
+const HARNESS_MODELS: Record<string, string[]> = {
+  claude: ["claude-opus-5", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-opus-4-8"],
+  opencode: [
+    "anthropic/claude-sonnet-4-6",
+    "openai/gpt-6.1-sol",
+    "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+  ],
+};
+
 function errText(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
@@ -49,45 +62,62 @@ function TupleLine({ tuple }: { tuple: TeamsModelsView["manager"]["resolved"] })
   );
 }
 
-/** A model text field with the chosen provider's catalog suggested, best-effort. */
+/** A model text field with the harness's own known models and the chosen provider's catalog
+ *  suggested, best-effort. The harness list is the fallback that works with no provider configured
+ *  (native Claude/OpenCode); the provider catalog adds the provider's discovered ids when there is
+ *  one. */
 function ModelField({
   value,
+  harness,
   provider,
   onChange,
 }: {
   value: string;
+  harness: string;
   provider: string;
   onChange: (v: string) => void;
 }) {
-  const [models, setModels] = React.useState<string[]>([]);
+  const listId = React.useId();
+  const [catalog, setCatalog] = React.useState<string[]>([]);
   React.useEffect(() => {
     if (!provider) {
-      setModels([]);
+      setCatalog([]);
       return;
     }
     let live = true;
     void fetchProviderCatalog(provider)
       .then((c) => {
-        if (live) setModels(c.models.map((m) => m.id));
+        if (live) setCatalog(c.models.map((m) => m.id));
       })
       .catch(() => {
-        if (live) setModels([]);
+        if (live) setCatalog([]);
       });
     return () => {
       live = false;
     };
   }, [provider]);
+  const suggestions = React.useMemo(() => {
+    const seen = new Set<string>();
+    const out: string[] = [];
+    for (const m of [...(HARNESS_MODELS[harness] ?? []), ...catalog]) {
+      if (m && !seen.has(m)) {
+        seen.add(m);
+        out.push(m);
+      }
+    }
+    return out;
+  }, [harness, catalog]);
   return (
     <>
       <TextInput
         value={value}
         onChange={(e) => onChange(e.target.value)}
         placeholder="model id (blank inherits)"
-        list={`models-${provider}`}
+        list={listId}
         aria-label="model"
       />
-      <datalist id={`models-${provider}`}>
-        {models.map((m) => (
+      <datalist id={listId}>
+        {suggestions.map((m) => (
           <option key={m} value={m} />
         ))}
       </datalist>
@@ -99,11 +129,15 @@ function RoutingEditor({
   value,
   providers,
   harnesses,
+  lockHarness,
   onChange,
 }: {
   value: ModelsRoutingView;
   providers: string[];
   harnesses: string[];
+  /** When set, the harness is shown as a fixed label rather than a selector — a review row is
+   *  keyed BY its harness, so offering to change it here would silently discard the change. */
+  lockHarness?: boolean;
   onChange: (v: ModelsRoutingView) => void;
 }) {
   const harnessOptions = [
@@ -118,12 +152,16 @@ function RoutingEditor({
   return (
     <div style={{ display: "grid", gap: 10 }}>
       <Field label="harness" inline>
-        <Select
-          value={value.harness}
-          options={harnessOptions}
-          onChange={(v) => set({ harness: v })}
-          width="100%"
-        />
+        {lockHarness ? (
+          <code style={{ fontSize: 12.5 }}>{value.harness}</code>
+        ) : (
+          <Select
+            value={value.harness}
+            options={harnessOptions}
+            onChange={(v) => set({ harness: v })}
+            width="100%"
+          />
+        )}
       </Field>
       <Field label="provider" inline>
         <Select
@@ -136,7 +174,8 @@ function RoutingEditor({
       <Field label="model" inline>
         <ModelField
           value={value.model}
-          provider={value.provider || value.harness}
+          harness={value.harness}
+          provider={value.provider}
           onChange={(v) => set({ model: v })}
         />
       </Field>
@@ -358,7 +397,13 @@ function ReviewRow({
     <div style={{ borderTop: "1px solid var(--line)", paddingTop: 14 }}>
       <strong>{row.harness}</strong>
       <div style={{ marginTop: 8 }}>
-        <RoutingEditor value={draft} providers={providers} harnesses={harnesses} onChange={setDraft} />
+        <RoutingEditor
+          value={draft}
+          providers={providers}
+          harnesses={harnesses}
+          lockHarness
+          onChange={setDraft}
+        />
         <div style={{ marginTop: 8 }}>
           <Button
             variant="primary"

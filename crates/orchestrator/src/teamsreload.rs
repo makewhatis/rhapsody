@@ -47,6 +47,32 @@ pub trait TeamsRoutingSink: Send + Sync {
     fn teams_routing_reload(&self, teams: &Teams);
 }
 
+/// The production sink for the manager arbiter (STUDIO-1976 review B1): hands a reloaded
+/// `teams.yaml`'s manager tuple to the arbiter so its NEXT turn resolves the live tuple. The triage
+/// task's own manager model is published through [`TriageHandle`](crate::triage::TriageHandle)
+/// directly by `on_teams_reload` (the control task can write that handle); this covers the arbiter,
+/// which the control task cannot otherwise reach.
+pub struct ManagerArbiterRoutingSink {
+    arbiter: Arc<crate::managerprep::ManagerArbiter>,
+}
+
+impl ManagerArbiterRoutingSink {
+    pub fn new(arbiter: Arc<crate::managerprep::ManagerArbiter>) -> Self {
+        Self { arbiter }
+    }
+}
+
+impl TeamsRoutingSink for ManagerArbiterRoutingSink {
+    fn teams_routing_reload(&self, teams: &Teams) {
+        self.arbiter
+            .set_manager_fields(&crate::selection::FieldSelection {
+                harness: teams.manager.harness.clone(),
+                provider: teams.manager.provider.clone(),
+                model: teams.manager.model.clone(),
+            });
+    }
+}
+
 impl Orchestrator {
     /// Installs the teams routing reload sink, before `Run` moves the orchestrator into the control
     /// task. `None` (the default for tests and any embedding with no off-loop Teams consumer) leaves
@@ -112,11 +138,37 @@ impl Orchestrator {
                 return;
             }
         };
+        // Validate the reloaded routing against the SAME oracle the Settings write uses, so a
+        // canonical-but-undefined provider or a provider on `claude` is refused here too rather than
+        // replacing the last-good routing (STUDIO-1976 review B2). A config that never loaded has no
+        // oracle to validate against; leave the reload to the boot path in that case.
+        if let Some(cfg) = self.eff.as_ref().map(|e| &e.cfg) {
+            let profiles_dir = self.teams_profiles_dir.as_deref();
+            if let Err(reason) =
+                crate::modelsview::validate_teams_routing(cfg, &reloaded, profiles_dir)
+            {
+                tracing::warn!(
+                    reason = %reason,
+                    path = %path.display(),
+                    "teams routing reload refused; keeping last-good routing"
+                );
+                return;
+            }
+        }
         let sink = self.teams_routing_sink.clone();
         let Some(teams) = self.teams.as_mut() else {
             return;
         };
         teams.apply_routing_overlay(&reloaded);
+        // Publish the manager's live tuple to the off-loop triage task (STUDIO-1976 review B1): its
+        // one-shot manager turns hold no `Orchestrator`, so the control task is the only writer.
+        if let Some(handle) = self.teams_triage.as_ref() {
+            handle.set_manager_routing(&crate::triage::ManagerRouting {
+                harness: teams.manager.harness.clone(),
+                provider: teams.manager.provider.clone(),
+                model: teams.manager.model.clone(),
+            });
+        }
         if let Some(sink) = sink {
             sink.teams_routing_reload(teams);
         }
@@ -246,5 +298,72 @@ mod tests {
                 .for_harness("opencode", "claude"),
             Some("deepseek-v4p1-flash")
         );
+    }
+
+    /// A CANONICAL but UNDEFINED provider is not syntactically invalid, so `Teams::validate` accepts
+    /// it — the reload must still refuse it against the workflow's provider registry and keep the
+    /// last-good routing (STUDIO-1976 review B2).
+    #[test]
+    fn a_reload_with_a_canonical_undefined_provider_keeps_the_last_good_routing() {
+        let dir = TempDir::new();
+        let path = std::path::PathBuf::from(dir.child("teams.yaml"));
+        std::fs::write(&path, teams_yaml("deepseek-v4p1-flash")).expect("write");
+        let mut o = orchestrator_with(path.clone());
+        // The workflow defines `testprovider`, never `not-defined`.
+        o.eff = Some(crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        )));
+        std::fs::write(
+            &path,
+            "enabled: true\nreview:\n  mode: ticketless\n  provider:\n    opencode: not-defined\n  model:\n    opencode: new-model\nmanager:\n  mode: labels\n  model: claude-opus-5\nroster:\n  - name: alice\n    profile: swe\n",
+        )
+        .expect("write");
+        o.on_teams_reload();
+        assert_eq!(
+            o.teams
+                .as_ref()
+                .unwrap()
+                .review
+                .model
+                .for_harness("opencode", "claude"),
+            Some("deepseek-v4p1-flash"),
+            "a canonical-but-undefined provider must not replace the last-good routing"
+        );
+    }
+
+    /// The production watcher posts `Event::TeamsReload` when the file's mtime moves, and
+    /// `on_teams_reload` (the loop's handler) folds the change in — the wiring a direct call to
+    /// `on_teams_reload` alone does not exercise (STUDIO-1976 review B5).
+    #[tokio::test]
+    async fn the_watcher_posts_a_teams_reload_event_and_the_handler_applies_it() {
+        let dir = TempDir::new();
+        let path = std::path::PathBuf::from(dir.child("teams.yaml"));
+        std::fs::write(&path, teams_yaml("deepseek-v4p1-flash")).expect("write");
+        let mut o = orchestrator_with(path.clone());
+        let mut rx = o.take_events_rx().expect("events rx");
+        let signal = crate::control_loop::CancelSignal::new();
+        let watch = o.start_watch_teams(signal.wait());
+
+        // Let the watcher take its baseline, then move the mtime.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        std::fs::write(&path, teams_yaml("openai/gpt-6.1-sol")).expect("write");
+
+        let ev = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("the watcher must post a reload event")
+            .expect("the channel stays open");
+        assert!(matches!(ev, Event::TeamsReload));
+        o.on_teams_reload();
+        assert_eq!(
+            o.teams
+                .as_ref()
+                .unwrap()
+                .review
+                .model
+                .for_harness("opencode", "claude"),
+            Some("openai/gpt-6.1-sol")
+        );
+        watch.abort();
+        signal.cancel();
     }
 }

@@ -1172,6 +1172,16 @@ where
         )),
     };
 
+    // STUDIO-1976 review B1: hand the manager arbiter the routing sink so a live `teams.yaml` edit
+    // re-resolves its tuple for the NEXT manager turn. The triage task's own manager model is
+    // published through `TriageHandle` by `on_teams_reload` directly; this covers the arbiter, which
+    // the control task cannot reach. Installed before `o.run()` moves the orchestrator into the loop.
+    o.set_teams_routing_sink(Arc::new(
+        rhapsody_orchestrator::teamsreload::ManagerArbiterRoutingSink::new(Arc::clone(
+            &manager_arbiter,
+        )),
+    ));
+
     let triage_task = if let Some(seam) = triage_seam {
         let triage_ctx = shutdown.wait();
         let triage_handle = handle.clone();

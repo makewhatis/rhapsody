@@ -141,8 +141,8 @@ secret has no field to travel in. Empty inherits (profile → the daemon's confi
 provider reference the config does not define, or an explicit provider on the `claude` harness, is a
 dispatch **refusal** — never a silent fallback to another provider or to `agent.backend`. A roster
 identity may also carry its own `harness:`/`provider:`/`model:`/`effort:`; those identity-tier
-fields are parsed and displayed but **not yet applied to a run** — see "Where the
-harness/provider/model comes from" below.
+fields **are applied to a run** (folded between the profile and the project/global defaults — see
+"Where the harness/provider/model comes from" below).
 
 **Define providers from Settings → Providers, not by hand-editing `WORKFLOW.md`.** The screen
 offers OpenAI-compatible presets (Fireworks, OpenRouter, OpenAI, Together, Groq) plus a custom
@@ -169,20 +169,18 @@ provider from below). Highest wins:
 ticket labels → review override (review runs) → profile → roster identity → project → global agent.*
 ```
 
-⚠️ **Only the profile, project and global tiers are applied to a dispatched run today.** A roster
-identity may carry its own `harness:`, `provider:`, `model:` and `effort:`, and `review.provider`
-may be configured, but neither the identity tier nor the review tier is fed at dispatch yet — a run
-still resolves its tuple from the profile tier and below, so an identity that names a provider does
-**not** yet change what its runs use. **`rhapsodyd teams show <name>`** prints the tuple a run would
-actually resolve, then lists any identity routing fields as *configured but not applied*, and
-reports a configured `review.provider` the same way, so you never mistake an unapplied override for
-a live one. (Wiring those tiers is tracked separately from this documentation change.)
+Every tier in that chain is fed to a dispatched run: the profile's fields, the roster identity's own
+`harness:`/`provider:`/`model:`/`effort:` (the identity tier, STUDIO-1976), the review override on a
+review run, the project and the global `agent.*`. A profile's field still wins over the identity's
+for that field — the identity answers wherever the profile is silent. **`rhapsodyd teams show <name>`**
+prints the tuple a run would actually resolve, folding the identity tier in and naming its origin
+`identity`, so you never have to reconstruct the chain by hand.
 
 An unset field inherits the next tier; an **invalid** one in an applied tier (unknown/non-canonical
 provider, provider on `claude`, missing model for an explicit provider) refuses that RUN — it never
 degrades the whole Teams feature to disabled, and it never falls back to another provider, harness,
 model, or auth source. The manager's own tuple **is** applied: `teams show` prints it with its
-origins, so you never have to reconstruct the chain by hand.
+origins.
 
 The three sources take effect at **different times** — do not tell an operator all three need a
 restart:
@@ -388,13 +386,14 @@ reviewer's runs actually use, the review is **refused** rather than sent to the 
 silently downgraded to a cheaper model — this is the trap above, closed by config. `review.effort`
 in the same situation just inherits, since an effort value can't make a provider reject a model.
 
-**`review.provider` is parsed and validated but not yet applied.** `review.provider`
+**`review.provider` is applied too, and harness-scoped like `review.model`.** `review.provider`
 (`review.provider: { opencode: fireworks }`, or a legacy bare scalar) is harness-scoped like
-`review.model`, and every value must be a canonical provider id. It is **not yet applied at
-dispatch**: a review run still takes its provider from the profile and global tiers, so configuring
-it changes nothing yet, and `rhapsodyd teams show <name>` reports the configured value as *not yet
-applied*. Unlike `review.model`, a `review.provider` aimed at a harness the routed reviewer does not
-use is therefore **not** a refusal today — nothing consumes it yet.
+`review.model`, and every value must be a canonical provider id. It **is applied at dispatch**
+(STUDIO-1976): a review run resolves its provider from the review tier, falling back to the profile
+and global tiers when unset. Like `review.model`, a `review.provider` aimed at a harness the routed
+reviewer does not use is a **refusal** — the review is refused rather than run on a provider scoped
+to another harness. A canonical provider id that `WORKFLOW.md` does not define is also refused, on
+both the Settings write and the live reload.
 
 **A cleared review can merge itself.** `review.auto_merge` (default `false`) lets the daemon merge
 a pull request once every reviewer has recorded a non-blocking verdict at its current head and CI
