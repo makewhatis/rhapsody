@@ -403,6 +403,11 @@ pub enum ReviewDispatchOutcome {
     /// A drain is armed, so the daemon is taking no new work of any kind (STUDIO-880). Nothing was
     /// touched; the row stays where it is and the sweep re-offers it once the drain is cancelled.
     Draining,
+    /// The scratch volume is under its free-space floor, so the daemon is taking no new work
+    /// (STUDIO-1993). Nothing was touched; the row stays where it is and the sweep re-offers it once
+    /// free space recovers. Its own outcome rather than `Refused` because it is a deliberate,
+    /// temporary hold an operator can act on, exactly as [`ReviewDispatchOutcome::BudgetHeld`] is.
+    DiskPressure,
     /// The coordinates cannot produce a review run; the payload names which. A `String` rather
     /// than `&'static str` because the `review.model` refusal (STUDIO-908) names the reviewer's
     /// harness, the configured model and the `review.model` origin — all data, not literals.
@@ -477,6 +482,13 @@ impl Orchestrator {
         // leaves the row exactly where it was.
         if self.drain.is_draining() {
             return ReviewDispatchOutcome::Draining;
+        }
+        // STUDIO-1993: the disk-pressure guard's third entry point, the same backstop the drain gate
+        // is for this path (it has no production caller today, but it reaches dispatch past both
+        // `on_tick` and `on_retry`). Refuse before the writes below mark the row in-flight, so a
+        // held daemon re-offers this head once free space recovers.
+        if self.scratch_dispatch_hold().is_some() {
+            return ReviewDispatchOutcome::DiskPressure;
         }
         if run.owner.is_empty() || run.repo.is_empty() {
             return ReviewDispatchOutcome::Refused("pull request has no owner/repo".to_string());

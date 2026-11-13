@@ -32,6 +32,7 @@ enum Kind {
     LimitSwitch,
     CreditSpend,
     CredentialRejected,
+    ScratchPressure,
 }
 impl Kind {
     fn group(self) -> &'static str {
@@ -42,9 +43,11 @@ impl Kind {
             | Self::LimitDecision
             | Self::CredentialRejected => "needs_you",
             Self::LeadDecision => "decisions",
-            Self::ManagerDisabled | Self::LoginCheck | Self::BudgetWall | Self::LimitWall => {
-                "system"
-            }
+            Self::ManagerDisabled
+            | Self::LoginCheck
+            | Self::BudgetWall
+            | Self::LimitWall
+            | Self::ScratchPressure => "system",
             Self::AutoMerge
             | Self::RcCut
             | Self::LimitPark
@@ -69,6 +72,7 @@ impl Kind {
             Self::LimitSwitch => "limit_switch",
             Self::CreditSpend => "credit_spend",
             Self::CredentialRejected => "credential_rejected",
+            Self::ScratchPressure => "scratch_pressure",
         }
     }
 }
@@ -218,6 +222,9 @@ async fn observe(
         let kind = match d.kind {
             D::CredentialInfrastructure => Kind::LoginCheck,
             D::ManagerDeferred => Kind::ManagerDisabled,
+            // STUDIO-1993: a disk-pressure hold is a daemon-side admission gate, surfaced as its own
+            // system notice so an operator sees WHY nothing is being admitted.
+            D::ScratchPressure => Kind::ScratchPressure,
             D::ChangesRequestedNoRun
             | D::ReviewRequestedNoRun
             | D::AuthorTokenCeilingStopped

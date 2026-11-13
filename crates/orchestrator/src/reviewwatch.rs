@@ -4061,6 +4061,9 @@ impl Orchestrator {
                 // A drain is armed: the row is untouched and this head is re-offered on the sweep
                 // after the drain is cancelled, exactly as a deferred one is.
                 ReviewDispatchOutcome::Draining => report.deferred += 1,
+                // The scratch volume is under its free-space floor (STUDIO-1993): the row is
+                // untouched and this head is re-offered once the janitor reclaims space.
+                ReviewDispatchOutcome::DiskPressure => report.deferred += 1,
                 // The reviewer's provider is out of daily budget (STUDIO-957): the row is untouched
                 // and this head is re-offered once the budget resets, exactly as a deferred one is.
                 // `dispatch_review` does not log here (it records the hold, which the sweep and

@@ -313,6 +313,14 @@ pub enum Event {
     ScratchSweep {
         reply: oneshot::Sender<crate::scratch::ScratchPlan>,
     },
+    /// The janitor's pre-removal ownership re-check (STUDIO-1993 review B3): does `run_id` own a
+    /// live run RIGHT NOW? The off-loop sweep asks this per candidate immediately before removing a
+    /// managed scratch directory, so a tree adopted by a resumed run after the plan snapshot is
+    /// spared — the same TOCTOU guard `WorkspaceInUse` provides for worktrees.
+    ScratchRunInUse {
+        run_id: i64,
+        reply: oneshot::Sender<bool>,
+    },
     /// The TOCTOU guard: is this worktree path a live running issue RIGHT NOW (Go `evWorkspaceInUse`)?
     WorkspaceInUse {
         mgr: Option<Arc<Manager>>,
@@ -999,6 +1007,9 @@ impl Orchestrator {
             Event::ScratchSweep { reply } => {
                 let _ = reply.send(self.build_scratch_plan());
             }
+            Event::ScratchRunInUse { run_id, reply } => {
+                let _ = reply.send(self.scratch_run_in_use(run_id));
+            }
             Event::WorkspaceInUse { mgr, path, reply } => {
                 let _ = reply.send(self.worktree_in_use(mgr.as_deref(), &path));
             }
@@ -1363,6 +1374,12 @@ impl Orchestrator {
         // gated is exactly one whose loop may be quietly burning budget. Local reads only (the watch
         // set + the `runs` ledger); the hold and the notifications happen off-loop.
         self.reconcile_breaker();
+        // STUDIO-1993 change item 4: compute the disk-pressure hold HERE, before the snapshot is
+        // published, so the plain reason reaches the reconciliation surface on THIS tick rather than
+        // the next (the guard branch below runs after the publish). A fresh computation each tick
+        // also CLEARS a hold that has released. `scratch_dispatch_hold` is a cheap `statvfs` read
+        // plus, on a missing root, a walk to its nearest existing ancestor — never the sweep itself.
+        self.scratch_hold = self.scratch_dispatch_hold();
         // Reconcile is the network-bound half of the tick AND the half that retires finished runs;
         // republish here so `/state` reflects them without waiting for fetch-candidates + dispatch
         // to finish (STUDIO-551).
@@ -1400,11 +1417,12 @@ impl Orchestrator {
         // STUDIO-1993: the disk-pressure guard. When free space on the scratch volume is under the
         // configured floor, hold ALL dispatch (the same "skip without claiming anything" discipline
         // as the drain gate above) and run the scratch janitor at once to reclaim what it can. The
-        // janitor's filesystem walk is off-loop; only the cheap `statvfs` reading is taken here.
-        if let Some(reason) = self.scratch_dispatch_hold() {
-            let plan = self.build_scratch_plan();
-            tokio::task::spawn_blocking(move || {
-                crate::scratch::run_sweep_and_log(&plan, std::time::SystemTime::now());
+        // reason was computed above so the snapshot carries it; the janitor's walk and removals are
+        // off-loop (and re-check current ownership per candidate — see `ControlHandle::sweep_scratch`).
+        if let Some(reason) = self.scratch_hold.clone() {
+            let handle = self.control();
+            tokio::spawn(async move {
+                handle.sweep_scratch().await;
             });
             tracing::warn!(
                 reason = %reason,

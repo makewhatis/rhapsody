@@ -300,6 +300,10 @@ pub enum DivergenceKind {
     ReviewInfrastructure,
     /// Repeated credential-probe timeouts; dispatch continues with an unknown login state.
     CredentialInfrastructure,
+    /// The scratch volume is under its free-space floor, so new dispatches are held until the
+    /// janitor reclaims enough space (STUDIO-1993). Reported from the same guard that holds the
+    /// dispatch gate, so an operator sees WHY nothing is being admitted instead of an idle board.
+    ScratchPressure,
 }
 
 impl DivergenceKind {
@@ -321,6 +325,7 @@ impl DivergenceKind {
             DivergenceKind::ManagerDeferred => "manager_deferred",
             DivergenceKind::ReviewInfrastructure => "review_infrastructure",
             DivergenceKind::CredentialInfrastructure => "credential_infrastructure",
+            DivergenceKind::ScratchPressure => "scratch_pressure",
         }
     }
     /// The operator-facing sentence: what was expected to happen, and what did not. Phrased as an
@@ -378,6 +383,10 @@ impl DivergenceKind {
             }
             DivergenceKind::CredentialInfrastructure => {
                 "credential probe infrastructure repeatedly timed out; dispatch continues; see the reason"
+            }
+            DivergenceKind::ScratchPressure => {
+                "the scratch volume is under its free-space floor, so new dispatches are held; see \
+                 the reason"
             }
         }
     }

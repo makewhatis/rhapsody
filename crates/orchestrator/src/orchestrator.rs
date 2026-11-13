@@ -935,6 +935,11 @@ pub struct Orchestrator {
     /// Separate from [`Orchestrator::review_divergence`] because it must SURVIVE a sweep that
     /// reports the same pull request again; the vector above is replaced wholesale.
     pub(crate) review_divergent: HashMap<String, usize>,
+    /// The current disk-pressure hold reason, or `None` when dispatch is not held (STUDIO-1993).
+    /// Recomputed at the top of every `on_tick` — BEFORE the snapshot is published — and read by
+    /// [`Orchestrator::scratch_human_feed`] so the plain reason reaches the reconciliation surface
+    /// (`/api/v1/state`'s `review_divergence`) rather than only the log. Loop-confined.
+    pub(crate) scratch_hold: Option<String>,
     /// Read-only handle onto the off-loop auto-merge half's own report of what it has already SAID
     /// about a pull request ([`crate::runautomerge::AutoMergeLedger`], STUDIO-874) — the control
     /// task never writes it. Shared for one reason (STUDIO-923):
@@ -1391,6 +1396,7 @@ impl Orchestrator {
             review_evidence: HashMap::new(),
             review_divergence: Vec::new(),
             review_divergent: HashMap::new(),
+            scratch_hold: None,
             automerge_ledger: None,
             adjudication_ledger: None,
             merge_inflight: HashMap::new(),
