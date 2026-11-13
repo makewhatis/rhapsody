@@ -73,9 +73,14 @@ impl ScratchDir {
     /// The rename is not cosmetic: the janitor protects a live run's scratch directory by the LIVE
     /// run's id, so a tree left under the cut-off run's id (which is no longer live) could be
     /// reclaimed from under the resumed run once it passes `scratch.ttl_hours`. Renaming it to the
-    /// resumed run's id closes that hole. When the rename is impossible (a cross-device root, a
-    /// target that already exists) it falls back to the original path — correct, but re-exposed to
-    /// the TTL — and to `provision` when the original is gone.
+    /// resumed run's id closes that hole. It is also the coordination point against a sweep already
+    /// under way (STUDIO-1993 review B3): the janitor takes ownership of a candidate by renaming the
+    /// SAME source path to a private `.trash-*` sibling before traversing it, so this rename and
+    /// that claim are atomic with each other — whichever wins outright. If the janitor won, `old` is
+    /// already gone and this falls through to `provision`, giving the resumed run a fresh directory
+    /// instead of one being deleted from under it. When the rename is otherwise impossible (a
+    /// cross-device root, a target that already exists) it falls back to the original path —
+    /// correct, but re-exposed to the TTL — and to `provision` when the original is gone.
     pub fn adopt_renamed(root: &str, run_id: i64, old: &Path) -> Option<Self> {
         if root.is_empty() || run_id <= 0 {
             return None;

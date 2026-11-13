@@ -6,8 +6,10 @@
 //!
 //! * [`managed_candidates`] selects managed-root children whose run id is no longer live and whose
 //!   mtime is older than `scratch.ttl_hours`; the off-loop driver
-//!   ([`ControlHandle::sweep_scratch`]) re-checks each against CURRENT ownership and then removes it,
-//!   so a tree a resume adopted (renamed) after the plan snapshot is spared;
+//!   ([`ControlHandle::sweep_scratch`]) re-checks each against CURRENT ownership, then takes
+//!   ownership of it by an ATOMIC rename to a private `.trash-*` sibling before traversing it, so a
+//!   resume that adopts (renames) the tree mid-deletion can never have its live contents removed
+//!   (STUDIO-1993 review B3 — see [`claim_for_deletion`]);
 //! * [`sweep_legacy`] removes a child of the historical `$TMPDIR/opencode` root that no live run's
 //!   path sits under, older than `scratch.legacy_ttl_hours` — the paths agents chose themselves
 //!   before the managed root existed (the 180 GiB this ticket is about);
@@ -19,6 +21,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use crate::control_loop::Event;
@@ -209,7 +212,9 @@ fn dir_size(path: &Path) -> u64 {
 }
 
 /// Removes a directory, best-effort, logging nothing (the caller logs the aggregate). Returns
-/// `false` on failure so the report never claims a removal that did not happen.
+/// `false` on failure so the report never claims a removal that did not happen. Used for the
+/// legacy root and for already-claimed `.trash-*` trees; managed-root candidates go through
+/// [`claim_and_remove`] instead, which takes ownership of the source first.
 fn remove(path: &Path) -> bool {
     match std::fs::remove_dir_all(path) {
         Ok(()) => true,
@@ -224,10 +229,97 @@ fn remove(path: &Path) -> bool {
     }
 }
 
+/// The private name a managed candidate is atomically RENAMED to before it is traversed: taking
+/// ownership of the source tree so a resume's adoption of the same path cannot begin under the
+/// deletion (STUDIO-1993 review B3). The name deliberately does not parse as a run id, so the
+/// candidate screen skips it and a crash mid-deletion leaves a `.trash-*` child [`sweep_trash`]
+/// reclaims unconditionally on the next sweep.
+const TRASH_PREFIX: &str = ".trash-";
+
+/// Uniquifies trash names within this process (the pid and a timestamp cover other processes).
+static TRASH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Atomically takes ownership of `path` by renaming it to a private `.trash-*` sibling, returning
+/// the trash path; `None` when it could not be claimed.
+///
+/// This is the fix for STUDIO-1993 review B3. A resume ADOPTS a retained tree by renaming
+/// `<root>/<old-id>` to `<root>/<live-id>` (see `rhapsody_agent::scratch::ScratchDir::adopt_renamed`).
+/// Checking that the OLD id is not live — the previous fix — cannot coordinate with that rename: the
+/// old id is never live, and `remove_dir_all` keeps deleting through an open directory after it is
+/// renamed, so a traversal that had already started would empty the now-live tree. Renaming the
+/// source first makes the two operations race on the SAME path with the filesystem as the arbiter:
+/// whichever rename wins outright. If the janitor wins, the adoption finds the source gone and
+/// provisions a fresh directory rather than adopting a tree being deleted; if the adoption wins, the
+/// janitor's claim fails with `NotFound` and the live tree is left untouched. No lock is needed, so
+/// nothing blocks and two daemons sharing a root coordinate through the filesystem itself.
+fn claim_for_deletion(path: &Path) -> Option<PathBuf> {
+    let parent = path.parent()?;
+    let name = path.file_name()?.to_string_lossy();
+    let seq = TRASH_SEQ.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let trash = parent.join(format!(
+        "{TRASH_PREFIX}{}-{seq}-{nanos}-{name}",
+        std::process::id()
+    ));
+    match std::fs::rename(path, &trash) {
+        Ok(()) => Some(trash),
+        // The source is already gone — most importantly, a resume renamed it to its live id first.
+        // Nothing to delete: the tree is (or is about to be) the live run's.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(), err = %e,
+                "scratch: could not claim a stale scratch directory for deletion; leaving it"
+            );
+            None
+        }
+    }
+}
+
+/// Takes ownership of a managed candidate with [`claim_for_deletion`] and then removes the claimed
+/// tree. Returns `false` when there was nothing to delete (the source was already gone — an adopted
+/// or twice-swept tree), so the report never claims a removal that did not happen.
+fn claim_and_remove(path: &Path) -> bool {
+    let Some(trash) = claim_for_deletion(path) else {
+        return false;
+    };
+    remove(&trash)
+}
+
+/// Removes every `.trash-*` direct child of the managed root, regardless of age: these are trees a
+/// previous sweep had already claimed (renamed) but did not finish deleting — a crash mid-traversal
+/// leaves one behind. Unconditional because a claimed tree is by definition being deleted, and the
+/// name cannot be a live run's directory (no run id parses as `.trash-*`).
+fn sweep_trash(root: &str) -> Vec<Deleted> {
+    if root.is_empty() {
+        return Vec::new();
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_string_lossy().starts_with(TRASH_PREFIX) {
+            continue;
+        }
+        let path = entry.path();
+        let bytes = dir_size(&path);
+        if remove(&path) {
+            out.push(Deleted { path, bytes });
+        }
+    }
+    out
+}
+
 /// One managed-root child the TTL/liveness screen selected for removal, with its measured size.
-/// A CANDIDATE, not a decision: the off-loop driver re-checks each against CURRENT ownership
-/// immediately before removing it, so a tree that became live after the plan snapshot is spared
-/// (STUDIO-1993 review B3). See [`ControlHandle::sweep_scratch`].
+/// A CANDIDATE, not a decision: the off-loop driver re-checks each against CURRENT ownership and
+/// then takes ownership of it by an atomic rename before traversing it, so a tree that became live
+/// after the plan snapshot — including one a resume adopted under its old id mid-sweep — is spared
+/// (STUDIO-1993 review B3). See [`ControlHandle::sweep_scratch`] and [`claim_for_deletion`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ManagedCandidate {
     pub path: PathBuf,
@@ -283,8 +375,10 @@ pub fn managed_candidates(
 
 /// Removes managed-root children whose run id is not live and whose mtime is older than `ttl_hours`.
 /// Pure snapshot semantics — the caller must have re-validated ownership against the CURRENT live
-/// set, which the production driver ([`ControlHandle::sweep_scratch`]) does per candidate. Kept as
-/// the pure building block the unit tests exercise; `ttl_hours <= 0` disables the managed sweep.
+/// set, which the production driver ([`ControlHandle::sweep_scratch`]) does per candidate. Each
+/// removal goes through [`claim_and_remove`], so a resume adoption racing the sweep is coordinated
+/// even here (STUDIO-1993 review B3). Kept as the pure building block the unit tests exercise;
+/// `ttl_hours <= 0` disables the managed sweep.
 pub fn sweep_managed(
     root: &str,
     ttl_hours: i64,
@@ -294,7 +388,7 @@ pub fn sweep_managed(
     managed_candidates(root, ttl_hours, now, live_run_ids)
         .into_iter()
         .filter_map(|c| {
-            remove(&c.path).then_some(Deleted {
+            claim_and_remove(&c.path).then_some(Deleted {
                 path: c.path,
                 bytes: c.bytes,
             })
@@ -344,8 +438,10 @@ pub fn sweep_legacy(
 
 /// Applies the managed deletions, re-checking CURRENT ownership per candidate via `live` (which
 /// round-trips the control loop in production) immediately before each removal, and logging every
-/// removal with its size. Extracted from the driver so the stale-plan/adoption interleaving is
-/// testable without a live control loop (STUDIO-1993 review B3).
+/// removal with its size. The removal takes ownership of the source tree by an atomic rename
+/// ([`claim_and_remove`]) so a resume adoption of the same path cannot begin mid-traversal
+/// (STUDIO-1993 review B3). Extracted from the driver so the stale-plan/adoption interleaving is
+/// testable without a live control loop.
 pub async fn apply_managed_deletions<F, Fut>(
     candidates: Vec<ManagedCandidate>,
     live: F,
@@ -360,7 +456,7 @@ where
             continue;
         }
         let path = candidate.path.clone();
-        let removed = tokio::task::spawn_blocking(move || remove(&path))
+        let removed = tokio::task::spawn_blocking(move || claim_and_remove(&path))
             .await
             .unwrap_or(false);
         if removed {
@@ -427,10 +523,10 @@ impl Orchestrator {
     /// Whether `run_id` owns a live run RIGHT NOW. MUST run on the control task: it reads the live
     /// `self.running`. The authoritative, snapshot-free liveness re-check the off-loop janitor
     /// consults immediately before each managed-root removal — the same TOCTOU guard the workspace
-    /// GC's `worktree_in_use` provides (STUDIO-1993 review B3). A resume ADOPTS a retained tree by
-    /// renaming it to the resumed run's id; because the run is registered in `self.running` before
-    /// the agent renames the tree, a directory the enumeration saw on disk is guaranteed live here
-    /// whenever its run is live — so a stale plan can never reclaim a resumed tree.
+    /// GC's `worktree_in_use` provides (STUDIO-1993 review B3). It spares a tree whose OWN id has
+    /// become live since the plan snapshot (a re-dispatched run reusing the id); it does NOT by
+    /// itself coordinate with a resume ADOPTING a retained tree under its OLD id, because that id is
+    /// never live. The atomic rename in [`claim_for_deletion`] is what closes that remaining race.
     pub fn scratch_run_in_use(&self, run_id: i64) -> bool {
         run_id > 0 && self.running.values().any(|re| re.run_id == run_id)
     }
@@ -487,14 +583,16 @@ impl ControlHandle {
     }
 
     /// Runs the janitor OFF the control loop: snapshots the plan, enumerates the stale managed-root
-    /// children, re-checks each against CURRENT ownership immediately before removing it, then
-    /// sweeps the legacy root. Backs the daemon's boot/hourly scheduler AND the disk-pressure path;
-    /// a gone loop is a no-op.
+    /// children, re-checks each against CURRENT ownership, takes ownership of it by an atomic rename
+    /// before traversing it, then sweeps the legacy root and any orphaned trash. Backs the daemon's
+    /// boot/hourly scheduler AND the disk-pressure path; a gone loop is a no-op.
     ///
-    /// The per-candidate re-check is the fix for STUDIO-1993 review B3: a plan captured before a
-    /// resume adopted (renamed) a retained tree would otherwise delete that now-live tree, because
-    /// the plan's live set predates the adoption. Coordination is cheap — one round-trip per
-    /// candidate, and only candidates already past the TTL are checked at all.
+    /// The per-candidate re-check AND the rename-claim are the fix for STUDIO-1993 review B3: a plan
+    /// captured before a resume adopted (renamed) a retained tree would otherwise delete that
+    /// now-live tree, because the plan's live set predates the adoption — and a re-check alone
+    /// cannot close the case where the traversal had already started on the OLD id. Coordination is
+    /// cheap — one round-trip and one atomic rename per candidate, and only candidates already past
+    /// the TTL are checked at all.
     pub async fn sweep_scratch(&self) -> SweepReport {
         let Some(plan) = self.scratch_sweep_plan().await else {
             return SweepReport::default();
@@ -515,6 +613,20 @@ impl ControlHandle {
             managed,
             legacy: Vec::new(),
         };
+        // Reclaim any `.trash-*` tree a previous sweep claimed (renamed) but did not finish deleting
+        // — a crash mid-traversal leaves one behind (STUDIO-1993 review B3). Unconditional and cheap.
+        let trash_root = plan.policy.root.clone();
+        let trash = tokio::task::spawn_blocking(move || sweep_trash(&trash_root))
+            .await
+            .unwrap_or_default();
+        for deleted in &trash {
+            tracing::info!(
+                path = %deleted.path.display(),
+                bytes = deleted.bytes,
+                "scratch: removed an orphaned scratch trash directory"
+            );
+        }
+        report.managed.extend(trash);
         // The legacy root is never renamed by resume adoption, and a live run's legacy directory is
         // created fresh at run start, so its snapshot live-path protection cannot go stale the way
         // the managed one can; sweep it with the plan's snapshot in one blocking pass.
@@ -799,6 +911,159 @@ mod tests {
         );
         assert!(root.join("12").is_dir(), "the resumed tree survives");
         drop(adopted);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // STUDIO-1993 review B3: the janitor takes ownership of a managed candidate by an ATOMIC rename
+    // of the source to a private `.trash-*` sibling — the SAME path a resume's adoption renames. The
+    // filesystem arbitrates, so whichever wins outright, and neither leaves the live run holding a
+    // half-deleted tree.
+    #[test]
+    fn a_claimed_source_cannot_be_adopted_and_an_adopted_source_cannot_be_claimed() {
+        // Janitor first: the claim renames the source away, so the adoption finds it gone and
+        // provisions a FRESH directory rather than adopting a tree the sweep is deleting.
+        let root = temp_dir("claim-janitor-first");
+        make_dir(&root.join("11"), 100 * 3600);
+        let trash = claim_for_deletion(&root.join("11")).expect("the janitor claims the aged tree");
+        assert!(
+            !root.join("11").exists(),
+            "the claimed tree leaves its run id"
+        );
+        let adopted = rhapsody_agent::scratch::ScratchDir::adopt_renamed(
+            &root.to_string_lossy(),
+            12,
+            &root.join("11"),
+        )
+        .expect("adoption provisions fresh");
+        assert_eq!(adopted.path(), root.join("12"));
+        assert_eq!(
+            std::fs::read_dir(adopted.path()).expect("dir").count(),
+            0,
+            "a fresh directory, never a half-deleted one"
+        );
+        assert!(
+            trash.is_dir(),
+            "the claimed tree is the one that gets deleted"
+        );
+        drop(adopted);
+        let _ = fs::remove_dir_all(&root);
+
+        // Adoption first: the source is renamed to the live run id, so the janitor's claim fails
+        // with NotFound and the live tree is left untouched.
+        let root = temp_dir("claim-adopt-first");
+        make_dir(&root.join("11"), 100 * 3600);
+        fs::write(root.join("11/marker"), b"keep").expect("write marker");
+        let adopted = rhapsody_agent::scratch::ScratchDir::adopt_renamed(
+            &root.to_string_lossy(),
+            12,
+            &root.join("11"),
+        )
+        .expect("adopted");
+        assert_eq!(adopted.path(), root.join("12"));
+        assert!(
+            claim_for_deletion(&root.join("11")).is_none(),
+            "nothing is left to claim once the resume renamed the tree"
+        );
+        assert!(
+            root.join("12/marker").is_file(),
+            "the live tree is untouched"
+        );
+        drop(adopted);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // STUDIO-1993 review B3 (the interleaving the earlier fix missed): a sweep must not keep deleting
+    // a tree a resume adopts WHILE the deletion is under way. The sweep and the adoption run
+    // concurrently here; the invariant is that the tree the resume ends up holding never loses
+    // entries to the sweep.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_sweep_never_empties_a_tree_a_resume_adopts_mid_deletion() {
+        let root = temp_dir("adopt-mid-sweep");
+        let tree = root.join("11");
+        fs::create_dir_all(&tree).expect("mkdir tree");
+        // A large tree so the destructive traversal is slow enough for the adoption to land in it.
+        const N: usize = 5_000;
+        for i in 0..N {
+            fs::create_dir_all(tree.join(format!("d{i:05}"))).expect("mkdir child");
+        }
+        fs::write(tree.join("marker"), b"keep").expect("write marker");
+        let when = SystemTime::now() - Duration::from_secs(100 * 3600);
+        fs::File::open(&tree)
+            .expect("open tree")
+            .set_modified(when)
+            .expect("age tree");
+
+        let candidates = managed_candidates(
+            &root.to_string_lossy(),
+            24,
+            SystemTime::now(),
+            &HashSet::new(),
+        );
+        assert_eq!(candidates.len(), 1, "the aged tree is a candidate");
+
+        let sweep = tokio::spawn(apply_managed_deletions(candidates, |_id| {
+            std::future::ready(false)
+        }));
+
+        // Adopt as soon as the sweep is demonstrably under way. In the fixed code the source is
+        // claimed (renamed away) before any child is deleted, so this finds `11` gone and provisions
+        // fresh; in the buggy code children vanish while `11` still exists, and this renames the very
+        // tree being traversed.
+        let adopted = loop {
+            let tree_gone = !tree.exists();
+            let children_vanishing = std::fs::read_dir(&tree)
+                .map(|d| d.count() < N + 1)
+                .unwrap_or(false);
+            if tree_gone || children_vanishing {
+                break rhapsody_agent::scratch::ScratchDir::adopt_renamed(
+                    &root.to_string_lossy(),
+                    12,
+                    &tree,
+                )
+                .expect("adopt");
+            }
+            tokio::task::yield_now().await;
+        };
+        let at_adoption = std::fs::read_dir(adopted.path())
+            .map(|d| d.count())
+            .unwrap_or(0);
+        let _ = sweep.await;
+        let after = std::fs::read_dir(adopted.path())
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(
+            after, at_adoption,
+            "the sweep emptied a tree the resume had adopted"
+        );
+        drop(adopted);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    // STUDIO-1993 review B3: a sweep that claimed a tree but crashed before deleting it leaves a
+    // `.trash-*` child; the next sweep reclaims it unconditionally, and it never collides with a run
+    // id (so it is never mistaken for a live run's directory).
+    #[test]
+    fn an_orphaned_trash_directory_is_reclaimed() {
+        let root = temp_dir("trash");
+        let trash = root.join(format!("{TRASH_PREFIX}999-0-0-11"));
+        fs::create_dir_all(&trash).expect("mkdir trash");
+        fs::write(trash.join("blob"), vec![0u8; 64]).expect("write");
+        make_dir(&root.join("12"), 100 * 3600); // a run directory, aged but not trash
+        let deleted = sweep_trash(&root.to_string_lossy());
+        assert_eq!(deleted.len(), 1, "only the trash child is reclaimed");
+        assert!(!trash.exists());
+        assert!(deleted[0].bytes >= 64, "the removal records its size");
+        assert!(root.join("12").is_dir(), "a run directory is not trash");
+        assert!(
+            managed_candidates(
+                &root.to_string_lossy(),
+                0,
+                SystemTime::now(),
+                &HashSet::new()
+            )
+            .is_empty(),
+            "ttl 0 disables the managed sweep, and trash never parses as a run id"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
