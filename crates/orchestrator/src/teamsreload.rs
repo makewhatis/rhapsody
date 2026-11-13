@@ -51,25 +51,30 @@ pub trait TeamsRoutingSink: Send + Sync {
 /// `teams.yaml`'s manager tuple to the arbiter so its NEXT turn resolves the live tuple. The triage
 /// task's own manager model is published through [`TriageHandle`](crate::triage::TriageHandle)
 /// directly by `on_teams_reload` (the control task can write that handle); this covers the arbiter,
-/// which the control task cannot otherwise reach.
+/// which the control task cannot otherwise reach. `backend` is the installation's `agent.backend`,
+/// the fallback harness a legacy bare `review.model` is scoped to
+/// ([`crate::reviewadjudicate::adjudication_model`]).
 pub struct ManagerArbiterRoutingSink {
     arbiter: Arc<crate::managerprep::ManagerArbiter>,
+    backend: String,
 }
 
 impl ManagerArbiterRoutingSink {
-    pub fn new(arbiter: Arc<crate::managerprep::ManagerArbiter>) -> Self {
-        Self { arbiter }
+    pub fn new(arbiter: Arc<crate::managerprep::ManagerArbiter>, backend: String) -> Self {
+        Self { arbiter, backend }
     }
 }
 
 impl TeamsRoutingSink for ManagerArbiterRoutingSink {
     fn teams_routing_reload(&self, teams: &Teams) {
-        self.arbiter
-            .set_manager_fields(&crate::selection::FieldSelection {
+        self.arbiter.set_manager_fields(
+            &crate::selection::FieldSelection {
                 harness: teams.manager.harness.clone(),
                 provider: teams.manager.provider.clone(),
                 model: teams.manager.model.clone(),
-            });
+            },
+            &crate::reviewadjudicate::adjudication_model(teams, &self.backend),
+        );
     }
 }
 
@@ -363,11 +368,13 @@ mod tests {
         }
     }
 
-    /// STUDIO-1976 review B5: the PRODUCTION reload-to-consumer chain with a manager invocation in
-    /// flight. `on_teams_reload` (the loop's `Event::TeamsReload` handler) must hand the live manager
-    /// tuple to BOTH off-loop consumers — the triage handle and the arbiter sink — while a manager
-    /// turn already past its snapshot keeps the tuple it started with, and the NEXT turn spends the
-    /// live one.
+    /// STUDIO-1976 review B5 (and B1's clearing transition): the PRODUCTION reload-to-consumer chain
+    /// with a manager invocation in flight. `on_teams_reload` (the loop's `Event::TeamsReload`
+    /// handler) must hand the live manager tuple to BOTH off-loop consumers — the triage handle and
+    /// the arbiter sink — while a manager turn already past its snapshot keeps the tuple it started
+    /// with, and the NEXT turn spends the live one. Here the reload CLEARS `manager.model`, so the
+    /// next native adjudication must spend the invocation-time `review.model` fallback rather than the
+    /// removed boot model — the transition the earlier already-empty fixture could not expose.
     ///
     /// MUTATION: replacing [`ManagerArbiterRoutingSink::teams_routing_reload`] with a no-op leaves
     /// the arbiter on the boot tuple, so the second invocation's argv keeps `claude-boot-model` and
@@ -377,8 +384,13 @@ mod tests {
         let dir = TempDir::new();
         let path = std::path::PathBuf::from(dir.child("teams.yaml"));
         let yaml = |model: &str| {
+            let model_line = if model.is_empty() {
+                "  model: \"\"\n".to_string()
+            } else {
+                format!("  model: {model}\n")
+            };
             format!(
-                "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  mode: labels\n  model: {model}\nroster:\n  - name: alice\n    profile: swe\n"
+                "enabled: true\nreview:\n  mode: ticketless\n  model:\n    claude: claude-review-fallback\nmanager:\n  mode: labels\n{model_line}roster:\n  - name: alice\n    profile: swe\n"
             )
         };
         std::fs::write(&path, yaml("claude-boot-model")).expect("write");
@@ -401,11 +413,13 @@ mod tests {
             rhapsody_config::providers::provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms),
             None,
             &cfg,
+            "claude-boot-model",
         ));
         // The PRODUCTION sink and the PRODUCTION handle are what the reload must reach.
-        o.set_teams_routing_sink(Arc::new(ManagerArbiterRoutingSink::new(Arc::clone(
-            &arbiter,
-        ))));
+        o.set_teams_routing_sink(Arc::new(ManagerArbiterRoutingSink::new(
+            Arc::clone(&arbiter),
+            cfg.agent.backend.clone(),
+        )));
         let handle = Arc::new(crate::triage::TriageHandle::new());
         o.teams_triage = Some(Arc::clone(&handle));
 
@@ -422,13 +436,13 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
-        // The operator edits the manager model; the loop's handler runs while #1 is in flight.
-        std::fs::write(&path, yaml("claude-live-model")).expect("write");
+        // The operator CLEARS the manager model; the loop's handler runs while #1 is in flight.
+        std::fs::write(&path, yaml("")).expect("write");
         o.on_teams_reload();
         assert_eq!(
             handle.manager_routing().map(|r| r.model),
-            Some("claude-live-model".to_string()),
-            "the reload must publish the live tuple to the triage handle"
+            Some(String::new()),
+            "the reload must publish the cleared manager model to the triage handle"
         );
 
         // The in-flight invocation keeps the tuple it started with...
@@ -440,15 +454,20 @@ mod tests {
             "an in-flight invocation keeps its model: {argv1:?}"
         );
 
-        // ...and the next invocation spends the live tuple.
+        // ...and the next invocation spends the invocation-time review fallback, NOT the cleared boot
+        // model (STUDIO-1976 review B1).
         let v2 = arbiter
             .adjudicate(&adjudication_request(&fast_command, "claude-boot-model"))
             .await;
         assert_eq!(v2, Ok(crate::reviewadjudicate::Verdict::Ship));
         let argv2 = std::fs::read_to_string(&fast_log).expect("argv #2");
         assert!(
-            argv2.contains("--model claude-live-model"),
-            "the next invocation spends the live manager model: {argv2:?}"
+            argv2.contains("--model claude-review-fallback"),
+            "the next invocation spends the live review fallback: {argv2:?}"
+        );
+        assert!(
+            !argv2.contains("claude-boot-model"),
+            "the cleared boot model must not reach the next invocation: {argv2:?}"
         );
     }
 

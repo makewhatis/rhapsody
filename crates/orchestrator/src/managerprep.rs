@@ -251,6 +251,13 @@ pub struct ManagerArbiter {
 struct ManagerLive {
     selection: Result<ResolvedSelection, String>,
     knobs: Option<HarnessKnobs>,
+    /// The invocation-time model the NATIVE (legacy `claude -p`) adjudication lane spends when the
+    /// manager names no model of its own: the `review.model` fallback
+    /// ([`crate::reviewadjudicate::adjudication_model`]). Seeded from the boot `teams.yaml` and
+    /// re-resolved on a routing reload, so CLEARING `manager.model` stops spending the removed boot
+    /// model (STUDIO-1976 review B1). `None` only on a test-constructed arbiter that never carried
+    /// the inputs; the triage/room lanes never read it.
+    native_fallback: Option<String>,
 }
 
 /// What a live manager-routing reload re-resolves against: the provider registry, the turn deadline
@@ -276,6 +283,7 @@ impl ManagerArbiter {
             live: std::sync::RwLock::new(ManagerLive {
                 selection: selection.map_err(|e| e.to_string()),
                 knobs,
+                native_fallback: None,
             }),
             reconfig: None,
             source,
@@ -286,12 +294,15 @@ impl ManagerArbiter {
 
     /// The convenience constructor the composition root uses: resolve the manager tuple from its own
     /// configured fields against the effective provider registry, and build the harness knobs.
+    /// `native_fallback` is the boot `review.model` fallback for the native adjudication lane
+    /// ([`crate::reviewadjudicate::adjudication_model`]), re-resolved on every routing reload.
     pub fn from_config(
         manager: &FieldSelection,
         providers: &std::collections::BTreeMap<String, ProviderDefinition>,
         turn_deadline_ms: u64,
         source: Option<Arc<dyn crate::providerprep::PreparedProviderSource>>,
         cfg: &rhapsody_config::Config,
+        native_fallback: &str,
     ) -> Self {
         let selection = resolve_manager_selection(manager, providers, turn_deadline_ms);
         let knobs = selection
@@ -305,12 +316,19 @@ impl ManagerArbiter {
             cfg: Arc::new(cfg.clone()),
         });
         arbiter
+            .live
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .native_fallback = Some(native_fallback.to_string());
+        arbiter
     }
 
     /// Re-resolves the manager tuple from `manager` and replaces the live selection + knobs
     /// (STUDIO-1976). Called by the composition root's routing sink on a `teams.yaml` reload; a
     /// no-op for a test-constructed arbiter that never carried the re-resolution inputs.
-    pub fn set_manager_fields(&self, manager: &FieldSelection) {
+    /// `native_fallback` is the reloaded `review.model` fallback for the native adjudication lane,
+    /// so CLEARING `manager.model` moves native adjudication off the removed boot model.
+    pub fn set_manager_fields(&self, manager: &FieldSelection, native_fallback: &str) {
         let Some(reconfig) = self.reconfig.as_ref() else {
             return;
         };
@@ -323,6 +341,7 @@ impl ManagerArbiter {
         *self.live.write().unwrap_or_else(|e| e.into_inner()) = ManagerLive {
             selection: selection.map_err(|e| e.to_string()),
             knobs,
+            native_fallback: Some(native_fallback.to_string()),
         };
     }
 
@@ -336,16 +355,29 @@ impl ManagerArbiter {
     /// Runs one manager turn and returns the model's text. The single place both manager-facing
     /// seams funnel through, so assignment and the room reader cannot diverge.
     async fn turn_text(&self, req: &TriageRequest) -> Result<String, String> {
-        // Clone the live pair out and drop the lock BEFORE any `.await`: a routing reload must never
-        // block behind a manager turn's provider session.
-        let (selection, knobs) = {
+        self.turn_text_inner(req, false).await
+    }
+
+    /// [`Self::turn_text`] with the native-lane model policy made explicit. `adjudication` is true
+    /// only for the review adjudication seam, whose request carries the BOOT-resolved model: on the
+    /// native lane with no live manager model it must spend the invocation-time `review.model`
+    /// fallback instead, never a manager model the operator has since cleared (STUDIO-1976 review
+    /// B1). The triage/room lanes keep the caller's model, so their behavior is unchanged.
+    async fn turn_text_inner(
+        &self,
+        req: &TriageRequest,
+        adjudication: bool,
+    ) -> Result<String, String> {
+        // Clone the live triple out and drop the lock BEFORE any `.await`: a routing reload must
+        // never block behind a manager turn's provider session.
+        let (selection, knobs, native_fallback) = {
             let live = self.live.read().unwrap_or_else(|e| e.into_inner());
             let selection = live
                 .selection
                 .as_ref()
                 .map_err(|e| format!("manager_selection_refused: {e}"))?
                 .clone();
-            (selection, live.knobs.clone())
+            (selection, live.knobs.clone(), live.native_fallback.clone())
         };
 
         let Some(plan) = &selection.provider else {
@@ -353,13 +385,22 @@ impl ManagerArbiter {
             // caller built from the boot-resolved manager tuple, but its MODEL is re-derived from the
             // invocation-time selection (STUDIO-1976 review B1): a live `teams.yaml` reload that
             // changed the manager model must reach native adjudication too, and an explicit change
-            // back from a provider to Claude must stop spending the old provider's model. The live
-            // manager model is absent only when the tuple names none — then the caller's model is
-            // kept, preserving the intended `review.model` fallback. No provider machinery is
-            // consulted.
+            // back from a provider to Claude must stop spending the old provider's model. When the
+            // live tuple names no model, an ADJUDICATION turn spends the invocation-time
+            // `review.model` fallback (possibly empty ⇒ the CLI default) rather than the request's
+            // boot value, which may be a manager model the operator has cleared. The triage/room
+            // lanes keep the caller's model. No provider machinery is consulted.
             let mut turn = req.clone();
             if let Some(model) = &selection.model {
                 turn.model = model.clone();
+            } else if adjudication {
+                // `Some` (even empty) means a live fallback has been resolved — spend it, so a
+                // cleared manager model stops spending the request's boot value. `None` means no
+                // re-resolution inputs were ever installed (a test/embedding arbiter), so the
+                // caller's model is kept, exactly as before this change.
+                if let Some(fallback) = native_fallback {
+                    turn.model = fallback;
+                }
             }
             return crate::triage::run_turn(&turn).await;
         };
@@ -438,6 +479,10 @@ impl RoomArbiter for ManagerArbiter {
 /// explicit manager its own provider session, limits and diagnostics, and leaves an EMPTY manager
 /// tuple on the legacy `claude -p` lane byte-for-byte as before (the request still carries the
 /// command/model the composition root resolved, including the `review.model` fallback).
+///
+/// The native lane resolves its model at INVOCATION time (`turn_text_inner(.., true)`): when the live
+/// manager names no model it spends the live `review.model` fallback, not the request's boot value,
+/// so clearing `manager.model` stops spending the removed model (STUDIO-1976 review B1).
 #[async_trait]
 impl ReviewAdjudicator for ManagerArbiter {
     async fn adjudicate(&self, req: &AdjudicationRequest) -> Result<Verdict, String> {
@@ -449,7 +494,7 @@ impl ReviewAdjudicator for ManagerArbiter {
             timeout: req.timeout,
             prompt: adjudication_prompt(req),
         };
-        parse_verdict(&self.turn_text(&turn).await?)
+        parse_verdict(&self.turn_text_inner(&turn, true).await?)
     }
 }
 
@@ -877,15 +922,15 @@ mod tests {
             DEADLINE,
             Some(source),
             &cfg,
+            "",
         )
         .with_turn_runner(turn.clone());
 
         // A live reload changes the manager model BEFORE the turn.
-        arbiter.set_manager_fields(&field(
-            "opencode",
-            "fireworks",
-            "accounts/fireworks/models/y",
-        ));
+        arbiter.set_manager_fields(
+            &field("opencode", "fireworks", "accounts/fireworks/models/y"),
+            "",
+        );
         arbiter
             .arbitrate(&request("assign"))
             .await
@@ -1278,10 +1323,11 @@ mod tests {
             DEADLINE,
             None,
             &cfg,
+            "claude-boot-model",
         );
 
         // A live reload changes the manager model BEFORE the adjudication turn.
-        arbiter.set_manager_fields(&field("claude", "", "claude-live-model"));
+        arbiter.set_manager_fields(&field("claude", "", "claude-live-model"), "");
 
         let mut req = adjudication_request("makewhatis/rhapsody#192");
         req.command = command;
@@ -1302,26 +1348,39 @@ mod tests {
         );
     }
 
-    /// A native manager tuple with NO model preserves the caller's model (the composition root's
-    /// `review.model` fallback): the live selection names nothing, so the request is spent unchanged.
+    /// STUDIO-1976 review B1 (clearing transition): boot with an explicit `manager.model` AND a
+    /// `review.model` fallback, then CLEAR `manager.model` on a live reload. The adjudication request
+    /// still carries the boot manager model, but native adjudication must spend the invocation-time
+    /// `review.model` fallback instead — the boot model the operator just removed must never reach
+    /// the subprocess. The previous fallback test started with an already-empty manager and could not
+    /// expose this.
+    ///
+    /// MUTATION: keeping the request's model when the live selection names none (the pre-fix
+    /// behavior) spends `claude-boot-model` and reds here.
     #[tokio::test]
-    async fn native_adjudication_keeps_the_caller_model_when_the_manager_names_none() {
+    async fn clearing_the_live_manager_model_moves_native_adjudication_to_the_review_fallback() {
         let cfg =
             crate::testsupport::empty_effective(Arc::new(rhapsody_tracker::fake::Fake::default()))
                 .cfg;
         let dir = crate::testsupport::TempDir::new();
         let (command, log) = fake_claude(&dir, "SHIP");
+        // Boot: an explicit manager model (so the composition root's AdjudicationTurn model is that
+        // explicit model) with the review fallback available.
         let arbiter = ManagerArbiter::from_config(
-            &field("claude", "", ""),
+            &field("claude", "", "claude-boot-model"),
             &registry(),
             DEADLINE,
             None,
             &cfg,
+            "claude-boot-model",
         );
+
+        // The operator CLEARS `manager.model`; the review fallback is what remains.
+        arbiter.set_manager_fields(&field("claude", "", ""), "claude-review-fallback");
 
         let mut req = adjudication_request("makewhatis/rhapsody#192");
         req.command = command;
-        req.model = "claude-review-fallback".to_string();
+        req.model = "claude-boot-model".to_string();
         let _ = arbiter
             .adjudicate(&req)
             .await
@@ -1329,7 +1388,46 @@ mod tests {
         let argv = std::fs::read_to_string(&log).expect("the fake recorded its argv");
         assert!(
             argv.contains("--model claude-review-fallback"),
-            "an empty live manager model keeps the caller's review.model fallback: {argv:?}"
+            "clearing the manager model must move native adjudication to the review fallback: {argv:?}"
+        );
+        assert!(
+            !argv.contains("claude-boot-model"),
+            "the removed boot model must not reach the subprocess: {argv:?}"
+        );
+    }
+
+    /// A native manager tuple with NO model AND no review fallback spends the CLI default (an empty
+    /// `--model`), never the request's boot value — clearing the manager model must not keep spending
+    /// it (STUDIO-1976 review B1).
+    #[tokio::test]
+    async fn clearing_the_manager_model_with_no_fallback_spends_no_model() {
+        let cfg =
+            crate::testsupport::empty_effective(Arc::new(rhapsody_tracker::fake::Fake::default()))
+                .cfg;
+        let dir = crate::testsupport::TempDir::new();
+        let (command, log) = fake_claude(&dir, "SHIP");
+        let arbiter = ManagerArbiter::from_config(
+            &field("claude", "", "claude-boot-model"),
+            &registry(),
+            DEADLINE,
+            None,
+            &cfg,
+            "claude-boot-model",
+        );
+
+        arbiter.set_manager_fields(&field("claude", "", ""), "");
+
+        let mut req = adjudication_request("makewhatis/rhapsody#192");
+        req.command = command;
+        req.model = "claude-boot-model".to_string();
+        let _ = arbiter
+            .adjudicate(&req)
+            .await
+            .expect("the manager adjudicates");
+        let argv = std::fs::read_to_string(&log).expect("the fake recorded its argv");
+        assert!(
+            !argv.contains("--model"),
+            "an empty live manager model with no fallback spends the CLI default: {argv:?}"
         );
     }
 
