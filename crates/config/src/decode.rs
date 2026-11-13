@@ -69,6 +69,12 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     limits.validate().map_err(ConfigError::Parse)?;
     let scratch = r.scratch.clone().unwrap_or_default();
     scratch.validate().map_err(ConfigError::Parse)?;
+    let review = r.review.clone().unwrap_or_default();
+    if review.ci_failure_escalation_hours == 0 {
+        return Err(ConfigError::Parse(
+            "review.ci_failure_escalation_hours: must be positive".into(),
+        ));
+    }
     let credential_canary_interval_ms = r.agent.credential_canary_interval_ms.unwrap_or(1_800_000);
     if credential_canary_interval_ms <= 0 {
         return Err(ConfigError::Parse(
@@ -396,6 +402,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         prices: r.prices.into_iter().collect(),
         limits,
         scratch,
+        review,
         notify,
         comms,
         providers,

@@ -70,6 +70,9 @@ fn raw_from_config(c: &Config) -> Raw {
     if c.scratch != crate::Scratch::default() {
         r.scratch = Some(c.scratch.clone());
     }
+    if c.review != crate::review_ci::ReviewCi::default() {
+        r.review = Some(c.review.clone());
+    }
 
     r.tracker.kind = c.tracker.kind.clone();
     r.tracker.endpoint = c.tracker.endpoint.clone();

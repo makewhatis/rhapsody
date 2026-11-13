@@ -597,6 +597,8 @@ impl Comms {
 /// The typed runtime view of a workflow (Go `Config`, upstream §4.1.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    /// CI route-back policy from WORKFLOW.md (not teams.yaml). Hot-reloaded.
+    pub review: crate::review_ci::ReviewCi,
     pub github: Option<crate::github::Github>,
     pub tracker: Tracker,
     pub polling: Polling,
@@ -720,6 +722,7 @@ pub(crate) struct Raw {
     /// `scratch:` front-matter block (STUDIO-1993). Rhapsody-only: absent ⇒ defaults. An `Option`
     /// so `encode` can emit the block only when it differs from the default.
     pub scratch: Option<crate::scratch::Scratch>,
+    pub review: Option<crate::review_ci::ReviewCi>,
     /// `notify:` front-matter block (STUDIO-1026). Rhapsody-only: absent ⇒ every channel off. An
     /// `Option` so `encode` can emit the block only when some channel is configured, keeping an
     /// unconfigured workflow byte-identical on the round-trip.
