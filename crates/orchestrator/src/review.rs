@@ -2092,6 +2092,64 @@ mod tests {
         );
     }
 
+    /// STUDIO-1976 review B6: a roster identity's own `effort` is the identity tier folded under the
+    /// profile (profile > identity), so it must reach the run even when neither the profile nor
+    /// `review.effort` names one. The prepared selection carries no effort, so this dispatch
+    /// fallback is the only path it has.
+    ///
+    /// MUTATION: dropping the effort fold in `dispatch_issue`'s identity fallback leaves the run at
+    /// `""` and reds here.
+    #[test]
+    fn a_roster_identity_effort_reaches_a_review_run() {
+        let (mut o, _d) = orch_with_review(true);
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].effort = "xhigh".to_string();
+        }
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override.effort, "xhigh",
+            "the roster identity's effort must reach the review run"
+        );
+    }
+
+    /// STUDIO-1976 review B6: a review is scoped by the harness the run ACTUALLY resolves to, which
+    /// is the roster identity's own harness when the profile is harness-silent. The old derivation
+    /// read only the profile (falling back to `agent.backend`), so a silent profile whose roster
+    /// entry named `opencode` was refused as a claude review — and would have been scoped to the
+    /// wrong override had it dispatched.
+    ///
+    /// MUTATION: reverting `review_harness_for`/the review tier to the profile-only derivation makes
+    /// this a `Refused(... runs the claude harness ...)` instead of a dispatch.
+    #[test]
+    fn a_review_is_scoped_by_the_roster_identitys_harness_when_the_profile_is_silent() {
+        let dir = TempDir::new();
+        write_profile(&dir, "swe", "---\nextends: swe\n---\nSwe.\n");
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].harness = "opencode".to_string();
+            teams.review.model.insert("opencode", "openai/gpt-6.1-sol");
+        }
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched,
+            "the review must dispatch on the roster harness, not be refused as a claude review"
+        );
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].harness, "opencode",
+            "the roster identity's harness is the one the review runs on"
+        );
+        assert_eq!(
+            o.running[&id].model_override.model, "openai/gpt-6.1-sol",
+            "review.model.opencode must apply to the roster harness"
+        );
+    }
+
     /// **STUDIO-1976 review B5: the review dispatch boundary.** A live `teams.yaml` edit applies to
     /// the NEXT review round through the production `on_teams_reload` handler, while the review
     /// already in flight keeps the model it started with.

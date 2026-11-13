@@ -349,11 +349,19 @@ impl ManagerArbiter {
         };
 
         let Some(plan) = &selection.provider else {
-            // The legacy/native-login lane. The request already carries the command, model, timeout
-            // and prompt the caller built from this SAME resolved manager tuple, and the empty-tuple
-            // branch is Claude with the CLI-default model, so this is byte-identical to the pre-P8
-            // manager turn. No provider machinery is consulted.
-            return crate::triage::run_turn(req).await;
+            // The legacy/native-login lane. The request carries the command, timeout and prompt the
+            // caller built from the boot-resolved manager tuple, but its MODEL is re-derived from the
+            // invocation-time selection (STUDIO-1976 review B1): a live `teams.yaml` reload that
+            // changed the manager model must reach native adjudication too, and an explicit change
+            // back from a provider to Claude must stop spending the old provider's model. The live
+            // manager model is absent only when the tuple names none — then the caller's model is
+            // kept, preserving the intended `review.model` fallback. No provider machinery is
+            // consulted.
+            let mut turn = req.clone();
+            if let Some(model) = &selection.model {
+                turn.model = model.clone();
+            }
+            return crate::triage::run_turn(&turn).await;
         };
 
         let source = self.source.as_deref().ok_or_else(|| {
@@ -1246,6 +1254,82 @@ mod tests {
         assert!(
             argv.starts_with("--model claude-opus-5 -p "),
             "the empty tuple's adjudication argv is the legacy `--model M -p <prompt>`: {argv:?}"
+        );
+    }
+
+    /// STUDIO-1976 review B1: a live manager-model reload must reach NATIVE adjudication too. The
+    /// adjudication request carries the boot-resolved model (the composition root's `review.model`
+    /// fallback), but the arbiter must spend its INVOCATION-TIME manager model. This is the remaining
+    /// consumer a live reload did not reach: a manager that changed from an explicit provider back to
+    /// Claude must stop spending the old provider's model.
+    ///
+    /// MUTATION: returning the request unchanged on the no-provider branch (the pre-fix behavior)
+    /// spends `claude-boot-model` and reds here.
+    #[tokio::test]
+    async fn a_live_manager_reload_reaches_native_adjudication() {
+        let cfg =
+            crate::testsupport::empty_effective(Arc::new(rhapsody_tracker::fake::Fake::default()))
+                .cfg;
+        let dir = crate::testsupport::TempDir::new();
+        let (command, log) = fake_claude(&dir, "SHIP");
+        let arbiter = ManagerArbiter::from_config(
+            &field("claude", "", "claude-boot-model"),
+            &registry(),
+            DEADLINE,
+            None,
+            &cfg,
+        );
+
+        // A live reload changes the manager model BEFORE the adjudication turn.
+        arbiter.set_manager_fields(&field("claude", "", "claude-live-model"));
+
+        let mut req = adjudication_request("makewhatis/rhapsody#192");
+        req.command = command;
+        req.model = "claude-boot-model".to_string();
+        let verdict = arbiter
+            .adjudicate(&req)
+            .await
+            .expect("the manager adjudicates");
+        assert_eq!(verdict, Verdict::Ship);
+        let argv = std::fs::read_to_string(&log).expect("the fake recorded its argv");
+        assert!(
+            argv.contains("--model claude-live-model"),
+            "native adjudication must spend the live manager model, not the boot one: {argv:?}"
+        );
+        assert!(
+            !argv.contains("claude-boot-model"),
+            "the boot model must not reach the subprocess: {argv:?}"
+        );
+    }
+
+    /// A native manager tuple with NO model preserves the caller's model (the composition root's
+    /// `review.model` fallback): the live selection names nothing, so the request is spent unchanged.
+    #[tokio::test]
+    async fn native_adjudication_keeps_the_caller_model_when_the_manager_names_none() {
+        let cfg =
+            crate::testsupport::empty_effective(Arc::new(rhapsody_tracker::fake::Fake::default()))
+                .cfg;
+        let dir = crate::testsupport::TempDir::new();
+        let (command, log) = fake_claude(&dir, "SHIP");
+        let arbiter = ManagerArbiter::from_config(
+            &field("claude", "", ""),
+            &registry(),
+            DEADLINE,
+            None,
+            &cfg,
+        );
+
+        let mut req = adjudication_request("makewhatis/rhapsody#192");
+        req.command = command;
+        req.model = "claude-review-fallback".to_string();
+        let _ = arbiter
+            .adjudicate(&req)
+            .await
+            .expect("the manager adjudicates");
+        let argv = std::fs::read_to_string(&log).expect("the fake recorded its argv");
+        assert!(
+            argv.contains("--model claude-review-fallback"),
+            "an empty live manager model keeps the caller's review.model fallback: {argv:?}"
         );
     }
 

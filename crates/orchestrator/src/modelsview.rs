@@ -208,12 +208,6 @@ pub fn manager_tuple(cfg: &Config, teams: &Teams) -> TupleView {
     ))
 }
 
-/// The first non-empty value, or `""`. Field-wise inheritance for the fields a write validates,
-/// mirroring the resolver's precedence across the tiers a write can name.
-fn first_non_empty<'a>(candidates: impl IntoIterator<Item = &'a str>) -> &'a str {
-    candidates.into_iter().find(|v| !v.is_empty()).unwrap_or("")
-}
-
 /// Refuse a candidate provider this build cannot run on `harness`: not a canonical provider id, not
 /// defined in WORKFLOW.md, an unknown protocol, or a protocol the harness adapter cannot consume —
 /// `claude` with `openai-compatible` is the "a provider on `claude`" case. `harness` is the
@@ -257,26 +251,39 @@ fn validate_harness(harness: &str) -> Result<(), String> {
 }
 
 /// Refuse a candidate teammate tuple BEFORE it replaces a last-good one. `profile` is the front
-/// matter the write would leave; `identity` is the roster entry's own fields. The effective harness
-/// and provider are resolved field-wise (profile > identity > global), exactly as the dispatch
-/// resolver does, so a blank harness that inherits `claude` refuses a provider.
+/// matter the write would leave; `identity` is the roster entry's own fields. The COMPLETE effective
+/// candidate — harness, provider AND model — is resolved field-wise (profile > identity > global)
+/// through the very resolver dispatch uses, so a blank harness that inherits `claude` refuses a
+/// provider AND an explicit provider with no model anywhere is refused as `MissingModel` rather than
+/// written over a working profile only to refuse every dispatch. Legitimate inheritance (a model
+/// supplied by a lower tier) still resolves and is accepted.
 pub fn validate_identity_routing(
     cfg: &Config,
     profile: &RoutingView,
     identity: &RoutingView,
 ) -> Result<(), String> {
-    let harness = first_non_empty([
-        profile.harness.as_str(),
-        identity.harness.as_str(),
-        cfg.agent.backend.as_str(),
-    ]);
-    validate_harness(harness)?;
-    let provider = first_non_empty([
-        profile.provider.as_str(),
-        identity.provider.as_str(),
-        cfg.agent.provider.as_str(),
-    ]);
-    validate_provider(cfg, harness, provider)
+    resolve_selection(&SelectionRequest {
+        tiers: SelectionTiers {
+            ticket: FieldSelection::default(),
+            review: None,
+            profile: FieldSelection {
+                harness: profile.harness.clone(),
+                provider: profile.provider.clone(),
+                model: profile.model.clone(),
+            },
+            identity: FieldSelection {
+                harness: identity.harness.clone(),
+                provider: identity.provider.clone(),
+                model: identity.model.clone(),
+            },
+            project: FieldSelection::default(),
+            global: FieldSelection::from_agent(&cfg.agent),
+        },
+        providers: &cfg.providers,
+        turn_deadline_ms: provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms),
+    })
+    .map(|_| ())
+    .map_err(|e| e.to_string())
 }
 
 /// Refuse a candidate review override. The row is per-harness, so the harness is explicit and only
@@ -532,6 +539,38 @@ mod tests {
                 &RoutingView::default()
             )
             .is_ok()
+        );
+    }
+
+    /// STUDIO-1976 review B2: an explicit provider with NO model anywhere must be refused BEFORE the
+    /// write. The old validator checked only harness/provider compatibility, so this tuple was
+    /// written over a working profile and then refused every dispatch (`MissingModel`). The resolver
+    /// now validates the complete effective candidate.
+    #[test]
+    fn an_explicit_provider_without_a_model_is_refused() {
+        let cfg = cfg();
+        let err = validate_identity_routing(
+            &cfg,
+            &routing("opencode", "testprovider", ""),
+            &RoutingView::default(),
+        )
+        .expect_err("an explicit provider requires an exact model");
+        assert!(err.contains("exact model"), "{err}");
+    }
+
+    /// Legitimate inheritance is retained: a provider with no model in the profile is legal when a
+    /// lower tier (the roster identity) supplies the model — the write must not over-refuse it.
+    #[test]
+    fn an_explicit_provider_inherits_a_model_from_the_identity_tier() {
+        let cfg = cfg();
+        assert!(
+            validate_identity_routing(
+                &cfg,
+                &routing("opencode", "testprovider", ""),
+                &routing("", "", "identity-model"),
+            )
+            .is_ok(),
+            "a model supplied by the identity tier keeps the tuple valid"
         );
     }
 

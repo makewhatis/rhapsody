@@ -761,24 +761,33 @@ impl Orchestrator {
     /// The harness a routed identity's profile asks for, WITHOUT composing the turn-1 section
     /// (STUDIO-908). `teammate_profile_for` resolves the same profile for the section; this is the
     /// harness-only half, so a dispatch-time check can ask before the section is worth building.
-    /// Empty for an identity with no profile and for an installation with no runtime home — both
-    /// meaning "inherit `agent.backend`", exactly as `teammate_profile_for` answers.
-    fn identity_harness(&self, teams: &Teams, identity: &str) -> String {
-        let profile = teams
-            .roster
-            .iter()
-            .find(|i| i.name == identity)
-            .map(|i| i.profile.clone())
-            .unwrap_or_default();
-        if profile.is_empty() {
-            return String::new();
-        }
-        let Some(dir) = self.teams_profiles_dir.as_ref() else {
+    ///
+    /// The roster entry's OWN `harness` is the identity tier folded UNDER the profile (STUDIO-1976
+    /// review B6): the selection resolver reads `profile > identity > project > global` field-wise, so
+    /// a harness-silent profile whose roster entry names `opencode` actually runs OpenCode. Returning
+    /// only the profile's harness let the review-admission gate and the review tier disagree with the
+    /// dispatch about the reviewer's harness. Empty — no profile harness and no identity harness — and
+    /// an installation with no runtime home both mean "inherit `agent.backend`", exactly as
+    /// `teammate_profile_for` answers.
+    pub(crate) fn identity_harness(&self, teams: &Teams, identity: &str) -> String {
+        let Some(entry) = teams.roster.iter().find(|i| i.name == identity) else {
             return String::new();
         };
-        rhapsody_config::profiles::resolve(dir, &profile)
+        let profile = entry.profile.clone();
+        if profile.is_empty() {
+            return entry.harness.clone();
+        }
+        let profile_harness = self
+            .teams_profiles_dir
+            .as_ref()
+            .and_then(|dir| rhapsody_config::profiles::resolve(dir, &profile).ok())
             .map(|p| p.harness)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        if profile_harness.is_empty() {
+            entry.harness.clone()
+        } else {
+            profile_harness
+        }
     }
 
     /// Whether the profile an identity wears can dispatch the `claude` harness — as its primary

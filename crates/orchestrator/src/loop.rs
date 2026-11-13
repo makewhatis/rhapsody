@@ -3261,6 +3261,36 @@ mod tests {
             .expect("loop task panicked");
     }
 
+    /// STUDIO-1976 review B5: the control loop INSTALLS the `teams.yaml` routing watcher and
+    /// dispatches its event to the production handler. The runtime test in `teamsreload` drives its
+    /// own watcher and so cannot protect the loop's installation; this source guard can — aborting or
+    /// removing the watcher in `run` reds here, and so does dropping the `Event::TeamsReload` arm.
+    #[test]
+    fn the_control_loop_installs_the_teams_watcher_and_dispatches_its_event() {
+        let src = include_str!("loop.rs");
+        let run_start = src
+            .find("pub async fn run(")
+            .expect("run is still the boot entry point");
+        let loaded = src[run_start..]
+            .find("self.run_loaded(ctx).await;")
+            .expect("run still awaits run_loaded");
+        let run_body = &src[run_start..run_start + loaded];
+        assert!(
+            run_body.contains("self.start_watch_teams("),
+            "run must install the teams routing watcher"
+        );
+        assert!(
+            !run_body.contains(".abort()"),
+            "the teams watcher must not be aborted before the control loop runs"
+        );
+        // Assembled at run time so this test's own source is not an occurrence of the needle.
+        let arm: String = ["Event::TeamsReload => self.", "on_teams_reload()"].concat();
+        assert!(
+            src.contains(&arm),
+            "the loop must dispatch Event::TeamsReload to on_teams_reload"
+        );
+    }
+
     // Mirrors Go `TestRunStartupValidationFailureReturnsError`: a real disk load with a missing file
     // must fail startup.
     #[tokio::test]

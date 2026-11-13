@@ -1049,12 +1049,19 @@ impl Orchestrator {
         // A REVIEW run's per-harness override (`review.model`/`review.provider`/`review.effort`) is
         // the review tier (STUDIO-1976): the resolver slots it between the ticket and the profile, so
         // a live `review.provider` change reaches the NEXT round's prepared selection. The reviewer's
-        // harness is the profile's (or the configured backend), the same value `review_harness_for`
-        // resolves and `dispatch_review` refuses against.
+        // harness is the profile's OR the roster identity's own, resolved field-wise
+        // (`identity_harness`), the SAME value `review_harness_for` resolves and `dispatch_review`
+        // refuses against (STUDIO-1976 review B6): a harness-silent profile whose roster entry names
+        // another harness must scope its review override to THAT harness, not the backend.
         let review_tier = if matches!(target, PreparedTarget::Review { .. }) {
             self.teams.as_ref().filter(|t| t.enabled).map(|teams| {
                 let harness = self.effective_harness(
-                    teams_dispatch.as_ref().map_or("", |td| td.harness.as_str()),
+                    &self.identity_harness(
+                        teams,
+                        teams_dispatch
+                            .as_ref()
+                            .map_or("", |td| td.identity.as_str()),
+                    ),
                 );
                 let fallback = self.configured_backend();
                 let provider = match teams.review_provider_for(&harness, &fallback) {

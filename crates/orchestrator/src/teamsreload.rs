@@ -183,6 +183,7 @@ mod tests {
     use rhapsody_config::teams::{ManagerMode, ReviewMode};
     use std::sync::Mutex;
 
+    use crate::reviewadjudicate::ReviewAdjudicator;
     use crate::testsupport::TempDir;
 
     /// A sink that records each delivery's review model for `opencode`.
@@ -328,6 +329,126 @@ mod tests {
                 .for_harness("opencode", "claude"),
             Some("deepseek-v4p1-flash"),
             "a canonical-but-undefined provider must not replace the last-good routing"
+        );
+    }
+
+    /// Writes a fake `claude` that records its own argv and then sleeps `sleep_secs` before printing
+    /// `SHIP`, so a test can PARK an invocation mid-turn and reload while it is in flight. The
+    /// command is `bash <script>`, so the recorded `$*` is exactly the argument tail `run_turn`
+    /// appended, and no direct exec of a just-written file means no `ETXTBSY` race.
+    fn fake_claude(dir: &TempDir, name: &str, sleep_secs: u64) -> (String, String) {
+        let script = dir.child(name);
+        let log = format!("{script}.argv");
+        let body = format!(
+            "#!/usr/bin/env bash\nprintf '%s' \"$*\" > {log:?}\n/bin/sleep {sleep_secs}\nprintf 'SHIP\\n'\n",
+        );
+        std::fs::write(&script, body).expect("write fake claude");
+        (format!("bash {script}"), log)
+    }
+
+    fn adjudication_request(
+        command: &str,
+        model: &str,
+    ) -> crate::reviewadjudicate::AdjudicationRequest {
+        crate::reviewadjudicate::AdjudicationRequest {
+            pr: "makewhatis/rhapsody#400".to_string(),
+            head: "be260a6b4366fac70fbc0e2dbabd9d51fe9d44e5".to_string(),
+            rounds: 3,
+            findings: vec!["alice asked for changes".to_string()],
+            command: command.to_string(),
+            billing_guard: false,
+            tracker_api_key: String::new(),
+            model: model.to_string(),
+            timeout: Duration::from_secs(30),
+        }
+    }
+
+    /// STUDIO-1976 review B5: the PRODUCTION reload-to-consumer chain with a manager invocation in
+    /// flight. `on_teams_reload` (the loop's `Event::TeamsReload` handler) must hand the live manager
+    /// tuple to BOTH off-loop consumers — the triage handle and the arbiter sink — while a manager
+    /// turn already past its snapshot keeps the tuple it started with, and the NEXT turn spends the
+    /// live one.
+    ///
+    /// MUTATION: replacing [`ManagerArbiterRoutingSink::teams_routing_reload`] with a no-op leaves
+    /// the arbiter on the boot tuple, so the second invocation's argv keeps `claude-boot-model` and
+    /// reds. This is the wiring the direct-setter tests could not protect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_live_reload_keeps_the_in_flight_manager_tuple_and_moves_the_next() {
+        let dir = TempDir::new();
+        let path = std::path::PathBuf::from(dir.child("teams.yaml"));
+        let yaml = |model: &str| {
+            format!(
+                "enabled: true\nreview:\n  mode: ticketless\nmanager:\n  mode: labels\n  model: {model}\nroster:\n  - name: alice\n    profile: swe\n"
+            )
+        };
+        std::fs::write(&path, yaml("claude-boot-model")).expect("write");
+        let mut o = orchestrator_with(path.clone());
+        o.eff = Some(crate::testsupport::empty_effective(std::sync::Arc::new(
+            rhapsody_tracker::fake::Fake::default(),
+        )));
+        let cfg = o.eff.as_ref().expect("eff").cfg.clone();
+
+        let (slow_command, slow_log) = fake_claude(&dir, "slow.sh", 2);
+        let (fast_command, fast_log) = fake_claude(&dir, "fast.sh", 0);
+
+        let arbiter = Arc::new(crate::managerprep::ManagerArbiter::from_config(
+            &crate::selection::FieldSelection {
+                harness: "claude".to_string(),
+                provider: String::new(),
+                model: "claude-boot-model".to_string(),
+            },
+            &cfg.providers,
+            rhapsody_config::providers::provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms),
+            None,
+            &cfg,
+        ));
+        // The PRODUCTION sink and the PRODUCTION handle are what the reload must reach.
+        o.set_teams_routing_sink(Arc::new(ManagerArbiterRoutingSink::new(Arc::clone(
+            &arbiter,
+        ))));
+        let handle = Arc::new(crate::triage::TriageHandle::new());
+        o.teams_triage = Some(Arc::clone(&handle));
+
+        // Invocation #1 parks on the slow script; it snapshots the boot tuple before it blocks.
+        let a1 = Arc::clone(&arbiter);
+        let req1 = adjudication_request(&slow_command, "claude-boot-model");
+        let parked = tokio::spawn(async move { a1.adjudicate(&req1).await });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !std::path::Path::new(&slow_log).exists() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "invocation #1 never started"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The operator edits the manager model; the loop's handler runs while #1 is in flight.
+        std::fs::write(&path, yaml("claude-live-model")).expect("write");
+        o.on_teams_reload();
+        assert_eq!(
+            handle.manager_routing().map(|r| r.model),
+            Some("claude-live-model".to_string()),
+            "the reload must publish the live tuple to the triage handle"
+        );
+
+        // The in-flight invocation keeps the tuple it started with...
+        let v1 = parked.await.expect("invocation #1 joined");
+        assert_eq!(v1, Ok(crate::reviewadjudicate::Verdict::Ship));
+        let argv1 = std::fs::read_to_string(&slow_log).expect("argv #1");
+        assert!(
+            argv1.contains("--model claude-boot-model"),
+            "an in-flight invocation keeps its model: {argv1:?}"
+        );
+
+        // ...and the next invocation spends the live tuple.
+        let v2 = arbiter
+            .adjudicate(&adjudication_request(&fast_command, "claude-boot-model"))
+            .await;
+        assert_eq!(v2, Ok(crate::reviewadjudicate::Verdict::Ship));
+        let argv2 = std::fs::read_to_string(&fast_log).expect("argv #2");
+        assert!(
+            argv2.contains("--model claude-live-model"),
+            "the next invocation spends the live manager model: {argv2:?}"
         );
     }
 
