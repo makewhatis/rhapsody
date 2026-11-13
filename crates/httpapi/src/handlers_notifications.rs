@@ -226,6 +226,7 @@ async fn observe(
             // system notice so an operator sees WHY nothing is being admitted.
             D::ScratchPressure => Kind::ScratchPressure,
             D::ChangesRequestedNoRun
+            | D::CiFailureNoRun
             | D::ReviewRequestedNoRun
             | D::AuthorTokenCeilingStopped
             | D::ReviewTokenCeilingStopped

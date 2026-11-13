@@ -154,7 +154,8 @@ impl Credentials {
             .map_err(|_| self.refusal(owner, "cannot create private gh config directory"))
     }
 
-    /// All daemon gh commands name a repo with --repo/-R, a REST repos endpoint, or a PR URL.
+    /// All daemon gh commands name a repo with --repo/-R, a REST repos endpoint, a PR URL,
+    /// or the explicit `owner` variable of a GraphQL request.
     /// Do not search arbitrary body/query arguments for an owner: unscoped commands fail closed.
     pub fn for_gh(&self, args: &[&str]) -> Result<Option<Arc<RunAuth>>, String> {
         if !self.configured() {
@@ -165,6 +166,20 @@ impl Credentials {
             .find(|a| matches!(a[0], "--repo" | "-R"))
             .and_then(|a| a[1].split_once('/').map(|(o, _)| o.to_string()))
             .or_else(|| {
+                if args.get(..2) == Some(&["api", "graphql"]) {
+                    return args
+                        .windows(2)
+                        .find(|a| {
+                            matches!(a[0], "-f" | "-F" | "--field" | "--raw-field")
+                                && a[1].starts_with("owner=")
+                        })
+                        .and_then(|a| a[1].strip_prefix("owner="))
+                        .filter(|o| {
+                            !o.is_empty()
+                                && o.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                        })
+                        .map(str::to_string);
+                }
                 if args.first() == Some(&"api") {
                     args.iter()
                         .skip(1)
@@ -274,6 +289,25 @@ mod tests {
             )]
             .into(),
         }));
+        assert!(
+            policy
+                .for_gh(&[
+                    "api",
+                    "graphql",
+                    "-f",
+                    "query=query($owner:String!){repository(owner:$owner,name:\"example\"){name}}",
+                    "-f",
+                    "owner=studio49dev"
+                ])
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            policy
+                .for_gh(&["api", "graphql", "-f", "query=owner=studio49dev"])
+                .is_err(),
+            "an owner hidden in query text is not a credential scope"
+        );
         let auth = policy
             .for_repo("git@github.com:studio49dev/example.git")
             .unwrap()

@@ -2479,6 +2479,22 @@ impl HeadAllowlist {
 /// each answers one question, and a caller that needs two asks twice.
 #[async_trait]
 pub trait PrStateSource: Send + Sync {
+    /// Required CI at an exact head. Sources without check access return no observation.
+    async fn review_ci(
+        &self,
+        _pr: &crate::prstate::PrCoord,
+        _head: &str,
+        _previous: Option<&crate::reviewci::CiSnapshot>,
+    ) -> Result<Option<crate::reviewci::CiSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+    async fn rerun_ci(
+        &self,
+        _pr: &crate::prstate::PrCoord,
+        _ci: &crate::reviewci::CiSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("CI rerun is unavailable".into())
+    }
     async fn pr_state(
         &self,
         owner: &str,
@@ -2533,6 +2549,158 @@ fn is_gone_message(err: &str) -> bool {
 
 #[async_trait]
 impl PrStateSource for GH {
+    async fn review_ci(
+        &self,
+        pr: &crate::prstate::PrCoord,
+        head: &str,
+        previous: Option<&crate::reviewci::CiSnapshot>,
+    ) -> Result<Option<crate::reviewci::CiSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
+        // Variables keep repository/check text out of GraphQL source. A truncated inventory is
+        // unknown, never permission to act on a subset of required checks.
+        let query = r#"query($owner:String!,$repo:String!,$number:Int!) {
+          repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
+            headRefOid state commits(last:1) { nodes { commit { oid statusCheckRollup {
+              contexts(first:100) { pageInfo { hasNextPage } nodes {
+                __typename
+                ... on CheckRun {
+                  id name status conclusion startedAt detailsUrl isRequired(pullRequestNumber:$number)
+                  annotations(first:100) { pageInfo { hasNextPage } nodes { path annotationLevel } }
+                  checkSuite { app { slug } workflowRun { workflow { name } } }
+                }
+                ... on StatusContext {
+                  id context state createdAt targetUrl isRequired(pullRequestNumber:$number)
+                }
+              } }
+            } } } }
+          } }
+        }"#;
+        let bytes = self
+            .run_off_task(vec![
+                "api".into(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={query}"),
+                "-f".into(),
+                format!("owner={}", pr.owner),
+                "-f".into(),
+                format!("repo={}", pr.repo),
+                "-F".into(),
+                format!("number={}", pr.number),
+            ])
+            .await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("errors").is_some() {
+            return Err("CI GraphQL read returned errors".into());
+        }
+        let Some(mut ci) = crate::reviewci::parse_snapshot(&value, head) else {
+            return Ok(None);
+        };
+        if ci.pending || ci.failed.is_empty() {
+            return Ok(Some(ci));
+        }
+        // The check conclusion is refreshed every tick, but immutable attempt logs/diff evidence
+        // cost only once per head + failed-attempt set. A new attempt has new check-run IDs.
+        if let Some(old) = previous
+            && old.head == ci.head
+            && !old.pending
+            && old
+                .failed
+                .iter()
+                .map(|c| &c.id)
+                .eq(ci.failed.iter().map(|c| &c.id))
+        {
+            return Ok(Some(old.clone()));
+        }
+        // Cheap excerpts only: at most four job logs, twenty failure lines per job. Check names
+        // and links still survive an unavailable log or a non-Actions CI provider.
+        for failure in ci.failed.iter_mut().take(4) {
+            if let Some((_, job)) = crate::reviewci::action_job(&failure.url) {
+                let slug = format!("{}/{}", pr.owner, pr.repo);
+                match self
+                    .run_off_task(vec![
+                        "run".into(),
+                        "view".into(),
+                        "--repo".into(),
+                        slug,
+                        "--job".into(),
+                        job.into(),
+                        "--log-failed".into(),
+                    ])
+                    .await
+                {
+                    Ok(log) => {
+                        failure.tests = crate::reviewci::test_lines(&String::from_utf8_lossy(&log));
+                        let paths = crate::reviewci::test_paths(&failure.tests);
+                        if paths.len() == failure.tests.len() {
+                            failure.paths.extend(paths);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%pr, %error, check = %failure.name, "CI route-back: job log unavailable")
+                    }
+                }
+            }
+        }
+        if ci.failed.iter().all(|c| !c.paths.is_empty()) {
+            match self
+                .review_surface(&pr.owner, &pr.repo, pr.number, head)
+                .await
+            {
+                Ok(Some(surface)) => {
+                    ci.unrelated = ci
+                        .failed
+                        .iter()
+                        .all(|c| c.paths.iter().all(|p| !surface.files.contains(p)))
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(%pr, %error, "CI route-back: diff unavailable; not inferring an unrelated failure")
+                }
+            }
+        }
+        Ok(Some(ci))
+    }
+
+    async fn rerun_ci(
+        &self,
+        pr: &crate::prstate::PrCoord,
+        ci: &crate::reviewci::CiSnapshot,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Recheck the head before spending the once-per-head rerun. Never rerun unrelated history.
+        let bytes = self
+            .run_off_task(vec![
+                "pr".into(),
+                "view".into(),
+                pr.number.to_string(),
+                "--repo".into(),
+                format!("{}/{}", pr.owner, pr.repo),
+                "--json".into(),
+                "headRefOid,state".into(),
+            ])
+            .await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value["headRefOid"].as_str() != Some(&ci.head) || value["state"] != "OPEN" {
+            return Ok(());
+        }
+        let mut runs = std::collections::BTreeSet::new();
+        for failure in &ci.failed {
+            if let Some((run, _)) = crate::reviewci::action_job(&failure.url) {
+                runs.insert(run);
+            }
+        }
+        for run in runs {
+            self.run_off_task(vec![
+                "run".into(),
+                "rerun".into(),
+                run.into(),
+                "--repo".into(),
+                format!("{}/{}", pr.owner, pr.repo),
+                "--failed".into(),
+            ])
+            .await?;
+        }
+        Ok(())
+    }
     /// One bounded `gh pr view <number> --repo <owner>/<repo> --json
     /// headRefOid,state,isDraft,mergedAt,headRepository,headRepositoryOwner,mergeStateStatus`.
     ///

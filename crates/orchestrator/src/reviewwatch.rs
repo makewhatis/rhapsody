@@ -421,6 +421,8 @@ const UNCAPPED_SLOTS: i64 = i64::MAX;
 /// off-loop diff comparison needs from it. The watcher keeps no row state of its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WatchedPr {
+    /// Current WORKFLOW policy, re-read on each watch-list round trip.
+    pub ci_failure_routing: bool,
     /// The pull request's repository and number.
     pub pr: PrCoord,
     /// Distinct non-empty `last_reviewed_sha` values across this pull request's live rows. A head
@@ -444,6 +446,7 @@ impl WatchedPr {
     /// A watched pull request with no completed review yet — the shape a freshly-introduced row has.
     pub fn new(pr: PrCoord) -> WatchedPr {
         WatchedPr {
+            ci_failure_routing: true,
             pr,
             reviewed_shas: Vec::new(),
             requested_shas: Vec::new(),
@@ -526,6 +529,14 @@ pub trait ReviewWatchSink: Send + Sync {
     /// A DEFAULT no-op so the many test doubles need no change; the production
     /// [`ControlWatchSink`] reaches the control handle's off-loop retry.
     async fn retry_pending(&self) {}
+    /// CI observations are read off-loop; only control decides whether to summon or rerun.
+    async fn ci(
+        &self,
+        _pr: PrCoord,
+        _ci: crate::reviewci::CiSnapshot,
+    ) -> crate::reviewci::CiAction {
+        crate::reviewci::CiAction::None
+    }
     async fn surface(
         &self,
         _pr: PrCoord,
@@ -602,6 +613,18 @@ impl ControlWatchSink {
 
 #[async_trait]
 impl ReviewWatchSink for ControlWatchSink {
+    async fn ci(&self, pr: PrCoord, ci: crate::reviewci::CiSnapshot) -> crate::reviewci::CiAction {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        if self
+            .control
+            .events
+            .send(Event::ReviewCi { pr, ci, reply })
+            .is_err()
+        {
+            return crate::reviewci::CiAction::None;
+        }
+        rx.await.unwrap_or(crate::reviewci::CiAction::None)
+    }
     async fn surface(
         &self,
         pr: PrCoord,
@@ -1015,6 +1038,7 @@ fn poll_interval(deps: &ReviewWatchDeps) -> i64 {
 /// and rebuild `running` first, and a tick that arrived before either would refuse everything and
 /// achieve nothing but a burst of `gh` calls at start-up.
 pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
+    let mut ci_cache: HashMap<PrCoord, crate::reviewci::CiSnapshot> = HashMap::new();
     let Some(src) = deps.pr_source.as_ref() else {
         tracing::info!(
             "ticketless review watcher: no GitHub source, so no pull request can be watched"
@@ -1046,6 +1070,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         // retry is where the tracker write happens; nothing here decides anything.
         deps.sink.retry_pending().await;
         let prs = deps.sink.watched().await;
+        ci_cache.retain(|pr, _| prs.iter().any(|w| w.pr == *pr && w.ci_failure_routing));
         if prs.is_empty() {
             cursor = 0;
             continue;
@@ -1162,7 +1187,42 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                 fresh.unchanged_from = unchanged;
                 fresh.head_patch_id = head_patch_id;
             }
+            let ci_target = match &fresh.lookup {
+                PrLookup::Found(snap)
+                    if snap.status == PrStatus::Open
+                        && recorded
+                            .get(&fresh.pr)
+                            .is_some_and(|w| w.ci_failure_routing) =>
+                {
+                    Some((fresh.pr.clone(), snap.head_sha.clone()))
+                }
+                _ => None,
+            };
             let (one, left) = deps.sink.sweep(vec![fresh], slots).await;
+            if let Some((pr, head)) = ci_target {
+                match src.review_ci(&pr, &head, ci_cache.get(&pr)).await {
+                    Ok(Some(ci)) => {
+                        ci_cache.insert(pr.clone(), ci.clone());
+                        // Log enrichment can take several bounded calls. Recheck a red head after
+                        // that work so an intervening push/close cannot summon on stale evidence.
+                        let current = ci.pending
+                            || ci.failed.is_empty()
+                            || matches!(src.pr_state_unconditional(&pr.owner, &pr.repo, pr.number, &deps.allow).await,
+                                Ok(PrLookup::Found(snap)) if snap.status == PrStatus::Open && snap.head_sha == ci.head);
+                        if current
+                            && deps.sink.ci(pr.clone(), ci.clone()).await
+                                == crate::reviewci::CiAction::Rerun
+                            && let Err(error) = src.rerun_ci(&pr, &ci).await
+                        {
+                            tracing::warn!(%pr, %error, "CI route-back: one rerun request failed; author will be summoned after the rerun grace period");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::warn!(%pr, %error, "CI route-back: checks unreadable; taking no action")
+                    }
+                }
+            }
             slots = Some(left);
             // Destructured rather than field-by-field so a field added later cannot be silently
             // dropped from the tick fold: the compiler flags the missing binding here.
@@ -1343,6 +1403,10 @@ impl Orchestrator {
                     // (STUDIO-1672). Resolved here because only the control task holds the
                     // configured projects; `None` (no owning project) falls back to the compare API.
                     watched.repo_url = self.review_repo_url(&row.key.owner, &row.key.repo);
+                    watched.ci_failure_routing = self
+                        .eff
+                        .as_ref()
+                        .is_some_and(|e| e.cfg.review.ci_failure_routing);
                     out.push(watched);
                     seen.insert(k, i);
                     i
@@ -2839,6 +2903,7 @@ impl Orchestrator {
         // route back, and leaving the entry would keep the reconciliation sweep silent about a
         // coordinate that is watched again later.
         self.conflict_routed.remove(pr);
+        self.ci_routed.remove(pr);
         // And the draft-poke bookkeeping (STUDIO-962): a re-introduced pull request must be poked
         // afresh, and an entry for a gone one would be a map that only ever grows.
         self.draft_pokes.remove(&churn_key(pr));
@@ -7339,6 +7404,7 @@ mod tests {
 
     fn mirror_watched(repo: &NoOpRebaseRepo) -> WatchedPr {
         WatchedPr {
+            ci_failure_routing: true,
             pr: coord(12),
             reviewed_shas: vec![repo.reviewed.clone()],
             requested_shas: Vec::new(),
@@ -10069,6 +10135,77 @@ mod tests {
     }
 
     // --- the conflict route-back (STUDIO-961) ------------------------------------------------
+
+    #[test]
+    fn ci_route_back_reaches_the_author_after_approval_and_honors_live_gates() {
+        use crate::reviewci::{CiAction, CiFailure, CiSnapshot};
+        let (mut o, mut rx) =
+            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+        introduce(&o, approved_row(12, "bob", HEAD_A));
+        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+        let ci = CiSnapshot {
+            head: HEAD_A.into(),
+            failed: vec![CiFailure {
+                name: "test".into(),
+                id: "1".into(),
+                tests: vec!["--- FAIL: TestUsage".into()],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        o.eff.as_mut().unwrap().cfg.review.ci_failure_routing = false;
+        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
+        o.eff.as_mut().unwrap().cfg.review.ci_failure_routing = true;
+        o.human_holds.note_human_label("STUDIO-721");
+        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
+        o.human_holds.begin_pass(true);
+        let mut author = crate::orchestrator::RunningEntry::empty(Issue::default());
+        author.issue.identifier = "STUDIO-721".into();
+        o.running.insert("author".into(), author);
+        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
+        o.running.clear();
+        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::Summon);
+        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
+        let c = rx.try_recv().unwrap();
+        assert_eq!(c.reason, crate::reviewnotify::CompletionReason::CiFailure);
+        assert_eq!(c.changes.as_ref().unwrap().identifier, "STUDIO-721");
+        let body = crate::reviewnotify::re_engage_comment(&c);
+        assert!(body.contains("FAILED"));
+        assert!(body.contains("TestUsage"));
+        assert!(body.contains("Do not loosen, skip or delete tests"));
+        assert!(crate::reviewnotify::summons_author(&body, &c.summon_token));
+        assert!(rx.try_recv().is_err());
+        let now = (o.now)();
+        assert!(
+            o.ci_divergences(now + chrono::Duration::minutes(119))
+                .is_empty()
+        );
+        let escalated = o.ci_divergences(now + chrono::Duration::hours(2));
+        assert_eq!(escalated.len(), 1);
+        assert_eq!(
+            escalated[0].kind,
+            crate::reviewreconcile::DivergenceKind::CiFailureNoRun
+        );
+        o.eff
+            .as_mut()
+            .unwrap()
+            .cfg
+            .review
+            .ci_failure_escalation_hours = 3;
+        assert!(
+            o.ci_divergences(now + chrono::Duration::hours(2))
+                .is_empty()
+        );
+        let mut next = ci;
+        next.head = HEAD_B.into();
+        assert_eq!(
+            o.observe_review_ci(&coord(12), &next),
+            CiAction::None,
+            "stale observations cannot target a different head"
+        );
+        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+        assert_eq!(o.observe_review_ci(&coord(12), &next), CiAction::Summon);
+    }
 
     /// [`ticketless`] with the route-back's state configured — the gate the transition reads.
     fn ticketless_conflict(names: &[&str], state: &str) -> Teams {
@@ -17024,6 +17161,7 @@ mod tests {
     /// A watched pull request at the fixed head [`HEAD_B`] with the given reviewed/requested SHAs.
     fn watched_pr(reviewed: &[&str], requested: &[&str]) -> WatchedPr {
         WatchedPr {
+            ci_failure_routing: true,
             pr: coord(12),
             reviewed_shas: reviewed.iter().map(|s| (*s).to_string()).collect(),
             requested_shas: requested.iter().map(|s| (*s).to_string()).collect(),

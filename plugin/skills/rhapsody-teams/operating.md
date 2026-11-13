@@ -92,6 +92,44 @@ can legitimately read "4h ago" while its state changed seconds ago.
 
 ## Releasing a pull request the manager has settled
 
+### A branch that needs its author: conflicts and red CI
+
+A conflicted watched PR routes back to its author once per conflicted head, even after approval
+or while publication is parked (STUDIO-961). Required CI failures now use that same route-back:
+a summons comment first, then the configured `teams.yaml` `review.changes_state` move if available.
+The comment names failed checks/jobs and run links, includes cheap Go `--- FAIL:` and Playwright
+`✘` log excerpts, and asks the author to fix the cause, run checks locally and push without
+loosening or skipping tests. Approval does not waive CI.
+
+Configure CI routing in **WORKFLOW.md**, not `teams.yaml`; both keys hot-reload:
+
+```yaml
+review:
+  ci_failure_routing: true           # default on; ticketless review watch set only
+  ci_failure_escalation_hours: 2     # positive hours; default 2
+```
+
+Only concluded failures at the current head act. Queued/pending required checks wait; an optional
+failure, a passed rerun, a live author run or `rhapsody:human` hold causes no summons. New pushes
+reset the head-scoped guard. Like conflict routing, the in-memory guard resets on daemon restart.
+Unknown/truncated check inventories do not authorize a route-back.
+
+When every failed check has file evidence and none of those files is in a complete PR diff, the
+comment says it looks unrelated and suggests a rerun first. For GitHub Actions the daemon requests
+one failed-jobs rerun per head before summoning, with a room post and log line. It waits for the
+new attempt; if the old answer persists for five minutes (including a refused rerun), it summons
+instead of silently waiting forever. Without file evidence it makes no claim about relevance.
+Job logs are bounded to four failed jobs and twenty failure lines per job; missing logs still
+leave check names and links. Excerpts are cached per failed attempt; conclusions are refreshed.
+
+Routing itself posts to the room and log. If no author run starts after the summons for the
+configured hours, the reconciliation sweep emits `ci_failure_no_run` as **needing a human**, in
+the log, room and `/api/v1/state` review-divergence feed. Inspect the failed run and author
+dispatch/credentials, then rerun CI or re-engage the author as appropriate. The sweep reports;
+it neither removes human holds nor loosens checks.
+
+### Clearing a settled review
+
 `POST /api/v1/reviews/clear` with `{"owner":…,"repo":…,"number":…}` forgets a pull request's
 review bound — **both** the durable round count and the manager's adjudication. The loop then
 resumes from zero and arms a round at the current head.

@@ -80,6 +80,8 @@ pub enum CompletionReason {
     /// The watched pull request was observed CONFLICTED and its ticket is being routed back to its
     /// author to publish a working diff (STUDIO-961).
     Conflict,
+    /// Required checks concluded red at the watched head (STUDIO-1994).
+    CiFailure,
 }
 
 /// One finished review round, as the CONTROL TASK observed it, on its way to a comment.
@@ -196,6 +198,19 @@ pub fn summons_author(body: &str, token: &str) -> bool {
 /// re-review loop needs — read the comments, push to this branch — rather than merely announcing
 /// that a review happened.
 pub fn re_engage_comment(c: &ReviewCompletion) -> String {
+    if c.reason == CompletionReason::CiFailure {
+        return format!(
+            "{} — {}, required CI checks FAILED at `{}`.\n\n{}\nFix the cause, run the checks locally and push to this branch. Do not loosen, skip or delete tests to get green. The daemon watches for your push; no new ticket is needed.",
+            c.summon_token,
+            if c.author.is_empty() {
+                "author"
+            } else {
+                &c.author
+            },
+            c.head_sha,
+            c.verdict_text,
+        );
+    }
     if c.reason == CompletionReason::Conflict {
         return conflict_comment(c);
     }
