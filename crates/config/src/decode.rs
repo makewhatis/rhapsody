@@ -67,6 +67,8 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     }
     let limits = r.limits.clone().unwrap_or_default();
     limits.validate().map_err(ConfigError::Parse)?;
+    let scratch = r.scratch.clone().unwrap_or_default();
+    scratch.validate().map_err(ConfigError::Parse)?;
     let credential_canary_interval_ms = r.agent.credential_canary_interval_ms.unwrap_or(1_800_000);
     if credential_canary_interval_ms <= 0 {
         return Err(ConfigError::Parse(
@@ -393,6 +395,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         budgets,
         prices: r.prices.into_iter().collect(),
         limits,
+        scratch,
         notify,
         comms,
         providers,

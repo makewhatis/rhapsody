@@ -33,6 +33,7 @@ pub mod providers;
 pub mod resolve;
 pub mod room;
 pub mod routing;
+pub mod scratch;
 pub mod teams;
 pub mod validate;
 pub mod warnings;
@@ -70,5 +71,6 @@ pub use providers::{
     normalize_provider_base_url, validate_model_id,
 };
 pub use resolve::{Resolved, resolve};
+pub use scratch::Scratch;
 pub use validate::{ValidationError, validate, validate_providers_only};
 pub use warnings::{LegacyWarning, legacy_warnings};

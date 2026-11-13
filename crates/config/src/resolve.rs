@@ -88,6 +88,18 @@ pub fn resolve(mut config: Config, workflow_dir: &str) -> Result<Resolved, Confi
     }
     config.logging.dir = clean(&abs(&log_dir)?);
 
+    // scratch.root: $VAR + ~ + relative-to-workflow-dir + absolute. Default ~/.rhapsody/scratch,
+    // the daemon-owned root per-run scratch directories live under (STUDIO-1993). Rhapsody-only.
+    let mut scratch_root = resolve_var(&config.scratch.root);
+    if scratch_root.is_empty() {
+        scratch_root = "~/.rhapsody/scratch".to_string();
+    }
+    scratch_root = expand_tilde(&scratch_root);
+    if !is_abs(&scratch_root) {
+        scratch_root = join(workflow_dir, &scratch_root);
+    }
+    config.scratch.root = clean(&abs(&scratch_root)?);
+
     // storage.path: $VAR + ~ + absolute. Default ~/.rhapsody/rhapsody.db (TRA-238 divergence; see the
     // workspace-root note above). "off" (case-insensitive) and ":memory:" (exact) are sentinels
     // honored verbatim — NOT path-resolved. Evaluate them against the resolved+trimmed value. Unlike
@@ -398,6 +410,25 @@ mod tests {
         c.workspace.root = "ws".to_string();
         let r = resolve(c, ".").expect("resolve");
         assert!(Path::new(&r.workspace.root).is_absolute());
+    }
+
+    // STUDIO-1993: scratch.root is normalized exactly like workspace.root — default, tilde, and
+    // relative-to-workflow-dir all resolve absolute. Rhapsody-only.
+    #[test]
+    fn scratch_root_is_normalized_like_workspace_root() {
+        let r = resolve(decode_blank(), "/tmp/wf").expect("resolve");
+        assert_eq!(r.scratch.root, clean(&expand_tilde("~/.rhapsody/scratch")));
+
+        let mut c = decode_blank();
+        c.scratch.root = "~/sc".to_string();
+        let r = resolve(c, "/tmp/wf").expect("resolve");
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert_eq!(r.scratch.root, join(&home, "sc"));
+
+        let mut c = decode_blank();
+        c.scratch.root = "rel-scratch".to_string();
+        let r = resolve(c, "/home/user/project").expect("resolve");
+        assert_eq!(r.scratch.root, "/home/user/project/rel-scratch");
     }
 
     // Mirrors Go `TestResolveSetsWorkflowDir`.
