@@ -91,7 +91,9 @@ mod tests {
     fn an_unconfigured_block_encodes_back_to_nothing() {
         // The default block must not be written into a saved workflow, so an install that never
         // configured scratch stays byte-identical on a console Save.
-        let def = crate::workflow::parse("---\ntracker:\n  kind: linear\n  project_slug: p\n---\nprompt").unwrap();
+        let def =
+            crate::workflow::parse("---\ntracker:\n  kind: linear\n  project_slug: p\n---\nprompt")
+                .unwrap();
         let cfg = crate::decode::decode(&def).unwrap();
         let encoded = crate::encode::encode(&cfg).unwrap();
         assert!(

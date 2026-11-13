@@ -915,11 +915,11 @@ impl OpencodeSession {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take();
-        if let Some(dir) = taken {
-            if keep {
-                dir.keep();
-            }
-            // Dropping `dir` removes it unless it was kept.
+        // Dropping `dir` removes the directory unless it was kept.
+        if let Some(dir) = taken
+            && keep
+        {
+            dir.keep();
         }
     }
 
@@ -1552,7 +1552,6 @@ impl OpencodeSession {
         // the always-on biometric-disable variable, applied to EVERY posture (legacy, manager,
         // brokered) so an `op` call in any of them fails fast instead of prompting. Injected into
         // the executor child env only; never logged.
-        let mut env = env;
         {
             let token = self
                 .onepassword_token
@@ -5147,9 +5146,10 @@ printf '{"type":"step_finish","sessionID":"ses_new","part":{"reason":"stop"}}\n'
             dir11.is_dir(),
             "a cut-off run must keep its scratch directory for the resume"
         );
-        let rec: crate::opencode::resume::ResumeRecord =
-            serde_json::from_str(&std::fs::read_to_string(record_file(&sr, "STUDIO-1993")).unwrap())
-                .expect("record parses");
+        let rec: crate::opencode::resume::ResumeRecord = serde_json::from_str(
+            &std::fs::read_to_string(record_file(&sr, "STUDIO-1993")).unwrap(),
+        )
+        .expect("record parses");
         assert_eq!(
             rec.scratch_dir,
             dir11.to_string_lossy(),

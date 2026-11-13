@@ -787,6 +787,22 @@ export async function fetchAccounts(): Promise<AccountView[]> {
   return response.accounts ?? [];
 }
 
+/** The per-run scratch-directory view (STUDIO-1993): the managed root's usage and the volume's
+ *  free space. `scratch` is null when the daemon did not assemble the view. */
+export interface ScratchStatus {
+  root: string;
+  dirs: number;
+  used_bytes: number;
+  free_gib: number | null;
+  min_free_gib: number;
+  held: boolean;
+}
+
+export async function fetchSystem(): Promise<{ scratch: ScratchStatus | null }> {
+  const response = await getJSON<{ scratch: ScratchStatus | null }>("/api/v1/system");
+  return { scratch: response.scratch ?? null };
+}
+
 export interface LeadDecision {
   id: number; subject: string; trigger: string; at: string; decision: string;
   reasoning: string; evidence: string; actions: string; harness: string; model: string;

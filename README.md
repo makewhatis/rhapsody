@@ -169,6 +169,30 @@ owners retain legacy authentication; configured owners still use their scoped to
 the existing environment and authentication behavior are unchanged. This is credential selection
 and fallback prevention, not an OS sandbox against a process that deliberately reads the user's files.
 
+### Per-run scratch directories
+
+Every dispatched run gets its own scratch directory under one daemon-owned root, and its agent
+process is pointed at it (`TMPDIR`, and `CARGO_TARGET_DIR` when the environment does not already set
+one), so the build output and temp files a coding agent creates land somewhere the daemon can
+reclaim. An agent's own `$TMPDIR/opencode/...` trees from before this setting existed are swept too.
+
+```yaml
+scratch:
+  root: ~/.rhapsody/scratch   # where per-run scratch dirs live; default ~/.rhapsody/scratch
+  ttl_hours: 24               # delete a run's dir once its run is not live; 0 disables
+  legacy_ttl_hours: 48        # delete stale $TMPDIR/opencode/* trees; 0 disables
+  min_free_gib: 50            # hold new dispatches below this much free space
+```
+
+A run's directory is removed when the run ends, unless the run was retained for a resume (a cut-off
+attempt whose session is kept), in which case the resumed run adopts and eventually removes it. A
+janitor runs once at startup and hourly: it deletes a managed-root directory whose run is no longer
+live and is older than `ttl_hours`, and a `$TMPDIR/opencode/*` directory older than
+`legacy_ttl_hours` that no live run's path sits under, logging each removal with its size. When free
+space on the scratch volume drops below `min_free_gib`, new dispatches are held (with the reason in
+the log) and the janitor runs at once. The dashboard's system panel shows the scratch root's usage
+and the volume's free space at `GET /api/v1/system`.
+
 Landing is configured with `projects[].landing` in WORKFLOW.md's YAML front matter, not in
 `teams.yaml`. The [Landing configuration reference](LANDING.md#workflowmd-configuration-reference)
 lists all eight keys (`enabled`, `auto_revert`, `deploy_timeout`, `watch`, `failure_threshold`,
@@ -224,6 +248,21 @@ requires byte-identical output. Editing, corrupting, or losing a committed golde
 Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this section says
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
+
+### Daemon-owned per-run scratch directories, a janitor and a disk guard (STUDIO-1993)
+
+The Go daemon lets each coding agent choose its own `$TMPDIR` paths and never removes them, so build
+output and probe checkouts accumulate under `$TMPDIR/opencode` without bound (180 GiB and growing on
+the operator's Mac). Rhapsody sets `TMPDIR`, and `CARGO_TARGET_DIR` when the environment does not
+already set one, to a per-run directory under one daemon-owned root (`scratch.root`, default
+`~/.rhapsody/scratch`) for both the OpenCode and Claude harnesses. The run's directory is removed at
+run end, kept when the run is retained for a resume and removed when that resume ends, and reclaimed
+by a boot+hourly janitor after `scratch.ttl_hours`; the janitor also removes stale `$TMPDIR/opencode`
+trees older than `scratch.legacy_ttl_hours`. When free space falls below `scratch.min_free_gib`, new
+dispatches are held and the janitor runs at once. An additive `GET /api/v1/system` endpoint exposes
+the scratch usage and free space for the dashboard; `/api/v1/state` is unchanged and stays
+byte-identical to the Go payload. A configuration that never writes `scratch:` behaves as before,
+apart from the child environment now pointing at the daemon-owned root.
 
 ### Linear request budget, 429 handling and completion retry (STUDIO-1896)
 

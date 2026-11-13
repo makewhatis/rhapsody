@@ -2,6 +2,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { AccountsPanel } from "./AccountsPanel";
+import { ScratchPanel } from "./AccountsPanel";
 import { LimitChips, jobLimitReports } from "./LimitChips";
 import type { AccountView } from "@/lib/api";
 
@@ -81,4 +82,18 @@ it("keeps a switched engine's history and names a verified identity handoff", ()
   expect(jobLimitReports([], [event], 3, "carol", 2)).toEqual([]);
   event.text = JSON.stringify({ ticket: "MT-1", account: "Claude", state: "handed_off", identity: "bob" });
   expect(jobLimitReports([], [event], 1, "bob")[0]).toMatchObject({ state: "handed_off", identity: "bob" });
+});
+
+describe("ScratchPanel", () => {
+  it("renders usage, free space, and the held warning", () => {
+    render(<ScratchPanel scratch={{ root: "/scratch", dirs: 2, used_bytes: 2 * 1024 * 1024 * 1024, free_gib: 12.5, min_free_gib: 50, held: true }} />);
+    expect(screen.getByText("dispatch held")).toBeTruthy();
+    expect(screen.getByText(/2 directories/)).toBeTruthy();
+    expect(screen.getByText("12.5 GiB free")).toBeTruthy();
+    expect(screen.getByText(/below the 50 GiB floor/)).toBeTruthy();
+  });
+  it("renders nothing without a configured root", () => {
+    const { container } = render(<ScratchPanel scratch={null} />);
+    expect(container.textContent).toBe("");
+  });
 });

@@ -166,7 +166,10 @@ mod tests {
             ScratchDir::provision(&root.to_string_lossy(), 0).is_none(),
             "no run id => off"
         );
-        assert!(!root.exists(), "nothing may be created when the feature is off");
+        assert!(
+            !root.exists(),
+            "nothing may be created when the feature is off"
+        );
     }
 
     #[test]
@@ -175,7 +178,10 @@ mod tests {
         let mut env = vec!["PATH=/bin".to_string(), "TMPDIR=/old".to_string()];
         apply_env(&mut env, dir);
         assert!(env.contains(&"TMPDIR=/scratch/9".to_string()));
-        assert!(!env.contains(&"TMPDIR=/old".to_string()), "TMPDIR is overridden");
+        assert!(
+            !env.contains(&"TMPDIR=/old".to_string()),
+            "TMPDIR is overridden"
+        );
         assert!(env.contains(&"CARGO_TARGET_DIR=/scratch/9".to_string()));
 
         let mut env = vec!["CARGO_TARGET_DIR=/operator/target".to_string()];
@@ -185,7 +191,9 @@ mod tests {
             "an inherited CARGO_TARGET_DIR must be honored"
         );
         assert_eq!(
-            env.iter().filter(|kv| kv.starts_with("CARGO_TARGET_DIR=")).count(),
+            env.iter()
+                .filter(|kv| kv.starts_with("CARGO_TARGET_DIR="))
+                .count(),
             1
         );
     }
@@ -197,7 +205,10 @@ mod tests {
         let s = ScratchDir::adopt(root.join("3"));
         assert_eq!(s.path(), root.join("3"));
         drop(s);
-        assert!(!root.join("3").exists(), "an adopted dir is removed on drop");
+        assert!(
+            !root.join("3").exists(),
+            "an adopted dir is removed on drop"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }

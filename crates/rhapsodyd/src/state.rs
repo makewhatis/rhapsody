@@ -251,6 +251,9 @@ impl StateProvider for DaemonState {
         self.handle
             .accounts(self.account_now_s.unwrap_or_else(|| Utc::now().timestamp()))
     }
+    async fn scratch_status(&self) -> Option<rhapsody_orchestrator::scratch::ScratchStatus> {
+        self.handle.scratch_status().await
+    }
     async fn clear_credential_hold(
         &self,
         harness: &str,

@@ -128,6 +128,29 @@ pub(crate) async fn handle_accounts(
     )
 }
 
+/// Additive, read-only scratch/disk view (STUDIO-1993): the managed scratch root's usage and the
+/// volume's free space, for the dashboard's system panel. `scratch` is `null` when the daemon did not
+/// assemble the view (a test provider, or a daemon whose loop is gone).
+pub(crate) async fn handle_system(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(response) = require_get(&method) {
+        return response;
+    }
+    let scratch = provider.scratch_status().await.map(|s| {
+        serde_json::json!({
+            "root": s.root,
+            "dirs": s.dirs,
+            "used_bytes": s.used_bytes,
+            "free_gib": s.free_gib,
+            "min_free_gib": s.min_free_gib,
+            "held": s.held,
+        })
+    });
+    write_json(StatusCode::OK, &serde_json::json!({ "scratch": scratch }))
+}
+
 /// Operator acknowledgement after re-authenticating, scoped to one harness/account.
 pub(crate) async fn handle_clear_credential(
     method: Method,
@@ -227,6 +250,44 @@ mod tests {
     }
 
     // ------- healthz (mirrors healthz_test.go) -------
+
+    #[tokio::test]
+    async fn system_endpoint_reports_scratch_usage_and_free_space() {
+        // No assembled view ⇒ `scratch: null` (never a 500).
+        let base = spawn(FakeProvider::ok(empty_snapshot())).await;
+        let response = reqwest::get(format!("{base}/api/v1/system")).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            serde_json::json!({"scratch": null})
+        );
+        // A POST is a 405, registered method-agnostically.
+        let response = crate::testutil::operator_client()
+            .post(format!("{base}/api/v1/system"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 405);
+
+        let status = rhapsody_orchestrator::scratch::ScratchStatus {
+            root: "/scratch".into(),
+            dirs: 3,
+            used_bytes: 4096,
+            free_gib: Some(12.5),
+            min_free_gib: 50,
+            held: true,
+        };
+        let base = spawn(FakeProvider::ok(empty_snapshot()).with_scratch_status(status)).await;
+        let response = reqwest::get(format!("{base}/api/v1/system")).await.unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            serde_json::json!({"scratch": {
+                "root": "/scratch", "dirs": 3, "used_bytes": 4096,
+                "free_gib": 12.5, "min_free_gib": 50, "held": true
+            }})
+        );
+    }
 
     #[tokio::test]
     async fn accounts_endpoint_shape() {

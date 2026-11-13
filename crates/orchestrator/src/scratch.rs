@@ -90,6 +90,40 @@ pub fn legacy_root() -> PathBuf {
     std::env::temp_dir().join("opencode")
 }
 
+/// The managed scratch root's usage: its direct-child count and total bytes. Best-effort.
+pub fn usage(root: &str) -> (u64, u64) {
+    if root.is_empty() {
+        return (0, 0);
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return (0, 0);
+    };
+    let mut dirs = 0u64;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        if entry.path().is_dir() {
+            dirs += 1;
+        }
+        bytes += dir_size(&entry.path());
+    }
+    (dirs, bytes)
+}
+
+/// The dashboard's scratch view: the managed root's usage and the volume's free space, plus whether
+/// the disk-pressure guard is currently holding dispatch. Rhapsody-only.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ScratchStatus {
+    pub root: String,
+    /// Direct children of the managed root (one per run that still has a scratch directory).
+    pub dirs: u64,
+    pub used_bytes: u64,
+    /// Free GiB on the scratch volume; `None` when it could not be read.
+    pub free_gib: Option<f64>,
+    pub min_free_gib: u64,
+    /// Whether free space is currently below the floor (dispatch is held).
+    pub held: bool,
+}
+
 /// Free GiB on the volume containing `path`, via `statvfs`. `None` when the path cannot be statted
 /// (a missing root, an unreadable mount) — the caller then does not hold dispatch, since a guard that
 /// holds on an unknown reading would strand every run.
@@ -341,6 +375,32 @@ impl ControlHandle {
         };
         run_sweep_and_log(&plan, SystemTime::now())
     }
+
+    /// The dashboard's scratch view: the managed root's usage and the volume's free space, read off
+    /// the control loop. Backs the additive `GET /api/v1/system` endpoint.
+    pub async fn scratch_status(&self) -> Option<ScratchStatus> {
+        let plan = self.scratch_sweep_plan().await?;
+        let root = plan.policy.root.clone();
+        let min_free_gib = plan.policy.min_free_gib;
+        tokio::task::spawn_blocking(move || {
+            if root.is_empty() {
+                return ScratchStatus::default();
+            }
+            let (dirs, used_bytes) = usage(&root);
+            let free = free_gib(Path::new(&root));
+            let held = free.is_some_and(|f| f < min_free_gib as f64);
+            ScratchStatus {
+                root,
+                dirs,
+                used_bytes,
+                free_gib: free,
+                min_free_gib,
+                held,
+            }
+        })
+        .await
+        .ok()
+    }
 }
 
 #[cfg(test)]
@@ -391,7 +451,10 @@ mod tests {
         assert!(!root.join("1").exists());
         assert!(root.join("2").is_dir(), "a live run's dir is never touched");
         assert!(root.join("3").is_dir(), "a fresh dir is kept");
-        assert!(root.join("notes").is_dir(), "a non-run-id child is left alone");
+        assert!(
+            root.join("notes").is_dir(),
+            "a non-run-id child is left alone"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -419,7 +482,10 @@ mod tests {
         assert_eq!(deleted.len(), 1);
         assert!(deleted[0].path.ends_with("carini-181-jimmy-target"));
         assert!(!root.join("carini-181-jimmy-target").exists());
-        assert!(root.join("live-run").is_dir(), "a live run's path is protected");
+        assert!(
+            root.join("live-run").is_dir(),
+            "a live run's path is protected"
+        );
         assert!(root.join("fresh").is_dir());
         let _ = fs::remove_dir_all(&root);
     }
@@ -431,12 +497,21 @@ mod tests {
             min_free_gib: 50,
             ..Default::default()
         };
-        assert!(dispatch_hold(&policy, 49.9).is_some(), "under the floor holds");
-        assert!(dispatch_hold(&policy, 50.0).is_none(), "at the floor releases");
+        assert!(
+            dispatch_hold(&policy, 49.9).is_some(),
+            "under the floor holds"
+        );
+        assert!(
+            dispatch_hold(&policy, 50.0).is_none(),
+            "at the floor releases"
+        );
         assert!(dispatch_hold(&policy, 200.0).is_none(), "above releases");
         let reason = dispatch_hold(&policy, 12.34).unwrap();
         assert!(reason.contains("12.3 GiB"), "the reason names the reading");
-        assert!(reason.contains("50 GiB floor"), "the reason names the floor");
+        assert!(
+            reason.contains("50 GiB floor"),
+            "the reason names the floor"
+        );
     }
 
     #[test]
