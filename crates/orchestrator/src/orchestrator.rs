@@ -451,6 +451,20 @@ pub struct Orchestrator {
     /// failure logs and drops the section rather than failing the run.
     pub teams_profiles_dir: Option<std::path::PathBuf>,
 
+    /// The path `teams.yaml` was loaded from (STUDIO-1976), or `None` when the daemon runs without
+    /// an on-disk runtime home. [`start_watch_teams`](Orchestrator::start_watch_teams) polls this
+    /// file's mtime and folds a validated change's ROUTING fields into
+    /// [`teams`](Orchestrator::teams) at the next control tick — the live model/provider switch,
+    /// with no restart.
+    pub teams_config_path: Option<std::path::PathBuf>,
+
+    /// The daemon's off-loop observer of a teams ROUTING reload (STUDIO-1976), mirroring
+    /// [`provider_reload`](Orchestrator::provider_reload). Installed by the composition root so a
+    /// boot-captured off-loop consumer (the triage task's one-shot manager turn) can see the same
+    /// routing the control task just applied. `None` for tests and any embedding with no off-loop
+    /// Teams consumer, which keeps the path byte-identical.
+    pub teams_routing_sink: Option<Arc<dyn crate::teamsreload::TeamsRoutingSink>>,
+
     /// The Rhapsody Teams **local** memory bank the dispatch path recalls from (STUDIO-645, T4;
     /// design record §5.2). `None` whenever there is nothing to recall: Teams off, no on-disk
     /// runtime home, or `memory.backend` set to anything other than `local`.
@@ -1312,6 +1326,8 @@ impl Orchestrator {
             capabilities_registry: None,
             teams: None,
             teams_profiles_dir: None,
+            teams_config_path: None,
+            teams_routing_sink: None,
             teams_bank: None,
             teams_prefetch: None,
             teams_triage: None,

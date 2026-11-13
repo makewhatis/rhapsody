@@ -21,6 +21,10 @@ use rhapsody_httpapi::{
 };
 use rhapsody_orchestrator::drain::{DrainReason, DrainStatus};
 use rhapsody_orchestrator::managerread::ManagerReadOutcome;
+use rhapsody_orchestrator::modelsview::{
+    RoutingEntry, RoutingView, TeamsModelsApplyResult, TeamsModelsError, TeamsModelsRequest,
+    TeamsModelsView, validate_identity_routing, validate_manager_routing, validate_review_routing,
+};
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::rundiff::DiffOutcome;
@@ -663,6 +667,139 @@ impl StateProvider for DaemonState {
         &self.teams_config_path
     }
 
+    // ── STUDIO-1976: Settings → Models ────────────────────────────────────────
+    //
+    // The view is built by the orchestrator's pure `modelsview` (the same resolver `teams show`
+    // uses), and the writes go through the config crate's comment-preserving editors. The daemon
+    // owns the file paths and the room line; the orchestrator owns the resolution.
+
+    async fn teams_models(&self) -> Result<TeamsModelsView, TeamsModelsError> {
+        let (teams, cfg, profiles_dir) = self.models_inputs()?;
+        Ok(rhapsody_orchestrator::modelsview::build_view(
+            &cfg,
+            &teams,
+            &profiles_dir,
+        ))
+    }
+
+    async fn teams_models_apply(
+        &self,
+        req: TeamsModelsRequest,
+    ) -> Result<TeamsModelsApplyResult, TeamsModelsError> {
+        let (teams, cfg, profiles_dir) = self.models_inputs()?;
+        let teams_path = std::path::PathBuf::from(&self.teams_config_path);
+        let mut changed: Vec<String> = Vec::new();
+        let mut previous: Vec<RoutingEntry> = Vec::new();
+
+        match req {
+            TeamsModelsRequest::Identity { name, routing } => {
+                let id = find_identity(&teams, &name)?;
+                validate_identity_routing(&cfg, &routing, &identity_view(id))
+                    .map_err(TeamsModelsError::Invalid)?;
+                write_profile_routing(&profiles_dir, &id.profile, &routing)?;
+                changed.push(models_line(&name, &routing));
+            }
+            TeamsModelsRequest::Review {
+                harness,
+                model,
+                provider,
+                effort,
+            } => {
+                if !rhapsody_orchestrator::modelsview::RUNNABLE_HARNESSES
+                    .contains(&harness.as_str())
+                {
+                    return Err(TeamsModelsError::Invalid(format!(
+                        "harness {harness:?} is not one this build can run"
+                    )));
+                }
+                validate_review_routing(&cfg, &harness, &provider)
+                    .map_err(TeamsModelsError::Invalid)?;
+                rhapsody_config::teams::save_review_routing(
+                    &teams_path,
+                    &harness,
+                    &model,
+                    &provider,
+                    &effort,
+                )
+                .map_err(map_teams_write_err)?;
+                changed.push(format!("models: review[{harness}] → {harness}/{model}"));
+            }
+            TeamsModelsRequest::Manager { routing } => {
+                validate_manager_routing(&cfg, &routing).map_err(TeamsModelsError::Invalid)?;
+                rhapsody_config::teams::save_manager_routing(
+                    &teams_path,
+                    &routing.harness,
+                    &routing.provider,
+                    &routing.model,
+                    &routing.effort,
+                )
+                .map_err(map_teams_write_err)?;
+                changed.push(format!(
+                    "models: manager → {}/{}",
+                    routing.harness, routing.model
+                ));
+            }
+            TeamsModelsRequest::MoveAll { routing } => {
+                // Pre-check every target profile has a file AND its candidate tuple resolves, so a
+                // missing file or an unrunnable tuple refuses the WHOLE move rather than leaving a
+                // partial write with no undo payload.
+                let targets: Vec<&rhapsody_config::teams::Identity> = teams
+                    .roster
+                    .iter()
+                    .filter(|id| !teams.review.is_code_reviewer(id))
+                    .collect();
+                for id in &targets {
+                    require_profile_file(&profiles_dir, &id.profile)?;
+                    validate_identity_routing(&cfg, &routing, &identity_view(id))
+                        .map_err(TeamsModelsError::Invalid)?;
+                }
+                // Snapshot EVERY target's previous tuple BEFORE writing any of them. Two identities
+                // may share one profile file, so reading inside the write loop would record the
+                // already-switched value for the second and leave the undo a no-op for it.
+                for id in &targets {
+                    previous.push(RoutingEntry {
+                        name: id.name.clone(),
+                        routing: read_profile_routing_view(&profiles_dir, &id.profile),
+                    });
+                }
+                for id in &targets {
+                    write_profile_routing(&profiles_dir, &id.profile, &routing)?;
+                    changed.push(models_line(&id.name, &routing));
+                }
+            }
+            TeamsModelsRequest::Undo { previous: entries } => {
+                let mut resolved = Vec::with_capacity(entries.len());
+                for entry in entries {
+                    let id = find_identity(&teams, &entry.name)?;
+                    require_profile_file(&profiles_dir, &id.profile)?;
+                    validate_identity_routing(&cfg, &entry.routing, &identity_view(id))
+                        .map_err(TeamsModelsError::Invalid)?;
+                    resolved.push((id, entry.routing));
+                }
+                for (id, routing) in resolved {
+                    write_profile_routing(&profiles_dir, &id.profile, &routing)?;
+                    changed.push(models_line(&id.name, &routing));
+                }
+            }
+        }
+
+        // Reload the view from disk so it reflects the writes immediately (the live routing the
+        // daemon itself applies follows via the `teamsreload` watcher within its poll interval).
+        let (teams, cfg, profiles_dir) = self.models_inputs()?;
+        let view = rhapsody_orchestrator::modelsview::build_view(&cfg, &teams, &profiles_dir);
+
+        // One operator room line per change; best-effort, exactly like a teammate post.
+        for line in &changed {
+            let _ = self.teams_room_post(line, &[]).await;
+        }
+
+        Ok(TeamsModelsApplyResult {
+            view,
+            previous,
+            changed,
+        })
+    }
+
     /// The room's read side (STUDIO-650, T5) — the fifth Teams surface, and read-only in the
     /// strongest sense: serving it advances no identity's cursor.
     async fn teams_room(&self, limit: usize) -> Result<RoomView, TeamsMemoryError> {
@@ -789,6 +926,138 @@ impl DaemonState {
     fn teams_memory(&self) -> Result<&Arc<TeamsMemory>, TeamsMemoryError> {
         self.handle.teams_memory().ok_or(TeamsMemoryError::Disabled)
     }
+
+    /// The inputs the Models view and writes need: the loaded `teams.yaml`, the decoded workflow
+    /// config, and the profiles directory beside `teams.yaml`. `Disabled` when there is no Teams
+    /// runtime home or Teams is off.
+    fn models_inputs(
+        &self,
+    ) -> Result<
+        (
+            rhapsody_config::teams::Teams,
+            rhapsody_config::Config,
+            std::path::PathBuf,
+        ),
+        TeamsModelsError,
+    > {
+        if self.teams_config_path.is_empty() {
+            return Err(TeamsModelsError::Disabled);
+        }
+        let teams_path = std::path::Path::new(&self.teams_config_path);
+        let teams = rhapsody_config::teams::Teams::try_load(teams_path)
+            .map_err(|e| TeamsModelsError::Io(e.to_string()))?;
+        if !teams.enabled {
+            return Err(TeamsModelsError::Disabled);
+        }
+        let def =
+            rhapsody_config::workflow::load(std::path::Path::new(self.handle.workflow_path()))
+                .map_err(|e| TeamsModelsError::Io(e.to_string()))?;
+        let cfg = rhapsody_config::decode::decode(&def)
+            .map_err(|e| TeamsModelsError::Io(e.to_string()))?;
+        let profiles_dir = teams_path
+            .parent()
+            .map(|p| p.join("teams").join("profiles"))
+            .unwrap_or_else(|| std::path::PathBuf::from("teams/profiles"));
+        Ok((teams, cfg, profiles_dir))
+    }
+}
+
+// ── STUDIO-1976: Settings → Models helpers ────────────────────────────────────
+
+/// The roster identity named `name`, or a 404.
+fn find_identity<'a>(
+    teams: &'a rhapsody_config::teams::Teams,
+    name: &str,
+) -> Result<&'a rhapsody_config::teams::Identity, TeamsModelsError> {
+    teams
+        .roster
+        .iter()
+        .find(|i| i.name == name)
+        .ok_or_else(|| TeamsModelsError::Unknown(format!("no roster identity {name:?}")))
+}
+
+/// The roster entry's own routing fields as the Settings view/write sees them.
+fn identity_view(id: &rhapsody_config::teams::Identity) -> RoutingView {
+    RoutingView {
+        harness: id.harness.clone(),
+        provider: id.provider.clone(),
+        model: id.model.clone(),
+        effort: id.effort.clone(),
+    }
+}
+
+/// Writes one teammate's routing into its profile file's front matter, preserving the body and every
+/// comment. A profile with no file of its own (a built-in-only profile) cannot be edited here and is
+/// reported rather than silently seeded.
+fn write_profile_routing(
+    dir: &std::path::Path,
+    profile: &str,
+    routing: &RoutingView,
+) -> Result<(), TeamsModelsError> {
+    require_profile_file(dir, profile)?;
+    let path = rhapsody_config::profiles::profile_path(dir, profile);
+    let pr = rhapsody_config::profiles::ProfileRouting {
+        harness: routing.harness.clone(),
+        provider: routing.provider.clone(),
+        model: routing.model.clone(),
+        effort: routing.effort.clone(),
+    };
+    rhapsody_config::profiles::save_routing(&path, &pr)
+        .map_err(|e| TeamsModelsError::Invalid(e.to_string()))?;
+    Ok(())
+}
+
+/// A batch write's pre-flight: every target profile must have a file, checked BEFORE any write so a
+/// missing one refuses the whole batch rather than leaving a partial change.
+fn require_profile_file(dir: &std::path::Path, profile: &str) -> Result<(), TeamsModelsError> {
+    let path = rhapsody_config::profiles::profile_path(dir, profile);
+    if !path.exists() {
+        return Err(TeamsModelsError::Invalid(format!(
+            "profile {profile:?} has no file at {} to edit; run `rhapsodyd teams fork {profile}` first",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+/// The profile file's CURRENT routing front matter, best-effort (empty when the file is absent).
+fn read_profile_routing_view(dir: &std::path::Path, profile: &str) -> RoutingView {
+    let path = rhapsody_config::profiles::profile_path(dir, profile);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return RoutingView::default();
+    };
+    let r = rhapsody_config::profiles::read_routing(&text);
+    RoutingView {
+        harness: r.harness,
+        provider: r.provider,
+        model: r.model,
+        effort: r.effort,
+    }
+}
+
+/// Maps a `teams.yaml` write failure onto the Models error: a validation rejection is a 400, an I/O
+/// failure a 500.
+fn map_teams_write_err(err: rhapsody_config::teams::TeamsError) -> TeamsModelsError {
+    match err {
+        rhapsody_config::teams::TeamsError::Invalid(m)
+        | rhapsody_config::teams::TeamsError::Parse(m) => TeamsModelsError::Invalid(m),
+        rhapsody_config::teams::TeamsError::Io(m) => TeamsModelsError::Io(m),
+    }
+}
+
+/// One room line for a routing change, e.g. `models: jerry → opencode/deepseek-v4p1-flash`.
+fn models_line(name: &str, routing: &RoutingView) -> String {
+    let harness = if routing.harness.is_empty() {
+        "inherit"
+    } else {
+        routing.harness.as_str()
+    };
+    let model = if routing.model.is_empty() {
+        "inherit"
+    } else {
+        routing.model.as_str()
+    };
+    format!("models: {name} → {harness}/{model}")
 }
 
 #[cfg(test)]
@@ -973,5 +1242,170 @@ mod tests {
             st.snapshot().await.is_err(),
             "no loop ⇒ snapshot unavailable"
         );
+    }
+
+    // ── STUDIO-1976: Settings → Models ────────────────────────────────────────
+
+    const WORKFLOW_WITH_PROVIDER: &str = "---\nagent:\n  backend: opencode\nproviders:\n  fireworks:\n    protocol: openai-compatible\n    base_url: http://127.0.0.1:9\n---\nbody\n";
+    const TEAMS_WITH_PROFILES: &str = "enabled: true\nreview:\n  mode: ticketless\n  code_review_profiles: [reviewer]\nmanager:\n  mode: labels\n  model: m\nroster:\n  - name: jerry\n    profile: swe-jr\n  - name: rev\n    profile: reviewer\n";
+
+    /// A daemon state over a temp `teams.yaml` + profiles dir + WORKFLOW.md.
+    fn models_state() -> (crate::testutil::TempDir, DaemonState) {
+        let dir = crate::testutil::TempDir::new();
+        let wf = dir.child("WORKFLOW.md");
+        std::fs::write(&wf, WORKFLOW_WITH_PROVIDER).unwrap();
+        let teams_path = dir.child("teams.yaml");
+        std::fs::write(&teams_path, TEAMS_WITH_PROFILES).unwrap();
+        let profiles = dir.child("teams/profiles");
+        std::fs::create_dir_all(&profiles).unwrap();
+        std::fs::write(
+            profiles.join("swe-jr.md"),
+            "---\nextends: swe\nharness: claude\n---\n{{ base }}\n\nBody line.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            profiles.join("reviewer.md"),
+            "---\nextends: swe\n---\nbody\n",
+        )
+        .unwrap();
+        let store: Arc<dyn Store + Send + Sync> =
+            Arc::new(Sqlite::open(StorePath::InMemory).unwrap());
+        let mut o = Orchestrator::new(wf.to_string_lossy().to_string());
+        o.set_store(store);
+        let st = DaemonState::new(o.control())
+            .with_teams_config_path(teams_path.to_string_lossy().to_string());
+        (dir, st)
+    }
+
+    fn routing(harness: &str, provider: &str, model: &str) -> RoutingView {
+        RoutingView {
+            harness: harness.into(),
+            provider: provider.into(),
+            model: model.into(),
+            effort: "high".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn move_all_skips_reviewers_and_undo_round_trips() {
+        let (_dir, st) = models_state();
+        let profiles =
+            std::path::Path::new(st.teams_config_path()).with_file_name("teams/profiles");
+        let res = st
+            .teams_models_apply(TeamsModelsRequest::MoveAll {
+                routing: routing("opencode", "fireworks", "deepseek-v4p1-flash"),
+            })
+            .await
+            .expect("move all");
+        // jerry moved; rev is a code reviewer and was skipped.
+        assert_eq!(res.previous.len(), 1);
+        assert_eq!(res.previous[0].name, "jerry");
+        assert_eq!(res.previous[0].routing.harness, "claude");
+        let moved = std::fs::read_to_string(profiles.join("swe-jr.md")).unwrap();
+        assert!(moved.contains("harness: opencode\n"));
+        assert!(moved.contains("model: deepseek-v4p1-flash\n"));
+        assert!(moved.ends_with("Body line.\n"), "body preserved: {moved}");
+        assert!(
+            !std::fs::read_to_string(profiles.join("reviewer.md"))
+                .unwrap()
+                .contains("opencode")
+        );
+        // Undo restores exactly.
+        st.teams_models_apply(TeamsModelsRequest::Undo {
+            previous: res.previous,
+        })
+        .await
+        .expect("undo");
+        let restored = std::fs::read_to_string(profiles.join("swe-jr.md")).unwrap();
+        assert!(restored.contains("harness: claude\n"));
+        assert!(!restored.contains("deepseek-v4p1-flash"));
+    }
+
+    /// Two workers wearing the SAME profile: the previous tuple must be snapshotted before any
+    /// write, or the second worker's snapshot records the already-switched value and the undo
+    /// cannot restore the shared file.
+    #[tokio::test]
+    async fn move_all_undo_round_trips_when_two_workers_share_a_profile() {
+        let (_dir, st) = models_state();
+        let teams_path = std::path::PathBuf::from(st.teams_config_path());
+        let profiles = teams_path.with_file_name("teams/profiles");
+        std::fs::write(
+            &teams_path,
+            "enabled: true\nreview:\n  mode: ticketless\n  code_review_profiles: [reviewer]\nmanager:\n  mode: labels\n  model: m\nroster:\n  - name: jerry\n    profile: swe-jr\n  - name: bob\n    profile: swe-jr\n  - name: rev\n    profile: reviewer\n",
+        )
+        .unwrap();
+        let original = std::fs::read_to_string(profiles.join("swe-jr.md")).unwrap();
+        let res = st
+            .teams_models_apply(TeamsModelsRequest::MoveAll {
+                routing: routing("opencode", "fireworks", "deepseek-v4p1-flash"),
+            })
+            .await
+            .expect("move all");
+        assert_eq!(res.previous.len(), 2);
+        // Both snapshots are the ORIGINAL tuple, taken before the first write.
+        assert!(res.previous.iter().all(|e| e.routing.harness == "claude"));
+        st.teams_models_apply(TeamsModelsRequest::Undo {
+            previous: res.previous,
+        })
+        .await
+        .expect("undo");
+        assert_eq!(
+            std::fs::read_to_string(profiles.join("swe-jr.md")).unwrap(),
+            original
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_tuple_is_refused_and_the_old_value_kept() {
+        let (_dir, st) = models_state();
+        let profiles =
+            std::path::Path::new(st.teams_config_path()).with_file_name("teams/profiles");
+        let before = std::fs::read_to_string(profiles.join("swe-jr.md")).unwrap();
+        // An unknown provider is refused.
+        assert!(
+            st.teams_models_apply(TeamsModelsRequest::Identity {
+                name: "jerry".into(),
+                routing: routing("opencode", "not-defined", "m"),
+            })
+            .await
+            .is_err()
+        );
+        // A provider on `claude` is refused.
+        assert!(
+            st.teams_models_apply(TeamsModelsRequest::Identity {
+                name: "jerry".into(),
+                routing: routing("claude", "fireworks", "m"),
+            })
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            std::fs::read_to_string(profiles.join("swe-jr.md")).unwrap(),
+            before
+        );
+    }
+
+    #[tokio::test]
+    async fn a_review_change_writes_teams_yaml_and_the_view_reflects_it() {
+        let (_dir, st) = models_state();
+        st.teams_models_apply(TeamsModelsRequest::Review {
+            harness: "opencode".into(),
+            model: "deepseek-v4p1-flash".into(),
+            provider: "fireworks".into(),
+            effort: "high".into(),
+        })
+        .await
+        .expect("review change");
+        let text = std::fs::read_to_string(st.teams_config_path()).unwrap();
+        assert!(text.contains("review:"));
+        assert!(text.contains("    opencode: deepseek-v4p1-flash"));
+        let view = st.teams_models().await.expect("view");
+        let row = view
+            .review
+            .iter()
+            .find(|r| r.harness == "opencode")
+            .expect("opencode review row");
+        assert_eq!(row.model, "deepseek-v4p1-flash");
+        assert_eq!(row.provider, "fireworks");
     }
 }

@@ -478,6 +478,9 @@ where
             ));
         }
         o.teams = Some(teams_cfg.clone());
+        // STUDIO-1976: the path the routing watcher polls so a live model/provider edit applies
+        // without a restart (see `teamsreload`). Teams-off / no-runtime-home leaves this `None`.
+        o.teams_config_path = Some(teams_path.clone());
         // A failed sandbox self-test disables only investigate, never manager authority.
         if teams_cfg.enabled
             && teams_cfg.manager.lead.investigate.enabled
@@ -1157,6 +1160,14 @@ where
                 rhapsody_config::providers::provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms),
                 Some(Arc::clone(&manager_source)),
                 cfg,
+                // The boot native-adjudication fallback (STUDIO-1976 review B1): the same
+                // `review.model` resolution the composition root puts on the AdjudicationTurn below,
+                // so CLEARING `manager.model` later moves native adjudication off the removed boot
+                // model instead of spending it.
+                &rhapsody_orchestrator::reviewadjudicate::adjudication_model(
+                    &teams_cfg,
+                    &cfg.agent.backend,
+                ),
             ))
         }
         // Teams cannot be on without a readable workflow, so this arm is unreachable in
@@ -1168,6 +1179,20 @@ where
             String::new(),
         )),
     };
+
+    // STUDIO-1976 review B1: hand the manager arbiter the routing sink so a live `teams.yaml` edit
+    // re-resolves its tuple for the NEXT manager turn. The triage task's own manager model is
+    // published through `TriageHandle` by `on_teams_reload` directly; this covers the arbiter, which
+    // the control task cannot reach. Installed before `o.run()` moves the orchestrator into the loop.
+    o.set_teams_routing_sink(Arc::new(
+        rhapsody_orchestrator::teamsreload::ManagerArbiterRoutingSink::new(
+            Arc::clone(&manager_arbiter),
+            resolved
+                .as_ref()
+                .map(|c| c.agent.backend.clone())
+                .unwrap_or_default(),
+        ),
+    ));
 
     let triage_task = if let Some(seam) = triage_seam {
         let triage_ctx = shutdown.wait();

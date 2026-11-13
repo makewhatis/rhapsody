@@ -581,7 +581,16 @@ impl Orchestrator {
             .as_ref()
             .filter(|t| t.review_ticketless())
             .and_then(|teams| {
-                match teams.review_model_for(&self.review_harness_for(&iss), &fallback) {
+                let harness = self.review_harness_for(&iss);
+                // A `review.provider` scoped to another harness is the provider-half of the model
+                // refusal below (STUDIO-1976 wires the provider into the selection; before that it
+                // was inert, so a wrong-harness value was silently dropped rather than refused).
+                if let rhapsody_config::teams::ReviewModelChoice::Refuse(why) =
+                    teams.review_provider_for(&harness, &fallback)
+                {
+                    return Some(why);
+                }
+                match teams.review_model_for(&harness, &fallback) {
                     rhapsody_config::teams::ReviewModelChoice::Refuse(why) => Some(why),
                     _ => None,
                 }
@@ -2083,8 +2092,107 @@ mod tests {
         );
     }
 
-    /// **jimmy round-1 finding 1 on PR #168, mutation-checked.** The `teams.route` events row is
-    /// the durable per-run record of the model an operator reads back to see what a run cost
+    /// STUDIO-1976 review B6: a roster identity's own `effort` is the identity tier folded under the
+    /// profile (profile > identity), so it must reach the run even when neither the profile nor
+    /// `review.effort` names one. The prepared selection carries no effort, so this dispatch
+    /// fallback is the only path it has.
+    ///
+    /// MUTATION: dropping the effort fold in `dispatch_issue`'s identity fallback leaves the run at
+    /// `""` and reds here.
+    #[test]
+    fn a_roster_identity_effort_reaches_a_review_run() {
+        let (mut o, _d) = orch_with_review(true);
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].effort = "xhigh".to_string();
+        }
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].model_override.effort, "xhigh",
+            "the roster identity's effort must reach the review run"
+        );
+    }
+
+    /// STUDIO-1976 review B6: a review is scoped by the harness the run ACTUALLY resolves to, which
+    /// is the roster identity's own harness when the profile is harness-silent. The old derivation
+    /// read only the profile (falling back to `agent.backend`), so a silent profile whose roster
+    /// entry named `opencode` was refused as a claude review — and would have been scoped to the
+    /// wrong override had it dispatched.
+    ///
+    /// MUTATION: reverting `review_harness_for`/the review tier to the profile-only derivation makes
+    /// this a `Refused(... runs the claude harness ...)` instead of a dispatch.
+    #[test]
+    fn a_review_is_scoped_by_the_roster_identitys_harness_when_the_profile_is_silent() {
+        let dir = TempDir::new();
+        write_profile(&dir, "swe", "---\nextends: swe\n---\nSwe.\n");
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_profiles_dir = Some(std::path::PathBuf::from(dir.child("profiles")));
+        if let Some(teams) = o.teams.as_mut() {
+            teams.roster[0].harness = "opencode".to_string();
+            teams.review.model.insert("opencode", "openai/gpt-6.1-sol");
+        }
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched,
+            "the review must dispatch on the roster harness, not be refused as a claude review"
+        );
+        let id = review_run("alice", HEAD_A).key();
+        assert_eq!(
+            o.running[&id].harness, "opencode",
+            "the roster identity's harness is the one the review runs on"
+        );
+        assert_eq!(
+            o.running[&id].model_override.model, "openai/gpt-6.1-sol",
+            "review.model.opencode must apply to the roster harness"
+        );
+    }
+
+    /// **STUDIO-1976 review B5: the review dispatch boundary.** A live `teams.yaml` edit applies to
+    /// the NEXT review round through the production `on_teams_reload` handler, while the review
+    /// already in flight keeps the model it started with.
+    #[test]
+    fn a_live_review_model_edit_applies_to_the_next_round_and_not_the_in_flight_one() {
+        let dir = TempDir::new();
+        let teams_path = dir.child("teams.yaml");
+        let yaml = |model: &str| {
+            format!(
+                "enabled: true\nreview:\n  mode: ticketless\n  model:\n    claude: {model}\nmanager:\n  mode: labels\n  model: m\nroster:\n  - name: alice\n    profile: swe\n"
+            )
+        };
+        std::fs::write(&teams_path, yaml("old-model")).expect("write teams");
+        let (mut o, _d) = orch_with_review(true);
+        o.teams_config_path = Some(std::path::PathBuf::from(&teams_path));
+        o.teams = Some(Teams::try_load(std::path::Path::new(&teams_path)).expect("boot teams"));
+
+        assert_eq!(
+            o.dispatch_review(review_run("alice", HEAD_A)),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id_a = review_run("alice", HEAD_A).key();
+        assert_eq!(o.running[&id_a].model_override.model, "old-model");
+
+        // The operator edits `review.model.claude` and the watcher's handler runs.
+        std::fs::write(&teams_path, yaml("new-model")).expect("write teams");
+        o.on_teams_reload();
+
+        // The in-flight review keeps the model it started with...
+        assert_eq!(o.running[&id_a].model_override.model, "old-model");
+        // ...and the next review round (a different pull request, so its slot is free) picks up the
+        // live one.
+        let mut next = review_run("alice", HEAD_B);
+        next.number = 13;
+        assert_eq!(
+            o.dispatch_review(next.clone()),
+            ReviewDispatchOutcome::Dispatched
+        );
+        let id_b = next.key();
+        assert_eq!(o.running[&id_b].model_override.model, "new-model");
+    }
+
+    /// **jimmy round-1 finding 1 on PR #168, mutation-checked.** The `teams.route` events row is    /// the durable per-run record of the model an operator reads back to see what a run cost
     /// (`RunningEntry::model_override`'s own doc, `route_teams`'s own doc). It must name what
     /// `review.model`/`review.effort` overrode to, not the reviewer's own profile — the exact
     /// mismatch a cost-allocation feature cannot afford. Reverting `record_route_event` to compose

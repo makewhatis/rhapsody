@@ -1064,6 +1064,27 @@ impl StateProvider for FakeProvider {
         &self.teams_config_path
     }
 
+    async fn teams_models(
+        &self,
+    ) -> Result<
+        rhapsody_orchestrator::modelsview::TeamsModelsView,
+        rhapsody_orchestrator::modelsview::TeamsModelsError,
+    > {
+        self.touch();
+        Err(rhapsody_orchestrator::modelsview::TeamsModelsError::Disabled)
+    }
+
+    async fn teams_models_apply(
+        &self,
+        _req: rhapsody_orchestrator::modelsview::TeamsModelsRequest,
+    ) -> Result<
+        rhapsody_orchestrator::modelsview::TeamsModelsApplyResult,
+        rhapsody_orchestrator::modelsview::TeamsModelsError,
+    > {
+        self.touch();
+        Err(rhapsody_orchestrator::modelsview::TeamsModelsError::Disabled)
+    }
+
     async fn reviews(&self) -> Result<ReviewsView, rhapsody_store::StoreError> {
         self.touch();
         match &self.reviews_err {

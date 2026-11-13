@@ -665,11 +665,10 @@ fn render_show(
 /// returns no credential.
 ///
 /// ⚠️ The tiers fed here are the tiers the DISPATCH path actually builds
-/// (`Orchestrator::selection_inputs`): the CLI has no ticket and no target project, and dispatch
-/// does NOT yet feed the identity or review tier — a roster entry's own `harness:`/`provider:`/
-/// `model:` and `review.provider` are parsed and displayed but do not reach a run (PR #273 round 1).
-/// Feeding them here would print a tuple no dispatch would ever produce and state an override as
-/// fact; they are reported separately, labeled configured-only, below.
+/// (`Orchestrator::selection_inputs`): the CLI has no ticket and no target project, but it DOES feed
+/// the roster identity's own `harness:`/`provider:`/`model:` as the identity tier, because dispatch
+/// does (STUDIO-1976) — so `show` cannot claim a tuple no dispatch would produce. The review tier is
+/// a review-run override and is reported separately below.
 ///
 /// A typed refusal is rendered IN PLACE of the resolved fields and the profile report is still
 /// printed above it: an invalid provider refuses the RUN, never degrades the whole Teams feature to
@@ -683,8 +682,8 @@ fn render_effective(
     let providers = &cfg.providers;
     let deadline_ms = provider_turn_deadline_ms(cfg.opencode.turn_timeout_ms);
     let tiers = SelectionTiers {
-        // The CLI has no ticket and no target project, and — like `selection_inputs` — it feeds
-        // neither the identity nor the review tier, because dispatch does not. See the doc comment.
+        // The CLI has no ticket and no target project; the review tier is a review-run override the
+        // CLI is not asking about.
         ticket: FieldSelection::default(),
         review: None,
         profile: FieldSelection {
@@ -692,13 +691,19 @@ fn render_effective(
             provider: profile.provider.clone(),
             model: profile.model.clone(),
         },
-        identity: FieldSelection::default(),
+        // The roster entry's own routing fields ARE the identity tier, exactly as dispatch feeds
+        // them (STUDIO-1976).
+        identity: identity.map_or_else(FieldSelection::default, |i| FieldSelection {
+            harness: i.harness.clone(),
+            provider: i.provider.clone(),
+            model: i.model.clone(),
+        }),
         project: FieldSelection::default(),
         global: FieldSelection::from_agent(&cfg.agent),
     };
     let mut out = String::new();
     out.push_str(
-        "\n--- effective selection (the tuple a dispatched run resolves; field-wise: ticket > review > profile > identity > project > global, but this command has no ticket or project in scope and dispatch feeds neither the review nor the identity tier) ---\n",
+        "\n--- effective selection (the tuple a dispatched run resolves; field-wise: ticket > review > profile > identity > project > global, but this command has no ticket or project in scope) ---\n",
     );
     match resolve_selection(&SelectionRequest {
         tiers,
@@ -721,27 +726,6 @@ fn render_effective(
             ));
         }
         Err(e) => out.push_str(&format!("REFUSED:   {e}\n")),
-    }
-    // A roster entry's own routing fields are parsed and shown, but dispatch does not feed the
-    // identity tier yet, so they must not be folded into the tuple above. Reported separately and
-    // labeled, rather than silently dropped or falsely claimed as applied (PR #273 round 1).
-    if let Some(i) = identity {
-        let configured = [
-            ("harness:", i.harness.as_str()),
-            ("provider:", i.provider.as_str()),
-            ("model:", i.model.as_str()),
-            ("effort:", i.effort.as_str()),
-        ];
-        if configured.iter().any(|(_, value)| !value.is_empty()) {
-            out.push_str(
-                "\n--- identity routing fields (configured on the roster entry, NOT yet applied at dispatch — a run still resolves from the profile tier and below) ---\n",
-            );
-            for (name, value) in configured {
-                if !value.is_empty() {
-                    out.push_str(&format!("{name:<10}{value}\n"));
-                }
-            }
-        }
     }
     // The manager's own tuple, which never borrows a teammate's (design §5 / parent D6) — the
     // independent half an operator has no other command to ask about.
@@ -917,17 +901,6 @@ fn review_field(
         } else {
             format!("review.{name}.{harness}")
         };
-        if name == "provider" {
-            // `review.provider` is parsed, validated and harness-scoped, but dispatch does not yet
-            // feed the review tier (`selection_inputs` passes `review: None`), so a review run
-            // still takes its provider from the profile and global tiers. Report the configured
-            // value and say so, rather than claiming an override that never happens (PR #273
-            // round 1).
-            return format!(
-                "{value} [{key} — configured, but not yet applied at dispatch: a review run still \
-                 uses this profile's provider]"
-            );
-        }
         return format!("{value} [{key} — overrides this profile's {name} for a review run]");
     }
     let listed = scoped
@@ -936,26 +909,18 @@ fn review_field(
         .map(|(h, v)| format!("{h}: {v}"))
         .collect::<Vec<_>>()
         .join(", ");
-    if name == "provider" {
-        // Nothing applies `review.provider` yet, so a value scoped to another harness is not the
-        // wrong-run refusal a `review.model` mismatch is: say exactly that instead of describing a
-        // refusal dispatch never performs.
-        format!(
-            "(unset for harness {harness} — review.provider names {listed}; it is not applied at \
-             dispatch yet, so no review is refused and a review on {harness} uses this profile's \
-             provider)"
-        )
-    } else if name == "model" {
-        // A model configured for another harness IS a refusal: handing a review a model its harness
-        // cannot honour would run it on the wrong model, which is the trap this closes.
-        format!(
-            "(unset for harness {harness} — review.model names {listed}, so a review on {harness} \
-             is refused rather than run on the wrong model)"
-        )
-    } else {
+    if name == "effort" {
         format!(
             "(unset for harness {harness} — review.effort names {listed}; a review on {harness} \
              inherits this profile's effort)"
+        )
+    } else {
+        // A model OR provider configured for another harness IS a refusal (STUDIO-1976 wired the
+        // provider into the review tier): handing a review a value its harness cannot honour would
+        // run it on the wrong model/provider, which is the trap this closes.
+        format!(
+            "(unset for harness {harness} — review.{name} names {listed}, so a review on {harness} \
+             is refused rather than run on the wrong {name})"
         )
     }
 }
@@ -1513,15 +1478,17 @@ mod tests {
         .expect("write teams.yaml");
         let out = run(&["show", "alice"], &env[0]).expect("show alice");
         assert!(
-            out.contains("review provider: fireworks [review.provider.opencode — configured, but not yet applied at dispatch: a review run still uses this profile's provider]"),
+            out.contains("review provider: fireworks [review.provider.opencode — overrides this profile's provider for a review run]"),
             "out = {out}"
         );
     }
 
     /// **The harness-scope mutation guard.** A `review.provider` configured for a harness the
     /// reviewer does not run on is reported with the OTHER harness named — never silently applied
-    /// to the wrong run and never silently dropped. A display that read `review.provider` unscoped
-    /// would print `fireworks [review.provider — …]` here instead, turning this red.
+    /// to the wrong run and never silently dropped. Since STUDIO-1976 the provider is applied at
+    /// dispatch, so a mismatch is the same wrong-run refusal `review.model` is. A display that read
+    /// `review.provider` unscoped would print `fireworks [review.provider — …]` here instead,
+    /// turning this red.
     #[test]
     fn show_reports_a_review_provider_scoped_to_another_harness() {
         let dir = TempDir::new();
@@ -1533,7 +1500,7 @@ mod tests {
         .expect("write teams.yaml");
         let out = run(&["show", "alice"], &env[0]).expect("show alice");
         assert!(
-            out.contains("review provider: (unset for harness claude — review.provider names opencode: fireworks; it is not applied at dispatch yet, so no review is refused and a review on claude uses this profile's provider)"),
+            out.contains("review provider: (unset for harness claude — review.provider names opencode: fireworks, so a review on claude is refused rather than run on the wrong provider)"),
             "out = {out}"
         );
     }
@@ -1595,7 +1562,7 @@ mod tests {
         );
         assert!(
             out.contains(
-                "--- effective selection (the tuple a dispatched run resolves; field-wise: ticket > review > profile > identity > project > global, but this command has no ticket or project in scope and dispatch feeds neither the review nor the identity tier) ---"
+                "--- effective selection (the tuple a dispatched run resolves; field-wise: ticket > review > profile > identity > project > global, but this command has no ticket or project in scope) ---"
             ),
             "out = {out}"
         );
@@ -1620,7 +1587,7 @@ mod tests {
     /// effective tuple (the pre-round-1 behaviour) would print `openrouter [identity]` above and red
     /// this.
     #[test]
-    fn show_reports_identity_fields_as_configured_but_not_applied() {
+    fn show_folds_the_identity_routing_fields_into_the_effective_tuple() {
         let dir = TempDir::new();
         let (env, profiles_dir) = hermetic_providers(&dir, "opencode");
         write_profile(&profiles_dir, "swe", "harness: opencode\n");
@@ -1630,32 +1597,23 @@ mod tests {
         )
         .expect("write teams.yaml");
         let out = run(&["show", "alice"], &env[0]).expect("show alice");
-        // The effective tuple is what dispatch would resolve: `swe` names no provider, so the global
-        // tier answers, and the identity's fields are nowhere in it.
+        // The identity tier IS applied (STUDIO-1976): the profile names no provider, so the roster
+        // entry's own provider and model answer, with the identity origin.
         assert!(
-            out.contains("\nprovider:  (none — native login; no Rhapsody provider selected)\n"),
+            out.contains("\nprovider:  openrouter [identity]\n"),
             "out = {out}"
         );
         assert!(
-            !out.contains("openrouter [identity]"),
-            "the identity tier must not be reported as applied: {out}"
-        );
-        // ...and the configured fields are disclosed separately, labeled as not applied.
-        assert!(
-            out.contains("--- identity routing fields (configured on the roster entry, NOT yet applied at dispatch"),
+            out.contains("\nmodel:     anthropic/claude-sonnet-4-6 [identity]\n"),
             "out = {out}"
         );
-        assert!(out.contains("\nprovider: openrouter\n"), "out = {out}");
-        assert!(
-            out.contains("\nmodel:    anthropic/claude-sonnet-4-6\n"),
-            "out = {out}"
-        );
-        assert!(out.contains("\neffort:   xhigh\n"), "out = {out}");
         // The profile itself names no provider, so the top-level line stays the inherit marker.
         assert!(
             out.contains("provider:      [unset — inherits the daemon's config]"),
             "out = {out}"
         );
+        // The old "configured but not applied" disclosure is gone — there is nothing to disclose.
+        assert!(!out.contains("NOT yet applied at dispatch"), "out = {out}");
     }
 
     /// The lowest tier is still an origin: a profile that names neither harness nor provider

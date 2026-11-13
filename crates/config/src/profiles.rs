@@ -1049,6 +1049,234 @@ pub fn fork_text(resolved: &ResolvedProfile) -> Result<String, ProfileError> {
     String::from_utf8(bytes).map_err(|e| ProfileError::Parse(e.to_string()))
 }
 
+// ── STUDIO-1976: the live routing edit ────────────────────────────────────────
+//
+// Settings → Models changes ONE teammate's harness/provider/model/effort by rewriting only those
+// four front-matter keys on the profile file the identity wears, leaving the prompt body — and every
+// comment and every other front-matter key — byte-for-byte untouched. That is the same surgical
+// write `provider_edit` performs on `WORKFLOW.md`'s `providers:` block, and for the same reason: a
+// re-serializing write would reformat the operator's hand-written file and drop its comments.
+//
+// The edit is deliberately a LINE edit rather than a YAML round-trip. A profile body is prose a
+// human wrote; `serde_yaml_ng` would re-emit the front matter in its own order with its own quoting
+// and lose the `#` comments beside the keys.
+
+/// The routing fields a Settings → Models write owns on a profile file's front matter — the four
+/// keys whose *resolved* values a teammate's runs actually use (STUDIO-868/902/985). Empty means
+/// inherit, exactly as it does everywhere else in this codebase.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProfileRouting {
+    #[serde(default)]
+    pub harness: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub effort: String,
+}
+
+/// The front-matter keys a routing write owns, in the order it writes them.
+pub const PROFILE_ROUTING_KEYS: [&str; 4] = ["harness", "provider", "model", "effort"];
+
+impl ProfileRouting {
+    /// The `(key, value)` pairs a write should set, in [`PROFILE_ROUTING_KEYS`] order.
+    fn fields(&self) -> [(&'static str, &str); 4] {
+        [
+            ("harness", &self.harness),
+            ("provider", &self.provider),
+            ("model", &self.model),
+            ("effort", &self.effort),
+        ]
+    }
+
+    /// Every field empty — the "inherit everything" tuple a `Move all workers` undo may restore.
+    pub fn is_empty(&self) -> bool {
+        self.fields().iter().all(|(_, v)| v.is_empty())
+    }
+}
+
+/// The byte span of the front matter inside `text`: `(open_end, close_start)`, where `open_end` is
+/// just after the opening `---\n` line and `close_start` is the start of the closing `---` line.
+/// `None` when the file has no complete front matter.
+fn front_matter_span(text: &str) -> Option<(usize, usize)> {
+    let mut offset = 0usize;
+    let mut open_end = None;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if open_end.is_none() {
+            if offset == 0 && trimmed == "---" {
+                open_end = Some(offset + line.len());
+            } else {
+                return None;
+            }
+        } else if trimmed == "---" {
+            return Some((open_end.unwrap_or(0), offset));
+        }
+        offset += line.len();
+    }
+    None
+}
+
+/// Reads the routing fields from a profile file's front matter. A key that is absent, or present
+/// with an empty/comment-only value, reads as empty (inherit). Parsing is line-based and tolerant:
+/// an unreadable line is simply not a routing key.
+pub fn read_routing(text: &str) -> ProfileRouting {
+    let mut routing = ProfileRouting::default();
+    let Some((open_end, close_start)) = front_matter_span(text) else {
+        return routing;
+    };
+    for line in text[open_end..close_start].split_inclusive('\n') {
+        let line = line.trim_end_matches(['\r', '\n']);
+        // Only top-level keys (no leading whitespace) are routing keys.
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.trim() != key || key.is_empty() {
+            continue;
+        }
+        let value = strip_yaml_value(value);
+        match key {
+            "harness" => routing.harness = value,
+            "provider" => routing.provider = value,
+            "model" => routing.model = value,
+            "effort" => routing.effort = value,
+            _ => {}
+        }
+    }
+    routing
+}
+
+/// A front-matter value with surrounding whitespace removed and a trailing `# comment` stripped, so
+/// `model: claude-opus-5 # premium` reads as `claude-opus-5`. A `#` inside quotes is left alone.
+fn strip_yaml_value(raw: &str) -> String {
+    let value = raw.trim();
+    let (value, quote) = match value.chars().next() {
+        Some(q @ ('"' | '\'')) => (&value[q.len_utf8()..], Some(q)),
+        _ => (value, None),
+    };
+    if let Some(q) = quote {
+        return value
+            .split_once(q)
+            .map(|(v, _)| v.to_string())
+            .unwrap_or_else(|| value.to_string());
+    }
+    match value.split_once(" #") {
+        Some((v, _)) => v.trim_end().to_string(),
+        None => value.to_string(),
+    }
+}
+
+/// The trailing `# comment` on a front-matter line, with a leading space, or `""` when there is
+/// none. A `#` inside quotes does not count.
+pub(crate) fn inline_comment(content: &str) -> String {
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = content.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'#' if !in_single && !in_double && i > 0 && bytes[i - 1] == b' ' => {
+                return format!(" {}", &content[i..]);
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    String::new()
+}
+
+/// Quotes `value` as a YAML scalar only when a plain scalar would not round-trip (a `#`, a leading
+/// or trailing space, a colon, or a character that starts a different YAML node). A model id like
+/// `fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash` is emitted bare.
+pub(crate) fn yaml_scalar(value: &str) -> String {
+    let plain = !value.is_empty()
+        && !value.starts_with([
+            ' ', '-', '?', ':', ',', '[', ']', '{', '}', '#', '&', '*', '!', '|', '>', '%', '@',
+            '`', '"', '\'',
+        ])
+        && !value.ends_with(' ')
+        && !value.contains(": ")
+        && !value.contains(" #")
+        && !value.contains('\n');
+    if plain {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "''"))
+    }
+}
+
+/// Returns `text` with the four routing keys set in the front matter, and every other byte — the
+/// body, the comments, every other key — preserved exactly. A key whose value is empty is REMOVED
+/// (empty means inherit, and a stale `model:` line left behind would read as a value); a non-empty
+/// key absent from the file is appended at the end of the front matter. A file with no front matter
+/// gains one whose body is the original text unchanged.
+pub fn apply_routing_edit(text: &str, routing: &ProfileRouting) -> String {
+    let Some((open_end, close_start)) = front_matter_span(text) else {
+        // No front matter: synthesize one and keep the original text as the body.
+        let mut out = String::from("---\n");
+        for (key, value) in routing.fields() {
+            if !value.is_empty() {
+                out.push_str(&format!("{key}: {}\n", yaml_scalar(value)));
+            }
+        }
+        out.push_str("---\n");
+        out.push_str(text);
+        return out;
+    };
+    let front = &text[open_end..close_start];
+    let mut lines: Vec<String> = Vec::new();
+    let mut seen: Vec<&str> = Vec::new();
+    for line in front.split_inclusive('\n') {
+        let content = line.trim_end_matches(['\r', '\n']);
+        let mut replaced = false;
+        if let Some((key, _)) = content.split_once(':')
+            && key.trim() == key
+            && !key.is_empty()
+            && let Some((_, value)) = routing.fields().iter().find(|(k, _)| *k == key)
+        {
+            seen.push(key);
+            replaced = true;
+            if !value.is_empty() {
+                // Keep a trailing inline comment on the line being rewritten, so
+                // `model: old # premium` becomes `model: new # premium`.
+                let comment = inline_comment(content);
+                lines.push(format!("{key}: {}{}\n", yaml_scalar(value), comment));
+            }
+            // An empty value drops the line entirely.
+        }
+        if !replaced {
+            lines.push(line.to_string());
+        }
+    }
+    // Append any routing key the file did not carry, in canonical order.
+    for (key, value) in routing.fields() {
+        if !value.is_empty() && !seen.contains(&key) {
+            lines.push(format!("{key}: {}\n", yaml_scalar(value)));
+        }
+    }
+    let mut out = String::with_capacity(text.len() + 64);
+    out.push_str(&text[..open_end]);
+    for line in &lines {
+        out.push_str(line);
+    }
+    out.push_str(&text[close_start..]);
+    out
+}
+
+/// Writes `routing` into the profile file at `path`, atomically (the crate's temp-file + rename +
+/// permission-preserving convention) and comment-preserving. Returns the routing that is now on
+/// disk. A missing or unreadable file is an error — Settings writes a profile that already exists,
+/// it never seeds one.
+pub fn save_routing(path: &Path, routing: &ProfileRouting) -> Result<ProfileRouting, ProfileError> {
+    let text = std::fs::read_to_string(path).map_err(|e| ProfileError::Io(e.to_string()))?;
+    let edited = apply_routing_edit(&text, routing);
+    workflow::save_text(path, &edited).map_err(|e| ProfileError::Io(e.to_string()))?;
+    Ok(read_routing(&edited))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2048,5 +2276,112 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["alice's profile \"swe\" overlays swe@1; the built-in is now swe@3"]
         );
+    }
+
+    // ── STUDIO-1976: the routing edit ─────────────────────────────────────────
+
+    const ROUTING_SAMPLE: &str = "---\nextends: swe\nharness: opencode\n# keep me: premium review\nmodel: claude-opus-5 # the expensive one\neffort: high\ncapabilities: []\n---\n{{ base }}\n\nBody line one.\nBody line two.\n";
+
+    #[test]
+    fn read_routing_reads_only_the_four_keys() {
+        let r = read_routing(ROUTING_SAMPLE);
+        assert_eq!(r.harness, "opencode");
+        assert_eq!(r.model, "claude-opus-5");
+        assert_eq!(r.effort, "high");
+        assert_eq!(r.provider, "");
+    }
+
+    #[test]
+    fn routing_edit_changes_only_the_front_matter_lines() {
+        let edited = apply_routing_edit(
+            ROUTING_SAMPLE,
+            &ProfileRouting {
+                harness: "opencode".into(),
+                provider: "fireworks".into(),
+                model: "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash".into(),
+                effort: "xhigh".into(),
+            },
+        );
+        // The body is byte-for-byte identical.
+        let body = |s: &str| s.split_once("---\n{{ base }}").map(|(_, b)| b.to_string());
+        assert_eq!(body(&edited), body(ROUTING_SAMPLE));
+        // The comment above `model:` and the inline comment are preserved.
+        assert!(edited.contains("# keep me: premium review\n"));
+        assert!(edited.contains("# the expensive one\n"));
+        // The changed values are the new ones; the untouched `extends`/`capabilities` survive.
+        let r = read_routing(&edited);
+        assert_eq!(
+            r.model,
+            "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash"
+        );
+        assert_eq!(r.effort, "xhigh");
+        assert_eq!(r.provider, "fireworks");
+        assert!(edited.contains("extends: swe\n"));
+        assert!(edited.contains("capabilities: []\n"));
+    }
+
+    #[test]
+    fn routing_edit_removes_a_key_set_empty() {
+        let edited = apply_routing_edit(
+            ROUTING_SAMPLE,
+            &ProfileRouting {
+                harness: "claude".into(),
+                ..ProfileRouting::default()
+            },
+        );
+        assert!(edited.contains("harness: claude\n"));
+        assert!(!edited.contains("\nmodel:"));
+        assert!(!edited.contains("\neffort:"));
+        assert_eq!(read_routing(&edited).model, "");
+    }
+
+    #[test]
+    fn routing_edit_appends_missing_keys_and_synthesizes_front_matter() {
+        let edited = apply_routing_edit(
+            "no front matter here\n",
+            &ProfileRouting {
+                harness: "opencode".into(),
+                model: "openai/gpt-6.1-sol".into(),
+                ..ProfileRouting::default()
+            },
+        );
+        assert_eq!(
+            edited,
+            "---\nharness: opencode\nmodel: openai/gpt-6.1-sol\n---\nno front matter here\n"
+        );
+    }
+
+    #[test]
+    fn routing_edit_quotes_a_value_that_needs_it() {
+        let edited = apply_routing_edit(
+            "---\nextends: swe\n---\nbody\n",
+            &ProfileRouting {
+                model: "weird: value # x".into(),
+                ..ProfileRouting::default()
+            },
+        );
+        assert!(edited.contains("model: 'weird: value # x'\n"));
+        assert_eq!(read_routing(&edited).model, "weird: value # x");
+    }
+
+    #[test]
+    fn save_routing_round_trips_through_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("swe.md");
+        std::fs::write(&path, ROUTING_SAMPLE).expect("write");
+        let on_disk = save_routing(
+            &path,
+            &ProfileRouting {
+                harness: "opencode".into(),
+                provider: "fireworks".into(),
+                model: "deepseek-v4p1-flash".into(),
+                effort: "high".into(),
+            },
+        )
+        .expect("save");
+        assert_eq!(on_disk.model, "deepseek-v4p1-flash");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.ends_with("Body line two.\n"));
+        assert_eq!(read_routing(&text), on_disk);
     }
 }

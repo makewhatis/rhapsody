@@ -755,6 +755,27 @@ impl Orchestrator {
             // The routed teammate's harness (STUDIO-902). Empty for every profile that names none,
             // so the worker keeps the configured backend's runner and the dispatch is unchanged.
             re.harness = td.harness.clone();
+            // STUDIO-1976 review B6: the roster identity's OWN routing fields are the identity tier,
+            // folded under the profile (profile wins). The prepared path folds them into
+            // `selection_inputs`; the INLINE path (no provider configured) has no selection, so the
+            // fallback is applied here. EFFORT is folded here too — the prepared selection carries no
+            // effort, so this is the only place a roster identity's effort reaches the run.
+            // A run already in flight keeps the tuple it captured above.
+            if let Some(id) = self
+                .teams
+                .as_ref()
+                .and_then(|t| t.roster.iter().find(|i| i.name == td.identity))
+            {
+                if re.harness.is_empty() {
+                    re.harness = id.harness.clone();
+                }
+                if re.model_override.model.is_empty() {
+                    re.model_override.model = id.model.clone();
+                }
+                if re.model_override.effort.is_empty() {
+                    re.model_override.effort = id.effort.clone();
+                }
+            }
         }
         // PB7 (STUDIO-1002, STUDIO-1602): a prepared dispatch runs on the harness/model the pure
         // SELECTION resolved, not the routed profile's — the spec owns the real adapter. Recording
@@ -805,8 +826,17 @@ impl Orchestrator {
         if review.is_some()
             && let Some(teams) = self.teams.as_ref()
         {
-            let harness = self
-                .effective_harness(teams_dispatch.as_ref().map_or("", |td| td.harness.as_str()));
+            // The reviewer's harness, resolved field-wise (profile > identity > backend) exactly as
+            // `review_harness_for`/`dispatch_review` resolve it (STUDIO-1976 review B6), so the
+            // inline override and the admission refusal are the same fact.
+            let harness = self.effective_harness(
+                &self.identity_harness(
+                    teams,
+                    teams_dispatch
+                        .as_ref()
+                        .map_or("", |td| td.identity.as_str()),
+                ),
+            );
             // The harness the legacy bare-scalar `review.model`/`review.effort` spelling belongs
             // to (STUDIO-908): the installation's configured `agent.backend`, not a hardcoded
             // `claude`. `dispatch_review` derives it the same way, so the refusal and the override

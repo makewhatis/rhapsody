@@ -293,6 +293,10 @@ pub enum Event {
     Retry(EvRetry),
     /// A WORKFLOW.md change observed by the watcher (Go `evReload`).
     Reload,
+    /// A `teams.yaml` change observed by the routing watcher (STUDIO-1976; Rhapsody-only, no Go
+    /// counterpart). The handler re-loads and validates the file and folds only its ROUTING fields
+    /// into the live config — the boot-loaded fields stay as they were at startup.
+    TeamsReload,
     /// A request for the race-free workspace-GC plan (Go `evWorkspaceGC`).
     WorkspaceGc {
         reply: oneshot::Sender<WorkspaceGcPlan>,
@@ -841,9 +845,11 @@ impl Orchestrator {
         let terminal_sweep =
             self.start_terminal_cleanup_schedule(ctx.clone(), TERMINAL_CLEANUP_INTERVAL);
         let watch = self.start_watch(ctx.clone());
+        let teams_watch = self.start_watch_teams(ctx.clone());
         self.run_loaded(ctx).await;
         terminal_sweep.abort();
         watch.abort();
+        teams_watch.abort();
         Ok(())
     }
 
@@ -972,6 +978,7 @@ impl Orchestrator {
                 }
             }
             Event::Reload => self.on_reload(),
+            Event::TeamsReload => self.on_teams_reload(),
             Event::DispatchPrepared {
                 id,
                 token,
@@ -3252,6 +3259,36 @@ mod tests {
             .await
             .expect("Run did not stop on context cancel")
             .expect("loop task panicked");
+    }
+
+    /// STUDIO-1976 review B5: the control loop INSTALLS the `teams.yaml` routing watcher and
+    /// dispatches its event to the production handler. The runtime test in `teamsreload` drives its
+    /// own watcher and so cannot protect the loop's installation; this source guard can — aborting or
+    /// removing the watcher in `run` reds here, and so does dropping the `Event::TeamsReload` arm.
+    #[test]
+    fn the_control_loop_installs_the_teams_watcher_and_dispatches_its_event() {
+        let src = include_str!("loop.rs");
+        let run_start = src
+            .find("pub async fn run(")
+            .expect("run is still the boot entry point");
+        let loaded = src[run_start..]
+            .find("self.run_loaded(ctx).await;")
+            .expect("run still awaits run_loaded");
+        let run_body = &src[run_start..run_start + loaded];
+        assert!(
+            run_body.contains("self.start_watch_teams("),
+            "run must install the teams routing watcher"
+        );
+        assert!(
+            !run_body.contains(".abort()"),
+            "the teams watcher must not be aborted before the control loop runs"
+        );
+        // Assembled at run time so this test's own source is not an occurrence of the needle.
+        let arm: String = ["Event::TeamsReload => self.", "on_teams_reload()"].concat();
+        assert!(
+            src.contains(&arm),
+            "the loop must dispatch Event::TeamsReload to on_teams_reload"
+        );
     }
 
     // Mirrors Go `TestRunStartupValidationFailureReturnsError`: a real disk load with a missing file

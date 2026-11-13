@@ -14,6 +14,9 @@ use rhapsody_config::ValidationError;
 use rhapsody_config::workflow::Definition;
 use rhapsody_orchestrator::drain::{DrainReason, DrainStatus};
 use rhapsody_orchestrator::managerread::{ManagerReadError, ManagerReadOutcome};
+use rhapsody_orchestrator::modelsview::{
+    TeamsModelsApplyResult, TeamsModelsError, TeamsModelsRequest, TeamsModelsView,
+};
 use rhapsody_orchestrator::prstate::PrCoord;
 use rhapsody_orchestrator::reviewconsole::{ReviewControlOutcome, ReviewsView};
 use rhapsody_orchestrator::rundiff::DiffOutcome;
@@ -69,7 +72,8 @@ use crate::handlers_rundiff::handle_run_diff;
 use crate::handlers_runmerge::{handle_run_merge, handle_run_mergeability};
 use crate::handlers_teams::{
     handle_run_post, handle_run_retain, handle_teams, handle_teams_config, handle_teams_invalidate,
-    handle_teams_recall, handle_teams_reinstate, handle_teams_room, handle_teams_roster,
+    handle_teams_models, handle_teams_recall, handle_teams_reinstate, handle_teams_room,
+    handle_teams_roster,
 };
 use crate::history::HistoryStore;
 use crate::logs::LogSource;
@@ -358,6 +362,22 @@ pub trait StateProvider: Send + Sync {
     /// works while the feature is off, which is the only state from which anyone would use it.
     fn teams_config_path(&self) -> &str {
         ""
+    }
+
+    /// The Settings → Models view (`GET /api/v1/teams/models`, STUDIO-1976): each teammate's, the
+    /// review overrides' and the manager's resolved harness/provider/model with origins, plus the
+    /// values the page edits. Teams off ⇒ [`TeamsModelsError::Disabled`].
+    async fn teams_models(&self) -> Result<TeamsModelsView, TeamsModelsError> {
+        Err(TeamsModelsError::Disabled)
+    }
+
+    /// Apply ONE Settings → Models change (`POST /api/v1/teams/models`, STUDIO-1976). The daemon's
+    /// own validation refuses an invalid edit and leaves the last-good file in place.
+    async fn teams_models_apply(
+        &self,
+        _req: TeamsModelsRequest,
+    ) -> Result<TeamsModelsApplyResult, TeamsModelsError> {
+        Err(TeamsModelsError::Disabled)
     }
 
     /// The one dashboard view: the roster, the manager mode and the memory backend
@@ -936,6 +956,11 @@ where
         // follows `POST /api/v1/config`'s discipline exactly — validate first, atomically rewrite
         // only when valid, leave the on-disk file untouched on a rejection.
         .route("/api/v1/teams/config", operator_write(handle_teams_config))
+        // Settings → Models (STUDIO-1976): the live routing read/write. Operator-guarded like
+        // `/config` and `/providers/config`; the GET is behind the same guard as the rest of the
+        // Teams routes would be — but it is a static path under `/teams/`, so a Teams-off daemon
+        // answers `teams_disabled` rather than 404.
+        .route("/api/v1/teams/models", operator_write(handle_teams_models))
         .route("/api/v1/teams/roster", any(handle_teams_roster))
         .route("/api/v1/teams/recall", any(handle_teams_recall))
         .route(
