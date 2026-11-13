@@ -741,6 +741,7 @@ pub(crate) fn seed_opencode_session(
         workspace: "/ws".to_string(),
         session_id: "ses_kept".to_string(),
         dir: dir.to_string_lossy().into_owned(),
+        scratch_dir: String::new(),
         saved_at_ms,
         prompt_sha256: String::new(),
     };

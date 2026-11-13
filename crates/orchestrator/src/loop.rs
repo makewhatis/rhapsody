@@ -307,6 +307,12 @@ pub enum Event {
     TerminalCleanup {
         reply: oneshot::Sender<TerminalCleanupPlan>,
     },
+    /// A request for the race-free scratch-sweep plan (STUDIO-1993; no Go counterpart). The periodic
+    /// janitor and the disk-pressure path read the scratch policy and the live run set through this
+    /// round-trip so the sweep never blocks the control loop.
+    ScratchSweep {
+        reply: oneshot::Sender<crate::scratch::ScratchPlan>,
+    },
     /// The TOCTOU guard: is this worktree path a live running issue RIGHT NOW (Go `evWorkspaceInUse`)?
     WorkspaceInUse {
         mgr: Option<Arc<Manager>>,
@@ -990,6 +996,9 @@ impl Orchestrator {
             Event::TerminalCleanup { reply } => {
                 let _ = reply.send(self.build_terminal_cleanup_plan(true));
             }
+            Event::ScratchSweep { reply } => {
+                let _ = reply.send(self.build_scratch_plan());
+            }
             Event::WorkspaceInUse { mgr, path, reply } => {
                 let _ = reply.send(self.worktree_in_use(mgr.as_deref(), &path));
             }
@@ -1384,6 +1393,24 @@ impl Orchestrator {
         // answer, so asking would spend a subprocess every tick for a decision already made.
         if self.drain_preflight() {
             self.refresh_gated_chatgpt_queue().await;
+            self.set_held_for_capacity(HashMap::new()); // see the retirement note above
+            self.schedule_tick(poll);
+            return;
+        }
+        // STUDIO-1993: the disk-pressure guard. When free space on the scratch volume is under the
+        // configured floor, hold ALL dispatch (the same "skip without claiming anything" discipline
+        // as the drain gate above) and run the scratch janitor at once to reclaim what it can. The
+        // janitor's filesystem walk is off-loop; only the cheap `statvfs` reading is taken here.
+        if let Some(reason) = self.scratch_dispatch_hold() {
+            let plan = self.build_scratch_plan();
+            tokio::task::spawn_blocking(move || {
+                crate::scratch::run_sweep_and_log(&plan, std::time::SystemTime::now());
+            });
+            tracing::warn!(
+                reason = %reason,
+                "dispatch held: scratch volume under the free-space floor; the scratch janitor was \
+                 run"
+            );
             self.set_held_for_capacity(HashMap::new()); // see the retirement note above
             self.schedule_tick(poll);
             return;
