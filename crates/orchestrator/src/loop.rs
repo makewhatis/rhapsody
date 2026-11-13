@@ -919,6 +919,9 @@ impl Orchestrator {
             Event::Tick => self.on_tick().await,
             Event::Refresh => {
                 self.rearm_refusal_gate();
+                // STUDIO-1998: an explicit operator refresh is the "operator retries" half of the
+                // model-not-found hold — the ticket is offered again without waiting for a restart.
+                self.clear_model_refusals();
                 self.on_tick().await;
             }
             Event::WorkerExit(e) => self.on_worker_exit(e),

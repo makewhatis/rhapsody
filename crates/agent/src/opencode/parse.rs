@@ -72,6 +72,12 @@ pub struct Failure {
     pub message: String,
     pub status_code: i64,
     pub retryable: bool,
+    /// The provider's structured error code (or `error.type` when it reports no code) from the
+    /// opencode `responseBody`, empty when the body carries none. The body is otherwise dropped at
+    /// this boundary, but the orchestrator's model-404 classifier needs the provider's own code —
+    /// OpenAI's `model_not_found` and Anthropic's `not_found_error` are not repeated in the prose
+    /// message, so re-deriving them from the summary alone misses them (STUDIO-1998 review B2).
+    pub provider_code: String,
 }
 
 impl Failure {
@@ -86,6 +92,9 @@ impl Failure {
         if self.status_code != 0 {
             s.push_str(&format!(" (status {}", self.status_code));
             s.push_str(if self.retryable { ", retryable)" } else { ")" });
+        }
+        if !self.provider_code.is_empty() {
+            s.push_str(&format!(" [code: {}]", self.provider_code));
         }
         s
     }
@@ -179,6 +188,38 @@ struct RawErrorData {
     status_code: i64,
     #[serde(rename = "isRetryable")]
     is_retryable: bool,
+    /// The provider's response, a JSON-encoded string on the measured captures but tolerated as an
+    /// already-decoded value so an unexpected shape can never drop the whole error line.
+    #[serde(rename = "responseBody")]
+    response_body: serde_json::Value,
+}
+
+/// The provider's structured error code from a `responseBody`, falling back to `error.type`.
+///
+/// OpenAI-compatible providers put the machine-readable reason in `error.code`
+/// (`model_not_found`); Anthropic puts it in `error.type` (`not_found_error`). The body arrives as
+/// a JSON string on the measured captures, so it is parsed once here rather than at every reader.
+fn provider_error_code(response_body: &serde_json::Value) -> String {
+    let parsed = match response_body {
+        serde_json::Value::String(text) => match serde_json::from_str::<serde_json::Value>(text) {
+            Ok(value) => value,
+            Err(_) => return String::new(),
+        },
+        other => other.clone(),
+    };
+    let Some(error) = parsed.get("error") else {
+        return String::new();
+    };
+    ["code", "type"]
+        .iter()
+        .find_map(|key| {
+            error
+                .get(*key)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// Maps one opencode JSONL line to a normalized event.
@@ -259,6 +300,7 @@ pub fn classify(line: &[u8]) -> Classified {
                 .and_then(crate::ratelimit::parse_opencode_limit);
             let e = r.error.unwrap_or_default();
             let failure = Failure {
+                provider_code: provider_error_code(&e.data.response_body),
                 name: e.name,
                 message: e.data.message,
                 status_code: e.data.status_code,
@@ -388,6 +430,46 @@ mod tests {
         assert!(auth.failure.unwrap().is_auth());
     }
 
+    // STUDIO-1998 review B2: the provider's machine-readable model-404 reason lives ONLY in
+    // `responseBody`, which the summary used to drop. Both required shapes must carry it into the
+    // summary so the orchestrator classifies on provider evidence rather than invented prose.
+    // Mutation: stop populating `provider_code` and neither assertion finds its code.
+    #[test]
+    fn provider_error_codes_survive_from_the_response_body_into_the_summary() {
+        // OpenAI-compatible: the reason is `error.code`.
+        let openai = classify(br#"{"type":"error","sessionID":"ses_o","error":{"name":"APIError","data":{"message":"The model `gpt-9` does not exist or you do not have access to it.","statusCode":404,"isRetryable":false,"responseBody":"{\"error\":{\"message\":\"The model `gpt-9` does not exist or you do not have access to it.\",\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}"}}}"#);
+        assert_eq!(
+            openai.failure.as_ref().expect("failure").provider_code,
+            "model_not_found"
+        );
+        assert!(
+            openai.event.message.contains("model_not_found"),
+            "the summary must carry the provider code: {}",
+            openai.event.message
+        );
+
+        // Anthropic: the reason is `error.type`, with no `code`.
+        let anthropic = classify(br#"{"type":"error","sessionID":"ses_a","error":{"name":"APIError","data":{"message":"model: claude-9","statusCode":404,"isRetryable":false,"responseBody":"{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-9\"}}"}}}"#);
+        assert_eq!(
+            anthropic.failure.as_ref().expect("failure").provider_code,
+            "not_found_error"
+        );
+        assert!(
+            anthropic.event.message.contains("not_found_error"),
+            "the summary must carry the provider type: {}",
+            anthropic.event.message
+        );
+
+        // An already-decoded body, and one with nothing structured, must not break the line.
+        let decoded = classify(br#"{"type":"error","error":{"name":"APIError","data":{"message":"boom","statusCode":500,"responseBody":{"error":{"code":"internal"}}}}}"#);
+        assert_eq!(
+            decoded.failure.as_ref().expect("failure").provider_code,
+            "internal"
+        );
+        let bare = classify(br#"{"type":"error","error":{"name":"APIError","data":{"message":"boom","statusCode":500}}}"#);
+        assert_eq!(bare.failure.as_ref().expect("failure").provider_code, "");
+    }
+
     // STUDIO-1118: the credential-rejection shapes — a bare 401, and the two OAuth messages a
     // provider reports — and nothing else (a 429 or a 500 is an ordinary, retryable failure).
     #[test]
@@ -397,6 +479,7 @@ mod tests {
             message: msg.to_string(),
             status_code: code,
             retryable: false,
+            provider_code: String::new(),
         };
         assert!(f(401, "The API key you provided is invalid.").is_auth());
         assert!(f(0, "Token refresh failed: Invalidated OAuth token").is_auth());
@@ -419,6 +502,7 @@ mod tests {
             message: msg.to_string(),
             status_code: code,
             retryable: false,
+            provider_code: String::new(),
         };
         assert!(
             f("UnknownError", "Token refresh failed: 401", 0).is_auth(),

@@ -260,6 +260,28 @@ fn parked_review_state<'a>(
     None
 }
 
+/// Whether a failed turn is a provider 404 that says the MODEL itself is unavailable (STUDIO-1998).
+///
+/// A configuration error, never a transient one: opencode reports the provider's HTTP status and
+/// message verbatim in `Failure::summary`, so the shapes this matches are the ones measured in the
+/// incident — OpenAI-compatible `model_not_found`, Fireworks' "Model not found, inaccessible, and/or
+/// not deployed (status 404)", and Anthropic's `not_found_error` on a model. The 404 gate is
+/// deliberate: a model-catalogue miss at another status is not the case this branch exists for, and
+/// requiring BOTH a 404 and model wording keeps an unrelated `404 ... not found` (a session or a
+/// repository) on the ordinary failure ladder.
+pub(crate) fn is_model_not_found(err: &str) -> bool {
+    let lower = err.to_ascii_lowercase();
+    let status_404 = lower.contains("status 404") || lower.contains("(404)");
+    if !status_404 {
+        return false;
+    }
+    lower.contains("model_not_found")
+        || lower.contains("model not found")
+        || (lower.contains("model") && lower.contains("not found, inaccessible"))
+        || (lower.contains("model") && lower.contains("not deployed"))
+        || (lower.contains("model") && lower.contains("not_found_error"))
+}
+
 /// Maps a clean worker exit to its stored outcome (taxonomy v2, INF-272) from the two freshest
 /// ticket-state samples (the worker's per-turn refresh + reconcile's snapshot; either may be newer —
 /// INF-266) plus whether the agent declared hand-off. The ticket is treated as having LEFT the active
@@ -592,6 +614,12 @@ impl Orchestrator {
             && !self.limit_dispatch_ready(&iss, route.as_ref().map_or("", |r| r.slug.as_str()))
         {
             if let Some(attempt) = attempt {
+                // STUDIO-1998: carry the gate's OWN reason. The ledger holds what refused this
+                // dispatch (no price, credential, account limit, 1Password); `"waiting: account
+                // limit"` is only the last-resort wording when nothing recorded one.
+                let reason = self
+                    .dispatch_wait_reason(&iss.identifier)
+                    .unwrap_or_else(|| "waiting: account limit".to_string());
                 self.schedule_retry_for(
                     RetryTarget {
                         id: &iss.id,
@@ -601,7 +629,7 @@ impl Orchestrator {
                     },
                     attempt,
                     60_000,
-                    "waiting: account limit",
+                    &reason,
                     iss.clone(),
                     self.planned_identity(&iss, &self.teammate_load())
                         .unwrap_or_default(),
@@ -984,6 +1012,12 @@ impl Orchestrator {
             .map(|p| p.stable_id().to_string());
         if !self.gate_limit_dispatch(&mut re, &mut engine, prepared_account.as_deref()) {
             if let Some(attempt) = attempt {
+                // STUDIO-1998: the gate recorded its own reason in the ledger (the USD gate's
+                // missing-price text, a credential refusal, or this account's limit). Report THAT
+                // on the retry row instead of collapsing every refusal into an account limit.
+                let reason = self
+                    .dispatch_wait_reason(&iss.identifier)
+                    .unwrap_or_else(|| "waiting: account limit".to_string());
                 self.schedule_retry_for(
                     RetryTarget {
                         id: &iss.id,
@@ -993,7 +1027,7 @@ impl Orchestrator {
                     },
                     attempt,
                     60_000,
-                    "waiting: account limit",
+                    &reason,
                     iss.clone(),
                     re.identity.clone(),
                 );
@@ -1714,6 +1748,69 @@ impl Orchestrator {
                 re.issue.clone(),
                 re.identity.clone(),
             );
+            return;
+        }
+        // A provider 404 that says the MODEL is unavailable is a configuration error, not a
+        // transient one (STUDIO-1998). The retry ladder would re-run the same broken profile every
+        // few minutes (STUDIO-1997 ran attempts 0–4 on it), so record ONE failed run, schedule no
+        // retry, and hold the ticket in the ledger until the resolved model changes or an operator
+        // refreshes. The reason names the model and the one key to change.
+        if is_model_not_found(&e.err_msg) {
+            self.completed.remove(&e.issue_id);
+            // Release the claim as well as the continuation marker: selection checks `claimed`
+            // BEFORE it reaches `limit_dispatch_ready`, so a retained claim would hide the ticket
+            // from the model-change gate forever and an operator refresh would clear the refusal
+            // but never re-admit it (STUDIO-1998 review B1). The ledger hold, not the claim, keeps
+            // the ticket out of dispatch, and the gate drops that hold when the resolved model
+            // changes or the operator refreshes.
+            self.claimed.remove(&e.issue_id);
+            let provider = if re.pricing.provider.is_empty() {
+                self.effective_harness(&re.harness)
+            } else {
+                re.pricing.provider.clone()
+            };
+            let resolved_model = re.pricing.model.clone();
+            let model = if resolved_model.is_empty() {
+                if re.model_override.model.is_empty() {
+                    re.model.clone()
+                } else {
+                    re.model_override.model.clone()
+                }
+            } else {
+                resolved_model.clone()
+            };
+            let reason = crate::budget::model_not_served_reason(&model, &provider);
+            tracing::warn!(
+                run_id = re.run_id,
+                issue_id = %e.issue_id,
+                issue_identifier = %re.issue.identifier,
+                model = %model,
+                provider = %provider,
+                "the provider does not serve this run's model: recording failed once, holding the \
+                 ticket and scheduling no retry until the resolved model changes"
+            );
+            self.persist_end_run(&re, store::OUTCOME_FAILED, &reason);
+            self.persist_complete(&re.issue.identifier);
+            self.persist_totals();
+            // The hold, not the claim: the ticket must be OFFERED again so a changed model can
+            // release it (see `limit_dispatch_ready`), and the ledger is what `/api/v1/state` and
+            // the reconciliation sweep read.
+            self.record_model_refusal(
+                crate::budget::BudgetHeld {
+                    subject: re.issue.identifier.clone(),
+                    title: re.issue.title.clone(),
+                    project: re.project_slug.clone(),
+                    provider,
+                    reason: reason.clone(),
+                    ..Default::default()
+                },
+                if resolved_model.is_empty() {
+                    &model
+                } else {
+                    &resolved_model
+                },
+            );
+            self.notify_model_not_found(&re.issue.identifier, &model, &reason);
             return;
         }
         // A non-zero err means the turn genuinely failed (git/SSH/clone, claude startup/turn error):
@@ -3197,6 +3294,166 @@ mod tests {
         });
         let re = o.retry_attempts.get("1").expect("backoff retry");
         assert_eq!(re.attempt, 3);
+    }
+
+    /// STUDIO-1998's classifier: ONLY a 404 whose body says the MODEL is unavailable. A 5xx, a 429
+    /// limit and an unrelated 404 stay on their existing ladder/park paths. The provider shapes are
+    /// driven through the REAL opencode parser (review B2): both required providers put the
+    /// machine-readable reason in `responseBody`, which the parser must carry into the summary it
+    /// hands the worker. Mutation: drop the 404 gate and the 5xx/429 assertions red; drop the model
+    /// wording or stop forwarding `responseBody` and the provider 404s miss.
+    #[test]
+    fn only_a_404_naming_the_model_is_a_model_not_found() {
+        let turn_failed_message = |line: &[u8]| {
+            format!(
+                "turn_failed: {}",
+                rhapsody_agent::opencode::classify(line).event.message
+            )
+        };
+        // The incident's own Fireworks text, and the two required provider shapes as the provider
+        // actually reports them: the code/type lives ONLY in `responseBody`.
+        let fireworks_404 = turn_failed_message(
+            br#"{"type":"error","sessionID":"ses_f","error":{"name":"APIError","data":{"message":"Model not found, inaccessible, and/or not deployed","statusCode":404,"isRetryable":false,"responseBody":"{\"error\":{\"message\":\"Model not found, inaccessible, and/or not deployed\",\"code\":\"NOT_FOUND\"}}"}}}"#,
+        );
+        let openai_404 = turn_failed_message(
+            br#"{"type":"error","sessionID":"ses_o","error":{"name":"APIError","data":{"message":"The model `gpt-9` does not exist or you do not have access to it.","statusCode":404,"isRetryable":false,"responseBody":"{\"error\":{\"message\":\"The model `gpt-9` does not exist or you do not have access to it.\",\"type\":\"invalid_request_error\",\"code\":\"model_not_found\"}}"}}}"#,
+        );
+        let anthropic_404 = turn_failed_message(
+            br#"{"type":"error","sessionID":"ses_a","error":{"name":"APIError","data":{"message":"model: claude-9","statusCode":404,"isRetryable":false,"responseBody":"{\"type\":\"error\",\"error\":{\"type\":\"not_found_error\",\"message\":\"model: claude-9\"}}"}}}"#,
+        );
+        for yes in [fireworks_404, openai_404, anthropic_404] {
+            assert!(
+                is_model_not_found(&yes),
+                "must classify as model-not-found: {yes}"
+            );
+        }
+        let transient_500 = turn_failed_message(
+            br#"{"type":"error","error":{"name":"APIError","data":{"message":"internal server error","statusCode":500,"isRetryable":true,"responseBody":"{\"error\":{\"code\":\"internal\"}}"}}}"#,
+        );
+        let real_429 = turn_failed_message(
+            br#"{"type":"error","error":{"name":"APIError","data":{"message":"rate limited","statusCode":429,"isRetryable":true,"responseBody":"{\"error\":{\"code\":\"usage_limit_reached\"}}"}}}"#,
+        );
+        let session_404 = turn_failed_message(
+            br#"{"type":"error","error":{"name":"APIError","data":{"message":"session not found","statusCode":404,"isRetryable":false,"responseBody":"{\"error\":{\"message\":\"session not found\",\"code\":\"not_found\"}}"}}}"#,
+        );
+        for no in [
+            transient_500,
+            real_429,
+            session_404,
+            "turn_failed: APIError: model_not_found on the provider side".to_string(),
+        ] {
+            assert!(
+                !is_model_not_found(&no),
+                "must NOT classify as model-not-found: {no}"
+            );
+        }
+    }
+
+    /// STUDIO-1998: a provider 404 that says the model is not served is a CONFIGURATION error. It
+    /// records ONE failed run with the actionable reason and schedules no retry — the incident ran
+    /// attempts 0–4 on the same broken model. The claim is RELEASED, so the refusal lives only in
+    /// the ledger and normal polling re-offers the ticket: a profile/label/WORKFLOW edit that
+    /// changes the resolved model re-dispatches it, and an explicit operator refresh re-admits it
+    /// even with the model unchanged (review B1). Mutation: retain the claim, and both the
+    /// changed-model and refresh cases stop dispatching; fold this into the ordinary failure branch
+    /// and the no-retry assertion reds.
+    #[tokio::test]
+    async fn a_model_not_found_404_fails_once_and_redispatch_waits_for_the_model_to_change() {
+        for trigger in ["model changed", "operator refresh"] {
+            let mt1 = issue("1", "MT-1", "Todo");
+            let mut fake = Fake::new();
+            fake.candidates = vec![mt1.clone()];
+            let (mut o, dispatched) = orch_for_retry(Arc::new(fake), 10);
+            {
+                let eff = o.eff.as_mut().expect("eff");
+                eff.cfg.agent.backend = "opencode".into();
+                eff.cfg.opencode.model = "fireworks-ai/m".into();
+            }
+            let store: Arc<dyn Store + Send + Sync> = Arc::new(
+                rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).expect("open"),
+            );
+            o.set_store(Arc::clone(&store));
+
+            o.dispatch_issue(mt1.clone(), None, None, String::new());
+            assert_eq!(dispatched.lock().unwrap().as_slice(), ["1"], "{trigger}");
+            let st = o.running["1"].started_at;
+
+            o.on_worker_exit(EvWorkerExit {
+                issue_id: "1".into(),
+                failed: true,
+                started_at: st,
+                err_msg:
+                    "turn_failed: APIError: Model not found, inaccessible, and/or not deployed \
+                          (status 404)"
+                        .into(),
+                last_state: "Todo".into(),
+                declared_handoff: false,
+                review_verdict: None,
+                verdict_text: None,
+                refused: false,
+                onepassword_hold: None,
+                onepassword_auth_failure: None,
+                auth_needed: false,
+            });
+
+            assert!(
+                !o.retry_attempts.contains_key("1"),
+                "{trigger}: a model-not-found 404 must not enter the retry ladder"
+            );
+            assert!(
+                !o.claimed.contains("1"),
+                "{trigger}: the claim is released so polling can re-offer the ticket"
+            );
+            let runs = store
+                .list_runs(rhapsody_store::RunFilter {
+                    issue: "MT-1".to_string(),
+                    ..Default::default()
+                })
+                .expect("list runs");
+            assert_eq!(runs.len(), 1, "{trigger}: the refusal records one run row");
+            assert_eq!(runs[0].outcome, store::OUTCOME_FAILED, "{trigger}");
+            assert_eq!(
+                runs[0].error,
+                "the model m isn't served by fireworks-ai: check the profile or opencode.model",
+                "{trigger}"
+            );
+
+            // Normal polling with the same resolved model re-offers the ticket but the gate holds
+            // it, without spawning a second run or burning the ladder.
+            o.on_tick().await;
+            assert_eq!(
+                dispatched.lock().unwrap().as_slice(),
+                ["1"],
+                "{trigger}: an unchanged model must not be re-dispatched"
+            );
+            assert_eq!(
+                o.dispatch_wait_reason("MT-1").as_deref(),
+                Some(
+                    "waiting: the model m isn't served by fireworks-ai: check the profile or \
+                     opencode.model"
+                ),
+                "{trigger}: the hold carries the actionable reason"
+            );
+
+            match trigger {
+                "model changed" => {
+                    // A WORKFLOW edit that changes the resolved model releases the hold.
+                    o.eff.as_mut().unwrap().cfg.opencode.model = "fireworks-ai/other".into();
+                    o.on_tick().await;
+                }
+                // An explicit operator retry clears the hold and re-admits the SAME model.
+                _ => o.drive_event(Event::Refresh).await,
+            }
+            assert_eq!(
+                dispatched.lock().unwrap().as_slice(),
+                ["1", "1"],
+                "{trigger}: the ticket must be re-dispatched"
+            );
+            assert!(
+                !o.has_model_refusal("MT-1"),
+                "{trigger}: the refusal is dropped once the ticket is re-admitted"
+            );
+        }
     }
 
     /// STUDIO-978: a TYPED CAPABILITY REFUSAL must NOT enter the failure-backoff loop. A refusal can

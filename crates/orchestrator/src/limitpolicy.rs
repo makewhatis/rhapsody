@@ -341,6 +341,28 @@ impl Orchestrator {
     }
 
     pub(crate) fn limit_dispatch_ready(&self, issue: &rhapsody_core::Issue, project: &str) -> bool {
+        // STUDIO-1998: a run that failed on a model its provider does not serve is not retried. The
+        // refusal is bound to the RESOLVED model — a profile, label or WORKFLOW edit that changes it
+        // releases the ticket here, with no operator action. Nothing is computed on the common path
+        // unless a refusal is actually recorded.
+        if self.has_model_refusal(&issue.identifier) {
+            let run = self.limit_projection(issue, project);
+            let pricing = self.run_pricing_for(&run.harness, &run.model_override, project);
+            if self.model_refusal_stands(&issue.identifier, &pricing.model) {
+                self.note_dispatch_hold(crate::budget::BudgetHeld {
+                    subject: issue.identifier.clone(),
+                    title: issue.title.clone(),
+                    project: project.into(),
+                    reason: crate::budget::model_not_served_reason(
+                        &pricing.model,
+                        &pricing.provider,
+                    ),
+                    provider: pricing.provider,
+                    ..Default::default()
+                });
+                return false;
+            }
+        }
         let now = (self.now)().timestamp();
         // STUDIO-1584: a held 1Password credential is checked first, so a bound-but-unusable
         // credential refuses dispatch with its own reason rather than falling through the fast path.
@@ -377,10 +399,15 @@ impl Orchestrator {
             &run.pricing.account
         };
         if let Some(reason) = self.rejected_credential_reason(&run.harness, account) {
-            if self.credential_canary_due(&run, account) {
-                return !self.credential_probe_held(&run.harness, project)
-                    && self.account_usable(account);
+            if self.credential_canary_due(&run, account)
+                && !self.credential_probe_held(&run.harness, project)
+                && self.account_usable(account)
+            {
+                return true;
             }
+            // STUDIO-1998: a canary that could not dispatch is still a refusal a retry will be
+            // scheduled for, so record its reason like every other path instead of letting the
+            // retry entry fall back to "waiting: account limit".
             self.note_credential_wait(issue, project, account, reason);
             return false;
         }
@@ -494,6 +521,20 @@ impl Orchestrator {
             return false;
         }
         let pricing = self.run_pricing_for(&re.harness, &re.model_override, &re.project_slug);
+        // STUDIO-1998: the same model-not-found hold as `limit_dispatch_ready`, repeated here for
+        // dispatches that SKIP that coarse pre-gate — a broker-custody preparation, a pinned engine,
+        // a manager or a landing. A changed resolved model releases the hold and proceeds.
+        if self.model_refusal_stands(&re.issue.identifier, &pricing.model) {
+            self.note_dispatch_hold(crate::budget::BudgetHeld {
+                subject: re.issue.identifier.clone(),
+                title: re.issue.title.clone(),
+                project: re.project_slug.clone(),
+                reason: crate::budget::model_not_served_reason(&pricing.model, &pricing.provider),
+                provider: pricing.provider.clone(),
+                ..Default::default()
+            });
+            return false;
+        }
         let account = account.unwrap_or(&pricing.account);
         let canary = self.credential_canary_due(re, account);
         if let Some(reason) = self.rejected_credential_reason(&re.harness, account)
@@ -584,6 +625,17 @@ impl Orchestrator {
         {
             tracing::warn!(ticket = %re.issue.identifier, %reason, "limit: holding dispatch");
         }
+        // STUDIO-1998: this path used to be the one refusal the budget ledger never heard about, so
+        // a retry it stranded carried the generic `"waiting: account limit"`. Record the reason it
+        // actually used, so the retry entry (and the console) name this gate's own words.
+        self.note_dispatch_hold(crate::budget::BudgetHeld {
+            subject: re.issue.identifier.clone(),
+            title: re.issue.title.clone(),
+            project: re.project_slug.clone(),
+            provider: account.to_string(),
+            reason,
+            ..Default::default()
+        });
         false
     }
 
@@ -1482,6 +1534,10 @@ impl Orchestrator {
             self.budget_ledger
                 .held(self.budget_hold_ttl())
                 .into_iter()
+                // STUDIO-1998: the account-limit fallthrough now records its reason in the ledger
+                // so a retry row can carry it. That subject is already in `limit_policy.holds`, so
+                // skip it here rather than reporting one hold twice.
+                .filter(|h| !self.limit_policy.holds.contains_key(&h.subject))
                 .filter(|h| {
                     h.reason.starts_with("waiting:")
                         && (h.reason.contains(" limit") || h.reason.contains(" credential"))

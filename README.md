@@ -4701,13 +4701,24 @@ These are example operator-maintained rates, not a bundled price catalog. A conf
 price takes precedence over the harness's reported dollars; a missing or zero harness
 cost is **unknown**, not a free API model. New dispatch requires either a table entry
 or a previous positive harness-cost observation for that exact provider/model. Otherwise
-it refuses with `no price for <model>; add it under prices: or daily_usd for <provider>
-cannot be enforced`. USD holds carry the reason on the state snapshot, dashboard and
-reconciliation report. A token ceiling and a USD ceiling may coexist; either can hold
-new dispatch. Existing continuation exemptions and token-only budgets are unchanged.
-Manager runs check their selected engine's USD budget at launch and before reserving
-an intervention attempt. An unknown price or spent cap defers them without consuming
-an attempt or generation allocation; a cleared budget releases the hold.
+it refuses with `no price for <model>; add it under prices: (the harness's model
+catalogue is not used for USD pricing)`. USD holds carry the reason on the state snapshot,
+dashboard and reconciliation report, and a retry scheduled by such a refusal carries it
+verbatim as `waiting: <reason>` — never the generic `waiting: account limit`. A token
+ceiling and a USD ceiling may coexist; either can hold new dispatch. Existing continuation
+exemptions and token-only budgets are unchanged. Manager runs check their selected engine's
+USD budget at launch and before reserving an intervention attempt. An unknown price or
+spent cap defers them without consuming an attempt or generation allocation; a cleared
+budget releases the hold.
+
+A provider 404 that says the resolved model itself is not found, inaccessible or not
+deployed (OpenAI-compatible `model_not_found`, Fireworks' "Model not found, inaccessible,
+and/or not deployed", Anthropic's `not_found_error`) is a **configuration** error, not a
+transient one. It fails the run once without spending the retry ladder, notifies the
+operator once, and holds the ticket with `the model <id> isn't served by <provider>: check
+the profile or opencode.model` until the resolved model changes (a profile, label or
+WORKFLOW edit) or an operator refreshes. A transient 5xx and a real 429 limit keep the
+ordinary retry-backoff and limit-park paths.
 
 Dollar snapshots are persisted per run/turn in `rhapsody_turn_spend`, leaving Go-owned
 tables and their goldens untouched. Live snapshots are replaced by terminal totals,
