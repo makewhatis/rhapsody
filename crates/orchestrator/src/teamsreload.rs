@@ -21,8 +21,10 @@
 //!
 //! The control task's `teams` field is not the only consumer of routing: the off-loop triage task
 //! holds a boot-captured `Arc<Teams>` and reads `manager.model` for its one-shot turn. A
-//! [`TeamsRoutingSink`] is the seam the composition root installs to hand that consumer the same
+//! [`TeamsRoutingSink`] is the seam the composition root CAN install to hand that consumer the same
 //! routing the control task just applied — the `ProviderReloadSink` pattern, for the same reason.
+//! The control-task consumers (review dispatch and the isolated manager run) read the live config
+//! directly and need no seam.
 
 use std::sync::Arc;
 use std::time::Duration;
