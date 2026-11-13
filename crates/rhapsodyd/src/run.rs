@@ -478,6 +478,9 @@ where
             ));
         }
         o.teams = Some(teams_cfg.clone());
+        // STUDIO-1976: the path the routing watcher polls so a live model/provider edit applies
+        // without a restart (see `teamsreload`). Teams-off / no-runtime-home leaves this `None`.
+        o.teams_config_path = Some(teams_path.clone());
         // A failed sandbox self-test disables only investigate, never manager authority.
         if teams_cfg.enabled
             && teams_cfg.manager.lead.investigate.enabled

@@ -2125,6 +2125,292 @@ impl Teams {
     }
 }
 
+// ── STUDIO-1976: hot-applied routing + comment-preserving writes ──────────────
+
+impl Teams {
+    /// Overlays ONLY the routing fields of `from` onto `self`: the review model/provider/effort
+    /// (each `HarnessScoped`), the manager's harness/provider/model/effort, and each roster
+    /// identity's own routing tuple (matched by name). Every other field — roster membership,
+    /// labels, quorum, review mode, memory — is left exactly as it was.
+    ///
+    /// This is the "hot-apply just the routing fields" half of STUDIO-1976: a reload of `teams.yaml`
+    /// validated the same way as at boot, then folded in through here, so a live daemon picks up a
+    /// model/provider change at the next dispatch/review/manager turn while the boot-loaded fields
+    /// keep whatever the daemon started with.
+    pub fn apply_routing_overlay(&mut self, from: &Teams) {
+        self.review.model = from.review.model.clone();
+        self.review.provider = from.review.provider.clone();
+        self.review.effort = from.review.effort.clone();
+        self.manager.harness = from.manager.harness.clone();
+        self.manager.provider = from.manager.provider.clone();
+        self.manager.model = from.manager.model.clone();
+        self.manager.effort = from.manager.effort.clone();
+        for id in &mut self.roster {
+            if let Some(src) = from.roster.iter().find(|s| s.name == id.name) {
+                id.harness = src.harness.clone();
+                id.provider = src.provider.clone();
+                id.model = src.model.clone();
+                id.effort = src.effort.clone();
+            }
+        }
+    }
+}
+
+/// Sets `review.<field>.<harness>` for `model`, `provider` and `effort` in `teams.yaml` in ONE
+/// atomic edit, preserving every comment and every other byte (STUDIO-1976). An empty value removes
+/// the entry. The whole edited file is validated ONCE before the write, so a tuple that is only
+/// valid as a whole (e.g. a non-Claude harness that requires both a provider and a model) is never
+/// rejected on a half-written intermediate state.
+pub fn save_review_routing(
+    path: &Path,
+    harness: &str,
+    model: &str,
+    provider: &str,
+    effort: &str,
+) -> Result<(), TeamsError> {
+    save_nested_scalars(
+        path,
+        &[
+            (&["review", "model", harness], model),
+            (&["review", "provider", harness], provider),
+            (&["review", "effort", harness], effort),
+        ],
+    )
+}
+
+/// Sets `manager.<field>` for `harness`, `provider`, `model` and `effort` in ONE atomic edit,
+/// preserving comments (STUDIO-1976). An empty value removes the key.
+pub fn save_manager_routing(
+    path: &Path,
+    harness: &str,
+    provider: &str,
+    model: &str,
+    effort: &str,
+) -> Result<(), TeamsError> {
+    save_nested_scalars(
+        path,
+        &[
+            (&["manager", "harness"], harness),
+            (&["manager", "provider"], provider),
+            (&["manager", "model"], model),
+            (&["manager", "effort"], effort),
+        ],
+    )
+}
+
+/// The shared write: read `teams.yaml`, apply every nested-scalar edit (removing a key when its
+/// value is empty), VALIDATE the result once, and only then atomically write it. Validation-first
+/// is what makes an invalid edit a no-op rather than a broken file the next reload would reject.
+fn save_nested_scalars(path: &Path, edits: &[(&[&str], &str)]) -> Result<(), TeamsError> {
+    let text = std::fs::read_to_string(path).map_err(|e| TeamsError::Io(e.to_string()))?;
+    let mut edited = text;
+    for (keys, value) in edits {
+        edited = set_nested_scalar(&edited, keys, value)?;
+    }
+    // Parse+validate the edited text BEFORE writing; a rejection writes nothing.
+    let candidate = Teams::parse(&edited)?;
+    candidate.validate()?;
+    Teams::write_teams_text(path, &edited)
+}
+
+impl Teams {
+    fn write_teams_text(path: &Path, yaml: &str) -> Result<(), TeamsError> {
+        let dir = match path.parent() {
+            Some(p) if !p.as_os_str().is_empty() => p,
+            _ => Path::new("."),
+        };
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(dir)
+            .map_err(|e| TeamsError::Io(e.to_string()))?;
+        let (file, tmp_path) =
+            create_temp(dir, "teams").map_err(|e| TeamsError::Io(e.to_string()))?;
+        write_temp_and_rename(file, &tmp_path, yaml.as_bytes(), 0o600, path).map_err(|e| {
+            let _ = std::fs::remove_file(&tmp_path);
+            TeamsError::Io(e.to_string())
+        })
+    }
+}
+
+/// One line of a YAML document, with the byte span that bounds it and its leading-space count.
+struct YamlLine<'a> {
+    content: &'a str,
+    start: usize,
+    end: usize,
+    indent: usize,
+}
+
+fn yaml_lines(text: &str) -> Vec<YamlLine<'_>> {
+    let mut out = Vec::new();
+    let mut offset = 0usize;
+    for raw in text.split_inclusive('\n') {
+        let content = raw.trim_end_matches(['\r', '\n']);
+        let indent = content.len() - content.trim_start_matches(' ').len();
+        out.push(YamlLine {
+            content,
+            start: offset,
+            end: offset + raw.len(),
+            indent,
+        });
+        offset += raw.len();
+    }
+    out
+}
+
+/// `Some((key, Some(value)))` for a `key: value` line, `Some((key, None))` for a bare `key:` block
+/// opener, `None` for anything else (a comment, a blank, a list item, a continuation).
+fn yaml_mapping_key(content: &str) -> Option<(&str, Option<&str>)> {
+    let trimmed = content.trim_start();
+    if trimmed.is_empty() || trimmed.starts_with('#') || trimmed.starts_with('-') {
+        return None;
+    }
+    let (key, rest) = trimmed.split_once(':')?;
+    if key.is_empty() || key.chars().any(char::is_whitespace) {
+        return None;
+    }
+    let rest = rest.trim_start();
+    if rest.is_empty() {
+        Some((key, None))
+    } else {
+        Some((key, Some(rest)))
+    }
+}
+
+/// Sets (or removes, when `value` is empty) the nested scalar at `path_keys` in `text`, preserving
+/// every other byte. The target's own trailing inline comment is kept on a rewrite. Missing
+/// intermediate blocks are created; a parent that is a SCALAR is refused rather than clobbered,
+/// because turning `review.model: claude-opus-5` into a per-harness map silently is exactly the
+/// re-scope the `HarnessScoped` doc warns against.
+fn set_nested_scalar(text: &str, path_keys: &[&str], value: &str) -> Result<String, TeamsError> {
+    let lines = yaml_lines(text);
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    // First pass: an exact match, replace or remove.
+    for line in &lines {
+        let Some((key, scalar)) = yaml_mapping_key(line.content) else {
+            continue;
+        };
+        while let Some((ind, _)) = stack.last() {
+            if *ind >= line.indent {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        let mut cur: Vec<&str> = stack.iter().map(|(_, k)| *k).collect();
+        cur.push(key);
+        if cur == path_keys {
+            let mut out = String::with_capacity(text.len() + 32);
+            out.push_str(&text[..line.start]);
+            if !value.is_empty() {
+                let comment = crate::profiles::inline_comment(line.content);
+                out.push_str(&format!(
+                    "{}{key}: {}{comment}",
+                    " ".repeat(line.indent),
+                    crate::profiles::yaml_scalar(value)
+                ));
+                if text[line.start..line.end].ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            out.push_str(&text[line.end..]);
+            return Ok(out);
+        }
+        stack.push((line.indent, key));
+        let _ = scalar;
+    }
+    // No exact match: find the deepest existing BLOCK ancestor and build the remainder under it.
+    for depth in (0..path_keys.len()).rev() {
+        let prefix = &path_keys[..depth];
+        if let Some((indent, block_end)) = find_block(&lines, prefix) {
+            let mut insert = String::new();
+            for (j, key) in path_keys[depth..].iter().enumerate() {
+                let ind = indent + 2 * (j + 1);
+                if j + depth == path_keys.len() - 1 {
+                    insert.push_str(&format!(
+                        "{}{key}: {}\n",
+                        " ".repeat(ind),
+                        crate::profiles::yaml_scalar(value)
+                    ));
+                } else {
+                    insert.push_str(&format!("{}{key}:\n", " ".repeat(ind)));
+                }
+            }
+            let mut out = String::with_capacity(text.len() + insert.len());
+            out.push_str(&text[..block_end]);
+            out.push_str(&insert);
+            out.push_str(&text[block_end..]);
+            return Ok(out);
+        }
+    }
+    // No ancestor at all: create the whole nested block at the top level, appended to the document.
+    let mut insert = String::new();
+    if !text.is_empty() && !text.ends_with('\n') {
+        insert.push('\n');
+    }
+    for (j, key) in path_keys.iter().enumerate() {
+        let ind = 2 * j;
+        if j == path_keys.len() - 1 {
+            insert.push_str(&format!(
+                "{}{key}: {}\n",
+                " ".repeat(ind),
+                crate::profiles::yaml_scalar(value)
+            ));
+        } else {
+            insert.push_str(&format!("{}{key}:\n", " ".repeat(ind)));
+        }
+    }
+    let mut out = String::with_capacity(text.len() + insert.len());
+    out.push_str(text);
+    out.push_str(&insert);
+    Ok(out)
+}
+
+/// The `(indent, block_end)` of the BLOCK opened by `path_keys`: `block_end` is the start of the
+/// first line after the block (the next line at `indent` or less, or end of text). `None` when the
+/// path is absent, or present as a scalar rather than a block.
+fn find_block(lines: &[YamlLine<'_>], path_keys: &[&str]) -> Option<(usize, usize)> {
+    let mut stack: Vec<(usize, &str)> = Vec::new();
+    for (i, line) in lines.iter().enumerate() {
+        let Some((key, scalar)) = yaml_mapping_key(line.content) else {
+            continue;
+        };
+        while let Some((ind, _)) = stack.last() {
+            if *ind >= line.indent {
+                stack.pop();
+            } else {
+                break;
+            }
+        }
+        let mut cur: Vec<&str> = stack.iter().map(|(_, k)| *k).collect();
+        cur.push(key);
+        if cur == path_keys {
+            if scalar.is_some() {
+                return None; // a scalar, not a block
+            }
+            // The block ends at the first later line at indent <= this line's indent.
+            let mut end = lines.len();
+            for (j, later) in lines.iter().enumerate().skip(i + 1) {
+                if later.content.trim().is_empty() {
+                    continue;
+                }
+                if later.indent <= line.indent {
+                    end = j;
+                    break;
+                }
+            }
+            let block_end = if end < lines.len() {
+                lines[end].start
+            } else {
+                lines.last().map_or(0, |l| l.end)
+            };
+            return Some((line.indent, block_end));
+        }
+        stack.push((line.indent, key));
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4599,5 +4885,113 @@ roster:
             .expect("parse");
         assert_eq!(t.memory.effective_team_recall_top_k(), 3);
         assert!(t.memory.team_bank_enabled());
+    }
+
+    // ── STUDIO-1976: routing overlay + comment-preserving writes ──────────────
+
+    fn routing_sample() -> &'static str {
+        "enabled: true\nreview:\n  mode: ticketless\n  # premium review on every harness\n  model:\n    claude: claude-opus-5\n    opencode: openai/gpt-6.1-sol # the cheap one\n  effort:\n    claude: high\nmanager:\n  mode: labels\n  model: claude-opus-5\nroster:\n  - name: alice\n    profile: reviewer\n  - name: bob\n    profile: swe\n"
+    }
+
+    #[test]
+    fn routing_overlay_moves_only_the_routing_fields() {
+        let mut boot = Teams::parse(routing_sample()).expect("parse");
+        // A boot config whose roster membership differs from the reloaded one must keep its OWN
+        // membership: only routing fields move.
+        let reloaded = Teams::parse(
+            "enabled: true\nreview:\n  mode: ticketless\n  model:\n    opencode: deepseek-v4p1-flash\nmanager:\n  mode: labels\n  model: gpt-6.1-sol\nroster:\n  - name: alice\n    profile: reviewer\n    model: deepseek-v4p1-flash\n  - name: carol\n    profile: swe\n",
+        )
+        .expect("parse");
+        boot.apply_routing_overlay(&reloaded);
+        // Routing moved.
+        assert_eq!(
+            boot.review.model.for_harness("opencode", "claude"),
+            Some("deepseek-v4p1-flash")
+        );
+        assert_eq!(boot.manager.model, "gpt-6.1-sol");
+        assert_eq!(boot.roster[0].model, "deepseek-v4p1-flash");
+        // Membership did NOT: carol is not added, bob is not removed.
+        assert_eq!(boot.roster.len(), 2);
+        assert_eq!(boot.roster[1].name, "bob");
+        assert_eq!(boot.roster[1].model, "");
+        // The `claude` review model is NOT carried over (the reloaded file dropped it).
+        assert_eq!(boot.review.model.for_harness("claude", "claude"), None);
+    }
+
+    #[test]
+    fn set_nested_scalar_rewrites_in_place_and_keeps_comments() {
+        let edited = set_nested_scalar(
+            routing_sample(),
+            &["review", "model", "opencode"],
+            "fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash",
+        )
+        .expect("edit");
+        assert!(edited.contains("# premium review on every harness\n"));
+        assert!(edited.contains(
+            "    opencode: fireworks-ai/accounts/fireworks/models/deepseek-v4p1-flash # the cheap one\n"
+        ));
+        // The sibling claude entry is untouched.
+        assert!(edited.contains("    claude: claude-opus-5\n"));
+    }
+
+    #[test]
+    fn set_nested_scalar_removes_on_empty_and_creates_missing_blocks() {
+        let removed = set_nested_scalar(routing_sample(), &["review", "effort", "claude"], "")
+            .expect("remove");
+        assert!(!removed.contains("    claude: high\n"));
+        // An entry absent from a present block is created under it.
+        let created = set_nested_scalar(
+            routing_sample(),
+            &["review", "provider", "opencode"],
+            "fireworks",
+        )
+        .expect("create");
+        assert!(created.contains("  provider:\n    opencode: fireworks\n"));
+    }
+
+    #[test]
+    fn save_review_routing_round_trips_and_refuses_invalid() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teams.yaml");
+        std::fs::write(&path, routing_sample()).expect("write");
+        save_review_routing(&path, "opencode", "deepseek-v4p1-flash", "", "").expect("save");
+        let on_disk = Teams::try_load(&path).expect("reload");
+        assert_eq!(
+            on_disk.review.model.for_harness("opencode", "claude"),
+            Some("deepseek-v4p1-flash")
+        );
+        // A comment on an unrelated line survives the write.
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("# premium review on every harness\n"));
+        // A non-canonical provider is refused and the file is left alone.
+        let before = std::fs::read_to_string(&path).expect("read");
+        assert!(save_review_routing(&path, "opencode", "m", "not a provider!", "").is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+    }
+
+    #[test]
+    fn set_nested_scalar_creates_an_absent_top_level_block() {
+        let edited = set_nested_scalar(
+            "enabled: true\nmanager:\n  mode: labels\n",
+            &["review", "model", "opencode"],
+            "m",
+        )
+        .expect("create");
+        assert!(
+            edited.ends_with("review:\n  model:\n    opencode: m\n"),
+            "{edited}"
+        );
+    }
+
+    #[test]
+    fn save_manager_routing_sets_a_scalar_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teams.yaml");
+        std::fs::write(&path, routing_sample()).expect("write");
+        save_manager_routing(&path, "", "", "gpt-6.1-sol", "").expect("save");
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("  model: gpt-6.1-sol\n"));
+        // The roster block after manager is untouched.
+        assert!(text.contains("roster:\n  - name: alice\n"));
     }
 }

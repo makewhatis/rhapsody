@@ -293,6 +293,10 @@ pub enum Event {
     Retry(EvRetry),
     /// A WORKFLOW.md change observed by the watcher (Go `evReload`).
     Reload,
+    /// A `teams.yaml` change observed by the routing watcher (STUDIO-1976; Rhapsody-only, no Go
+    /// counterpart). The handler re-loads and validates the file and folds only its ROUTING fields
+    /// into the live config — the boot-loaded fields stay as they were at startup.
+    TeamsReload,
     /// A request for the race-free workspace-GC plan (Go `evWorkspaceGC`).
     WorkspaceGc {
         reply: oneshot::Sender<WorkspaceGcPlan>,
@@ -841,9 +845,11 @@ impl Orchestrator {
         let terminal_sweep =
             self.start_terminal_cleanup_schedule(ctx.clone(), TERMINAL_CLEANUP_INTERVAL);
         let watch = self.start_watch(ctx.clone());
+        let teams_watch = self.start_watch_teams(ctx.clone());
         self.run_loaded(ctx).await;
         terminal_sweep.abort();
         watch.abort();
+        teams_watch.abort();
         Ok(())
     }
 
@@ -972,6 +978,7 @@ impl Orchestrator {
                 }
             }
             Event::Reload => self.on_reload(),
+            Event::TeamsReload => self.on_teams_reload(),
             Event::DispatchPrepared {
                 id,
                 token,

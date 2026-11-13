@@ -18,6 +18,7 @@ import { ProjectsTab } from "./ProjectsTab";
 import { ProvidersTab } from "./ProvidersTab";
 import { AddAgentSheet } from "./AddAgentSheet";
 import { TeamsTab } from "./TeamsTab";
+import { ModelsTab } from "./ModelsTab";
 import { ToolsTab } from "./ToolsTab";
 import { LogsTab } from "./LogsTab";
 import { UpdatesTab } from "./UpdatesTab";
@@ -29,6 +30,7 @@ const SETTINGS_NAV: { id: SettingsTabId; label: string }[] = [
   { id: "providers", label: "Providers" },
   { id: "projects", label: "Projects" },
   { id: "teams", label: "Teams" },
+  { id: "models", label: "Models" },
   { id: "tools", label: "Tools" },
   { id: "logs", label: "Logs" },
   { id: "updates", label: "Updates" },
@@ -47,6 +49,10 @@ const TAB_META: Record<SettingsTabId, { title: string; desc: string }> = {
   teams: {
     title: "Teams",
     desc: "Named teammates with their own profiles, memory and a shared room — off until you create teams.yaml.",
+  },
+  models: {
+    title: "Models",
+    desc: "Live harness, provider and model for every teammate, the reviews and the manager — no restart.",
   },
   tools: { title: "Tools", desc: "Detected CLIs and connection health, re-checked on launch." },
   logs: { title: "Logs", desc: "Live daemon process log — polling, dispatch, restarts, and errors." },
@@ -224,11 +230,13 @@ export function Settings({ tab, onTab, onBack, updater }: SettingsProps) {
   // draft, so they render before the config load/skeleton guards (and hide the autosave indicator).
   // "Teams" joins them (STUDIO-652): it reads teams.yaml, not WORKFLOW.md, and it deliberately has
   // no autosave — autosaving a file whose ABSENCE is the off state would create it on open.
-  const readOnlyTab = tab === "tools" || tab === "logs" || tab === "updates" || tab === "teams";
+  const readOnlyTab = tab === "tools" || tab === "logs" || tab === "updates" || tab === "teams" || tab === "models";
 
   let body: React.ReactNode;
   if (tab === "teams") {
     body = <TeamsTab />;
+  } else if (tab === "models") {
+    body = <ModelsTab />;
   } else if (tab === "tools") {
     body = <ToolsTab />;
   } else if (tab === "logs") {

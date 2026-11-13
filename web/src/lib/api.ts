@@ -2365,3 +2365,83 @@ export async function fetchTeamsConfig(): Promise<TeamsConfigView> {
 export async function saveTeamsConfig(config: TeamsConfig): Promise<TeamsConfigView> {
   return postJSON<TeamsConfigView>("/api/v1/teams/config", { config });
 }
+
+// ── STUDIO-1976: Settings → Models ───────────────────────────────────────────
+//
+// The live routing view: each teammate's resolved harness/provider/model with origins, the review
+// overrides per harness, and the manager's tuple. A teammate's change rewrites that profile's
+// front matter; a review/manager change rewrites the teams.yaml field in place. Both apply at the
+// next dispatch/review/manager turn — no restart.
+
+export interface ModelsTupleView {
+  harness: string;
+  harness_origin: string;
+  provider: string;
+  provider_origin: string;
+  model: string;
+  model_origin: string;
+  refused?: string;
+}
+
+export interface ModelsRoutingView {
+  harness: string;
+  provider: string;
+  model: string;
+  effort: string;
+}
+
+export interface ModelsIdentityRow {
+  name: string;
+  profile: string;
+  resolved: ModelsTupleView;
+  configured: ModelsRoutingView;
+  identity: ModelsRoutingView;
+  code_reviewer: boolean;
+  profile_error?: string;
+}
+
+export interface ModelsReviewRow {
+  harness: string;
+  model: string;
+  provider: string;
+  effort: string;
+}
+
+export interface ModelsManagerRow {
+  resolved: ModelsTupleView;
+  configured: ModelsRoutingView;
+}
+
+export interface TeamsModelsView {
+  identities: ModelsIdentityRow[];
+  review: ModelsReviewRow[];
+  manager: ModelsManagerRow;
+  harnesses: string[];
+  providers: string[];
+}
+
+export interface ModelsRoutingEntry {
+  name: string;
+  routing: ModelsRoutingView;
+}
+
+export interface TeamsModelsApplyResult {
+  view: TeamsModelsView;
+  previous?: ModelsRoutingEntry[];
+  changed?: string[];
+}
+
+export type TeamsModelsRequest =
+  | { target: "identity"; name: string; routing: ModelsRoutingView }
+  | { target: "review"; harness: string; model: string; provider: string; effort: string }
+  | { target: "manager"; routing: ModelsRoutingView }
+  | { target: "move_all"; routing: ModelsRoutingView }
+  | { target: "undo"; previous: ModelsRoutingEntry[] };
+
+export async function fetchTeamsModels(): Promise<TeamsModelsView> {
+  return getJSON<TeamsModelsView>("/api/v1/teams/models");
+}
+
+export async function applyTeamsModels(req: TeamsModelsRequest): Promise<TeamsModelsApplyResult> {
+  return postJSON<TeamsModelsApplyResult>("/api/v1/teams/models", req);
+}

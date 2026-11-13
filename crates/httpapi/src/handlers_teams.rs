@@ -634,6 +634,78 @@ fn no_teams_config_home() -> Response {
     )
 }
 
+// ── STUDIO-1976: Settings → Models ────────────────────────────────────────────
+//
+// The DTOs and the pure view builder live in `rhapsody_orchestrator::modelsview`, so the daemon's
+// `StateProvider` implementation (in `rhapsodyd`) can name them too — the same split the Teams
+// memory views use. This module owns only the wire handler and the error → envelope mapping.
+
+use rhapsody_orchestrator::modelsview::{TeamsModelsError, TeamsModelsRequest};
+
+fn teams_models_error(err: &TeamsModelsError) -> Response {
+    match err {
+        TeamsModelsError::Disabled => write_error(
+            StatusCode::CONFLICT,
+            "teams_disabled",
+            "teams_disabled",
+            None,
+        ),
+        TeamsModelsError::Invalid(m) => {
+            write_error(StatusCode::BAD_REQUEST, "invalid_models_edit", m, None)
+        }
+        TeamsModelsError::Unknown(m) => write_error(StatusCode::NOT_FOUND, "not_found", m, None),
+        TeamsModelsError::Io(m) => write_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "models_io_error",
+            m,
+            None,
+        ),
+    }
+}
+
+/// Caps a models POST. A change names a few short strings.
+const MAX_MODELS_BODY: usize = 64 * 1024;
+
+/// `GET`/`POST /api/v1/teams/models` — the Settings → Models read and write (STUDIO-1976).
+pub(crate) async fn handle_teams_models(
+    method: Method,
+    State(provider): State<Arc<dyn StateProvider>>,
+    body: Bytes,
+) -> Response {
+    match method {
+        Method::GET | Method::HEAD => match provider.teams_models().await {
+            Ok(view) => write_json(StatusCode::OK, &view),
+            Err(e) => teams_models_error(&e),
+        },
+        Method::POST => {
+            if body.len() > MAX_MODELS_BODY {
+                return write_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    "request body exceeds 64 KiB",
+                    None,
+                );
+            }
+            let req: TeamsModelsRequest = match serde_json::from_slice(&body) {
+                Ok(req) => req,
+                Err(err) => {
+                    return write_error(StatusCode::BAD_REQUEST, "bad_json", err.to_string(), None);
+                }
+            };
+            match provider.teams_models_apply(req).await {
+                Ok(result) => write_json(StatusCode::OK, &result),
+                Err(e) => teams_models_error(&e),
+            }
+        }
+        _ => write_error(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "method_not_allowed",
+            "use GET to read or POST to write models",
+            Some("GET, HEAD, POST"),
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! The Teams memory endpoints, driven end to end against a REAL
@@ -913,7 +985,12 @@ mod tests {
     async fn every_teams_route_is_disabled_without_a_teams_runtime() {
         let url = spawn(Arc::new(FakeProvider::ok(empty_snapshot()))).await;
 
-        for path in ["/api/v1/teams/roster", "/api/v1/teams/recall?identity=a"] {
+        for path in [
+            "/api/v1/teams/roster",
+            "/api/v1/teams/recall?identity=a",
+            // STUDIO-1976: the Settings → Models read is gated like the rest.
+            "/api/v1/teams/models",
+        ] {
             let resp = reqwest::get(&format!("{url}{path}")).await.expect("GET");
             assert_eq!(resp.status(), 409, "{path}");
             assert_eq!(err_code(resp).await, "teams_disabled", "{path}");
@@ -931,6 +1008,11 @@ mod tests {
             ("/api/v1/runs/7/post", r#"{"body":"x"}"#),
             // The human door is gated exactly like the agent-facing ones (STUDIO-661).
             ("/api/v1/teams/room", r#"{"body":"x"}"#),
+            // STUDIO-1976: the Settings → Models write is gated like the rest.
+            (
+                "/api/v1/teams/models",
+                r#"{"target":"manager","routing":{}}"#,
+            ),
         ] {
             let resp = post(&format!("{url}{path}"), body).await;
             assert_eq!(resp.status(), 409, "{path}");

@@ -1795,7 +1795,7 @@ absent on a fresh install, absence means `enabled: false`, and nothing ever crea
 | MCP `list_tools` | byte-identical — the `teams_*` routes are **removed**, not disabled |
 | Filesystem | nothing created: no `teams.yaml`, no `teams/profiles/`, no `teams/banks/`, no `teams/room/` |
 
-Nine **additive** Rhapsody-only endpoints back the Teams tools and the dashboard; no existing
+Ten **additive** Rhapsody-only endpoints back the Teams tools and the dashboard; no existing
 payload changes shape and no golden moves. Each answers `409 teams_disabled` when Teams is off:
 
 | Endpoint | Serves |
@@ -1809,6 +1809,7 @@ payload changes shape and no golden moves. Each answers `409 teams_disabled` whe
 | `POST /api/v1/teams/room` | the OPERATOR's own post to the room, `from` stamped `operator` (STUDIO-661) |
 | `POST /api/v1/runs/{id}/post` | post to the team room as a live run, `from` stamped by the host |
 | `GET /api/v1/teams` | the dashboard's one view: the roster with derived status, the manager mode and the memory backend (STUDIO-652) |
+| `GET`/`POST /api/v1/teams/models` | the Settings → Models view and its live routing writes (STUDIO-1976): each teammate's resolved tuple + the profile it edits, the review overrides per harness, the manager's tuple; a teammate change rewrites that profile's front matter, a review/manager change rewrites the `teams.yaml` field in place, and `move_all`/`undo` batch the teammates |
 
 The matching MCP tools are `teams_roster`, `teams_recall`, `teams_invalidate`, `teams_reinstate`,
 `teams_retain`, `teams_room_read` and `teams_post`. `teams_retain` takes `content` and an optional
@@ -2032,8 +2033,14 @@ anyone would open it. It follows `POST /api/v1/config`'s discipline instead: the
 candidate with the same `Teams::validate` it applies at boot, writes atomically only when valid, and
 leaves the on-disk file untouched on a rejection, surfacing its own complaint verbatim. **The
 never-seed rule is unchanged** — reading it creates nothing, and `teams.yaml` appears only when
-someone explicitly saves one. Because Teams config is boot-loaded (there is no watcher on
-`teams.yaml`, unlike `WORKFLOW.md`), the response carries `restart_required` and the UI says so.
+someone explicitly saves one. Because the boot-loaded part of Teams config (roster membership,
+labels, quorum, review mode, memory) has no watcher, the response carries `restart_required` and the
+UI says so. **STUDIO-1976 makes the ROUTING fields live**: `review.model`/`review.provider`/
+`review.effort` per harness, the manager's `harness`/`provider`/`model`/`effort`, and each roster
+identity's routing tuple now apply at the next dispatch/review/manager turn without a restart (see
+the Settings → Models page below). A watcher re-reads `teams.yaml`, validates it the same way as at
+boot, and folds only those fields into the live config; an invalid edit is refused and the last good
+value kept. Everything else still needs a restart.
 
 With Teams off the dashboard is byte-for-byte what it was: no status chip, no panel, and **zero**
 requests against `/api/v1/teams*`, because the gate is the `teams_enabled` field above. With Teams
@@ -2044,6 +2051,46 @@ provenance-prefixed data — they are untrusted content that reaches every teamm
 app never renders them as bare prose. Since STUDIO-661 the room also has a **compose box**: the
 operator types a line, the daemon posts it as `operator`, and it appears in the tail immediately and
 in every teammate's next catch-up.
+
+### Settings → Models: change a harness/provider/model live (STUDIO-1976)
+
+The problem this closes: a model switch used to mean waiting for the daemon to go quiet and
+restarting it — a restart costs a drain, and a burn-window switch (Claude at 86%, move the working
+teammates to DeepSeek) cannot wait for one. Profiles were already resolved at dispatch, so a
+hand-edited profile's `harness`/`model` took effect with no restart — but that was six files of
+front-matter surgery by hand, and everything in `teams.yaml` (the review overrides, the manager's
+tuple, each identity's routing fields) was boot-loaded.
+
+The feature has two halves. **A `teams.yaml` routing watcher** (`crates/orchestrator/src/teamsreload.rs`,
+no Go counterpart) mirrors the `WORKFLOW.md` watcher: it polls the file's mtime, re-reads and
+VALIDATES it exactly as at boot, and folds only the routing fields into the live config through
+`Teams::apply_routing_overlay` — `review.model`/`review.provider`/`review.effort` per harness, the
+manager's `harness`/`provider`/`model`/`effort`, and each roster identity's routing tuple. Roster
+membership, labels, quorum, review mode and memory are deliberately NOT overlaid: those stay
+boot-loaded. An invalid file is refused, logged at `warn!`, and the last-good routing kept, so a bad
+edit never degrades Teams to off. A run already in flight keeps the tuple it started with; the next
+dispatch/review/manager turn reads the new one. The control-task consumers — review dispatch and the
+isolated MANAGER RUN — read the live config directly. The off-loop triage task's one-shot
+assignment turn still reads the config it was booted with; a `TeamsRoutingSink` seam (the
+`ProviderReloadSink` pattern) is provided to hand it the same routing, and wiring it is the
+remaining follow-up.
+
+**The Settings → Models page** (the same React build in the dashboard and the desktop app) is the
+operator surface. It adds one endpoint, `GET`/`POST /api/v1/teams/models` (operator-guarded like
+`/config`), backed by a pure view builder (`crates/orchestrator/src/modelsview.rs`) that runs the
+SAME resolver `rhapsodyd teams show` does, so the page can never disagree with what a run selects. A
+row per teammate shows the resolved tuple and where each field comes from; a teammate's edit rewrites
+only that profile file's front-matter `harness`/`provider`/`model`/`effort` lines (body and every
+comment byte-for-byte untouched, like Settings → Providers does for `WORKFLOW.md`); a review or
+manager edit rewrites the `teams.yaml` field in place with comments preserved. **Move all workers
+to…** applies one tuple to every non-reviewer teammate and returns an undo payload that restores each
+one's previous tuple. Every change posts one operator line to the room (`models: jerry → opencode/deepseek-v4p1-flash`).
+
+One honest gap, carried from before this ticket: a roster identity's own `harness`/`provider`/
+`model`/`effort` are still parsed and hot-applied but **not fed to dispatch** — `prepare.rs`'s
+identity tier is empty, so a run resolves from the profile tier and below. The Models page edits the
+PROFILE for a teammate for exactly that reason. The manager's tuple and the review overrides ARE
+applied.
 
 **Two cross-process contracts stay on the Go spelling and are not divergences:** the git branch
 prefix is `symphony/<key>` and the agent env vars are `SYMPHONY_*`. Both are read by things outside

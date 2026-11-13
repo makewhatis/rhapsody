@@ -392,6 +392,8 @@ mod router_tests {
         "/api/v1/drain",
         "/api/v1/config",
         "/api/v1/teams/config",
+        // STUDIO-1976: the Settings → Models write (profile / teams.yaml routing).
+        "/api/v1/teams/models",
         "/api/v1/teams/invalidate",
         "/api/v1/teams/reinstate",
         "/api/v1/teams/room",
@@ -708,6 +710,8 @@ mod router_tests {
             // A remove reaches the provider's reference check (the definition never exists here,
             // so it answers 404 — past the guard and past body validation).
             "/api/v1/providers/config" => r#"{"op":"remove","provider_id":"unknown"}"#,
+            // A valid tagged request, so it reaches the provider rather than the body parser.
+            "/api/v1/teams/models" => r#"{"target":"manager","routing":{}}"#,
             _ => "{}",
         }
     }
