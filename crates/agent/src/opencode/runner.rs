@@ -283,7 +283,8 @@ impl Runner {
             auth_failed: AtomicBool::new(false),
             manager: None,
             account_oauth: std::sync::OnceLock::new(),
-            scratch: Mutex::new(scratch.map(ScratchDir::adopt)),
+            scratch: Mutex::new(None),
+            adopted_scratch: Mutex::new(scratch),
         }))
     }
 }
@@ -510,6 +511,7 @@ impl Runner {
             }),
             account_oauth: std::sync::OnceLock::new(),
             scratch: Mutex::new(None),
+            adopted_scratch: Mutex::new(None),
         }))
     }
 }
@@ -675,7 +677,8 @@ impl crate::Runner for Runner {
             auth_failed: AtomicBool::new(false),
             manager: None,
             account_oauth: std::sync::OnceLock::new(),
-            scratch: Mutex::new(scratch.map(ScratchDir::adopt)),
+            scratch: Mutex::new(None),
+            adopted_scratch: Mutex::new(scratch),
         }))
     }
 }
@@ -760,6 +763,9 @@ struct OpencodeSession {
     /// the run id is known, or adopted from a resumed session's record. Removed at run end unless
     /// retained for a resume. `None` when the feature is off.
     scratch: Mutex<Option<ScratchDir>>,
+    /// The scratch tree a resumed session's record named, adopted (and renamed to this run's id) on
+    /// the first turn. `None` for a fresh run or a record that named no scratch directory.
+    adopted_scratch: Mutex<Option<PathBuf>>,
 }
 
 struct ManagerParams {
@@ -900,8 +906,16 @@ impl OpencodeSession {
     fn scratch_path(&self) -> Option<PathBuf> {
         let mut guard = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
-            *guard =
-                ScratchDir::provision(&self.cfg.scratch_root, self.run_id.load(Ordering::SeqCst));
+            let run_id = self.run_id.load(Ordering::SeqCst);
+            let adopted = self
+                .adopted_scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            *guard = match adopted {
+                Some(old) => ScratchDir::adopt_renamed(&self.cfg.scratch_root, run_id, &old),
+                None => ScratchDir::provision(&self.cfg.scratch_root, run_id),
+            };
         }
         guard.as_ref().map(|s| s.path().to_path_buf())
     }
@@ -5176,15 +5190,16 @@ printf '{"type":"step_finish","sessionID":"ses_new","part":{"reason":"stop"}}\n'
         let (_s2, on2) = collector();
         let (tr2, err2) = sess2.run_turn("retry", None, None, &on2).await;
         assert_eq!(tr2.status, TURN_SUCCEEDED, "{err2:?}");
+        let dir12 = scratch_root.path().join("12");
         let env2 = std::fs::read_to_string(&env2_log).expect("env2 log");
         assert!(
-            env2.contains(&format!("TMPDIR={}", dir11.display())),
-            "the resumed run must adopt the kept scratch dir: {env2}"
+            env2.contains(&format!("TMPDIR={}", dir12.display())),
+            "the resumed run must adopt the kept scratch tree, renamed to its own run id: {env2}"
         );
         sess2.stop().await.expect("stop");
         drop(sess2);
         assert!(
-            !dir11.exists(),
+            !dir12.exists() && !dir11.exists(),
             "a completed resume must remove the adopted scratch directory"
         );
 

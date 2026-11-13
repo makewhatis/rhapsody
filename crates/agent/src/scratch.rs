@@ -68,6 +68,48 @@ impl ScratchDir {
         }
     }
 
+    /// Adopts a retained scratch tree for a new run, renaming it to `<root>/<run_id>`.
+    ///
+    /// The rename is not cosmetic: the janitor protects a live run's scratch directory by the LIVE
+    /// run's id, so a tree left under the cut-off run's id (which is no longer live) could be
+    /// reclaimed from under the resumed run once it passes `scratch.ttl_hours`. Renaming it to the
+    /// resumed run's id closes that hole. When the rename is impossible (a cross-device root, a
+    /// target that already exists) it falls back to the original path — correct, but re-exposed to
+    /// the TTL — and to `provision` when the original is gone.
+    pub fn adopt_renamed(root: &str, run_id: i64, old: &Path) -> Option<Self> {
+        if root.is_empty() || run_id <= 0 {
+            return None;
+        }
+        let new = Path::new(root).join(run_id.to_string());
+        if new.is_dir() {
+            return Some(Self {
+                dir: new,
+                kept: AtomicBool::new(false),
+            });
+        }
+        if old.is_dir()
+            && std::fs::create_dir_all(root).is_ok()
+            && std::fs::rename(old, &new).is_ok()
+        {
+            return Some(Self {
+                dir: new,
+                kept: AtomicBool::new(false),
+            });
+        }
+        if old.is_dir() {
+            tracing::warn!(
+                from = %old.display(), to = %new.display(),
+                "scratch: could not rename an adopted scratch directory to the resumed run's id; \
+                 using the original path"
+            );
+            return Some(Self {
+                dir: old.to_path_buf(),
+                kept: AtomicBool::new(false),
+            });
+        }
+        Self::provision(root, run_id)
+    }
+
     /// The directory the child processes are pointed at.
     pub fn path(&self) -> &Path {
         &self.dir
@@ -209,6 +251,34 @@ mod tests {
             !root.join("3").exists(),
             "an adopted dir is removed on drop"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adopt_renamed_moves_the_tree_to_the_live_run_id() {
+        let root = temp_root("rename");
+        std::fs::create_dir_all(root.join("11")).expect("mkdir old");
+        std::fs::write(root.join("11/cargo-target"), b"x").expect("write");
+        let s = ScratchDir::adopt_renamed(&root.to_string_lossy(), 12, &root.join("11"))
+            .expect("adopted");
+        assert_eq!(s.path(), root.join("12"), "the tree takes the live run id");
+        assert!(!root.join("11").exists(), "the old id is gone");
+        assert!(
+            root.join("12/cargo-target").is_file(),
+            "contents moved with it"
+        );
+        drop(s);
+        assert!(!root.join("12").exists(), "removed on drop");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn adopt_renamed_provisions_fresh_when_the_tree_is_gone() {
+        let root = temp_root("rename-gone");
+        let s = ScratchDir::adopt_renamed(&root.to_string_lossy(), 5, &root.join("4"))
+            .expect("provisions fresh");
+        assert_eq!(s.path(), root.join("5"));
+        drop(s);
         let _ = std::fs::remove_dir_all(&root);
     }
 }

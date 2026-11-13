@@ -1,8 +1,7 @@
 // @vitest-environment jsdom
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { AccountsPanel } from "./AccountsPanel";
-import { ScratchPanel } from "./AccountsPanel";
+import { AccountsPanel, ScratchPanel } from "./AccountsPanel";
 import { LimitChips, jobLimitReports } from "./LimitChips";
 import type { AccountView } from "@/lib/api";
 
