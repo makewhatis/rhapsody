@@ -1411,6 +1411,7 @@ impl Orchestrator {
                 "dispatch held: scratch volume under the free-space floor; the scratch janitor was \
                  run"
             );
+            self.refresh_gated_chatgpt_queue().await;
             self.set_held_for_capacity(HashMap::new()); // see the retirement note above
             self.schedule_tick(poll);
             return;
