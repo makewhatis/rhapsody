@@ -30,6 +30,7 @@ pub mod onepassword;
 pub mod opencode;
 pub mod proctree;
 pub mod ratelimit;
+pub mod scratch;
 
 pub use dispatch::{
     DispatchRefusal, DispatchRunner, LaunchContext, PreparedHarnessSpec, PreparedProvider,

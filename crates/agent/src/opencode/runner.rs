@@ -64,6 +64,7 @@ use crate::opencode::probe;
 use crate::opencode::resume::{self, ResumeDecision, ResumeRecord};
 use crate::opencode::state::RunState;
 use crate::proctree::{KillTreeOnDrop, kill_tree};
+use crate::scratch::ScratchDir;
 use crate::{
     AgentError, EVENT_NOTIFICATION, EVENT_SESSION_STARTED, EVENT_STARTUP_FAILED,
     EVENT_TURN_COMPLETED, EVENT_TURN_FAILED, Event, Session, TURN_FAILED, TURN_SUCCEEDED,
@@ -154,16 +155,17 @@ impl Runner {
     /// resume itself.
     ///
     /// Returns the state, the session id to continue (empty for a cold start), the digest of the
-    /// last prompt that session received in full (empty when unknown), and whether it was adopted.
+    /// last prompt that session received in full (empty when unknown), whether it was adopted, and
+    /// the scratch directory the adopted run used (STUDIO-1993), when the record names one.
     fn resolve_state(
         &self,
         workspace_path: &str,
         issue: &Issue,
         provision: impl FnOnce() -> Result<RunState, AgentError>,
-    ) -> Result<(RunState, String, String, bool), AgentError> {
+    ) -> Result<(RunState, String, String, bool, Option<PathBuf>), AgentError> {
         if self.force_fresh {
             resume::discard(&self.cfg.state_root, &issue.identifier);
-            return provision().map(|state| (state, String::new(), String::new(), false));
+            return provision().map(|state| (state, String::new(), String::new(), false, None));
         }
         let now = Utc::now().timestamp_millis();
         match resume::select(
@@ -180,7 +182,8 @@ impl Runner {
                     issue = %issue.identifier, session = %rec.session_id, dir = %rec.dir,
                     "opencode: resuming the retained session of a cut-off attempt"
                 );
-                Ok((state, rec.session_id, rec.prompt_sha256, true))
+                let scratch = adopted_scratch(&self.cfg.scratch_root, &rec.scratch_dir);
+                Ok((state, rec.session_id, rec.prompt_sha256, true, scratch))
             }
             ResumeDecision::Cold(reason) => {
                 if !reason.is_empty() {
@@ -189,7 +192,7 @@ impl Runner {
                         "opencode: not resuming a previous attempt; starting a cold session"
                     );
                 }
-                provision().map(|state| (state, String::new(), String::new(), false))
+                provision().map(|state| (state, String::new(), String::new(), false, None))
             }
         }
     }
@@ -239,7 +242,7 @@ impl Runner {
         // A credential-FREE private state directory: no auth.json is created or copied. A retained
         // brokered session is resumed from its kept directory (STUDIO-1043), which likewise holds
         // no reusable credential — only what the per-turn capabilities left behind.
-        let (state, resume_session, held_prompt, adopted) =
+        let (state, resume_session, held_prompt, adopted, scratch) =
             self.resolve_state(workspace_path, &issue, || {
                 RunState::provision_brokered(
                     &self.cfg.state_root,
@@ -280,6 +283,8 @@ impl Runner {
             auth_failed: AtomicBool::new(false),
             manager: None,
             account_oauth: std::sync::OnceLock::new(),
+            scratch: Mutex::new(None),
+            adopted_scratch: Mutex::new(scratch),
         }))
     }
 }
@@ -505,6 +510,8 @@ impl Runner {
                 xdg,
             }),
             account_oauth: std::sync::OnceLock::new(),
+            scratch: Mutex::new(None),
+            adopted_scratch: Mutex::new(None),
         }))
     }
 }
@@ -585,7 +592,7 @@ impl crate::Runner for Runner {
         let (name, base_args) = split_command(&self.cfg.command)?;
         // A retained session is resumed from its kept directory; otherwise a fresh one is
         // provisioned, refusing a missing credential before anything is spawned.
-        let (state, resume_session, held_prompt, adopted) =
+        let (state, resume_session, held_prompt, adopted, scratch) =
             self.resolve_state(workspace_path, &issue, || {
                 RunState::provision_legacy(
                     &self.cfg.state_root,
@@ -670,7 +677,30 @@ impl crate::Runner for Runner {
             auth_failed: AtomicBool::new(false),
             manager: None,
             account_oauth: std::sync::OnceLock::new(),
+            scratch: Mutex::new(None),
+            adopted_scratch: Mutex::new(scratch),
         }))
+    }
+}
+
+/// Validates a resume record's scratch directory (STUDIO-1993): it must be a direct child of the
+/// configured scratch root and still exist. A hand-edited or corrupt record must never be able to
+/// point the cleanup at an arbitrary path, so anything else is refused and the resumed run provisions
+/// a fresh scratch directory instead.
+fn adopted_scratch(root: &str, rec_dir: &str) -> Option<PathBuf> {
+    if root.is_empty() || rec_dir.is_empty() {
+        return None;
+    }
+    let dir = PathBuf::from(rec_dir);
+    if dir.parent() == Some(Path::new(root)) && dir.is_dir() {
+        Some(dir)
+    } else {
+        tracing::warn!(
+            dir = %dir.display(), root,
+            "opencode: a retained-session record names a scratch directory outside the scratch \
+             root; refusing to adopt it"
+        );
+        None
     }
 }
 
@@ -729,6 +759,13 @@ struct OpencodeSession {
     manager: Option<ManagerParams>,
     /// Kind read from this session's selected-provider login once, before its first turn.
     account_oauth: std::sync::OnceLock<Option<bool>>,
+    /// This run's private scratch directory (STUDIO-1993), provisioned lazily on the first turn once
+    /// the run id is known, or adopted from a resumed session's record. Removed at run end unless
+    /// retained for a resume. `None` when the feature is off.
+    scratch: Mutex<Option<ScratchDir>>,
+    /// The scratch tree a resumed session's record named, adopted (and renamed to this run's id) on
+    /// the first turn. `None` for a fresh run or a record that named no scratch directory.
+    adopted_scratch: Mutex<Option<PathBuf>>,
 }
 
 struct ManagerParams {
@@ -844,6 +881,7 @@ impl OpencodeSession {
     fn end_of_run(&self) {
         if self.manager.is_some() {
             self.state.cleanup();
+            self.finish_scratch(false);
             return;
         }
         let ran_a_turn = self.turn_n.load(Ordering::SeqCst) > 0;
@@ -856,6 +894,46 @@ impl OpencodeSession {
         } else {
             self.state.cleanup();
             resume::clear(&self.cfg.state_root, &self.issue.identifier);
+        }
+        // The scratch directory follows the state directory (STUDIO-1993): kept with a retained
+        // session, removed otherwise. A kept tree is named by the resume record so the resumed run
+        // adopts and eventually removes it.
+        self.finish_scratch(self.state.is_kept());
+    }
+
+    /// Provisions (or adopts) this run's scratch directory and returns its path (STUDIO-1993). Off
+    /// when no scratch root is configured or no run id is known yet.
+    fn scratch_path(&self) -> Option<PathBuf> {
+        let mut guard = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            let run_id = self.run_id.load(Ordering::SeqCst);
+            let adopted = self
+                .adopted_scratch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+            *guard = match adopted {
+                Some(old) => ScratchDir::adopt_renamed(&self.cfg.scratch_root, run_id, &old),
+                None => ScratchDir::provision(&self.cfg.scratch_root, run_id),
+            };
+        }
+        guard.as_ref().map(|s| s.path().to_path_buf())
+    }
+
+    /// The end-of-run disposition of the scratch directory: keep it (a retained session's tree,
+    /// removed when the resume ends) or remove it now. Idempotent — the `stop` and `Drop` paths both
+    /// reach it, and the second pass finds nothing to do.
+    fn finish_scratch(&self, keep: bool) {
+        let taken = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        // Dropping `dir` removes the directory unless it was kept.
+        if let Some(dir) = taken
+            && keep
+        {
+            dir.keep();
         }
     }
 
@@ -871,12 +949,20 @@ impl OpencodeSession {
         if session_id.is_empty() || !dir.is_dir() {
             return;
         }
+        let scratch_dir = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|s| s.path().to_string_lossy().into_owned())
+            .unwrap_or_default();
         let rec = ResumeRecord {
             harness: resume::HARNESS.to_string(),
             model: self.cfg.model.clone(),
             workspace: self.ws_path.clone(),
             session_id,
             dir: dir.to_string_lossy().into_owned(),
+            scratch_dir,
             saved_at_ms: Utc::now().timestamp_millis(),
             prompt_sha256: self.locked_held_prompt().clone(),
         };
@@ -1469,11 +1555,17 @@ impl OpencodeSession {
             }
             env
         };
+        // STUDIO-1993: point the child at this run's daemon-owned scratch directory. Applied to
+        // every posture, after the posture-specific env is chosen (so a manager/brokered allow-list
+        // cannot drop it) and before the size check below (so it counts).
+        let mut env = env;
+        if let Some(dir) = self.scratch_path() {
+            crate::scratch::apply_env(&mut env, &dir);
+        }
         // STUDIO-1584: the run's 1Password service-account token (when the project binds one) plus
         // the always-on biometric-disable variable, applied to EVERY posture (legacy, manager,
         // brokered) so an `op` call in any of them fails fast instead of prompting. Injected into
         // the executor child env only; never logged.
-        let mut env = env;
         {
             let token = self
                 .onepassword_token
@@ -5016,6 +5108,120 @@ printf '{"type":"step_finish","sessionID":"ses_new","part":{"reason":"stop"}}\n'
 
     /// A successful cold run removes its directory and leaves no record — the legacy cleanup the
     /// ticket requires to be unchanged.
+    /// STUDIO-1993 acceptance: a run's child env points `TMPDIR` and `CARGO_TARGET_DIR` at its
+    /// per-run scratch directory; the directory is removed at run end; a cut-off run keeps it and
+    /// names it in the resume record, and the resumed run adopts and finally removes it.
+    #[tokio::test]
+    async fn scratch_dir_is_set_in_the_env_and_kept_only_for_a_resume() {
+        let _env = ENV_GUARD.read().await;
+        let scripts = TempDir::new();
+        let auth = seeded_auth(&scripts);
+        let state_root = TempDir::new();
+        let root = TempDir::new();
+        let scratch_root = TempDir::new();
+        let ws = make_ws(&root, "w");
+        let sr = state_root.path().to_string_lossy().into_owned();
+        let scr = scratch_root.path().to_string_lossy().into_owned();
+        let dir11 = scratch_root.path().join("11");
+
+        // --- Attempt 1: cut off by the deadline, scratch dir left for the resume. ---
+        let env1_log = scripts.path().join("env1.txt");
+        let cut = write_script(
+            &scripts,
+            "cut.sh",
+            &format!(
+                "printf '{{\"type\":\"step_start\",\"sessionID\":\"ses_cut\",\"part\":{{}}}}\\n'\nenv > \"{}\"\nsleep 30\n",
+                env1_log.display()
+            ),
+        );
+        let mut runner = runner_with(&cut, &root, &auth, &sr, "m", 1);
+        runner.cfg.scratch_root = scr.clone();
+        let sess = runner
+            .start_session(&ws, issue("STUDIO-1993"), None)
+            .await
+            .expect("session");
+        sess.set_run_id(11);
+        let (_s, on) = collector();
+        let (tr, err) = sess.run_turn("cut", None, None, &on).await;
+        assert_eq!(tr.status, TURN_TIMED_OUT, "{err:?}");
+        sess.stop().await.expect("stop");
+        drop(sess);
+
+        let env1 = std::fs::read_to_string(&env1_log).expect("env1 log");
+        assert!(
+            env1.contains(&format!("TMPDIR={}", dir11.display())),
+            "TMPDIR must point at the run's scratch dir: {env1}"
+        );
+        assert!(
+            env1.contains(&format!("CARGO_TARGET_DIR={}", dir11.display())),
+            "CARGO_TARGET_DIR must point at the run's scratch dir: {env1}"
+        );
+        assert!(
+            dir11.is_dir(),
+            "a cut-off run must keep its scratch directory for the resume"
+        );
+        let rec: crate::opencode::resume::ResumeRecord = serde_json::from_str(
+            &std::fs::read_to_string(record_file(&sr, "STUDIO-1993")).unwrap(),
+        )
+        .expect("record parses");
+        assert_eq!(
+            rec.scratch_dir,
+            dir11.to_string_lossy(),
+            "the resume record must name the kept scratch directory"
+        );
+
+        // --- Attempt 2: the retry adopts the kept scratch dir and removes it on success. ---
+        let env2_log = scripts.path().join("env2.txt");
+        let clean = write_script(
+            &scripts,
+            "clean.sh",
+            &format!(
+                "env > \"{}\"\nprintf '{{\"type\":\"step_finish\",\"sessionID\":\"ses_cut\",\"part\":{{\"reason\":\"stop\"}}}}\\n'\n",
+                env2_log.display()
+            ),
+        );
+        let mut retry = runner_with(&clean, &root, &auth, &sr, "m", 30);
+        retry.cfg.scratch_root = scr.clone();
+        let sess2 = retry
+            .start_session(&ws, issue("STUDIO-1993"), None)
+            .await
+            .expect("retry session");
+        sess2.set_run_id(12);
+        let (_s2, on2) = collector();
+        let (tr2, err2) = sess2.run_turn("retry", None, None, &on2).await;
+        assert_eq!(tr2.status, TURN_SUCCEEDED, "{err2:?}");
+        let dir12 = scratch_root.path().join("12");
+        let env2 = std::fs::read_to_string(&env2_log).expect("env2 log");
+        assert!(
+            env2.contains(&format!("TMPDIR={}", dir12.display())),
+            "the resumed run must adopt the kept scratch tree, renamed to its own run id: {env2}"
+        );
+        sess2.stop().await.expect("stop");
+        drop(sess2);
+        assert!(
+            !dir12.exists() && !dir11.exists(),
+            "a completed resume must remove the adopted scratch directory"
+        );
+
+        // A run that never fails removes its own scratch directory too.
+        let mut fresh = runner_with(&clean, &root, &auth, &sr, "m", 30);
+        fresh.cfg.scratch_root = scr.clone();
+        let sess3 = fresh
+            .start_session(&ws, issue("STUDIO-1993-B"), None)
+            .await
+            .expect("session");
+        sess3.set_run_id(13);
+        let (_s3, on3) = collector();
+        let (tr3, err3) = sess3.run_turn("ok", None, None, &on3).await;
+        assert_eq!(tr3.status, TURN_SUCCEEDED, "{err3:?}");
+        sess3.stop().await.expect("stop");
+        drop(sess3);
+        assert!(
+            !scratch_root.path().join("13").exists(),
+            "a successful run must remove its scratch directory"
+        );
+    }
+
     #[tokio::test]
     async fn a_successful_run_leaves_no_session_and_no_record() {
         let _env = ENV_GUARD.read().await;

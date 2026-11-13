@@ -1781,6 +1781,20 @@ impl Orchestrator {
             self.arm_retry_timer(&e.issue_id, crate::drain::DRAIN_REQUEUE_DELAY_MS);
             return;
         }
+        // STUDIO-1993 review B1: the disk-pressure guard's SECOND entry point. A due retry dispatches
+        // straight from here, bypassing `on_tick`, so a guard that gated only the tick kept launching
+        // attempts while the ordinary poll reported dispatch held. Park exactly as the drain gate
+        // does — the entry keeps its claim and its attempt number and only the timer is re-armed —
+        // so a later pass dispatches it once free space recovers. Off (no root configured) on a
+        // scratch-disabled install, so this is byte-identical there.
+        if self.scratch_dispatch_hold().is_some() && self.retry_attempts.contains_key(&e.issue_id) {
+            tracing::debug!(
+                issue_id = %e.issue_id,
+                "scratch: parking a due retry; disk pressure; claim and attempt kept"
+            );
+            self.arm_retry_timer(&e.issue_id, crate::scratch::SCRATCH_REQUEUE_DELAY_MS);
+            return;
+        }
         let Some(re) = self.retry_attempts.remove(&e.issue_id) else {
             return;
         };
@@ -4361,6 +4375,47 @@ mod tests {
             !o.retry_attempts.contains_key("1"),
             "retry entry should be cleared on dispatch"
         );
+    }
+
+    // STUDIO-1993 review B1: a due retry must not launch a new run while the disk-pressure guard
+    // holds dispatch. It is parked exactly as the drain gate parks it — the entry keeps its claim and
+    // its attempt number, and only the timer is re-armed — so a later pass dispatches it.
+    #[tokio::test]
+    async fn on_retry_parks_under_disk_pressure_keeping_the_claim_and_attempt() {
+        let mut f = Fake::new();
+        f.candidates = vec![issue("1", "MT-1", "In Progress")];
+        let tr = Arc::new(f);
+        let (mut o, dispatched) = orch_for_retry(Arc::clone(&tr), 10);
+        // An existing scratch root and an always-under floor: the guard holds.
+        {
+            let eff = o.eff.as_mut().expect("effective config");
+            eff.cfg.scratch.root = std::env::temp_dir().to_string_lossy().into_owned();
+            eff.cfg.scratch.min_free_gib = u64::MAX;
+            eff.cfg.scratch.legacy_ttl_hours = 0;
+        }
+        o.claimed.insert("1".into());
+        o.retry_attempts
+            .insert("1".into(), retry_entry("1", "MT-1", 3));
+
+        o.on_retry(EvRetry {
+            issue_id: "1".into(),
+        })
+        .await;
+
+        assert!(
+            dispatched.lock().unwrap().is_empty(),
+            "no run may launch under the disk-pressure hold"
+        );
+        assert!(o.running.is_empty(), "no worker admitted under the hold");
+        assert!(o.claimed.contains("1"), "the claim survives the park");
+        let kept = o
+            .retry_attempts
+            .get("1")
+            .expect("the retry entry survives the park");
+        assert_eq!(kept.attempt, 3, "the attempt number is not incremented");
+        if let Some(t) = o.retry_timers.remove("1") {
+            t.abort();
+        }
     }
 
     // Mirrors Go `TestOnRetryReleasesRecoveredWhenPRLinked` (INF-191).

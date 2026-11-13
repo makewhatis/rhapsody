@@ -289,6 +289,7 @@ impl Orchestrator {
                 .chain(self.lead_human_feed())
                 .chain(self.credential_human_feed())
                 .chain(self.onepassword_human_feed())
+                .chain(self.scratch_human_feed())
                 .collect(),
             // STUDIO-949: the current hold set, replaced every selection pass; empty on a daemon with
             // no human-gated ticket, which keeps the wire payload — and the golden — unchanged.

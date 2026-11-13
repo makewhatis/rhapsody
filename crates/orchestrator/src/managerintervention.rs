@@ -74,7 +74,10 @@ pub fn stall_kind_for(kind: DivergenceKind) -> Option<&'static str> {
         // and routing it to the manager would page a human a second time for work they reserved.
         | DivergenceKind::HeldForHuman
         | DivergenceKind::ManagerDeferred
-        | DivergenceKind::ReviewInfrastructure | DivergenceKind::CredentialInfrastructure => None,
+        | DivergenceKind::ReviewInfrastructure
+        | DivergenceKind::CredentialInfrastructure
+        // STUDIO-1993: a disk-pressure hold is a daemon-side admission gate, not a manager stall.
+        | DivergenceKind::ScratchPressure => None,
     }
 }
 

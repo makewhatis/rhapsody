@@ -641,6 +641,9 @@ pub struct Config {
     pub prices: HashMap<String, Price>,
     /// Default-on account limit handling (STUDIO-1126), independent of provider budgets.
     pub limits: crate::limits::Limits,
+    /// Per-run scratch-directory policy (STUDIO-1993). Rhapsody-only; every field has a working
+    /// default, so an install that never writes `scratch:` behaves as before.
+    pub scratch: crate::scratch::Scratch,
 
     /// The operator-notification channels the runaway-loop breaker escalates to (STUDIO-1026).
     /// Rhapsody-only; every channel defaults off, so an install that never writes `notify:` is
@@ -714,6 +717,9 @@ pub(crate) struct Raw {
     pub budgets: BTreeMap<String, RawProviderBudget>,
     pub prices: BTreeMap<String, Price>,
     pub limits: Option<crate::limits::Limits>,
+    /// `scratch:` front-matter block (STUDIO-1993). Rhapsody-only: absent ⇒ defaults. An `Option`
+    /// so `encode` can emit the block only when it differs from the default.
+    pub scratch: Option<crate::scratch::Scratch>,
     /// `notify:` front-matter block (STUDIO-1026). Rhapsody-only: absent ⇒ every channel off. An
     /// `Option` so `encode` can emit the block only when some channel is configured, keeping an
     /// unconfigured workflow byte-identical on the round-trip.

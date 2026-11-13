@@ -1,6 +1,7 @@
-import type { AccountView } from "@/lib/api";
+import type { AccountView, ScratchStatus } from "@/lib/api";
 import { Card, Chip, Pill, PILL_COLORS, type PillVariant } from "@/components/console";
 import { useAccounts } from "@/hooks/useAccounts";
+import { useSystem } from "@/hooks/useSystem";
 import { useEffect, useState } from "react";
 import { useNotificationCentre } from "./NotificationCentre";
 
@@ -49,14 +50,37 @@ export function AccountsPanel({ accounts, nowS }: { accounts: AccountView[]; now
   </Card>;
 }
 
+function gib(bytes: number): string {
+  const g = bytes / (1024 * 1024 * 1024);
+  return g >= 10 ? `${g.toFixed(0)} GiB` : `${g.toFixed(2)} GiB`;
+}
+
+/** The system panel's scratch row (STUDIO-1993): the per-run scratch root's usage and the volume's
+ *  free space, with a warning when the disk-pressure guard is holding dispatch. */
+export function ScratchPanel({ scratch }: { scratch: ScratchStatus | null }) {
+  if (scratch === null || scratch.root === "") return null;
+  const free = scratch.free_gib === null ? "unknown" : `${scratch.free_gib.toFixed(1)} GiB free`;
+  return <Card title="Scratch" sub="per-run build & temp directories">
+    <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
+      {scratch.held ? <Pill variant="blocked">dispatch held</Pill> : <Pill variant="run">ok</Pill>}
+      <span className="mono">{scratch.dirs} {scratch.dirs === 1 ? "directory" : "directories"} · {gib(scratch.used_bytes)}</span>
+      <span className="mono">{free}</span>
+      {scratch.held ? <span className="sub">below the {scratch.min_free_gib} GiB floor</span> : null}
+    </div>
+    <p className="sub mono" title={scratch.root}>{scratch.root}</p>
+  </Card>;
+}
+
 export function AccountsPage() {
   const query = useAccounts();
   const system = useNotificationCentre().notices.filter((n) => n.group === "system" && n.active);
+  const scratch = useSystem();
   const [nowS, setNowS] = useState(() => Math.floor(Date.now() / 1000));
   useEffect(() => { const timer = window.setInterval(() => setNowS(Math.floor(Date.now() / 1000)), 1000); return () => window.clearInterval(timer); }, []);
   return <section>
     <h1>Accounts</h1>
     {system.length > 0 ? <Card title="System status">{system.map((n) => <p key={n.id}><Pill variant="review">{n.subject}</Pill> {n.summary}</p>)}</Card> : null}
+    {scratch.isSuccess ? <ScratchPanel scratch={scratch.data?.scratch ?? null} /> : null}
     {query.isPending ? <div className="empty">Loading accounts…</div> : query.isError ? <div role="alert">Account usage could not be read.</div> : <AccountsPanel accounts={query.data ?? []} nowS={nowS} />}
   </section>;
 }

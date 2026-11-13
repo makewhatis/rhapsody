@@ -119,6 +119,7 @@ pub mod runautomerge;
 pub mod rundiff;
 pub mod runmanagerapply;
 pub mod runmerge;
+pub mod scratch;
 pub mod select;
 pub mod selection;
 pub mod snapshot;

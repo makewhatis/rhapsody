@@ -67,6 +67,9 @@ fn raw_from_config(c: &Config) -> Raw {
     if c.limits != crate::Limits::default() {
         r.limits = Some(c.limits.clone());
     }
+    if c.scratch != crate::Scratch::default() {
+        r.scratch = Some(c.scratch.clone());
+    }
 
     r.tracker.kind = c.tracker.kind.clone();
     r.tracker.endpoint = c.tracker.endpoint.clone();

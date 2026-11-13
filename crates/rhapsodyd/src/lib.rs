@@ -35,6 +35,7 @@ pub mod providers;
 pub mod prune;
 pub mod run;
 pub mod runlock;
+pub mod scratch;
 pub mod state;
 pub mod teams;
 

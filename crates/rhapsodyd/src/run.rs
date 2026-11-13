@@ -1072,6 +1072,21 @@ where
         crate::prune::run_prune_schedule(prune_ctx, sf, rf, pw, rl).await;
     });
 
+    // --- scratch janitor (STUDIO-1993; startup + hourly) ---
+    //
+    // The per-run scratch directories the daemon hands each agent (`~/.rhapsody/scratch/<run-id>/`)
+    // and the historical `$TMPDIR/opencode` trees agents chose themselves. The sweep runs off-loop
+    // through the control handle, exactly as the prune scheduler's worktree GC does.
+    let scratch_ctx = shutdown.wait();
+    let scratch_handle = handle.clone();
+    let scratch_task = tokio::spawn(async move {
+        crate::scratch::run_scratch_schedule(scratch_ctx, move || {
+            let h = scratch_handle.clone();
+            async move { h.sweep_scratch().await }
+        })
+        .await;
+    });
+
     // --- manager self-test watcher (STUDIO-1049, §4.7) ---
     //
     // Spawned for configured authority, even while every entry is failing. Boot waits for a usable
@@ -1877,6 +1892,9 @@ where
     }
     // Stop + join the prune task BEFORE writing to stderr so its logging cannot race run's output.
     let _ = prune_task.await;
+    // The scratch janitor is cancelled by the same signal; a sweep already in flight is bounded by
+    // the plan round-trip, so joining it here cannot hang shutdown.
+    let _ = scratch_task.await;
     // The manager self-test watcher is cancelled by the same signal and checks it around its sleep,
     // so its wait is bounded by one probe (and, at most, one canary turn, itself capped by the turn
     // timeout).

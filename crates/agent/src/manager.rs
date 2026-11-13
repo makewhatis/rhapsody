@@ -353,6 +353,7 @@ pub fn manager_config(base: &Config, mcp_config_path: &str) -> Config {
         inject_mcp: false,
         daemon_bin: base.daemon_bin.clone(),
         workflow_path: base.workflow_path.clone(),
+        scratch_root: base.scratch_root.clone(),
     }
 }
 

@@ -66,6 +66,8 @@ pub(crate) struct FakeProvider {
     notification_store: Option<Arc<dyn rhapsody_store::Store + Send + Sync>>,
     lead_reports: Option<Arc<rhapsody_orchestrator::leadreport::LeadReports>>,
     lead_harnesses: Option<Arc<rhapsody_orchestrator::managerselftest::runtime::LeadHarnesses>>,
+    /// The canned scratch/disk view (STUDIO-1993). `None` renders `scratch: null`.
+    scratch_status: Option<rhapsody_orchestrator::scratch::ScratchStatus>,
     snap: Snapshot,
     snap_err: Option<String>,
     history: Arc<dyn HistoryStore>,
@@ -236,6 +238,13 @@ impl FakeProvider {
         self.accounts = accounts;
         self
     }
+    pub(crate) fn with_scratch_status(
+        mut self,
+        status: rhapsody_orchestrator::scratch::ScratchStatus,
+    ) -> Self {
+        self.scratch_status = Some(status);
+        self
+    }
 
     /// A provider that returns `snap` from every `snapshot()` call, with an empty (Noop) history store.
     pub(crate) fn ok(snap: Snapshot) -> Self {
@@ -246,6 +255,7 @@ impl FakeProvider {
             snap_err: None,
             drain: rhapsody_orchestrator::drain::DrainSignal::new(),
             accounts: Vec::new(),
+            scratch_status: None,
             history: Arc::new(Noop),
             transcript: None,
             linear_projects: Vec::new(),
@@ -777,6 +787,10 @@ impl StateProvider for FakeProvider {
     }
     fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
         self.accounts.clone()
+    }
+    async fn scratch_status(&self) -> Option<rhapsody_orchestrator::scratch::ScratchStatus> {
+        self.touch();
+        self.scratch_status.clone()
     }
     async fn clear_credential_hold(
         &self,

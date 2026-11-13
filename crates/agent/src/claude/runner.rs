@@ -147,6 +147,7 @@ impl crate::Runner for Runner {
             manager_credential: None,
             account_oauth: Mutex::new(None),
             activity_callback: Mutex::new(None),
+            scratch: Mutex::new(None),
         }))
     }
 }
@@ -206,6 +207,7 @@ impl Harness for Runner {
             manager_credential: None,
             account_oauth: Mutex::new(None),
             activity_callback: Mutex::new(None),
+            scratch: Mutex::new(None),
         }))
     }
 
@@ -286,6 +288,7 @@ impl Harness for Runner {
             manager_credential: req.model_credential,
             account_oauth: Mutex::new(None),
             activity_callback: Mutex::new(None),
+            scratch: Mutex::new(None),
         }))
     }
 }
@@ -349,6 +352,10 @@ struct ClaudeSession {
     /// Nonsecret auth observed from the first system/init; frozen for this run.
     account_oauth: Mutex<Option<bool>>,
     activity_callback: Mutex<Option<crate::ActivityCallback>>,
+    /// This run's private scratch directory (STUDIO-1993), provisioned lazily on the first turn once
+    /// the run id is known. Removed when the session drops; claude retains no session for resume, so
+    /// there is nothing to keep. `None` when the feature is off.
+    scratch: Mutex<Option<crate::scratch::ScratchDir>>,
 }
 
 impl ClaudeSession {
@@ -477,6 +484,33 @@ impl ClaudeSession {
             "agent result exit grace expired; killing lingering process tree"
         );
         kill_tree(pid);
+    }
+
+    /// Provisions this run's scratch directory on first use and returns its path (STUDIO-1993). Off
+    /// when no scratch root is configured or no run id is known yet.
+    fn scratch_path(&self) -> Option<std::path::PathBuf> {
+        let mut guard = self.scratch.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = crate::scratch::ScratchDir::provision(
+                &self.cfg.scratch_root,
+                self.run_id.load(Ordering::SeqCst),
+            );
+        }
+        guard.as_ref().map(|s| s.path().to_path_buf())
+    }
+}
+
+/// Removes the run's scratch directory when the session is dropped. Claude retains no session for
+/// resume, so every scratch tree is removed at run end (STUDIO-1993); a cancelled run reaches this
+/// too, since the worker drops the session future.
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        let taken = self
+            .scratch
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        drop(taken); // `ScratchDir`'s own Drop removes the directory
     }
 }
 
@@ -655,6 +689,11 @@ impl Session for ClaudeSession {
             crate::onepassword::append_onepassword_env(&mut env, token.as_deref());
         }
         cmd.env_clear();
+        // STUDIO-1993: point the child at this run's daemon-owned scratch directory, so its temp
+        // files and cargo target dirs land where the janitor can reclaim them.
+        if let Some(dir) = self.scratch_path() {
+            crate::scratch::apply_env(&mut env, &dir);
+        }
         if let Some(auth) = self
             .github_auth
             .lock()
@@ -2731,6 +2770,41 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"complete-sessi
             env.get("SYMPHONY_ISSUE").map(String::as_str),
             Some("MT-RUNID"),
             "SYMPHONY_ISSUE must still be set"
+        );
+    }
+
+    /// STUDIO-1993: with a scratch root configured and a run id set, the claude child's env points
+    /// `TMPDIR` and `CARGO_TARGET_DIR` at `<scratch_root>/<run_id>`, and the directory is removed when
+    /// the session drops (claude retains no session for resume).
+    #[tokio::test]
+    async fn run_turn_points_tmpdir_and_cargo_target_dir_at_the_scratch_dir() {
+        let _env = ENV_GUARD.read().await;
+        let root = TempDir::new();
+        let scratch_root = TempDir::new();
+        let ws = make_ws(&root, "MT-SCRATCH");
+        let (_s, script) = env_dump_script();
+        let mut r = new_runner(&script, &root.path());
+        r.cfg.scratch_root = scratch_root.path();
+        let dir = scratch_root.join("77");
+        {
+            let sess = r
+                .start_session(&ws, issue("s1", "MT-SCRATCH"), None)
+                .await
+                .expect("start session");
+            sess.set_run_id(77);
+            let (_t, on_event) = type_collector();
+            let (_res, err) = sess.run_turn("p", None, None, &on_event).await;
+            assert!(err.is_none(), "RunTurn err = {err:?}");
+            let env = read_env_dump(&format!("{ws}/env.dump"));
+            assert_eq!(env.get("TMPDIR").map(String::as_str), Some(dir.as_str()));
+            assert_eq!(
+                env.get("CARGO_TARGET_DIR").map(String::as_str),
+                Some(dir.as_str())
+            );
+        }
+        assert!(
+            !std::path::Path::new(&dir).exists(),
+            "dropping the session must remove the run's scratch directory"
         );
     }
 

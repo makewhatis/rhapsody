@@ -35,7 +35,7 @@ use rhapsody_store::StoreError;
 
 use crate::handlers::{
     handle_accounts, handle_clear_credential, handle_healthz, handle_refresh, handle_state,
-    handle_version,
+    handle_system, handle_version,
 };
 use crate::handlers_config::{handle_capabilities, handle_config};
 use crate::handlers_drain::handle_drain;
@@ -124,6 +124,11 @@ pub trait StateProvider: Send + Sync {
     /// Read-only account ledger snapshot (STUDIO-1123); no control round-trip or provider I/O.
     fn accounts(&self) -> Vec<rhapsody_orchestrator::accounts::AccountView> {
         Vec::new()
+    }
+    /// The additive scratch/disk view (STUDIO-1993). `None` when the daemon has not assembled it
+    /// (a test provider, or a loop that is gone); the `/api/v1/system` handler then renders `null`.
+    async fn scratch_status(&self) -> Option<rhapsody_orchestrator::scratch::ScratchStatus> {
+        None
     }
     /// Explicit credential recovery acknowledgement; mutation is scheduling-task-owned.
     async fn clear_credential_hold(
@@ -899,6 +904,9 @@ where
         // Build identity (STUDIO-380): which commit this daemon was built from. Additive and
         // state-free — `/state` is golden-pinned to the Go daemon's payload and cannot carry it.
         .route("/api/v1/version", any(handle_version))
+        // Per-run scratch usage + free space (STUDIO-1993): additive, state-free of the golden-pinned
+        // `/state` payload, for the dashboard's system panel.
+        .route("/api/v1/system", any(handle_system))
         .route("/api/v1/accounts", any(handle_accounts))
         .route(
             "/api/v1/accounts/{id}/credentials/{harness}/clear",
