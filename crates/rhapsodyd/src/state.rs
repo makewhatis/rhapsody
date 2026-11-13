@@ -745,10 +745,17 @@ impl StateProvider for DaemonState {
             }
             TeamsModelsRequest::MoveAll { routing } => {
                 validate_routing(&routing, &cfg)?;
-                for id in &teams.roster {
-                    if teams.review.is_code_reviewer(id) {
-                        continue;
-                    }
+                // Pre-check every target profile has a file, so a missing one refuses the WHOLE
+                // move rather than leaving a partial write with no undo payload.
+                let targets: Vec<&rhapsody_config::teams::Identity> = teams
+                    .roster
+                    .iter()
+                    .filter(|id| !teams.review.is_code_reviewer(id))
+                    .collect();
+                for id in &targets {
+                    require_profile_file(&profiles_dir, &id.profile)?;
+                }
+                for id in targets {
                     previous.push(RoutingEntry {
                         name: id.name.clone(),
                         routing: read_profile_routing_view(&profiles_dir, &id.profile),
@@ -758,11 +765,16 @@ impl StateProvider for DaemonState {
                 }
             }
             TeamsModelsRequest::Undo { previous: entries } => {
+                let mut resolved = Vec::with_capacity(entries.len());
                 for entry in entries {
                     let id = find_identity(&teams, &entry.name)?;
                     validate_routing(&entry.routing, &cfg)?;
-                    write_profile_routing(&profiles_dir, &id.profile, &entry.routing)?;
-                    changed.push(models_line(&entry.name, &entry.routing));
+                    require_profile_file(&profiles_dir, &id.profile)?;
+                    resolved.push((id, entry.routing));
+                }
+                for (id, routing) in resolved {
+                    write_profile_routing(&profiles_dir, &id.profile, &routing)?;
+                    changed.push(models_line(&id.name, &routing));
                 }
             }
         }
@@ -1006,13 +1018,8 @@ fn write_profile_routing(
     profile: &str,
     routing: &RoutingView,
 ) -> Result<(), TeamsModelsError> {
+    require_profile_file(dir, profile)?;
     let path = rhapsody_config::profiles::profile_path(dir, profile);
-    if !path.exists() {
-        return Err(TeamsModelsError::Invalid(format!(
-            "profile {profile:?} has no file at {} to edit; run `rhapsodyd teams fork {profile}` first",
-            path.display()
-        )));
-    }
     let pr = rhapsody_config::profiles::ProfileRouting {
         harness: routing.harness.clone(),
         provider: routing.provider.clone(),
@@ -1021,6 +1028,19 @@ fn write_profile_routing(
     };
     rhapsody_config::profiles::save_routing(&path, &pr)
         .map_err(|e| TeamsModelsError::Invalid(e.to_string()))?;
+    Ok(())
+}
+
+/// A batch write's pre-flight: every target profile must have a file, checked BEFORE any write so a
+/// missing one refuses the whole batch rather than leaving a partial change.
+fn require_profile_file(dir: &std::path::Path, profile: &str) -> Result<(), TeamsModelsError> {
+    let path = rhapsody_config::profiles::profile_path(dir, profile);
+    if !path.exists() {
+        return Err(TeamsModelsError::Invalid(format!(
+            "profile {profile:?} has no file at {} to edit; run `rhapsodyd teams fork {profile}` first",
+            path.display()
+        )));
+    }
     Ok(())
 }
 

@@ -4983,6 +4983,23 @@ roster:
         );
     }
 
+    /// A legacy bare-scalar `review.model` cannot be edited per-harness without re-scoping it, so the
+    /// write is REFUSED (the duplicate `model:` key fails validation) rather than silently producing
+    /// a file the daemon would re-read as the wrong shape.
+    #[test]
+    fn a_legacy_bare_review_model_refuses_a_per_harness_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("teams.yaml");
+        std::fs::write(
+            &path,
+            "enabled: true\nreview:\n  mode: ticketless\n  model: claude-opus-5\nmanager:\n  mode: labels\n  model: m\n",
+        )
+        .expect("write");
+        let before = std::fs::read_to_string(&path).expect("read");
+        assert!(save_review_routing(&path, "opencode", "m", "", "").is_err());
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), before);
+    }
+
     #[test]
     fn save_manager_routing_sets_a_scalar_and_keeps_the_rest() {
         let dir = tempfile::tempdir().expect("tempdir");
