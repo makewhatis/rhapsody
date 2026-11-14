@@ -249,6 +249,19 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Lead memory recall resilience and health (STUDIO-2012)
+
+Off-loop lead prefetch and manager operator-preference reads retry a timeout or HTTP 5xx once,
+with jitter, inside the existing 15-second budget. Each attempt gets at most 7.375 seconds;
+operator and team banks remain concurrent with independent deadlines and independently retained
+results. These reads ask Hindsight for 1,024 tokens instead of the ordinary recall's 4,096.
+Each attempt logs `bank`, `elapsed_ms`, `outcome` and `result_count`. `GET /api/v1/teams` adds
+`memory_health`: per-bank attempt/failure totals and nearest-rank p50/p95 latency over the last
+256 attempts, plus `decided_without_memory`, counted once per decision context when any required
+bank is unavailable (including missing configuration). Totals reset when the Teams runtime is
+recreated or the daemon restarts; a successful empty recall is available memory. These Teams-only
+paths have no Go counterpart; Go-owned API/configuration goldens remain unchanged.
+
 ### Failed required CI routes back to the author (STUDIO-1994)
 
 Ticketless review watches required checks at the current PR head and routes concluded failures

@@ -103,6 +103,16 @@ impl OperatorMemory {
         self.backend.recall_shared(&self.bank, query).await
     }
 
+    /// The exact bank id, for off-loop recall diagnostics.
+    pub fn bank(&self) -> &str {
+        &self.bank
+    }
+
+    /// Narrow lead/manager context without changing ordinary interactive recall.
+    pub async fn recall_prefetch(&self, query: &Query) -> Result<Recalled, MemoryError> {
+        self.backend.recall_shared_prefetch(&self.bank, query).await
+    }
+
     pub async fn retain_decision(&self, record: &Record) -> Result<String, MemoryError> {
         self.retain(record, "lead").await
     }
@@ -181,6 +191,9 @@ pub const FACT_TYPE_OBSERVATION: &str = "observation";
 /// could move underneath a released daemon. The answer is bounded again by
 /// [`Query::top_k`] and by [`MAX_FACT_CONTENT_BYTES`] on the way out.
 pub const RECALL_MAX_TOKENS: i64 = 4096;
+
+/// Smaller server-side response budget for the lead's bounded prefetch.
+pub const PREFETCH_MAX_TOKENS: i64 = 1024;
 
 /// The `Authorization` scheme prefixed to a bare credential. An
 /// `memory.api_key` that already names a scheme is sent verbatim
@@ -587,6 +600,17 @@ impl HindsightBackend {
         fallback_identity: &str,
         q: &Query,
     ) -> Result<Recalled, MemoryError> {
+        self.recall_with_tokens(bank, fallback_identity, q, RECALL_MAX_TOKENS)
+            .await
+    }
+
+    async fn recall_with_tokens(
+        &self,
+        bank: &str,
+        fallback_identity: &str,
+        q: &Query,
+        max_tokens: i64,
+    ) -> Result<Recalled, MemoryError> {
         let top_k = effective_top_k(q);
         if q.state != RecallState::Valid {
             return self.browse(bank, fallback_identity, top_k, q.state).await;
@@ -604,7 +628,7 @@ impl HindsightBackend {
             "query": query,
             "types": [FACT_TYPE_EXPERIENCE, FACT_TYPE_WORLD],
             "include": { "source_facts": {} },
-            "max_tokens": RECALL_MAX_TOKENS,
+            "max_tokens": max_tokens,
         });
         let resp = self
             .send(
@@ -726,6 +750,12 @@ impl HindsightBackend {
 
 #[async_trait]
 impl MemoryBackend for HindsightBackend {
+    async fn recall_shared_prefetch(&self, bank: &str, q: &Query) -> Result<Recalled, MemoryError> {
+        Self::checked_shared_bank(bank)?;
+        self.recall_with_tokens(bank, "", q, PREFETCH_MAX_TOKENS)
+            .await
+    }
+
     /// `POST …/memories` with one `MemoryItem`.
     ///
     /// §5.1's provenance travels as the item's `metadata`, which the deployed
