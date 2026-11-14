@@ -57,6 +57,9 @@ the `Orchestrator` struct itself. Concretely:
     for the two mirrors that genuinely need loop-owned state (`running`, `mailboxes`,
     `RunningEntry::event_seq`). That round-trip is best-effort by construction — the post is
     already in the log — so a gone loop costs nothing.
+    Its `MemoryHealth` cell also records off-loop lead/manager recall attempts and degraded
+    decision contexts for the Teams overview. The mutex covers bounded latency samples and
+    counters only, never an await; lead execution reads it through the same ControlHandle.
   - `lifecycle.rs`'s `LifecycleCache` (`Orchestrator::lifecycle: Arc<LifecycleCache>`,
     STUDIO-702) — three `Mutex`-guarded TTL memos, of each ticket's CURRENT tracker state, of its
     DURABLE assignee (STUDIO-735) and of whether it is a REVIEW TICKET (STUDIO-780), read and

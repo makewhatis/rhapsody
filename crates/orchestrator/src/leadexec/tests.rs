@@ -2393,45 +2393,59 @@ async fn memory_stub_body(
     delay: std::time::Duration,
     body: &str,
 ) -> OperatorStub {
+    memory_stub_sequence(bank, vec![(status, delay, body.to_string())]).await
+}
+
+async fn memory_stub_sequence(
+    bank: &str,
+    replies: Vec<(u16, std::time::Duration, String)>,
+) -> OperatorStub {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let requests = Arc::new(Mutex::new(Vec::new()));
     let sink = requests.clone();
     let bank = bank.to_string();
-    let body = body.to_string();
     let task = tokio::spawn(async move {
+        let mut children = tokio::task::JoinSet::new();
+        let mut index = 0;
         while let Ok((mut stream, _)) = listener.accept().await {
-            let mut bytes = Vec::new();
-            let mut buf = [0; 4096];
-            loop {
-                let n = stream.read(&mut buf).await.unwrap();
-                if n == 0 {
-                    break;
-                }
-                bytes.extend_from_slice(&buf[..n]);
-                if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let headers = String::from_utf8_lossy(&bytes[..end]);
-                    let len = headers
-                        .lines()
-                        .filter_map(|l| l.split_once(':'))
-                        .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
-                        .and_then(|(_, v)| v.trim().parse::<usize>().ok())
-                        .unwrap_or(0);
-                    if bytes.len() >= end + 4 + len {
+            let (status, delay, body) = replies[index.min(replies.len() - 1)].clone();
+            index += 1;
+            let sink = sink.clone();
+            let bank = bank.clone();
+            children.spawn(async move {
+                let mut bytes = Vec::new();
+                let mut buf = [0; 4096];
+                loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
                         break;
                     }
+                    bytes.extend_from_slice(&buf[..n]);
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let len = headers
+                            .lines()
+                            .filter_map(|l| l.split_once(':'))
+                            .find(|(k, _)| k.eq_ignore_ascii_case("content-length"))
+                            .and_then(|(_, v)| v.trim().parse::<usize>().ok())
+                            .unwrap_or(0);
+                        if bytes.len() >= end + 4 + len {
+                            break;
+                        }
+                    }
                 }
-            }
-            let request = String::from_utf8(bytes).unwrap();
-            assert!(request.contains(&format!("/banks/{bank}")), "{request}");
-            sink.lock().unwrap().push(request);
-            tokio::time::sleep(delay).await;
-            let response = format!(
-                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
+                let request = String::from_utf8(bytes).unwrap();
+                assert!(request.contains(&format!("/banks/{bank}")), "{request}");
+                sink.lock().unwrap().push(request);
+                tokio::time::sleep(delay).await;
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
         }
     });
     OperatorStub {
@@ -2479,6 +2493,11 @@ fn memory_runtime(
     o.set_store(store.clone());
     let mut teams = rhapsody_config::teams::Teams::disabled();
     teams.memory.team_bank = "scratch-team".into();
+    teams.enabled = true;
+    o.teams_memory = Some(Arc::new(crate::teamsmemory::TeamsMemory::new(
+        Arc::new(teams.clone()),
+        Arc::new(rhapsody_config::memory::NoneBackend),
+    )));
     LeadRuntime {
         control: o.control(),
         store,
@@ -2649,6 +2668,16 @@ async fn lead_operator_recall_error_is_not_discarded() {
         "{text}"
     );
     assert!(text.contains("decide without memory and say so in your reasoning summary"));
+    assert_eq!(stub.requests.lock().unwrap().len(), 2);
+    let health = runtime
+        .control
+        .teams_memory()
+        .unwrap()
+        .overview()
+        .unwrap()
+        .memory_health;
+    assert_eq!(health.decided_without_memory, 1);
+    assert_eq!(health.banks["scratch-lead"].recalls, 2);
 }
 
 #[tokio::test]
@@ -2687,8 +2716,160 @@ async fn lead_memory_unavailable_reason_names_timeout() {
         "{text}"
     );
     assert!(!text.contains("backend request failed"), "{text}");
-    assert_eq!(operator.requests.lock().unwrap().len(), 1);
-    assert_eq!(team.requests.lock().unwrap().len(), 1);
+    assert_eq!(operator.requests.lock().unwrap().len(), 2);
+    assert_eq!(team.requests.lock().unwrap().len(), 2);
+    assert_eq!(
+        runtime
+            .control
+            .teams_memory()
+            .unwrap()
+            .overview()
+            .unwrap()
+            .memory_health
+            .decided_without_memory,
+        1,
+        "two failed banks are one degraded decision context"
+    );
+}
+
+#[tokio::test]
+async fn lead_prefetch_retries_transient_failures_and_preserves_the_other_bank() {
+    use rhapsody_config::hindsight::HindsightBackend;
+    use std::time::Duration;
+    let fact = r#"{"results":[{"id":"recovered","text":"Recovered operator preference"}]}"#;
+    for (status, delay) in [(502, Duration::ZERO), (200, Duration::from_secs(1))] {
+        let operator = memory_stub_sequence(
+            "scratch-lead",
+            vec![
+                (status, delay, "{}".into()),
+                (200, Duration::ZERO, fact.into()),
+            ],
+        )
+        .await;
+        let team = memory_stub(200, "scratch-team").await;
+        let (store, _, _) = setup("transient memory failure");
+        let mut runtime = memory_runtime(store, Some(operator.memory.clone()));
+        runtime.memory = Some(Arc::new(
+            HindsightBackend::new(&team.endpoint, "", "").unwrap(),
+        ));
+        let text = runtime
+            .prefetch_memory_with_budget("TEST-100", "preferences", Duration::from_millis(300))
+            .await;
+        assert!(text.contains("Recovered operator preference"), "{text}");
+        assert!(
+            text.contains("Prefer diagnosis before spending credits"),
+            "{text}"
+        );
+        assert!(!text.contains("unavailable"), "{text}");
+        assert_eq!(operator.requests.lock().unwrap().len(), 2);
+        assert_eq!(team.requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            runtime
+                .control
+                .teams_memory()
+                .unwrap()
+                .overview()
+                .unwrap()
+                .memory_health
+                .decided_without_memory,
+            0
+        );
+        for request in operator
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .chain(team.requests.lock().unwrap().iter())
+        {
+            assert!(request.contains("\"max_tokens\":1024"), "{request}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn slow_team_bank_keeps_successful_operator_memory_and_reports_health() {
+    use rhapsody_config::hindsight::HindsightBackend;
+    use std::time::Duration;
+    let operator = operator_stub(200).await;
+    let team = memory_stub_delayed(200, "scratch-team", Duration::from_secs(2)).await;
+    let (store, _, _) = setup("slow team bank");
+    let mut runtime = memory_runtime(store, Some(operator.memory.clone()));
+    runtime.memory = Some(Arc::new(
+        HindsightBackend::new(&team.endpoint, "", "").unwrap(),
+    ));
+    let _serial = crate::testsupport::TRACING_TEST_LOCK.lock().await;
+    let (events, subscriber) = crate::testsupport::recording_subscriber();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    // Like the control-loop log tests, register shared callsites BEFORE rebuilding interest:
+    // a parallel no-subscriber test can otherwise register them with Interest::never.
+    let warmup = crate::teamsmemory::MemoryHealth::default();
+    warmup.without_memory();
+    warmup
+        .recall("warmup", Duration::from_secs(1), || async {
+            Ok(rhapsody_config::memory::Recalled::default())
+        })
+        .await
+        .unwrap();
+    tracing::callsite::rebuild_interest_cache();
+    events.lock().unwrap().clear();
+    let text = tokio::time::timeout(
+        Duration::from_secs(1),
+        runtime.prefetch_memory_with_budget("TEST-100", "preferences", Duration::from_millis(300)),
+    )
+    .await
+    .expect("the slow bank must not extend the prefetch budget");
+    assert!(
+        text.contains("Prefer diagnosis before spending credits"),
+        "{text}"
+    );
+    assert!(text.contains("bank=scratch-team, timeout"), "{text}");
+    let health = runtime
+        .control
+        .teams_memory()
+        .unwrap()
+        .overview()
+        .unwrap()
+        .memory_health;
+    assert_eq!(health.decided_without_memory, 1);
+    assert_eq!(health.banks["scratch-team"].recalls, 2);
+    assert_eq!(health.banks["scratch-team"].failures, 2);
+    assert!(health.banks["scratch-team"].p50_ms >= 100);
+    assert!(health.banks["scratch-team"].p95_ms >= health.banks["scratch-team"].p50_ms);
+    let events = events.lock().unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.message == "Manager decided without memory"),
+        "{events:?}"
+    );
+    let recalls: Vec<_> = events
+        .iter()
+        .filter(|e| e.message == "memory recall finished")
+        .collect();
+    assert_eq!(recalls.len(), 3);
+    for event in recalls {
+        for field in ["bank", "elapsed_ms", "outcome", "result_count"] {
+            assert!(event.fields.contains_key(field), "{event:?}");
+        }
+        if event.fields["bank"] == "scratch-lead" {
+            assert_eq!(event.fields["outcome"], "ok");
+            assert_eq!(event.fields["result_count"], "1");
+        } else {
+            assert_eq!(event.fields["outcome"], "timeout");
+            assert_eq!(event.fields["result_count"], "0");
+        }
+    }
+    let wire =
+        serde_json::to_value(runtime.control.teams_memory().unwrap().overview().unwrap()).unwrap();
+    assert_eq!(wire["memory_health"]["decided_without_memory"], 1);
+    assert_eq!(
+        wire["memory_health"]["banks"]["scratch-team"]["p50_ms"],
+        health.banks["scratch-team"].p50_ms
+    );
+    assert_eq!(
+        wire["memory_health"]["banks"]["scratch-team"]["p95_ms"],
+        health.banks["scratch-team"].p95_ms
+    );
 }
 
 #[tokio::test]

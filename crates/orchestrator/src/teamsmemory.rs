@@ -59,6 +59,9 @@ use rhapsody_config::room::{
 use rhapsody_config::teams::Teams;
 use serde::Serialize;
 
+mod recallhealth;
+pub use recallhealth::{MemoryHealth, MemoryHealthView};
+
 /// How long the best-effort `git rev-parse HEAD` that stamps `commit_sha` may
 /// take before the record is written without one. A local read of a local
 /// repository; if it has not answered in this long, something is wrong with the
@@ -122,6 +125,7 @@ pub struct RosterView {
 /// unambiguous shape rather than inferring the feature's state from an HTTP status.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct TeamsView {
+    pub memory_health: MemoryHealthView,
     pub enabled: bool,
     /// `off` | `labels` | `labels+model` — the wire spelling `teams.yaml` uses.
     pub manager_mode: String,
@@ -306,6 +310,7 @@ impl From<MemoryError> for TeamsMemoryError {
 /// The shared Teams memory runtime: the loaded config, the backend, and the
 /// live run → identity binding the control task maintains.
 pub struct TeamsMemory {
+    pub(crate) memory_health: MemoryHealth,
     teams: Arc<Teams>,
     backend: Arc<dyn MemoryBackend>,
     operator_memory: Option<Arc<rhapsody_config::hindsight::OperatorMemory>>,
@@ -365,6 +370,7 @@ impl TeamsMemory {
             })
             .collect();
         Self {
+            memory_health: MemoryHealth::default(),
             teams,
             backend,
             operator_memory,
@@ -621,7 +627,15 @@ impl TeamsMemory {
             ..Default::default()
         };
         let recalled = match &self.operator_memory {
-            Some(memory) => memory.recall(&q).await.ok(),
+            Some(memory) => self
+                .memory_health
+                .recall(
+                    memory.bank(),
+                    rhapsody_config::hindsight::RECALL_TIMEOUT,
+                    || memory.recall_prefetch(&q),
+                )
+                .await
+                .ok(),
             None => None,
         };
         match recalled {
@@ -629,6 +643,7 @@ impl TeamsMemory {
                 serde_json::json!({"available":true,"context":"context, not binding precedent or policy", "facts":recalled.facts,"skipped":recalled.skipped.len()}),
             ),
             None => {
+                self.memory_health.without_memory();
                 tracing::warn!(
                     run_id,
                     "Operator memory unavailable; manager will decide without memory"
@@ -731,6 +746,7 @@ impl TeamsMemory {
     pub fn overview(&self) -> Result<TeamsView, TeamsMemoryError> {
         let roster = self.roster()?;
         Ok(TeamsView {
+            memory_health: self.memory_health.view(),
             enabled: self.teams.enabled,
             manager_mode: manager_mode_name(&self.teams),
             default_identity: self.teams.manager.default_identity.clone(),

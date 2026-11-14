@@ -323,6 +323,11 @@ impl MemoryError {
 /// module docs: that is exactly why no caller on the dispatch path may hold one.
 #[async_trait]
 pub trait MemoryBackend: Send + Sync {
+    /// Narrow lead prefetch; backends without a server-side token budget use ordinary recall.
+    async fn recall_shared_prefetch(&self, bank: &str, q: &Query) -> Result<Recalled, MemoryError> {
+        self.recall_shared(bank, q).await
+    }
+
     /// Store a host-stamped record. Best-effort at every call site: a failed
     /// retain logs and the run completes (§5.1). Returns the new record's id.
     async fn retain(&self, rec: &Record) -> Result<String, MemoryError>;
