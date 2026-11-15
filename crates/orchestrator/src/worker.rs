@@ -5430,37 +5430,47 @@ exit 1
     }
 
     #[tokio::test]
-    async fn lead_worker_carries_a_blocked_in_review_ending() {
+    async fn lead_worker_distinguishes_explicit_blocked_and_successful_handoffs() {
         for enabled in [false, true] {
-            let ag = fake_agent(vec![agentfake::TurnScript {
-                result: TurnResult {
-                    status: TURN_SUCCEEDED.to_string(),
-                    result_text: "Blocked pending two human decisions.\nAuthorize a credential source and clarify the Event representation.\nHANDOFF: in-review".into(),
+            for marker in ["blocked", "in-review", "done"] {
+                let ag = fake_agent(vec![agentfake::TurnScript {
+                    result: TurnResult {
+                        status: TURN_SUCCEEDED.to_string(),
+                        result_text: format!(
+                            "Blocked check: missing test environment.\nAuthorize a credential source and clarify the Event representation.\nHANDOFF: {marker}"
+                        ),
+                        ..Default::default()
+                    },
                     ..Default::default()
-                }, ..Default::default()
-            }]);
-            let mut tr = trackerfake::Fake::new();
-            tr.states_by_ids_func = Some(Box::new(|_| Ok(vec![issue("1", "MT-1", "In Review")])));
-            let (ws, _root) = test_workspace(HookScripts::default());
-            let mut d = make_deps(ws, ag, Arc::new(tr), "do it", 1);
-            d.lead_enabled = enabled;
-            let (_, declared, err) =
-                run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
-            assert!(err.is_none());
-            assert_eq!(declared.blocked_question.is_some(), enabled);
-            if enabled {
-                assert!(
-                    declared
-                        .blocked_question
-                        .expect("question")
-                        .contains("Event representation")
+                }]);
+                let mut tr = trackerfake::Fake::new();
+                tr.states_by_ids_func =
+                    Some(Box::new(|_| Ok(vec![issue("1", "MT-1", "In Review")])));
+                let (ws, _root) = test_workspace(HookScripts::default());
+                let mut d = make_deps(ws, ag, Arc::new(tr), "do it", 1);
+                d.lead_enabled = enabled;
+                let (_, declared, err) =
+                    run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
+                assert!(err.is_none());
+                assert!(declared.declared_handoff);
+                assert_eq!(
+                    declared.blocked_question.is_some(),
+                    enabled && marker == "blocked"
                 );
+                if enabled && marker == "blocked" {
+                    assert!(
+                        declared
+                            .blocked_question
+                            .expect("question")
+                            .contains("Event representation")
+                    );
+                }
             }
         }
     }
 
     #[tokio::test]
-    async fn lead_worker_reads_current_progress_beside_a_plain_handoff() {
+    async fn lead_worker_successful_handoff_overrides_current_progress() {
         let ag = fake_agent(vec![agentfake::TurnScript {
             result: TurnResult {
                 status: TURN_SUCCEEDED.to_string(),
@@ -5473,7 +5483,7 @@ exit 1
         let dir = std::path::PathBuf::from(&root.path);
         std::fs::write(
             dir.join("MT-1-progress.md"),
-            "## Current blocker\nBLOCKED: Human must decide the Event representation.",
+            "## Current blocker\nHuman must decide the Event representation.\nHANDOFF: blocked",
         )
         .expect("progress");
         let mut d = make_deps(ws, ag, Arc::new(trackerfake::Fake::new()), "do it", 1);
@@ -5482,12 +5492,7 @@ exit 1
         let (_, declaration, err) =
             run_agent_attempt(&mut d, dispatched(), None, None, &noop_event(), None).await;
         assert!(err.is_none());
-        assert!(
-            declaration
-                .blocked_question
-                .expect("question")
-                .contains("Event representation")
-        );
+        assert!(declaration.blocked_question.is_none());
     }
 
     // Mirrors Go `TestWorkerReturnsLastKnownState`: the worker propagates its last-known state.

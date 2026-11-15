@@ -1052,7 +1052,7 @@ unknown actions are invalid. Each action object includes "action" and its fields
 - authorize_credential {ticket, rule}
 - escalate {need}
 - release {ticket, reason}: lift a circuit-breaker/blocked hold only for a concrete change; reason is audited
-- resolve {reason}: close this lead item when evidence confirms no work is needed; closes its marked commission scope if present
+- resolve {reason}: close this lead item when evidence confirms no work is needed; closes its marked commission scope if present and releases a false blocked hold so pending summonses can reach the author (never an escalation or human-label hold)
 At most 8 actions, each string at most 4000 characters. Choose at most one work transition
 (route_back, requeue or commission). Escalate is the only action when it is needed.
 Resolve is also used alone. Document-only reviews legitimately have no PR: read the findings with
@@ -1614,7 +1614,16 @@ async fn apply_action(
             result.commission_ticket = Some(commissioned);
         }
         LeadAction::Escalate { need } => result.escalation = Some(need.clone()),
-        LeadAction::Resolve { .. } => host.close_commission(ticket, case.item.id).await?,
+        LeadAction::Resolve { reason } => {
+            let hold = stored(store.subject_hold(&ticket.identifier))?
+                .filter(|hold| hold.kind == "blocked");
+            host.close_commission(ticket, case.item.id).await?;
+            if let Some(hold) = hold
+                && !stored(store.release_subject_episode(hold.id, &hold.kind, reason))?
+            {
+                return Err("hold changed during resolution; refusing to lift the new park".into());
+            }
+        }
     }
     Ok(())
 }

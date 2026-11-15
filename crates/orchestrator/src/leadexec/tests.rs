@@ -278,6 +278,130 @@ async fn escalated_subject_history_includes_open_need_and_previous_decisions() {
     assert!(history.contains("\"decision\":\"escalate:"));
 }
 
+#[tokio::test]
+async fn resolving_a_lead_item_does_not_release_other_hold_kinds() {
+    for kind in ["escalation", "breaker", "blocked_no_pr"] {
+        let (store, host, case) = setup("The lead question is answered.");
+        store
+            .park_subject(&rhapsody_store::SubjectHold {
+                subject: case.subject.ticket.identifier.clone(),
+                kind: kind.into(),
+                ..Default::default()
+            })
+            .unwrap();
+        replay(
+            store.as_ref(),
+            &host,
+            &case,
+            serde_json::json!([
+                {"action":"resolve", "reason":"The lead question is answered"}
+            ]),
+        )
+        .await;
+        assert_eq!(
+            store
+                .subject_hold(&case.subject.ticket.identifier)
+                .unwrap()
+                .unwrap()
+                .kind,
+            kind
+        );
+    }
+}
+
+#[tokio::test]
+async fn resolving_a_false_blocker_releases_the_park_and_admits_pending_summons() {
+    use crate::testsupport::{empty_effective, set_of};
+    let (store, host, case) = setup("Not a real blocker; the PR is ready for review.");
+    let mut o = crate::Orchestrator::new("WORKFLOW.md");
+    let mut eff = empty_effective(Arc::new(rhapsody_tracker::fake::Fake::new()));
+    eff.active_states = set_of(&["todo", "in progress"]);
+    eff.review_states = set_of(&["in review"]);
+    eff.max_concurrent = 10;
+    let root = crate::testsupport::TempDir::new();
+    eff.workspace = Arc::new(
+        rhapsody_workspace::Manager::new(rhapsody_workspace::Config {
+            root: root.path.clone(),
+            hooks: Default::default(),
+            hook_timeout: std::time::Duration::from_secs(1),
+        })
+        .unwrap(),
+    );
+    let mut agent = Fake::new();
+    agent.turns = vec![TurnScript {
+        events: vec![rhapsody_agent::Event {
+            event_type: rhapsody_agent::EVENT_SESSION_STARTED.into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    let agent = Arc::new(agent);
+    eff.agent = agent.clone();
+    eff.max_turns = 1;
+    o.eff = Some(eff);
+    o.set_store(store.clone());
+    o.spawn = Some(Box::new(|_, _, _| {}));
+    let ticket = case.subject.ticket.clone();
+    store
+        .park_subject(&rhapsody_store::SubjectHold {
+            subject: ticket.identifier.clone(),
+            kind: "blocked".into(),
+            need: "Blocked check".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    store
+        .queue_summon_message(
+            7,
+            &rhapsody_store::SummonWatermark {
+                identifier: ticket.identifier.clone(),
+                at: "2026-11-15T12:00:00Z".into(),
+                body: "Fix the review finding".into(),
+            },
+            &crate::message::operator_wrap("Fix the review finding"),
+            1,
+            16,
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        o.select_dispatch_with_reopens(vec![ticket.clone()])
+            .1
+            .is_empty()
+    );
+    replay(
+        store.as_ref(),
+        &host,
+        &case,
+        serde_json::json!([
+            {"action":"resolve", "reason":"Not a real blocker; PR is ready"}
+        ]),
+    )
+    .await;
+    assert!(store.subject_hold(&ticket.identifier).unwrap().is_none());
+    let (_, reopen, _) = o.select_dispatch_with_reopens(vec![ticket.clone()]);
+    assert_eq!(
+        reopen.len(),
+        1,
+        "the pending review summons can reach the author"
+    );
+    o.dispatch_issue(ticket.clone(), None, None, String::new());
+    let run = o.running[&ticket.id].run_id;
+    let queued = store.pending_run_messages(&ticket.identifier).unwrap();
+    assert_eq!(queued.len(), 1);
+    assert!(queued[0].prompt.contains("Fix the review finding"));
+    let mut deps = crate::control_loop::worker_deps_for(o.eff.as_ref().unwrap(), None, &o.drain);
+    deps.run_id = run;
+    deps.message_store = Some(store.clone());
+    let (_, _, error) =
+        crate::worker::run_agent_attempt(&mut deps, ticket.clone(), None, None, &|_| {}, None)
+            .await;
+    assert!(error.is_none(), "{error:?}");
+    assert!(agent.last_prompt().contains("Fix the review finding"));
+    assert_eq!(store.list_run_messages(run).unwrap()[0].status, "delivered");
+    assert!(!o.has_pending_summons(&ticket.identifier));
+}
+
 /// Finite incident replay, using scripted Fake turns and the real selection, handoff, review
 /// introduction/sweep/exit and lead executor. No poll task, live daemon, network or stress loop.
 #[tokio::test]

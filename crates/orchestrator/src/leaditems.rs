@@ -170,15 +170,23 @@ pub fn enqueue(store: &dyn Store, t: LeadTrigger) -> i64 {
     }
 }
 
+/// Only an unquoted, unfenced `HANDOFF: blocked` line declares a blocker. Explicit successful
+/// handoffs take precedence over both final-message prose and stale progress notes.
 pub fn detect_blocked_handoff(final_text: &str, progress_md: Option<&str>) -> Option<String> {
+    if handoff_lines(final_text).any(|line| {
+        line.trim()
+            .strip_prefix("HANDOFF:")
+            .is_some_and(|payload| matches!(payload.trim(), "in-review" | "done"))
+    }) {
+        return None;
+    }
     if let Some(question) = blocked_question(final_text) {
         return Some(question);
     }
     if final_declares_complete(final_text) {
         return None;
     }
-    // An in-review marker alone does not claim completion: blocked agents use it too. Progress
-    // notes are append-only, so fallback inspects their newest section rather than historical blocks.
+    // Progress notes are append-only; inspect only their newest section.
     let progress = progress_md?;
     let start = progress
         .match_indices("\n##")
@@ -205,52 +213,23 @@ pub(crate) fn final_declares_complete(text: &str) -> bool {
         .any(|s| lower.contains(s))
 }
 
-fn blocked_question(text: &str) -> Option<String> {
+fn handoff_lines(text: &str) -> impl Iterator<Item = &str> {
     let mut fenced = false;
-    let lines: Vec<&str> = text
-        .lines()
-        .filter(|line| {
-            if line.trim_start().starts_with("```") {
-                fenced = !fenced;
-                return false;
-            }
-            !fenced && !line.trim_start().starts_with('>')
-        })
-        .collect();
-    let start = lines.iter().position(|line| {
-        let lower = line
-            .trim_start_matches(['#', '*', '`', '-', ' ', '\t'])
-            .to_ascii_lowercase();
-        if [
-            "unblocked",
-            "no longer blocked",
-            "not blocked",
-            "previous block",
-        ]
-        .iter()
-        .any(|s| lower.contains(s))
-            || (lower.contains("resolved") && !lower.contains("unresolved"))
-        {
+    text.lines().filter(move |line| {
+        if line.trim_start().starts_with("```") {
+            fenced = !fenced;
             return false;
         }
-        lower.contains("handoff: blocked")
-            || lower.starts_with("blocked")
-            || lower.starts_with("handoff is blocked")
-            || (lower.contains("when blocked") && lower.contains("must decide"))
-            || lower.contains("remains blocked")
-            || (lower.starts_with("returning for the same required human decisions")
-                && lower.contains("when blocked"))
-    })?;
-    let start = if lines[start]
-        .trim_start()
-        .to_ascii_lowercase()
-        .starts_with("handoff: blocked")
-    {
-        0
-    } else {
-        start
-    };
-    let question = lines[start..]
+        !fenced && !line.trim_start().starts_with('>')
+    })
+}
+
+fn blocked_question(text: &str) -> Option<String> {
+    let lines: Vec<&str> = handoff_lines(text).collect();
+    lines
+        .iter()
+        .find(|line| line.trim() == "HANDOFF: blocked")?;
+    let question = lines
         .iter()
         .take_while(|line| {
             let lower = line.to_ascii_lowercase();
@@ -1143,34 +1122,59 @@ mod tests {
     }
 
     #[test]
-    fn detects_real_blocked_phrasings() {
-        // Survey: MH3 progress and L1 final text (2026-10-06/07), including in-review markers.
+    fn explicit_success_handoff_wins_over_blocked_checks_and_progress() {
+        for marker in ["in-review", "done"] {
+            let text =
+                format!("Blocked check: Rust tests need CARINI_TEST_OWNER_URL.\nHANDOFF: {marker}");
+            assert_eq!(
+                detect_blocked_handoff(&text, Some("HANDOFF: blocked\nOld blocker")),
+                None
+            );
+        }
+        for text in [
+            "Blocked check: missing test environment",
+            "Blocked dependency",
+            "HANDOFF: blocked-ish",
+            "> HANDOFF: blocked",
+            "```text\nHANDOFF: blocked\n```",
+        ] {
+            assert_eq!(detect_blocked_handoff(text, None), None, "{text}");
+        }
+        assert_eq!(
+            detect_blocked_handoff("HANDOFF: blocked\nHANDOFF: in-review", None),
+            None
+        );
+        for quoted_success in ["> HANDOFF: in-review", "```text\nHANDOFF: done\n```"] {
+            assert!(
+                detect_blocked_handoff(&format!("{quoted_success}\nHANDOFF: blocked"), None)
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn blocked_prose_requires_the_explicit_blocked_marker() {
         let cases = [
             "## BLOCKED — spec §4.5 vs installed CLI resolved permissions\nStop per When blocked; human/spec owner must decide whether to retain strict failure or approve a narrow exception.",
             "Handoff is BLOCKED acceptance, not done: one real canary did not pass. Human must determine environment/model/login remedy.",
             "**Blocked pending two human decisions; L1 remains incomplete.**\nRequired to resume:\n1. Authorize a named, read-only OpenCode credential source.\n2. Clarify whether Event should gain an optional LimitObs payload.\nHANDOFF: in-review",
             "**Blocked; returned for a human decision. L1 is not complete.**\nProvide a permitted access-only credential copy.\nHANDOFF: in-review",
             "Returning for the same required human decisions under When blocked: authorize a named read-only native credential source; approve an additive observation payload.",
-            "HANDOFF: blocked\nQuestion: which event representation is approved?",
             "BLOCKED: operator must supply a permitted measurement input.",
             "BLOCKED: the credential source remains unresolved; human must decide.",
             "When blocked: a human must decide which event representation is approved.",
             "**B1 remains blocked.**\nNext action: operator diagnosis of the environment/model/login remedy.",
         ];
         for text in cases {
-            let question = detect_blocked_handoff(text, None).expect(text);
-            assert!(!question.is_empty());
-            assert!(
-                question.contains("credential")
-                    || question.contains("permission")
-                    || question.contains("exception")
-                    || question.contains("remedy")
-                    || question.contains("event")
-                    || question.contains("measurement"),
-                "{question}"
-            );
+            assert_eq!(detect_blocked_handoff(text, None), None, "{text}");
         }
-        assert!(detect_blocked_handoff("", Some(cases[0])).is_some());
+        let blocked = "HANDOFF: blocked\nQuestion: which event representation is approved?";
+        assert!(
+            detect_blocked_handoff(blocked, None)
+                .unwrap()
+                .contains("event representation")
+        );
+        assert!(detect_blocked_handoff("", Some(blocked)).is_some());
         for text in [
             "All acceptance met; ready for review. HANDOFF: in-review",
             "A dependency is blocked by this ticket.",
@@ -1472,12 +1476,11 @@ mod tests {
     }
 
     #[test]
-    fn lead_progress_can_declare_a_block_beside_an_in_review_marker() {
-        let progress = "## Current blocker\nBLOCKED: Human must decide which Event representation is approved.";
-        assert!(
-            detect_blocked_handoff("HANDOFF: in-review", Some(progress))
-                .expect("question")
-                .contains("Event representation")
+    fn explicit_handoff_overrides_a_stale_progress_block() {
+        let progress = "## Current blocker\nHuman must decide which Event representation is approved.\nHANDOFF: blocked";
+        assert_eq!(
+            detect_blocked_handoff("HANDOFF: in-review", Some(progress)),
+            None
         );
         assert_eq!(
             detect_blocked_handoff(
