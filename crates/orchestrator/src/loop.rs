@@ -700,7 +700,7 @@ impl Orchestrator {
 /// top-level. Mirrors Go `workerDepsFor` (dropping the telemetry fields — Tracer/Metrics/Model/
 /// DispatchSpanContext — per the P6 deferral; see `worker.rs`). `run_id` is per-dispatch, not
 /// per-project, so [`Orchestrator::spawn_worker`] stamps it (STUDIO-675).
-fn worker_deps_for(
+pub(crate) fn worker_deps_for(
     eff: &Effective,
     rp: Option<&ResolvedProject>,
     drain: &crate::drain::DrainSignal,

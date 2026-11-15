@@ -249,6 +249,18 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Explicit blocked handoffs and lead resolution (STUDIO-2085)
+
+The Rhapsody-only blocked detector requires an exact `HANDOFF: blocked` line (surrounding
+whitespace permitted), outside fenced code and blockquotes. Include the question requiring a
+human decision alongside it. Prose such as `Blocked check:` does not declare a blocker.
+An explicit `HANDOFF: in-review` or `HANDOFF: done` in the final message overrides blocked
+prose, blocked markers and stale progress notes. With no successful marker or completed summary,
+the newest progress section can still supply `HANDOFF: blocked`. A lead `resolve` releases that
+ticket's blocked episode, clears its hold notification and grants author resume admission so
+pending review summonses can be delivered. It does not release an escalation or an independent
+human-label hold. These paths have no frozen Go counterpart; parity fixtures are unchanged.
+
 ### Lead memory recall resilience and health (STUDIO-2012)
 
 Off-loop lead prefetch and manager operator-preference reads retry a timeout or HTTP 5xx once,
