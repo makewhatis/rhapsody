@@ -95,7 +95,7 @@ can legitimately read "4h ago" while its state changed seconds ago.
 ### A branch that needs its author: conflicts and red CI
 
 A conflicted watched PR routes back to its author once per conflicted head, even after approval
-or while publication is parked (STUDIO-961). Required CI failures now use that same route-back:
+or while publication is parked (STUDIO-961). CI failures use that same route-back:
 a summons comment first, then the configured `teams.yaml` `review.changes_state` move if available.
 The comment names failed checks/jobs and run links, includes cheap Go `--- FAIL:` and Playwright
 `✘` log excerpts, and asks the author to fix the cause, run checks locally and push without
@@ -109,8 +109,12 @@ review:
   ci_failure_escalation_hours: 2     # positive hours; default 2
 ```
 
-Only concluded failures at the current head act. Queued/pending required checks wait; an optional
-failure, a passed rerun, a live author run or `rhapsody:human` hold causes no summons. New pushes
+The routing gate uses **required checks** when any check in the head's inventory is marked required;
+optional failures are then ignored. If none is required, it uses **all checks (this repository marks
+none required)** for failures, pending checks and unrelated-file evidence. This fallback affects
+routing only, not merge policy. The summons comment and routing log name the mode used.
+Only concluded failures at the current head act. Queued/pending gate checks wait;
+a passed rerun, a live author run or `rhapsody:human` hold causes no summons. New pushes
 reset the head-scoped guard. Like conflict routing, the in-memory guard resets on daemon restart.
 Unknown/truncated check inventories do not authorize a route-back.
 

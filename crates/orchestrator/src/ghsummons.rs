@@ -2556,7 +2556,7 @@ impl PrStateSource for GH {
         previous: Option<&crate::reviewci::CiSnapshot>,
     ) -> Result<Option<crate::reviewci::CiSnapshot>, Box<dyn std::error::Error + Send + Sync>> {
         // Variables keep repository/check text out of GraphQL source. A truncated inventory is
-        // unknown, never permission to act on a subset of required checks.
+        // unknown, never permission to act on a subset of the routing gate.
         let query = r#"query($owner:String!,$repo:String!,$number:Int!) {
           repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
             headRefOid state commits(last:1) { nodes { commit { oid statusCheckRollup {
@@ -2602,6 +2602,7 @@ impl PrStateSource for GH {
         // cost only once per head + failed-attempt set. A new attempt has new check-run IDs.
         if let Some(old) = previous
             && old.head == ci.head
+            && old.all_checks == ci.all_checks
             && !old.pending
             && old
                 .failed

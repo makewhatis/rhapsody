@@ -10138,73 +10138,82 @@ mod tests {
 
     #[test]
     fn ci_route_back_reaches_the_author_after_approval_and_honors_live_gates() {
-        use crate::reviewci::{CiAction, CiFailure, CiSnapshot};
-        let (mut o, mut rx) =
-            conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
-        introduce(&o, approved_row(12, "bob", HEAD_A));
-        o.handle_review_sweep(&[open_at(12, HEAD_A)]);
-        let ci = CiSnapshot {
-            head: HEAD_A.into(),
-            failed: vec![CiFailure {
-                name: "test".into(),
-                id: "1".into(),
-                tests: vec!["--- FAIL: TestUsage".into()],
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        o.eff.as_mut().unwrap().cfg.review.ci_failure_routing = false;
-        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
-        o.eff.as_mut().unwrap().cfg.review.ci_failure_routing = true;
-        o.human_holds.note_human_label("STUDIO-721");
-        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
-        o.human_holds.begin_pass(true);
-        let mut author = crate::orchestrator::RunningEntry::empty(Issue::default());
-        author.issue.identifier = "STUDIO-721".into();
-        o.running.insert("author".into(), author);
-        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
-        o.running.clear();
-        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::Summon);
-        assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
-        let c = rx.try_recv().unwrap();
-        assert_eq!(c.reason, crate::reviewnotify::CompletionReason::CiFailure);
-        assert_eq!(c.changes.as_ref().unwrap().identifier, "STUDIO-721");
-        let body = crate::reviewnotify::re_engage_comment(&c);
-        assert!(body.contains("FAILED"));
-        assert!(body.contains("TestUsage"));
-        assert!(body.contains("Do not loosen, skip or delete tests"));
-        assert!(crate::reviewnotify::summons_author(&body, &c.summon_token));
-        assert!(rx.try_recv().is_err());
-        let now = (o.now)();
-        assert!(
-            o.ci_divergences(now + chrono::Duration::minutes(119))
-                .is_empty()
-        );
-        let escalated = o.ci_divergences(now + chrono::Duration::hours(2));
-        assert_eq!(escalated.len(), 1);
-        assert_eq!(
-            escalated[0].kind,
-            crate::reviewreconcile::DivergenceKind::CiFailureNoRun
-        );
-        o.eff
-            .as_mut()
-            .unwrap()
-            .cfg
-            .review
-            .ci_failure_escalation_hours = 3;
-        assert!(
-            o.ci_divergences(now + chrono::Duration::hours(2))
-                .is_empty()
-        );
-        let mut next = ci;
-        next.head = HEAD_B.into();
-        assert_eq!(
-            o.observe_review_ci(&coord(12), &next),
-            CiAction::None,
-            "stale observations cannot target a different head"
-        );
-        o.handle_review_sweep(&[open_at(12, HEAD_B)]);
-        assert_eq!(o.observe_review_ci(&coord(12), &next), CiAction::Summon);
+        use crate::reviewci::CiAction;
+        for required in [true, false] {
+            let (mut o, mut rx) =
+                conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+            introduce(&o, approved_row(12, "bob", HEAD_A));
+            o.handle_review_sweep(&[open_at(12, HEAD_A)]);
+            let payload = serde_json::json!({"data":{"repository":{"pullRequest":{
+                "state":"OPEN", "headRefOid":HEAD_A, "commits":{"nodes":[{"commit":{
+                    "oid":HEAD_A, "statusCheckRollup":{"contexts":{
+                        "pageInfo":{"hasNextPage":false}, "nodes":[{
+                            "__typename":"CheckRun", "name":"test", "id":"1",
+                            "status":"COMPLETED", "conclusion":"FAILURE", "isRequired":required
+                        }]
+                    }}
+                }}]}
+            }}}});
+            let mut ci = crate::reviewci::parse_snapshot(&payload, HEAD_A).unwrap();
+            ci.failed[0].tests = vec!["--- FAIL: TestUsage".into()];
+            o.eff.as_mut().unwrap().cfg.review.ci_failure_routing = false;
+            assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
+            o.eff.as_mut().unwrap().cfg.review.ci_failure_routing = true;
+            o.human_holds.note_human_label("STUDIO-721");
+            assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
+            o.human_holds.begin_pass(true);
+            let mut author = crate::orchestrator::RunningEntry::empty(Issue::default());
+            author.issue.identifier = "STUDIO-721".into();
+            o.running.insert("author".into(), author);
+            assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
+            o.running.clear();
+            assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::Summon);
+            assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
+            let c = rx.try_recv().unwrap();
+            assert_eq!(c.reason, crate::reviewnotify::CompletionReason::CiFailure);
+            assert_eq!(c.changes.as_ref().unwrap().identifier, "STUDIO-721");
+            let body = crate::reviewnotify::re_engage_comment(&c);
+            assert!(body.contains("FAILED"));
+            assert!(body.contains(if required {
+                "Routing gate: required checks."
+            } else {
+                "Routing gate: all checks (this repository marks none required)."
+            }));
+            assert!(body.contains("TestUsage"));
+            assert!(body.contains("Do not loosen, skip or delete tests"));
+            assert!(crate::reviewnotify::summons_author(&body, &c.summon_token));
+            assert!(rx.try_recv().is_err());
+            let now = (o.now)();
+            assert!(
+                o.ci_divergences(now + chrono::Duration::minutes(119))
+                    .is_empty()
+            );
+            let escalated = o.ci_divergences(now + chrono::Duration::hours(2));
+            assert_eq!(escalated.len(), 1);
+            assert_eq!(
+                escalated[0].kind,
+                crate::reviewreconcile::DivergenceKind::CiFailureNoRun
+            );
+            o.eff
+                .as_mut()
+                .unwrap()
+                .cfg
+                .review
+                .ci_failure_escalation_hours = 3;
+            assert!(
+                o.ci_divergences(now + chrono::Duration::hours(2))
+                    .is_empty()
+            );
+            let mut next = ci;
+            next.head = HEAD_B.into();
+            assert_eq!(
+                o.observe_review_ci(&coord(12), &next),
+                CiAction::None,
+                "stale observations cannot target a different head"
+            );
+            o.handle_review_sweep(&[open_at(12, HEAD_B)]);
+            assert_eq!(o.observe_review_ci(&coord(12), &next), CiAction::Summon);
+        }
     }
 
     /// [`ticketless`] with the route-back's state configured — the gate the transition reads.

@@ -15,10 +15,22 @@ pub struct CiFailure {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CiSnapshot {
     pub head: String,
+    /// Routing fallback when no context in the complete inventory is marked required.
+    pub all_checks: bool,
     pub failed: Vec<CiFailure>,
     pub pending: bool,
     /// Proven only from a complete PR inventory and file evidence for EVERY failing check.
     pub unrelated: bool,
+}
+
+impl CiSnapshot {
+    fn gate(&self) -> &'static str {
+        if self.all_checks {
+            "all checks (this repository marks none required)"
+        } else {
+            "required checks"
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,10 +151,16 @@ pub(crate) fn parse_snapshot(value: &serde_json::Value, head: &str) -> Option<Ci
         head: head.into(),
         ..Default::default()
     };
+    let nodes = contexts["nodes"].as_array()?;
+    let mut has_required = false;
+    for c in nodes {
+        has_required |= c["isRequired"].as_bool()?;
+    }
+    ci.all_checks = !has_required;
     // A rerun at the same SHA can coexist with an older red attempt in the rollup. Only the
     // newest attempt of a context/app is authoritative, including when it is still queued.
     let mut latest = std::collections::BTreeMap::new();
-    for c in contexts["nodes"].as_array()? {
+    for c in nodes {
         let name = c["name"].as_str().or_else(|| c["context"].as_str())?;
         let app = c["checkSuite"]["app"]["slug"].as_str().unwrap_or("");
         let workflow = c["checkSuite"]["workflowRun"]["workflow"]["name"]
@@ -163,7 +181,7 @@ pub(crate) fn parse_snapshot(value: &serde_json::Value, head: &str) -> Option<Ci
         }
     }
     for (_, c) in latest.into_values() {
-        if !c["isRequired"].as_bool()? {
+        if !ci.all_checks && !c["isRequired"].as_bool()? {
             continue;
         }
         let state = if c["__typename"] == "CheckRun" {
@@ -290,7 +308,7 @@ impl crate::orchestrator::Orchestrator {
                 reviewer: String::new(), stale_secs: state.summoned_at.map_or(0, |at| now.signed_duration_since(at).num_seconds()),
                 auto_merge_reason: None, capacity_held: None, capacity_unreadable: None,
                 adjudicated_head: String::new(), current_head: state.head.clone(), rounds: 0, findings: Vec::new(),
-                reason: format!("required CI is red at {}; its author has not answered the summons after {} hours — needs a human; inspect the failed run and author dispatch/credentials", state.head, eff.cfg.review.ci_failure_escalation_hours),
+                reason: format!("CI is red at {}; its author has not answered the summons after {} hours — needs a human; inspect the failed run and author dispatch/credentials", state.head, eff.cfg.review.ci_failure_escalation_hours),
             });
         }
         found
@@ -352,14 +370,16 @@ impl crate::orchestrator::Orchestrator {
         let reran = state.rerun.is_some();
         let line = if action == CiAction::Rerun {
             format!(
-                "CI route-back on {pr} at {}: failed check file evidence touches no file in the PR diff; rerunning failed jobs once before summoning {ticket}.",
-                ci.head
+                "CI route-back on {pr} at {} using {}: failed check file evidence touches no file in the PR diff; rerunning failed jobs once before summoning {ticket}.",
+                ci.head,
+                ci.gate()
             )
         } else {
             format!(
-                "CI route-back on {pr} at {}: summoning {} ({ticket}) for failed required checks: {}.",
+                "CI route-back on {pr} at {}: summoning {} ({ticket}) for failed {}: {}.",
                 ci.head,
                 row.author,
+                ci.gate(),
                 ci.failed
                     .iter()
                     .map(|c| c.name.as_str())
@@ -396,7 +416,7 @@ impl crate::orchestrator::Orchestrator {
 }
 
 fn failure_details(ci: &CiSnapshot, reran: bool) -> String {
-    let mut out = String::new();
+    let mut out = format!("Routing gate: {}.\n\n", ci.gate());
     for c in &ci.failed {
         out.push_str(&format!(
             "- {} / {} — {}\n",
@@ -450,57 +470,74 @@ mod tests {
 
     #[tokio::test]
     async fn fake_github_required_checks_and_job_logs_form_the_author_evidence() {
-        let payload = check_payload("FAILURE");
-        let gh = GH::new(
-            "",
-            Some(Box::new(move |args| {
-                if args[..2] == ["api", "graphql"] {
-                    assert!(
-                        args.iter()
-                            .any(|a| a.contains("isRequired(pullRequestNumber:$number)"))
-                    );
-                    return Ok(serde_json::to_vec(&payload).unwrap());
-                }
-                if args[0] == "api" {
-                    return match args[1] {
+        for required in [true, false] {
+            let mut payload = check_payload("FAILURE");
+            payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+                ["contexts"]["nodes"][0]["isRequired"] = required.into();
+            let gh = GH::new(
+                "",
+                Some(Box::new(move |args| {
+                    if args[..2] == ["api", "graphql"] {
+                        assert!(
+                            args.iter()
+                                .any(|a| a.contains("isRequired(pullRequestNumber:$number)"))
+                        );
+                        return Ok(serde_json::to_vec(&payload).unwrap());
+                    }
+                    if args[0] == "api" {
+                        return match args[1] {
                     "repos/o/r/pulls/1" => Ok(br#"{"head":{"sha":"a"},"base":{"sha":"base"},"changed_files":1,"labels":[]}"#.to_vec()),
                     "repos/o/r/compare/base...a" => Ok(br#"{"files":[{"filename":"src/usage.go","status":"modified"}]}"#.to_vec()),
                     other => panic!("unexpected endpoint: {other}"),
                 };
-                }
-                assert_eq!(
-                    args,
-                    [
-                        "run",
-                        "view",
-                        "--repo",
-                        "o/r",
-                        "--job",
-                        "456",
-                        "--log-failed"
-                    ]
-                );
-                Ok("noise\n2026-11-13 --- FAIL: TestUsageTotals (0.02s)\n2026-11-13 ✘ 1 tests/usage.spec.ts:42\nmore noise".as_bytes().to_vec())
-            })),
-        );
-        let ci = gh
-            .review_ci(&crate::prstate::PrCoord::new("o", "r", 1), "a", None)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(ci.failed.len(), 1);
-        assert_eq!(ci.failed[0].workflow, "ci");
-        assert!(ci.unrelated);
-        assert_eq!(ci.failed[0].tests.len(), 2);
-        assert!(ci.failed[0].tests[0].contains("TestUsageTotals"));
-        let details = failure_details(&ci, false);
-        assert!(details.contains("usage.spec.ts:42"));
-        assert!(details.contains("https://github.com/o/r/actions/runs/123/job/456"));
-        let wrong_head = gh
-            .review_ci(&crate::prstate::PrCoord::new("o", "r", 1), "b", None)
-            .await
-            .unwrap();
-        assert!(wrong_head.is_none());
+                    }
+                    assert_eq!(
+                        args,
+                        [
+                            "run",
+                            "view",
+                            "--repo",
+                            "o/r",
+                            "--job",
+                            "456",
+                            "--log-failed"
+                        ]
+                    );
+                    Ok("noise\n2026-11-13 --- FAIL: TestUsageTotals (0.02s)\n2026-11-13 ✘ 1 tests/usage.spec.ts:42\nmore noise".as_bytes().to_vec())
+                })),
+            );
+            let ci = gh
+                .review_ci(&crate::prstate::PrCoord::new("o", "r", 1), "a", None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(ci.failed.len(), 1);
+            assert_eq!(ci.all_checks, !required);
+            assert_eq!(ci.failed[0].workflow, "ci");
+            assert!(ci.unrelated);
+            assert_eq!(ci.failed[0].tests.len(), 2);
+            assert!(ci.failed[0].tests[0].contains("TestUsageTotals"));
+            let details = failure_details(&ci, false);
+            assert!(details.contains("usage.spec.ts:42"));
+            assert!(details.contains("https://github.com/o/r/actions/runs/123/job/456"));
+            let mut previous = ci.clone();
+            previous.all_checks = !ci.all_checks;
+            let refreshed = gh
+                .review_ci(
+                    &crate::prstate::PrCoord::new("o", "r", 1),
+                    "a",
+                    Some(&previous),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(refreshed.all_checks, ci.all_checks);
+            let wrong_head = gh
+                .review_ci(&crate::prstate::PrCoord::new("o", "r", 1), "b", None)
+                .await
+                .unwrap();
+            assert!(wrong_head.is_none());
+        }
     }
 
     #[test]
@@ -509,6 +546,11 @@ mod tests {
         let nodes = &mut payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
             ["statusCheckRollup"]["contexts"];
         nodes["nodes"][0]["isRequired"] = false.into();
+        let mut required = nodes["nodes"][0].clone();
+        required["name"] = "required passing check".into();
+        required["isRequired"] = true.into();
+        required["conclusion"] = "SUCCESS".into();
+        nodes["nodes"].as_array_mut().unwrap().push(required);
         assert!(parse_snapshot(&payload, "a").unwrap().failed.is_empty());
         let mut payload = check_payload("FAILURE");
         payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
@@ -525,6 +567,35 @@ mod tests {
                 .failed
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn no_required_checks_summons_the_author_and_defers_pending_or_truncated_answers() {
+        let mut payload = check_payload("FAILURE");
+        payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+            ["contexts"]["nodes"][0]["isRequired"] = false.into();
+        let ci = parse_snapshot(&payload, "a").unwrap();
+        let now = Utc::now();
+        let mut state = CiState::default();
+        assert_eq!(state.decide(&ci, now, false, false), CiAction::Summon);
+        assert_eq!(state.decide(&ci, now, false, false), CiAction::None);
+
+        let contexts = &mut payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+            ["statusCheckRollup"]["contexts"];
+        let mut pending = contexts["nodes"][0].clone();
+        pending["name"] = "pending check".into();
+        pending["status"] = "QUEUED".into();
+        contexts["nodes"].as_array_mut().unwrap().push(pending);
+        let ci = parse_snapshot(&payload, "a").unwrap();
+        assert!(ci.pending);
+        assert_eq!(ci.failed.len(), 1);
+        assert_eq!(
+            CiState::default().decide(&ci, now, false, false),
+            CiAction::None
+        );
+        payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+            ["contexts"]["pageInfo"]["hasNextPage"] = true.into();
+        assert!(parse_snapshot(&payload, "a").is_none());
     }
 
     #[test]

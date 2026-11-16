@@ -200,7 +200,7 @@ pub fn summons_author(body: &str, token: &str) -> bool {
 pub fn re_engage_comment(c: &ReviewCompletion) -> String {
     if c.reason == CompletionReason::CiFailure {
         return format!(
-            "{} — {}, required CI checks FAILED at `{}`.\n\n{}\nFix the cause, run the checks locally and push to this branch. Do not loosen, skip or delete tests to get green. The daemon watches for your push; no new ticket is needed.",
+            "{} — {}, CI checks FAILED at `{}`.\n\n{}\nFix the cause, run the checks locally and push to this branch. Do not loosen, skip or delete tests to get green. The daemon watches for your push; no new ticket is needed.",
             c.summon_token,
             if c.author.is_empty() {
                 "author"

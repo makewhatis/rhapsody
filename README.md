@@ -277,7 +277,10 @@ paths have no Go counterpart; Go-owned API/configuration goldens remain unchange
 ### Failed required CI routes back to the author (STUDIO-1994)
 
 Ticketless review watches required checks at the current PR head and routes concluded failures
-through the same author summons/state-move path as conflicts, independently of approval. WORKFLOW.md
+through the same author summons/state-move path as conflicts, independently of approval. If no
+check in the complete head inventory is marked required, all checks become the routing gate for
+failures, pending and unrelated-file evidence (STUDIO-2094). With any required check, optional
+failures remain ignored. Comments and logs name the mode; merge policy is unchanged. WORKFLOW.md
 `review.ci_failure_routing` defaults on and hot-reloads; `review.ci_failure_escalation_hours` defaults
 to two hours before an unanswered summons is reported as needing a human. Pending checks, live
 author runs and human-held tickets do not summon. File-evidenced unrelated Actions failures get
