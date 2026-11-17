@@ -12,6 +12,24 @@ use crate::*;
 pub struct Noop;
 
 impl Store for Noop {
+    fn get_ci_rerun(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _number: i64,
+        _head: &str,
+    ) -> Result<Option<CiRerun>, StoreError> {
+        Ok(None)
+    }
+    fn reserve_ci_rerun(&self, _row: &CiRerun) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn finish_ci_rerun(&self, _row: &CiRerun) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn list_ci_reruns(&self) -> Result<Vec<CiRerun>, StoreError> {
+        Ok(Vec::new())
+    }
     fn review_selection(&self, _key: &ReviewWatchKey) -> Result<Option<String>, StoreError> {
         Ok(None)
     }
