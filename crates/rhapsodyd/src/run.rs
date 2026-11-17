@@ -209,7 +209,8 @@ where
         std::sync::Arc<crate::credential_client::CredentialResolver>,
     > = if flags.credential_bootstrap {
         let probe = flags.credential_probe.clone();
-        let resolver = std::sync::Arc::new(crate::credential_client::CredentialResolver::new());
+        let resolver =
+            std::sync::Arc::new(crate::credential_client::CredentialResolver::awaiting_bootstrap());
         let task_resolver = std::sync::Arc::clone(&resolver);
         tokio::spawn(async move {
             match probe {
