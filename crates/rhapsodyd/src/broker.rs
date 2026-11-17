@@ -115,7 +115,7 @@ impl BrokerRuntime {
 ///   cancels before the task is ever polled): the daemon asked to stop, so the exit is clean and
 ///   the broker stays **available** — nothing failed, so nothing is revoked and nothing is logged
 ///   loudly. Pinned by `tests::a_shutdown_before_the_accept_loop_is_still_clean`; the `biased`
-///   select below is what keeps that independent of which future happens to complete first.
+///   select and exit-branch cancellation recheck also cover shutdown arriving between branch polls.
 /// * If the serving task ends **while the daemon is still live** (an accept error, or a task that
 ///   died silently), the broker is atomically marked unavailable and every grant is revoked, and
 ///   one bounded error is logged. The daemon keeps running: legacy native-login work may continue,
@@ -126,10 +126,19 @@ impl BrokerRuntime {
 pub async fn supervise(
     serve: JoinHandle<std::io::Result<()>>,
     broker: Broker,
+    shutdown: CancelWait,
+    drain: Duration,
+) {
+    supervise_exit(serve, broker, shutdown, drain).await;
+}
+
+async fn supervise_exit(
+    serve: impl std::future::Future<Output = Result<std::io::Result<()>, tokio::task::JoinError>>,
+    broker: Broker,
     mut shutdown: CancelWait,
     drain: Duration,
 ) {
-    let mut serve = serve;
+    tokio::pin!(serve);
     tokio::select! {
         biased;
         _ = shutdown.cancelled() => {
@@ -138,6 +147,12 @@ pub async fn supervise(
             let _ = tokio::time::timeout(drain, &mut serve).await;
         }
         result = &mut serve => {
+            // Cancellation can arrive after the shutdown branch was polled pending but before
+            // this branch observes the serving task's clean exit. Bias alone cannot close that
+            // window; classify against the current shutdown state before reporting a failure.
+            if shutdown.is_cancelled() {
+                return;
+            }
             match result {
                 Ok(Err(error)) => tracing::error!(
                     err = %error,
@@ -312,6 +327,34 @@ mod tests {
         assert!(
             runtime.broker_handle().is_available(),
             "a clean daemon shutdown must not mark the broker unavailable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_shutdown_between_branch_polls_is_still_clean() {
+        let runtime = BrokerRuntime::bind().expect("bind");
+        let (token, _access, _receipt, _session) = mint_live(&runtime.registrar());
+        let shutdown = CancelSignal::new();
+        // The biased select polls shutdown first, while it is still pending. The serving task
+        // then observes cancellation and exits during the second poll of that same select.
+        let serve = std::future::poll_fn(|_| {
+            shutdown.cancel();
+            std::task::Poll::Ready(Ok(Ok(())))
+        });
+        supervise_exit(
+            serve,
+            runtime.broker_handle(),
+            shutdown.wait(),
+            Duration::from_secs(2),
+        )
+        .await;
+        assert!(
+            runtime.broker_handle().is_available(),
+            "a clean shutdown between branch polls must not mark the broker unavailable"
+        );
+        assert!(
+            runtime.broker_handle().lookup_capability(&token).is_ok(),
+            "the supervisor must not revoke grants on a clean shutdown"
         );
     }
 
