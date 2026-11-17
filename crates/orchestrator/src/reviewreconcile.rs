@@ -1379,6 +1379,13 @@ impl Orchestrator {
                 // (the review watcher never spawned) and no entry for this coordinate (auto-merge
                 // off, or this head never reached a gate) both fall back to the plain wording.
                 if d.kind == DivergenceKind::ApprovedStillOpen {
+                    if self
+                        .automerge_ledger
+                        .as_ref()
+                        .is_some_and(|l| l.waiting_to_land(pr))
+                    {
+                        return None;
+                    }
                     // STUDIO-961: a conflict route-back the watcher has already fired IS the
                     // progress this pull request was waiting on — the author has been handed it and
                     // owns the next move. Reporting it as needing a human would be the false
@@ -5542,6 +5549,43 @@ mod store_tests {
             !warn.message.contains("nothing has reported it blocked"),
             "the enriched line must replace the fallback wording, not sit beside it: {}",
             warn.message
+        );
+    }
+
+    #[test]
+    fn landing_wait_and_running_front_checks_are_not_reconciliation_stalls() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        let ledger = Arc::new(crate::runautomerge::AutoMergeLedger::default());
+        let front = PrCoord::new("makewhatis", "rhapsody", 163);
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        ledger.test_landing(&front, "ready");
+        ledger.test_landing(&pr, "ready");
+        o.automerge_ledger = Some(ledger.clone());
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergent.is_empty(),
+            "waiting is intentional, not a stall"
+        );
+        ledger.remove_from_line(&front);
+        ledger.test_landing(&pr, "checks_running");
+        o.reconcile_review_divergence();
+        assert!(
+            o.review_divergent.is_empty(),
+            "front checks are still running"
+        );
+        ledger.test_landing(&pr, "blocked");
+        o.reconcile_review_divergence();
+        assert_eq!(o.review_divergent.len(), 1);
+        assert_eq!(
+            o.review_divergences()[0].kind,
+            DivergenceKind::ApprovedStillOpen
         );
     }
 

@@ -249,6 +249,24 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Per-repository auto-merge landing lines (STUDIO-2126)
+
+For bases with strict up-to-date status-check protection (classic branch protection or an
+effective ruleset), approved ticketless PRs enter a process-local FIFO when first observed
+merge-eligible. Only the front is updated or merged; it keeps its place while a daemon branch
+update runs checks and review. Findings, CI routed to the author, closure, draft and human holds
+release its place. A confirmed merge advances the line on the next observation. Repositories
+without strict protection retain independent merge attempts, and `review.auto_merge: false`
+still performs no merges. Every existing approval, check, draft and hold gate remains required.
+
+`GET /api/v1/reviews` adds optional `landing` data to PR rows: repository, PR number, one-based
+`position`, `total` and `state` (`waiting`, `ready`, `updating`, `reviewing`, `checks_running`,
+`blocked` or `merged`). Group those rows by repository and position to read each line; the
+dashboard shows the position and state on its Reviews PR rows. Waiting PRs and front PRs with
+running checks do not produce `approved_still_open` reconciliation stalls; a front whose checks
+finished but still cannot merge remains reportable. Admission order is rebuilt after restart.
+This changes the Rhapsody-only auto-merge subsystem; Go parity fixtures are unchanged.
+
 ### Explicit blocked handoffs and lead resolution (STUDIO-2085)
 
 The Rhapsody-only blocked detector requires an exact `HANDOFF: blocked` line (surrounding

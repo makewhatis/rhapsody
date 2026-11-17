@@ -256,6 +256,9 @@ pub struct CredentialResolver {
     /// observe an availability transition. `None` inside the cell means a frame WAS read but is
     /// unusable/absent (EOF/malformed/timeout), a stable state that needs no re-read.
     channel: OnceCell<Option<BootstrapMessage>>,
+    /// Only a desktop boot starts pending. Credential reads wait for that bounded bootstrap task,
+    /// while a bare CLI resolver remains immediately unavailable without ever touching stdin.
+    bootstrap_complete: tokio::sync::watch::Sender<bool>,
 }
 
 impl Default for CredentialResolver {
@@ -263,6 +266,7 @@ impl Default for CredentialResolver {
         CredentialResolver {
             state: std::sync::Mutex::new(HashMap::new()),
             channel: OnceCell::new(),
+            bootstrap_complete: tokio::sync::watch::channel(true).0,
         }
     }
 }
@@ -306,6 +310,15 @@ impl CredentialResolver {
         CredentialResolver::default()
     }
 
+    /// Construct the desktop boundary before spawning its bounded stdin bootstrap task. Only
+    /// credential reads wait for the outcome; HTTP readiness and the control loop stay independent.
+    pub fn awaiting_bootstrap() -> CredentialResolver {
+        CredentialResolver {
+            bootstrap_complete: tokio::sync::watch::channel(false).0,
+            ..Self::default()
+        }
+    }
+
     /// Reads and remembers the one bootstrap frame from `stdin`. Idempotent: only the first call
     /// consumes `stdin`; every later call is a no-op. A process that never receives a frame simply
     /// resolves `OwnerUnavailable` for its whole lifetime.
@@ -317,6 +330,7 @@ impl CredentialResolver {
             .channel
             .get_or_init(|| async { read_bootstrap(stdin).await })
             .await;
+        self.bootstrap_complete.send_replace(true);
     }
 
     /// Seeds this resolver's channel directly with an already-read bootstrap frame (or `None` for "no
@@ -328,6 +342,7 @@ impl CredentialResolver {
     /// `OnceCell::set` on an already-set cell is a no-op, so a later `learn_bootstrap` cannot clobber it.
     pub fn adopt_bootstrap(&self, message: Option<BootstrapMessage>) {
         let _ = self.channel.set(message);
+        self.bootstrap_complete.send_replace(true);
     }
 
     /// Reads one credential through the learned channel and folds the result into this resolver.
@@ -335,6 +350,10 @@ impl CredentialResolver {
     /// successive reads observe an availability transition. Not `resolve(stdin, ..)`: the bootstrap
     /// frame is consumed exactly once by [`learn_bootstrap`], never per read.
     pub async fn read_bound(&self, account: String, expected_binding: Binding) -> ObservedRead {
+        let mut complete = self.bootstrap_complete.subscribe();
+        if complete.wait_for(|ready| *ready).await.is_err() {
+            return self.observe(&account, unavailable_read());
+        }
         let read = match self.channel.get() {
             Some(Some(msg)) => read_over_channel(msg, account.clone(), expected_binding).await,
             // No bootstrap frame ever arrived (or it was malformed/timed out): no owner for this
@@ -1037,6 +1056,66 @@ mod tests {
         assert_eq!(resolver.high_water(&account), Some(Revision(12)));
         // A different account is independent.
         assert_eq!(resolver.high_water("v1:q"), None);
+    }
+
+    #[tokio::test]
+    async fn a_read_started_before_bootstrap_waits_for_the_owner() {
+        let path = unix_socket_path("boot-race");
+        let listener = tokio::net::UnixListener::bind(&path).expect("bind real socket");
+        let accept = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let hello: HelloFrame = read_frame(&mut stream).await.unwrap();
+            let mut session = ServerSession::new(Token::new("secret".into()));
+            session.accept_hello(&hello.token).unwrap();
+            let ClientFrame::ReadBound { seq, .. } = read_frame(&mut stream).await.unwrap();
+            session.accept_client_seq(seq).unwrap();
+            write_frame(
+                &mut stream,
+                &ServerFrame::ReadBoundResult {
+                    seq: session.next_outgoing_seq(),
+                    revision: Revision(9),
+                    state: CredentialStateTag::Absent,
+                    lease: None,
+                },
+            )
+            .await
+            .unwrap();
+        });
+        let resolver = CredentialResolver::awaiting_bootstrap();
+        let read = resolver.read_bound("v1:x".into(), a_binding());
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = &mut read => panic!("a pending bootstrap must not publish OwnerUnavailable"),
+            () = std::future::ready(()) => {}
+        }
+        resolver.adopt_bootstrap(Some(BootstrapMessage {
+            token: "secret".into(),
+            socket_path: path.to_string_lossy().into_owned(),
+        }));
+        let observed = read.await;
+        assert_eq!(observed.read.revision, Revision(9));
+        assert_eq!(observed.read.state.tag(), CredentialStateTag::Absent);
+        accept.await.unwrap();
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_pending_bootstrap_eof_releases_credential_reads() {
+        let resolver = CredentialResolver::awaiting_bootstrap();
+        let read = resolver.read_bound("v1:x".into(), a_binding());
+        tokio::pin!(read);
+        tokio::select! {
+            biased;
+            _ = &mut read => panic!("the bootstrap outcome is still pending"),
+            () = std::future::ready(()) => {}
+        }
+        resolver.learn_bootstrap(tokio::io::empty()).await;
+        let observed = read.await;
+        assert_eq!(
+            observed.read.state.tag(),
+            CredentialStateTag::OwnerUnavailable
+        );
     }
 
     #[tokio::test]

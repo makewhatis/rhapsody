@@ -64,6 +64,51 @@ use rhapsody_store::{
 use crate::managerapproval::ApprovalScope;
 use crate::prstate::PrCoord;
 
+/// Admission order is independent of PR number and watcher rotation. An updated front retains
+/// admission while its new head is checked/reviewed; a findings verdict discharges it.
+#[derive(Default)]
+pub(crate) struct LandingLine {
+    pub entries: Vec<LandingEntry>,
+}
+
+pub(crate) struct LandingEntry {
+    pub pr: PrCoord,
+    pub updated: bool,
+    pub updated_from: String,
+    pub state: &'static str,
+}
+
+impl LandingLine {
+    pub fn admit(&mut self, pr: &PrCoord) {
+        if !self.entries.iter().any(|e| e.pr == *pr) {
+            self.entries.push(LandingEntry {
+                pr: pr.clone(),
+                updated: false,
+                updated_from: String::new(),
+                state: "ready",
+            });
+        }
+    }
+
+    pub fn remove(&mut self, pr: &PrCoord) {
+        self.entries.retain(|e| e.pr != *pr);
+    }
+
+    pub fn position(&self, pr: &PrCoord) -> Option<(usize, usize)> {
+        let repo: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|e| {
+                e.pr.owner.eq_ignore_ascii_case(&pr.owner)
+                    && e.pr.repo.eq_ignore_ascii_case(&pr.repo)
+            })
+            .collect();
+        repo.iter()
+            .position(|e| e.pr == *pr)
+            .map(|i| (i + 1, repo.len()))
+    }
+}
+
 /// Loop-owned landing admission across an off-loop merge attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LandingMergeState {
@@ -463,6 +508,26 @@ mod tests {
 
     const HEAD: &str = "c366a61c366a61c366a61c366a61c366a61c366a";
     const OLD: &str = "a324d2da324d2da324d2da324d2da324d2da324d";
+
+    #[test]
+    fn landing_fifo_keeps_admission_order_and_advances_on_departure() {
+        let mut line = LandingLine::default();
+        let a = PrCoord::new("owner", "repo", 3);
+        let b = PrCoord::new("owner", "repo", 1);
+        let c = PrCoord::new("owner", "other", 2);
+        line.admit(&a);
+        line.admit(&b);
+        line.admit(&c);
+        line.admit(&a);
+        assert_eq!(line.position(&a), Some((1, 2)));
+        assert_eq!(line.position(&b), Some((2, 2)));
+        assert_eq!(line.position(&c), Some((1, 1)));
+        // Merged, findings, held and drafted all discharge admission the same way.
+        line.remove(&a);
+        assert_eq!(line.position(&b), Some((1, 1)));
+        line.admit(&a);
+        assert_eq!(line.position(&a), Some((2, 2)));
+    }
 
     #[test]
     fn revert_pr_merges_without_peer_approval_when_revert_review_false() {

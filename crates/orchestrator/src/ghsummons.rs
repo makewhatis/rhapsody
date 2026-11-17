@@ -1317,10 +1317,85 @@ pub type BranchUpdateResult = Result<bool, Box<dyn std::error::Error + Send + Sy
 #[async_trait]
 pub trait BranchUpdateSource: Send + Sync {
     async fn allows_branch_update(&self, owner: &str, repo: &str) -> BranchUpdateResult;
+
+    /// Effective strict status-check protection on this PR's base, independently of whether
+    /// GitHub permits updating branches. Other consumers do not need this read.
+    async fn requires_up_to_date(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _number: i64,
+    ) -> BranchUpdateResult {
+        Ok(false)
+    }
 }
 
 #[async_trait]
 impl BranchUpdateSource for GH {
+    async fn requires_up_to_date(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+    ) -> BranchUpdateResult {
+        let query = r#"query($owner:String!,$repo:String!,$number:Int!) {
+          repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
+            baseRefName baseRef { branchProtectionRule { requiresStatusChecks requiresStrictStatusChecks } }
+          } }
+        }"#;
+        let bytes = self
+            .run_off_task(vec![
+                "api".into(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={query}"),
+                "-f".into(),
+                format!("owner={owner}"),
+                "-f".into(),
+                format!("repo={repo}"),
+                "-F".into(),
+                format!("number={number}"),
+            ])
+            .await?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes)?;
+        if value.get("errors").is_some() {
+            return Err("branch protection GraphQL read returned errors".into());
+        }
+        let pr = &value["data"]["repository"]["pullRequest"];
+        let branch = pr["baseRefName"]
+            .as_str()
+            .ok_or("branch protection read has no base ref")?;
+        let protection = &pr["baseRef"]["branchProtectionRule"];
+        if protection["requiresStatusChecks"].as_bool() == Some(true)
+            && protection["requiresStrictStatusChecks"].as_bool() == Some(true)
+        {
+            return Ok(true);
+        }
+        // Rulesets can enforce strict checks without a classic branchProtectionRule. The effective
+        // branch-rules endpoint includes inherited rules and excludes disabled/evaluate rulesets.
+        let encoded: String = branch
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {
+                    (b as char).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        let bytes = self
+            .run_off_task(vec![
+                "api".into(),
+                format!("repos/{owner}/{repo}/rules/branches/{encoded}"),
+            ])
+            .await?;
+        let rules: Vec<serde_json::Value> = serde_json::from_slice(&bytes)?;
+        Ok(rules.iter().any(|r| {
+            r["type"] == "required_status_checks"
+                && r["parameters"]["strict_required_status_checks_policy"] == true
+        }))
+    }
+
     /// One bounded `gh api repos/<owner>/<repo> --jq .allow_update_branch`.
     ///
     /// `--jq` rather than decoding the repository object, because that object is large and this
@@ -4793,6 +4868,48 @@ mod tests {
                 seen.lock().unwrap_or_else(|e| e.into_inner()).clone(),
                 vec!["api repos/o/r --jq .allow_update_branch".to_string()]
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn strict_protection_reads_classic_rulesets_and_unprotected_bases() {
+        for (classic, rules, want) in [
+            (true, "[]", true),
+            (
+                false,
+                r#"[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":true}}]"#,
+                true,
+            ),
+            (
+                false,
+                r#"[{"type":"required_status_checks","parameters":{"strict_required_status_checks_policy":false}}]"#,
+                false,
+            ),
+            (false, "[]", false),
+        ] {
+            let src = GH::new(
+                "@symphony",
+                Some(Box::new(move |args| {
+                    if args.get(1) == Some(&"graphql") {
+                        Ok(serde_json::to_vec(
+                            &serde_json::json!({"data":{"repository":{"pullRequest":{
+                            "baseRefName":"release/next", "baseRef":{"branchProtectionRule":{"requiresStatusChecks":classic,"requiresStrictStatusChecks":classic}}
+                                }}}}),
+                        )?)
+                    } else {
+                        assert_eq!(args, ["api", "repos/o/r/rules/branches/release%2Fnext"]);
+                        Ok(rules.as_bytes().to_vec())
+                    }
+                })),
+            );
+            assert_eq!(src.requires_up_to_date("o", "r", 1).await.unwrap(), want);
+        }
+        for body in ["{}", r#"{"errors":[{"message":"denied"}]}"#] {
+            let src = GH::new(
+                "@symphony",
+                Some(run_recording(body, Arc::new(Mutex::new(Vec::new())))),
+            );
+            assert!(src.requires_up_to_date("o", "r", 1).await.is_err());
         }
     }
 

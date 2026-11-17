@@ -4,10 +4,17 @@
 //! **No Go v0.4.0 counterpart.** [`crate::runmerge`]'s sibling, and deliberately its shape: every
 //! `gh` call is out here, the module holds no [`Orchestrator`](crate::orchestrator::Orchestrator),
 //! sends no control event, and the only lock it shares with the control task is
-//! [`AutoMergeLedger`]'s — taken read-only, through [`AutoMergeLedger::peek`] (see below) — so a
+//! [`AutoMergeLedger`]'s short synchronous cells (see below) — so a
 //! slow `gh` delays the watcher's next tick and nothing else. The DECISION that needs loop state —
 //! the head-keyed reviewer verdicts — was made in [`crate::automerge`] and arrives here already
 //! made, as an [`AutoMergePlan`].
+//!
+//! STUDIO-2126 adds a repository FIFO beside the refusal ledger. Control admits eligible plans
+//! and removes ineligible observations; this task records strict protection and attempt progress.
+//! Only a strict repository's front may update or merge. An updated front keeps admission during
+//! checks/review, and a merged front is released by the next observation, not mid-batch. The review
+//! API reads positions/states and reconciliation suppresses deliberate waits through this handle.
+//! No lock spans I/O or an await. Admission is process-local and rebuilt on restart.
 //!
 //! # Why this does not arm GitHub's own auto-merge
 //!
@@ -73,12 +80,12 @@
 //! ([`refuse_loudly`]), because a line spoken before the ledger rules repeats however the ledger
 //! rules.
 //!
-//! A refusal is deliberately NOT surfaced outside the log as well — not on the run, not on the pull
+//! A refusal is deliberately NOT surfaced on the run or the pull
 //! request, not the way [`CREDENTIAL_DEAD_WARNING`](crate::preflight) reaches `/api/v1/projects` per
 //! project. That warning rides loop-owned state; this module holds no `Orchestrator`, sends no
 //! control event, and shares no lock with the control task beyond the ledger's own — which is its
 //! whole containment guarantee for the `gh` I/O this half performs (see the opening paragraph).
-//! Surfacing from here beyond the one exception below needs a new control event, which is a design
+//! Surfacing refusals beyond the exception below needs a new control event, which is a design
 //! change rather than a bug fix, and the volume problem that prompted the question is answered at
 //! its source, on BOTH sides of the seam: the control task announces a plan once per head
 //! ([`crate::reviewwatch`]) and this half announces its refusal once per head and reason, where the
@@ -340,18 +347,49 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
     // said the pull request is not a draft, and the reader carries that default itself so the draft
     // poke can take the opposite one from the same unstated answer.
     if snap.draft_blocks_merge() {
+        deps.ledger
+            .1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .line
+            .remove(&plan.pr);
         return refuse(plan, deps, DECLINE_DRAFT);
     }
 
+    let strict = match deps.policy.requires_up_to_date(owner, repo, number).await {
+        Ok(strict) => strict,
+        Err(error) => return AutoMergeOutcome::Failed(error.to_string()),
+    };
+    if !deps.ledger.landing_turn(&plan.pr, strict) {
+        return AutoMergeOutcome::Held("waiting its turn to land");
+    }
     // 2. GitHub's own verdict on whether this can merge at all.
     let state = match deps.mergestate.merge_state(owner, repo, number).await {
         Ok(state) => state,
         Err(e) => return AutoMergeOutcome::Failed(e.to_string()),
     };
+    if deps.ledger.update_in_flight(&plan.pr, &plan.head, &state) {
+        return AutoMergeOutcome::Held("waiting for the updated head to be observed");
+    }
     if state == MERGE_STATE_BEHIND {
         return update_behind_branch(plan, deps).await;
     }
     if state != MERGE_STATE_CLEAN {
+        let progress = match deps.checks.pr_checks(owner, repo, number).await {
+            Ok(checks)
+                if checks.iter().any(|c| {
+                    matches!(
+                        c.state.as_str(),
+                        "IN_PROGRESS" | "QUEUED" | "PENDING" | "WAITING" | "REQUESTED"
+                    )
+                }) =>
+            {
+                "checks_running"
+            }
+            Ok(_) => "blocked",
+            Err(error) => return AutoMergeOutcome::Failed(error.to_string()),
+        };
+        deps.ledger.set_landing_state(&plan.pr, progress);
         // Every other value, including one this daemon has never seen. Named in the log rather
         // than in the refusal, which is a fixed phrase.
         return refuse_loudly(
@@ -374,11 +412,25 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
         Err(e) => return AutoMergeOutcome::Failed(e.to_string()),
     };
     if checks.is_empty() {
+        deps.ledger.set_landing_state(&plan.pr, "blocked");
         // Not "no checks, so nothing failed": an empty rollup is no EVIDENCE of green, and this
         // repository always runs several. Fails closed.
         return refuse(plan, deps, "no checks have reported on this head");
     }
     if let Some(bad) = blocking_check(&checks) {
+        deps.ledger.set_landing_state(
+            &plan.pr,
+            if checks.iter().any(|c| {
+                matches!(
+                    c.state.as_str(),
+                    "IN_PROGRESS" | "QUEUED" | "PENDING" | "WAITING" | "REQUESTED"
+                )
+            }) {
+                "checks_running"
+            } else {
+                "blocked"
+            },
+        );
         return refuse_loudly(plan, deps, "a check is failing or has not finished", || {
             tracing::info!(
                 pr = %plan.pr, check = %bad.name, state = %bad.state,
@@ -386,6 +438,8 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
             )
         });
     }
+
+    deps.ledger.set_landing_state(&plan.pr, "ready");
 
     // 3b. The manager-approval recheck (STUDIO-1011; §8.3), immediately before the merge command and
     //     after every read above. A plan that counted an `effective` manager approval must still find
@@ -422,6 +476,9 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
         .await
     {
         Ok(said) => {
+            // Keep the slot until the NEXT observation confirms the merge, so later plans from
+            // this same tick cannot update against a base that just moved.
+            deps.ledger.set_landing_state(&plan.pr, "merged");
             // The one audit line for a merge. The caller logs nothing further: two INFO lines
             // saying `auto-merge: merged` read as two merges.
             tracing::info!(
@@ -527,9 +584,9 @@ fn refuse_loudly(
     outcome
 }
 
-/// The refusal this half has already ANNOUNCED for each pull request, and the only state it keeps.
+/// The refusals this half has already ANNOUNCED, plus the STUDIO-2126 landing-line cell.
 ///
-/// It remembers what was SAID, never what GitHub answered: every gate above is re-read from GitHub
+/// The refusal map remembers what was SAID, never what GitHub answered: every gate above is re-read from GitHub
 /// on every tick and re-decided from scratch, so nothing here can strand a pull request whose
 /// refusal has since cleared. Marking a draft ready for review, resolving a conflict and a slow
 /// check turning green all clear on the very next tick, and the ledger has no say in it.
@@ -548,12 +605,188 @@ fn refuse_loudly(
 /// bounds in practice; [`LEDGER_CAPACITY`] bounds it in a daemon that runs for months anyway, at a
 /// cost of one repeated log line per pull request on the tick it is emptied.
 #[derive(Default)]
-pub struct AutoMergeLedger(Mutex<HashMap<PrCoord, (String, &'static str)>>);
+pub struct AutoMergeLedger(
+    Mutex<HashMap<PrCoord, (String, &'static str)>>,
+    Mutex<LandingQueue>,
+);
+
+#[derive(Default)]
+struct LandingQueue {
+    line: crate::automerge::LandingLine,
+    strict: HashMap<(String, String), bool>,
+    announced: HashMap<PrCoord, (usize, usize)>,
+    excluded: std::collections::HashSet<PrCoord>,
+}
+
+/// One PR's place in a strict repository's landing line, served by GET /api/v1/reviews.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LandingPosition {
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    pub position: usize,
+    pub total: usize,
+    pub state: &'static str,
+}
+
+fn repo_key(pr: &PrCoord) -> (String, String) {
+    (pr.owner.to_ascii_lowercase(), pr.repo.to_ascii_lowercase())
+}
 
 /// See [`AutoMergeLedger`]. Comfortably above any plausible open watch set.
 const LEDGER_CAPACITY: usize = 256;
 
 impl AutoMergeLedger {
+    pub(crate) fn retain_watched(&self, prs: &[PrCoord]) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        queue.line.entries.retain(|e| prs.contains(&e.pr));
+        queue.excluded.retain(|pr| prs.contains(pr));
+        queue.announced.retain(|pr, _| prs.contains(pr));
+        queue
+            .strict
+            .retain(|key, _| prs.iter().any(|pr| repo_key(pr) == *key));
+    }
+
+    pub(crate) fn admit(&self, pr: &PrCoord) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        if !queue.excluded.contains(pr) {
+            queue.line.admit(pr);
+        }
+    }
+
+    pub(crate) fn remove_from_line(&self, pr: &PrCoord) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        queue.line.remove(pr);
+        queue.announced.remove(pr);
+        queue.excluded.insert(pr.clone());
+    }
+
+    /// Called on control from fresh observations. Only a daemon-initiated update may keep a
+    /// temporarily unapproved front in the line; findings/holds/drafts always remove it.
+    pub(crate) fn observe_eligibility(&self, pr: &PrCoord, eligible: bool, reviewing: bool) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        if eligible {
+            queue.excluded.remove(pr);
+        }
+        let retaining_update =
+            reviewing && queue.line.entries.iter().any(|e| e.pr == *pr && e.updated);
+        if !eligible && !retaining_update {
+            queue.excluded.insert(pr.clone());
+        }
+        if let Some(entry) = queue.line.entries.iter_mut().find(|e| e.pr == *pr) {
+            if eligible {
+                if entry.state == "reviewing" {
+                    entry.state = "ready";
+                }
+            } else if reviewing && entry.updated {
+                entry.state = "reviewing";
+            } else {
+                queue.line.remove(pr);
+                queue.announced.remove(pr);
+                queue.excluded.insert(pr.clone());
+            }
+        }
+    }
+
+    pub fn landing_lines(&self) -> Vec<LandingPosition> {
+        let queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        queue
+            .line
+            .entries
+            .iter()
+            .filter_map(|e| {
+                if queue.strict.get(&repo_key(&e.pr)) != Some(&true) {
+                    return None;
+                }
+                let (position, total) = queue.line.position(&e.pr)?;
+                Some(LandingPosition {
+                    owner: e.pr.owner.clone(),
+                    repo: e.pr.repo.clone(),
+                    number: e.pr.number,
+                    position,
+                    total,
+                    state: if position > 1 { "waiting" } else { e.state },
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) fn waiting_to_land(&self, pr: &PrCoord) -> bool {
+        self.landing_lines().iter().any(|p| {
+            p.owner.eq_ignore_ascii_case(&pr.owner)
+                && p.repo.eq_ignore_ascii_case(&pr.repo)
+                && p.number == pr.number
+                && (p.position > 1
+                    || matches!(p.state, "checks_running" | "updating" | "reviewing"))
+        })
+    }
+
+    fn set_landing_state(&self, pr: &PrCoord, state: &'static str) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = queue.line.entries.iter_mut().find(|e| e.pr == *pr) {
+            entry.state = state;
+            if state == "updating" {
+                entry.updated = true;
+            }
+        }
+    }
+
+    fn mark_updated(&self, plan: &AutoMergePlan) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = queue.line.entries.iter_mut().find(|e| e.pr == plan.pr) {
+            entry.updated = true;
+            entry.updated_from = plan.head.clone();
+            entry.state = "updating";
+        }
+    }
+
+    fn update_failed(&self, plan: &AutoMergePlan) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(entry) = queue.line.entries.iter_mut().find(|e| e.pr == plan.pr) {
+            // A failed command may have reached GitHub. Keep admission if the head moved, but
+            // permit another attempt if the next observation still sees the old approved head.
+            entry.updated_from.clear();
+            entry.state = "blocked";
+        }
+    }
+
+    fn update_in_flight(&self, pr: &PrCoord, head: &str, state: &str) -> bool {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = queue.line.entries.iter_mut().find(|e| e.pr == *pr) else {
+            return false;
+        };
+        // Success can mean "already up to date", with no new head to observe. Re-read the gates
+        // once GitHub no longer reports BEHIND, but never repeat a real update on its old head
+        // while that same BEHIND observation persists. A later base advance may need a new update.
+        if state != MERGE_STATE_BEHIND {
+            entry.updated_from.clear();
+            return false;
+        }
+        entry.updated && entry.updated_from == head
+    }
+
+    fn landing_turn(&self, pr: &PrCoord, strict: bool) -> bool {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        if queue.excluded.contains(pr) {
+            return false;
+        }
+        queue.strict.insert(repo_key(pr), strict);
+        if !strict {
+            return true;
+        }
+        queue.line.admit(pr);
+        let Some((position, total)) = queue.line.position(pr) else {
+            return false;
+        };
+        if position == 1 {
+            return true;
+        }
+        if queue.announced.insert(pr.clone(), (position, total)) != Some((position, total)) {
+            tracing::info!(%pr, position, total, "waiting its turn to land (position {position} of {total} in {}/{})", pr.owner, pr.repo);
+        }
+        false
+    }
+
     fn refuse(&self, pr: &PrCoord, head: &str, why: &'static str) -> AutoMergeOutcome {
         let mut seen = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if seen.len() >= LEDGER_CAPACITY && !seen.contains_key(pr) {
@@ -600,6 +833,13 @@ impl AutoMergeLedger {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .insert(pr.clone(), (head.to_string(), why));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_landing(&self, pr: &PrCoord, state: &'static str) {
+        self.admit(pr);
+        self.landing_turn(pr, true);
+        self.set_landing_state(pr, state);
     }
 }
 
@@ -683,6 +923,9 @@ async fn update_behind_branch(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> Aut
             );
         }
     }
+    // Reserve before the write: control can observe the new head while gh is still returning.
+    // Without this ordering it would drop the front as stale before learning this was our update.
+    deps.ledger.mark_updated(plan);
     match deps.updater.update_branch(owner, repo, number).await {
         Ok(said) => {
             tracing::info!(
@@ -692,7 +935,10 @@ async fn update_behind_branch(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> Aut
             );
             AutoMergeOutcome::Updated
         }
-        Err(e) => AutoMergeOutcome::Failed(e.to_string()),
+        Err(e) => {
+            deps.ledger.update_failed(plan);
+            AutoMergeOutcome::Failed(e.to_string())
+        }
     }
 }
 
@@ -718,6 +964,329 @@ mod tests {
             approved_by: vec!["alice".to_string()],
             manager_approval: None,
         }
+    }
+
+    struct StrictPolicy;
+    #[async_trait]
+    impl BranchUpdateSource for StrictPolicy {
+        async fn allows_branch_update(&self, _: &str, _: &str) -> BranchUpdateResult {
+            Ok(true)
+        }
+        async fn requires_up_to_date(&self, _: &str, _: &str, _: i64) -> BranchUpdateResult {
+            Ok(true)
+        }
+    }
+
+    fn numbered(number: i64) -> AutoMergePlan {
+        AutoMergePlan {
+            pr: PrCoord::new("makewhatis", "tally", number),
+            ..plan()
+        }
+    }
+
+    #[tokio::test]
+    async fn landing_update_reserves_before_control_can_observe_its_new_head() {
+        struct ObservingUpdater(Arc<AutoMergeLedger>);
+        #[async_trait]
+        impl BranchUpdater for ObservingUpdater {
+            async fn update_branch(&self, owner: &str, repo: &str, number: i64) -> MergeResult {
+                self.0
+                    .observe_eligibility(&PrCoord::new(owner, repo, number), false, true);
+                Ok("updated".into())
+            }
+        }
+        let ledger = Arc::new(AutoMergeLedger::default());
+        let first = numbered(1);
+        let next = numbered(2);
+        ledger.admit(&first.pr);
+        ledger.admit(&next.pr);
+        let d = AutoMergeDeps {
+            ledger: ledger.clone(),
+            policy: Arc::new(StrictPolicy),
+            updater: Arc::new(ObservingUpdater(ledger.clone())),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_BEHIND,
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        assert_eq!(
+            perform_auto_merge(&first, &d).await,
+            AutoMergeOutcome::Updated
+        );
+        assert_eq!(ledger.landing_lines()[0].number, 1);
+        assert_eq!(
+            perform_auto_merge(&next, &d).await,
+            AutoMergeOutcome::Held("waiting its turn to land")
+        );
+    }
+
+    #[tokio::test]
+    async fn landing_successful_noop_update_rechecks_same_head_and_advances() {
+        for state in [MERGE_STATE_CLEAN, "BLOCKED"] {
+            let first = numbered(1);
+            let next = numbered(2);
+            let updater = Arc::new(FakeUpdater::default());
+            let merger = Arc::new(FakeMerger::default());
+            let mut d = AutoMergeDeps {
+                policy: Arc::new(StrictPolicy),
+                updater: updater.clone(),
+                ..deps(
+                    found(HEAD, PrStatus::Open),
+                    MERGE_STATE_BEHIND,
+                    all_green(),
+                    merger.clone(),
+                )
+            };
+            d.ledger.admit(&first.pr);
+            d.ledger.admit(&next.pr);
+            // A successful update need not move HEAD (gh may find it already up to date).
+            assert_eq!(
+                perform_auto_merge(&first, &d).await,
+                AutoMergeOutcome::Updated
+            );
+            d.ledger.observe_eligibility(&first.pr, true, false);
+            assert_eq!(
+                perform_auto_merge(&first, &d).await,
+                AutoMergeOutcome::Held("waiting for the updated head to be observed")
+            );
+            assert_eq!(*updater.calls.lock().unwrap(), [1]);
+
+            d.mergestate = merge_state(Some(state));
+            let outcome = perform_auto_merge(&first, &d).await;
+            if state == MERGE_STATE_CLEAN {
+                assert!(
+                    matches!(outcome, AutoMergeOutcome::Merged(_)),
+                    "{outcome:?}"
+                );
+                assert_eq!(merger.calls.lock().unwrap()[0].3.as_deref(), Some(HEAD));
+            } else {
+                assert!(
+                    matches!(outcome, AutoMergeOutcome::Declined(_)),
+                    "{outcome:?}"
+                );
+                assert!(merger.calls.lock().unwrap().is_empty());
+            }
+            assert!(!d.ledger.waiting_to_land(&first.pr));
+            assert!(d.ledger.waiting_to_land(&next.pr));
+            assert_eq!(
+                perform_auto_merge(&next, &d).await,
+                AutoMergeOutcome::Held("waiting its turn to land")
+            );
+
+            d.mergestate = merge_state(Some(MERGE_STATE_BEHIND));
+            if state == MERGE_STATE_CLEAN {
+                // The confirmed merge releases the next PR only on the following observation.
+                d.ledger.observe_eligibility(&first.pr, false, false);
+                assert_eq!(
+                    perform_auto_merge(&next, &d).await,
+                    AutoMergeOutcome::Updated
+                );
+                assert_eq!(*updater.calls.lock().unwrap(), [1, 2]);
+            } else {
+                // Once observed current, a later base advance requires a fresh update.
+                assert_eq!(
+                    perform_auto_merge(&first, &d).await,
+                    AutoMergeOutcome::Updated
+                );
+                assert_eq!(*updater.calls.lock().unwrap(), [1, 1]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn landing_update_failure_does_not_prevent_retrying_the_front() {
+        let updater = Arc::new(FakeUpdater {
+            fail: Some("HTTP 502"),
+            ..Default::default()
+        });
+        let d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            updater: updater.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_BEHIND,
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        for _ in 0..2 {
+            assert!(matches!(
+                perform_auto_merge(&numbered(1), &d).await,
+                AutoMergeOutcome::Failed(_)
+            ));
+        }
+        assert_eq!(*updater.calls.lock().unwrap(), [1, 1]);
+    }
+
+    #[tokio::test]
+    async fn landing_line_updates_only_front_and_keeps_it_during_review() {
+        let updater = Arc::new(FakeUpdater::default());
+        let d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            updater: updater.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_BEHIND,
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        let plans = [numbered(3), numbered(1), numbered(2)];
+        for p in &plans {
+            d.ledger.admit(&p.pr);
+        }
+        for p in &plans {
+            perform_auto_merge(p, &d).await;
+        }
+        assert_eq!(*updater.calls.lock().unwrap(), [3]);
+        assert_eq!(
+            d.ledger
+                .landing_lines()
+                .iter()
+                .map(|p| (p.number, p.position, p.state))
+                .collect::<Vec<_>>(),
+            [(3, 1, "updating"), (1, 2, "waiting"), (2, 3, "waiting")]
+        );
+        d.ledger.observe_eligibility(&plans[0].pr, false, true);
+        for p in &plans {
+            perform_auto_merge(p, &d).await;
+        }
+        assert_eq!(
+            *updater.calls.lock().unwrap(),
+            [3],
+            "the updated front keeps its place during a new round"
+        );
+        // A findings verdict (not an owed round) removes it and the next PR advances.
+        d.ledger.observe_eligibility(&plans[0].pr, false, false);
+        for p in &plans[1..] {
+            perform_auto_merge(p, &d).await;
+        }
+        assert_eq!(*updater.calls.lock().unwrap(), [3, 1]);
+    }
+
+    #[tokio::test]
+    async fn landing_line_merge_releases_next_only_on_following_observation() {
+        let updater = Arc::new(FakeUpdater::default());
+        let ledger = Arc::new(AutoMergeLedger::default());
+        let first = numbered(3);
+        let next = numbered(1);
+        ledger.admit(&first.pr);
+        ledger.admit(&next.pr);
+        let clean = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ledger: ledger.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        let behind = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ledger: ledger.clone(),
+            updater: updater.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_BEHIND,
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        assert!(matches!(
+            perform_auto_merge(&first, &clean).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        perform_auto_merge(&next, &behind).await;
+        assert!(updater.calls.lock().unwrap().is_empty());
+        ledger.observe_eligibility(&first.pr, false, false); // next tick: MERGED
+        assert_eq!(
+            perform_auto_merge(&next, &behind).await,
+            AutoMergeOutcome::Updated
+        );
+        assert_eq!(*updater.calls.lock().unwrap(), [1]);
+    }
+
+    #[tokio::test]
+    async fn landing_line_repositories_advance_independently_and_nonstrict_bypasses_order() {
+        let updater = Arc::new(FakeUpdater::default());
+        let d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            updater: updater.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_BEHIND,
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        let a = numbered(1);
+        let b = numbered(2);
+        let other = AutoMergePlan {
+            pr: PrCoord::new("another", "repo", 4),
+            ..plan()
+        };
+        for p in [&a, &b, &other] {
+            d.ledger.admit(&p.pr);
+        }
+        for p in [&a, &b, &other] {
+            perform_auto_merge(p, &d).await;
+        }
+        assert_eq!(*updater.calls.lock().unwrap(), [1, 4]);
+        let merger = Arc::new(FakeMerger::default());
+        let nonstrict = AutoMergeDeps {
+            ledger: d.ledger.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                merger.clone(),
+            )
+        };
+        assert!(matches!(
+            perform_auto_merge(&b, &nonstrict).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        assert_eq!(merger.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn landing_line_silences_waiters_and_pending_checks_but_not_green_unmergeable_front() {
+        let first = numbered(1);
+        let next = numbered(2);
+        let ledger = Arc::new(AutoMergeLedger::default());
+        ledger.admit(&first.pr);
+        ledger.admit(&next.pr);
+        let pending = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ledger: ledger.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                "BLOCKED",
+                checks(&[("test", "IN_PROGRESS")]),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        perform_auto_merge(&first, &pending).await;
+        assert!(ledger.waiting_to_land(&first.pr));
+        assert!(ledger.waiting_to_land(&next.pr));
+        let finished = AutoMergeDeps {
+            checks: all_green(),
+            ..pending
+        };
+        perform_auto_merge(&first, &finished).await;
+        assert!(!ledger.waiting_to_land(&first.pr));
+        assert!(ledger.waiting_to_land(&next.pr));
+        let unreadable = AutoMergeDeps {
+            checks: no_checks(),
+            ..finished
+        };
+        assert!(matches!(
+            perform_auto_merge(&first, &unreadable).await,
+            AutoMergeOutcome::Failed(_)
+        ));
     }
 
     /// The answer is behind a `Mutex` so a test can run several TICKS against one set of deps and

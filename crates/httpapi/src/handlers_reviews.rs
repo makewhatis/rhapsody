@@ -304,6 +304,7 @@ mod tests {
             open,
             manager: None,
             infrastructure: None,
+            landing: None,
         }
     }
 

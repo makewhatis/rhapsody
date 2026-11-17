@@ -85,6 +85,19 @@ afterEach(() => {
 });
 
 describe("the Reviews surface", () => {
+  it("shows a PR's repository landing position and waiting state", async () => {
+    mount({
+      enabled: true,
+      reviews: [job({
+        status: "approved",
+        landing: {
+          owner: "makewhatis", repo: "rhapsody", number: 12,
+          position: 2, total: 3, state: "waiting",
+        },
+      })],
+    });
+    expect(await screen.findByText("Landing 2 of 3 in makewhatis/rhapsody · waiting")).toBeTruthy();
+  });
   /** **Acceptance 1.** A row per watched (PR, reviewer) with its reviewer, status and read SHA. */
   it("lists each watched pull request with its reviewer, status and reviewed SHA", async () => {
     mount({
