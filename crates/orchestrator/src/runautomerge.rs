@@ -37,11 +37,12 @@
 //! GitHub completing the merge, a same-head event can still land. Reviewer-only plans keep exactly
 //! the window they had before.
 //!
-//! # Only `CLEAN` proceeds — and `CLEAN` is not sufficient
+//! # `CLEAN`, or a proven optional-only `UNSTABLE`, proceeds
 //!
-//! The `mergeStateStatus` gate is an ALLOWLIST of one. GitHub's vocabulary here is open and has
-//! grown before, and every other value it currently spells is a reason not to merge — `DRAFT`,
-//! `DIRTY` (a conflict), `BLOCKED`, `UNSTABLE`, `UNKNOWN` (GitHub is still computing). A blocklist
+//! The `mergeStateStatus` gate is an allowlist. `UNSTABLE` additionally requires a fresh,
+//! head-pinned `MERGEABLE` answer, a complete inventory with satisfied required checks, and
+//! only concluded non-required failures. Those failures are named in one post-merge comment.
+//! Other values remain reasons not to merge — `DRAFT`, `DIRTY`, `BLOCKED`, `UNKNOWN`. A blocklist
 //! of the ones known today would merge on the one added tomorrow, which is this batch's signature
 //! defect: a guard that does not guard. `BEHIND` is the single value with a branch of its own,
 //! because it is the one that can be CLEARED — see below.
@@ -53,7 +54,7 @@
 //! GitHub volunteers was never going to be enough on its own; the field that answers the question
 //! has to be asked for.
 //!
-//! The check rollup is then read anyway, at the same head, even though `CLEAN` already means
+//! For `CLEAN`, the check rollup is then read anyway, even though `CLEAN` already means
 //! GitHub's required contexts passed. Two independent reads of "is it green" is the ticket's
 //! explicit ask (the slow `desktop` job among them), and they fail in different ways: `CLEAN` is
 //! GitHub's judgement about REQUIRED contexts under branch protection, while the rollup is every
@@ -118,6 +119,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::automerge::AutoMergePlan;
 use crate::ghsummons::{
@@ -133,6 +135,140 @@ pub const AUTO_MERGE_METHOD: MergeMethod = MergeMethod::Squash;
 /// The one `mergeStateStatus` an auto-merge proceeds on. See the module doc: an allowlist, because
 /// GitHub's vocabulary is open.
 pub const MERGE_STATE_CLEAN: &str = "CLEAN";
+
+/// Head-pinned evidence for the narrow UNSTABLE exception, and its post-merge audit.
+#[async_trait::async_trait]
+pub trait UnstableMergeSource: Send + Sync {
+    async fn optional_failures(
+        &self,
+        pr: &PrCoord,
+        head: &str,
+    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>>;
+    async fn report(
+        &self,
+        pr: &PrCoord,
+        head: &str,
+        failures: &[String],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>;
+}
+
+#[async_trait::async_trait]
+impl UnstableMergeSource for crate::ghsummons::GH {
+    async fn optional_failures(
+        &self,
+        pr: &PrCoord,
+        head: &str,
+    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+        let query = r#"query($owner:String!,$repo:String!,$number:Int!){
+          repository(owner:$owner,name:$repo){pullRequest(number:$number){
+            state headRefOid mergeable mergeStateStatus
+            commits(last:1){nodes{commit{oid statusCheckRollup{contexts(first:100){
+              pageInfo{hasNextPage} nodes{
+                ... on CheckRun{name status conclusion isRequired(pullRequestNumber:$number)}
+                ... on StatusContext{context state isRequired(pullRequestNumber:$number)}
+              }
+            }}}}}
+          }}
+        }"#;
+        let body = self
+            .run_off_task(vec![
+                "api".into(),
+                "graphql".into(),
+                "-f".into(),
+                format!("query={query}"),
+                "-f".into(),
+                format!("owner={}", pr.owner),
+                "-f".into(),
+                format!("repo={}", pr.repo),
+                "-F".into(),
+                format!("number={}", pr.number),
+            ])
+            .await?;
+        let value: serde_json::Value = serde_json::from_slice(&body)?;
+        Ok(unstable_optional_failures(&value, head))
+    }
+
+    async fn report(
+        &self,
+        pr: &PrCoord,
+        head: &str,
+        failures: &[String],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::ghsummons::PrCommentSink;
+        self.post_pr_comment(&pr.owner, &pr.repo, pr.number, &format!(
+            "Merged approved head {head} with required checks satisfied under branch protection. Non-required checks were red: {}.", failures.join(", ")
+        )).await
+    }
+}
+
+fn unstable_optional_failures(value: &serde_json::Value, head: &str) -> Option<Vec<String>> {
+    let pr = &value["data"]["repository"]["pullRequest"];
+    if value.get("errors").is_some()
+        || pr["headRefOid"].as_str()? != head
+        || pr["state"] != "OPEN"
+        || pr["mergeable"] != "MERGEABLE"
+        || pr["mergeStateStatus"] != "UNSTABLE"
+    {
+        return None;
+    }
+    let commit = &pr["commits"]["nodes"].as_array()?.last()?["commit"];
+    if commit["oid"].as_str()? != head {
+        return None;
+    }
+    let contexts = &commit["statusCheckRollup"]["contexts"];
+    if contexts["pageInfo"]["hasNextPage"].as_bool()? {
+        return None;
+    }
+    let mut required = Vec::new();
+    let mut optional = Vec::new();
+    for c in contexts["nodes"].as_array()? {
+        let name = c["name"].as_str().or_else(|| c["context"].as_str())?;
+        let state = if c.get("status").is_some() && c["status"] != "COMPLETED" {
+            c["status"].as_str()?
+        } else {
+            c["conclusion"].as_str().or_else(|| c["state"].as_str())?
+        };
+        let check = CheckRun {
+            name: name.into(),
+            state: state.into(),
+        };
+        if c["isRequired"].as_bool()? {
+            required.push(check);
+        } else {
+            optional.push(check);
+        }
+    }
+    if required.is_empty() || blocking_check(&required).is_some() {
+        return None;
+    }
+    let mut failures = Vec::new();
+    for c in &optional {
+        if !NON_BLOCKING_CHECKS.contains(&c.state.as_str()) {
+            if !matches!(
+                c.state.as_str(),
+                "FAILURE"
+                    | "ERROR"
+                    | "TIMED_OUT"
+                    | "CANCELLED"
+                    | "ACTION_REQUIRED"
+                    | "STARTUP_FAILURE"
+            ) {
+                return None;
+            }
+            if c.state == CHECK_CANCELLED
+                && optional
+                    .iter()
+                    .any(|s| s.name == c.name && s.state == CHECK_SUCCESS)
+            {
+                continue;
+            }
+            failures.push(format!("{} ({})", c.name, c.state));
+        }
+    }
+    failures.sort();
+    failures.dedup();
+    Some(failures)
+}
 
 /// The refusal a DRAFT pull request gets (STUDIO-881). Named because two gates answer with it —
 /// the snapshot read below, and the classifier that reads GitHub's own refusal if a draft somehow
@@ -228,6 +364,8 @@ impl ApprovalRecheckSource for ControlApprovalRecheck {
 /// Everything the off-loop half runs against. No `Orchestrator`, no store, no control channel —
 /// the off-loop guarantee, in the type.
 pub struct AutoMergeDeps {
+    /// Fresh branch-protection evidence and the audit comment for the UNSTABLE exception.
+    pub unstable: Option<Arc<dyn UnstableMergeSource>>,
     /// Re-resolves the pull request: is it still open, and is it still at the head the verdicts
     /// were recorded against?
     pub prs: Arc<dyn PrStateSource>,
@@ -284,7 +422,30 @@ pub enum AutoMergeOutcome {
 /// re-resolved before anything else, so a merged, closed, DRAFT or moved head costs one call and
 /// stops.
 pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoMergeOutcome {
+    perform_auto_merge_at(plan, deps, Instant::now()).await
+}
+
+async fn perform_auto_merge_at(
+    plan: &AutoMergePlan,
+    deps: &AutoMergeDeps,
+    now: Instant,
+) -> AutoMergeOutcome {
+    deps.ledger.clear_check_progress(&plan.pr);
     let outcome = attempt_auto_merge(plan, deps).await;
+    match &outcome {
+        AutoMergeOutcome::Declined(why) | AutoMergeOutcome::Held(why)
+            if *why != "waiting its turn to land" =>
+        {
+            deps.ledger.record_decline(plan, why, now);
+        }
+        // Unknown GitHub refusals and transient failures keep their retry/log classification,
+        // but neither may pin this repository's front indefinitely.
+        AutoMergeOutcome::Failed(_) => {
+            deps.ledger
+                .record_decline(plan, "an auto-merge lookup or command failed", now);
+        }
+        _ => {}
+    }
     // A pull request that MOVED is a change of subject, so its next refusal is news again. Done in
     // one place rather than on each of the returns that qualify, because a path that forgot would
     // go silent instead of loud and nothing would notice.
@@ -300,6 +461,7 @@ pub async fn perform_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> A
         AutoMergeOutcome::Merged(_) | AutoMergeOutcome::Updated
     ) {
         deps.ledger.forget(&plan.pr);
+        deps.ledger.clear_decline(&plan.pr);
     }
     outcome
 }
@@ -374,7 +536,18 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
     if state == MERGE_STATE_BEHIND {
         return update_behind_branch(plan, deps).await;
     }
-    if state != MERGE_STATE_CLEAN {
+    let optional_failures = if state == "UNSTABLE" {
+        match &deps.unstable {
+            Some(source) => match source.optional_failures(&plan.pr, &plan.head).await {
+                Ok(failures) => failures,
+                Err(error) => return AutoMergeOutcome::Failed(error.to_string()),
+            },
+            None => None,
+        }
+    } else {
+        None
+    };
+    if state != MERGE_STATE_CLEAN && optional_failures.is_none() {
         let progress = match deps.checks.pr_checks(owner, repo, number).await {
             Ok(checks)
                 if checks.iter().any(|c| {
@@ -417,7 +590,7 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
         // repository always runs several. Fails closed.
         return refuse(plan, deps, "no checks have reported on this head");
     }
-    if let Some(bad) = blocking_check(&checks) {
+    if let Some(bad) = blocking_check(&checks).filter(|_| optional_failures.is_none()) {
         deps.ledger.set_landing_state(
             &plan.pr,
             if checks.iter().any(|c| {
@@ -476,6 +649,13 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
         .await
     {
         Ok(said) => {
+            if let (Some(source), Some(failures)) = (&deps.unstable, optional_failures)
+                && !failures.is_empty()
+                && deps.ledger.claim_optional_comment(&plan.pr, &plan.head)
+                && let Err(error) = source.report(&plan.pr, &plan.head, &failures).await
+            {
+                tracing::warn!(pr = %plan.pr, %error, "auto-merge: merged but could not comment on non-required failures");
+            }
             // Keep the slot until the NEXT observation confirms the merge, so later plans from
             // this same tick cannot update against a base that just moved.
             deps.ledger.set_landing_state(&plan.pr, "merged");
@@ -616,6 +796,10 @@ struct LandingQueue {
     strict: HashMap<(String, String), bool>,
     announced: HashMap<PrCoord, (usize, usize)>,
     excluded: std::collections::HashSet<PrCoord>,
+    declined_since: HashMap<PrCoord, (String, Instant)>,
+    rotations: HashMap<PrCoord, &'static str>,
+    timeout: Option<Duration>,
+    optional_comments: std::collections::HashSet<(PrCoord, String)>,
 }
 
 /// One PR's place in a strict repository's landing line, served by GET /api/v1/reviews.
@@ -637,11 +821,97 @@ fn repo_key(pr: &PrCoord) -> (String, String) {
 const LEDGER_CAPACITY: usize = 256;
 
 impl AutoMergeLedger {
+    fn clear_check_progress(&self, pr: &PrCoord) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        // Only THIS attempt's check evidence may exempt a refusal from the timeout. Early exits
+        // (including BEHIND/update-policy refusals) must not inherit an old pending-check answer.
+        if let Some(entry) = queue.line.entries.iter_mut().find(|e| e.pr == *pr)
+            && entry.state == "checks_running"
+        {
+            entry.state = "blocked";
+        }
+    }
+
+    fn claim_optional_comment(&self, pr: &PrCoord, head: &str) -> bool {
+        self.1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .optional_comments
+            .insert((pr.clone(), head.into()))
+    }
+    pub(crate) fn set_front_timeout(&self, seconds: u64) {
+        self.1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .timeout = Some(Duration::from_secs(seconds.max(1)));
+    }
+
+    fn record_decline(&self, plan: &AutoMergePlan, why: &'static str, now: Instant) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        if queue.strict.get(&repo_key(&plan.pr)) != Some(&true)
+            || queue
+                .line
+                .position(&plan.pr)
+                .is_none_or(|(position, _)| position != 1)
+        {
+            return;
+        }
+        if queue
+            .line
+            .entries
+            .iter()
+            .any(|e| e.pr == plan.pr && e.state == "checks_running")
+        {
+            queue.declined_since.remove(&plan.pr);
+            return;
+        }
+        let timeout = queue.timeout.unwrap_or(Duration::from_secs(1200));
+        let (head, since) = queue
+            .declined_since
+            .entry(plan.pr.clone())
+            .or_insert_with(|| (plan.head.clone(), now));
+        if *head != plan.head {
+            *head = plan.head.clone();
+            *since = now;
+        }
+        if now.saturating_duration_since(*since) < timeout {
+            return;
+        }
+        if let Some(index) = queue.line.entries.iter().position(|e| e.pr == plan.pr) {
+            let mut entry = queue.line.entries.remove(index);
+            entry.state = "blocked";
+            queue.line.entries.push(entry);
+            queue.declined_since.remove(&plan.pr);
+            queue.rotations.entry(plan.pr.clone()).or_insert(why);
+            tracing::warn!(pr = %plan.pr, reason = why, timeout_s = timeout.as_secs(),
+                "auto-merge: moving declined front to the back of the landing line");
+        }
+    }
+
+    fn clear_decline(&self, pr: &PrCoord) {
+        self.1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .declined_since
+            .remove(pr);
+    }
+
+    pub(crate) fn take_rotation(&self, pr: &PrCoord) -> Option<&'static str> {
+        self.1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .rotations
+            .remove(pr)
+    }
+
     pub(crate) fn retain_watched(&self, prs: &[PrCoord]) {
         let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
         queue.line.entries.retain(|e| prs.contains(&e.pr));
         queue.excluded.retain(|pr| prs.contains(pr));
         queue.announced.retain(|pr, _| prs.contains(pr));
+        queue.declined_since.retain(|pr, _| prs.contains(pr));
+        queue.rotations.retain(|pr, _| prs.contains(pr));
+        queue.optional_comments.retain(|(pr, _)| prs.contains(pr));
         queue
             .strict
             .retain(|key, _| prs.iter().any(|pr| repo_key(pr) == *key));
@@ -657,6 +927,7 @@ impl AutoMergeLedger {
     pub(crate) fn remove_from_line(&self, pr: &PrCoord) {
         let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
         queue.line.remove(pr);
+        queue.declined_since.remove(pr);
         queue.announced.remove(pr);
         queue.excluded.insert(pr.clone());
     }
@@ -682,6 +953,7 @@ impl AutoMergeLedger {
                 entry.state = "reviewing";
             } else {
                 queue.line.remove(pr);
+                queue.declined_since.remove(pr);
                 queue.announced.remove(pr);
                 queue.excluded.insert(pr.clone());
             }
@@ -728,6 +1000,9 @@ impl AutoMergeLedger {
             if state == "updating" {
                 entry.updated = true;
             }
+        }
+        if matches!(state, "checks_running" | "merged") {
+            queue.declined_since.remove(pr);
         }
     }
 
@@ -840,6 +1115,19 @@ impl AutoMergeLedger {
         self.admit(pr);
         self.landing_turn(pr, true);
         self.set_landing_state(pr, state);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_rotate(&self, pr: &PrCoord, head: &str, why: &'static str) {
+        let plan = AutoMergePlan {
+            pr: pr.clone(),
+            head: head.into(),
+            approved_by: Vec::new(),
+            manager_approval: None,
+        };
+        let start = Instant::now();
+        self.record_decline(&plan, why, start);
+        self.record_decline(&plan, why, start + Duration::from_secs(1200));
     }
 }
 
@@ -982,6 +1270,281 @@ mod tests {
             pr: PrCoord::new("makewhatis", "tally", number),
             ..plan()
         }
+    }
+
+    fn unstable_response() -> serde_json::Value {
+        serde_json::json!({"data":{"repository":{"pullRequest":{
+            "state":"OPEN", "headRefOid":HEAD, "mergeable":"MERGEABLE", "mergeStateStatus":"UNSTABLE",
+            "commits":{"nodes":[{"commit":{"oid":HEAD,"statusCheckRollup":{"contexts":{
+                "pageInfo":{"hasNextPage":false}, "nodes":[
+                    {"name":"test","status":"COMPLETED","conclusion":"SUCCESS","isRequired":true},
+                    {"name":"agent-image-build","status":"COMPLETED","conclusion":"FAILURE","isRequired":false},
+                    {"context":"apple-e2e","state":"ERROR","isRequired":false}
+                ]
+            }}}}]}
+        }}}})
+    }
+
+    #[tokio::test]
+    async fn unstable_merges_and_comments_once_naming_only_nonrequired_failures() {
+        let response = unstable_response();
+        let comments = Arc::new(Mutex::new(Vec::new()));
+        let captured = comments.clone();
+        let gh = crate::ghsummons::GH::new(
+            "",
+            Some(Box::new(move |args| {
+                if args[0..2] == ["api", "graphql"] {
+                    assert!(
+                        args.iter()
+                            .any(|a| a.contains("isRequired(pullRequestNumber:$number)"))
+                    );
+                    return Ok(serde_json::to_vec(&response).unwrap());
+                }
+                assert_eq!(&args[0..2], &["pr", "comment"]);
+                captured
+                    .lock()
+                    .unwrap()
+                    .push(args.last().unwrap().to_string());
+                Ok(Vec::new())
+            })),
+        );
+        let merger = Arc::new(FakeMerger::default());
+        let d = AutoMergeDeps {
+            unstable: Some(Arc::new(gh)),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                "UNSTABLE",
+                checks(&[
+                    ("test", "SUCCESS"),
+                    ("agent-image-build", "FAILURE"),
+                    ("apple-e2e", "ERROR"),
+                ]),
+                merger.clone(),
+            )
+        };
+        assert!(matches!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        assert!(matches!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        let comments = comments.lock().unwrap();
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].contains("agent-image-build (FAILURE)"));
+        assert!(comments[0].contains("apple-e2e (ERROR)"));
+        assert!(!comments[0].contains("test ("));
+        assert_eq!(merger.calls.lock().unwrap()[0].3.as_deref(), Some(HEAD));
+    }
+
+    #[tokio::test]
+    async fn unstable_with_a_required_failure_never_merges() {
+        let mut response = unstable_response();
+        response["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+            ["contexts"]["nodes"][0]["conclusion"] = "FAILURE".into();
+        let gh = crate::ghsummons::GH::new(
+            "",
+            Some(Box::new(move |args| {
+                assert_eq!(&args[0..2], &["api", "graphql"]);
+                Ok(serde_json::to_vec(&response).unwrap())
+            })),
+        );
+        let merger = Arc::new(FakeMerger::default());
+        let d = AutoMergeDeps {
+            unstable: Some(Arc::new(gh)),
+            policy: Arc::new(StrictPolicy),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                "UNSTABLE",
+                checks(&[("test", "FAILURE")]),
+                merger.clone(),
+            )
+        };
+        assert!(matches!(
+            perform_auto_merge(&plan(), &d).await,
+            AutoMergeOutcome::Declined(_)
+        ));
+        assert!(merger.calls.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unstable_proof_requires_matching_head_mergeability_and_complete_required_checks() {
+        let original = unstable_response();
+        assert_eq!(
+            unstable_optional_failures(&original, HEAD).unwrap().len(),
+            2
+        );
+        assert!(unstable_optional_failures(&original, OTHER).is_none());
+        for (field, replacement) in [
+            ("mergeable", "UNKNOWN"),
+            ("mergeable", "CONFLICTING"),
+            ("state", "CLOSED"),
+            ("mergeStateStatus", "BLOCKED"),
+        ] {
+            let mut value = original.clone();
+            value["data"]["repository"]["pullRequest"][field] = replacement.into();
+            assert!(unstable_optional_failures(&value, HEAD).is_none());
+        }
+        let mut value = original.clone();
+        value["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+            ["contexts"]["pageInfo"]["hasNextPage"] = true.into();
+        assert!(unstable_optional_failures(&value, HEAD).is_none());
+        for state in ["FAILURE", "IN_PROGRESS", "UNKNOWN"] {
+            let mut value = original.clone();
+            value["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
+                ["contexts"]["nodes"][0]["status"] = state.into();
+            assert!(unstable_optional_failures(&value, HEAD).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn declined_front_rotates_after_twenty_minutes_and_next_updates() {
+        let first = numbered(1);
+        let next = numbered(2);
+        let ledger = Arc::new(AutoMergeLedger::default());
+        ledger.admit(&first.pr);
+        ledger.admit(&next.pr);
+        let d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ledger: ledger.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                "UNKNOWN",
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        let start = Instant::now();
+        perform_auto_merge_at(&first, &d, start).await;
+        perform_auto_merge_at(&first, &d, start + Duration::from_secs(1199)).await;
+        assert_eq!(ledger.landing_lines()[0].number, 1);
+        perform_auto_merge_at(&first, &d, start + Duration::from_secs(1200)).await;
+        assert_eq!(ledger.landing_lines()[0].number, 2);
+        assert_eq!(
+            ledger.take_rotation(&first.pr),
+            Some("GitHub does not report the pull request as mergeable")
+        );
+        assert_eq!(ledger.take_rotation(&first.pr), None);
+        let behind = AutoMergeDeps {
+            mergestate: merge_state(Some(MERGE_STATE_BEHIND)),
+            ..d
+        };
+        assert_eq!(
+            perform_auto_merge(&next, &behind).await,
+            AutoMergeOutcome::Updated
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_checks_then_refused_update_rotates_the_front() {
+        struct NoUpdates;
+        #[async_trait]
+        impl BranchUpdateSource for NoUpdates {
+            async fn allows_branch_update(&self, _: &str, _: &str) -> BranchUpdateResult {
+                Ok(false)
+            }
+            async fn requires_up_to_date(&self, _: &str, _: &str, _: i64) -> BranchUpdateResult {
+                Ok(true)
+            }
+        }
+        let first = numbered(1);
+        let next = numbered(2);
+        let mut d = AutoMergeDeps {
+            policy: Arc::new(NoUpdates),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                "BLOCKED",
+                checks(&[("test", "IN_PROGRESS")]),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        d.ledger.admit(&first.pr);
+        d.ledger.admit(&next.pr);
+        let start = Instant::now();
+        perform_auto_merge_at(&first, &d, start).await;
+        assert_eq!(d.ledger.landing_lines()[0].state, "checks_running");
+        d.mergestate = merge_state(Some(MERGE_STATE_BEHIND));
+        d.checks = all_green();
+        for seconds in [1, 1200] {
+            perform_auto_merge_at(&first, &d, start + Duration::from_secs(seconds)).await;
+            assert_eq!(d.ledger.landing_lines()[0].number, 1);
+        }
+        perform_auto_merge_at(&first, &d, start + Duration::from_secs(1201)).await;
+        assert_eq!(d.ledger.landing_lines()[0].number, 2);
+        assert_eq!(
+            d.ledger.take_rotation(&first.pr),
+            Some("the branch is behind its base and the repository will not update it")
+        );
+        d.policy = Arc::new(StrictPolicy);
+        assert_eq!(
+            perform_auto_merge(&next, &d).await,
+            AutoMergeOutcome::Updated
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_merge_command_failure_rotates_the_front() {
+        let first = numbered(1);
+        let next = numbered(2);
+        let error = "GraphQL: Base branch policy prohibits merge (mergePullRequest)";
+        let merger = Arc::new(FakeMerger {
+            fail: Some(error),
+            ..Default::default()
+        });
+        let mut d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                merger.clone(),
+            )
+        };
+        d.ledger.admit(&first.pr);
+        d.ledger.admit(&next.pr);
+        let start = Instant::now();
+        for seconds in [0, 1199, 1200] {
+            assert_eq!(
+                perform_auto_merge_at(&first, &d, start + Duration::from_secs(seconds)).await,
+                AutoMergeOutcome::Failed(error.into())
+            );
+            assert_eq!(
+                d.ledger.landing_lines()[0].number,
+                if seconds < 1200 { 1 } else { 2 }
+            );
+        }
+        assert_eq!(merger.calls.lock().unwrap().len(), 3);
+        assert!(d.ledger.take_rotation(&first.pr).is_some());
+        assert_eq!(d.ledger.take_rotation(&first.pr), None);
+        d.mergestate = merge_state(Some(MERGE_STATE_BEHIND));
+        assert_eq!(
+            perform_auto_merge(&next, &d).await,
+            AutoMergeOutcome::Updated
+        );
+    }
+
+    #[tokio::test]
+    async fn running_checks_do_not_time_out_the_front() {
+        let first = numbered(1);
+        let ledger = Arc::new(AutoMergeLedger::default());
+        ledger.admit(&first.pr);
+        ledger.admit(&numbered(2).pr);
+        let d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ledger: ledger.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                "BLOCKED",
+                checks(&[("test", "IN_PROGRESS")]),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        let start = Instant::now();
+        perform_auto_merge_at(&first, &d, start).await;
+        perform_auto_merge_at(&first, &d, start + Duration::from_secs(2400)).await;
+        assert_eq!(ledger.landing_lines()[0].number, 1);
+        assert_eq!(ledger.take_rotation(&first.pr), None);
     }
 
     #[tokio::test]
@@ -1484,6 +2047,7 @@ mod tests {
         merger: Arc<FakeMerger>,
     ) -> AutoMergeDeps {
         AutoMergeDeps {
+            unstable: None,
             prs,
             mergestate: merge_state(Some(state)),
             policy: Arc::new(FakePolicy(Some(true))),

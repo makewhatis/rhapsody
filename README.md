@@ -249,6 +249,23 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Optional-only UNSTABLE merges and bounded landing fronts (STUDIO-2137)
+
+Auto-merge also accepts `UNSTABLE` when a fresh, head-pinned GitHub read reports
+`mergeable=MERGEABLE`, the complete check inventory marks required checks and all of them
+are satisfied, and only non-required checks have concluded failures. A single post-merge PR
+comment names those failures; a comment error is logged without retrying the merge.
+Other merge gates remain in force, and required failures retain their existing author route-back.
+
+A strict landing-line front declined or failing to complete an attempt for 20 minutes moves to
+the back, allowing the next PR to update on its next attempt. Configure the bound in `teams.yaml` as
+`review.landing_front_timeout_s` (default `1200`, zero clamped to one second; boot-loaded).
+Running checks observed in the current attempt reset the refusal clock and never time out.
+A head change, branch update, merge, or line removal resets it too.
+Rotation logs its reason and is reported once by the stuck-PR
+sweep, including when the rotated PR is now waiting. Timers and notices are process-local.
+This extends the Rhapsody-only auto-merge subsystem; Go parity fixtures are unchanged.
+
 ### Durable unrelated-CI reruns and flake log (STUDIO-2136)
 
 Before routing a file-evidenced unrelated CI failure to its author, ticketless review waits for

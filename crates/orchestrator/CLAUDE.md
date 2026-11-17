@@ -113,6 +113,8 @@ the `Orchestrator` struct itself. Concretely:
     projection reads positions and states through control. Reconciliation reads deliberate waits
     before reporting ApprovedStillOpen. Neither cell holds a lock across I/O or an await; the
     refusal map remains off-loop single-writer. An updated front retains admission during review.
+    STUDIO-2137 adds head-scoped refusal timers and rotation notices to the landing cell;
+    reconciliation consumes each rotation notice once, even if the PR is now waiting in line.
 
   - `dispatch.rs`'s `HumanHoldLedger` (`Orchestrator::human_holds: Arc<HumanHoldLedger>`,
     STUDIO-949) — a `Mutex`-guarded handle over four sets behind a `&self`-callable API: the ticket

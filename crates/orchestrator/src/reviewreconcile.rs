@@ -1379,10 +1379,14 @@ impl Orchestrator {
                 // (the review watcher never spawned) and no entry for this coordinate (auto-merge
                 // off, or this head never reached a gate) both fall back to the plain wording.
                 if d.kind == DivergenceKind::ApprovedStillOpen {
+                    let rotated = self.automerge_ledger.as_ref().and_then(|l| l.take_rotation(pr));
+                    if let Some(reason) = rotated {
+                        d.reason = format!("Landing-line front moved to the back after its refusal timeout: {reason}");
+                    }
                     if self
                         .automerge_ledger
                         .as_ref()
-                        .is_some_and(|l| l.waiting_to_land(pr))
+                        .is_some_and(|l| l.waiting_to_land(pr)) && rotated.is_none()
                     {
                         return None;
                     }
@@ -1403,7 +1407,7 @@ impl Orchestrator {
                     {
                         return None;
                     }
-                    d.auto_merge_reason = self.automerge_ledger.as_ref().and_then(|l| l.peek(pr));
+                    d.auto_merge_reason = rotated.or_else(|| self.automerge_ledger.as_ref().and_then(|l| l.peek(pr)));
                     // The approved-and-open arm hardcodes `capacity_held` to `None` (a hold defers a
                     // ROUND, and this row's next move is a merge), but that reasoning does not extend
                     // to the unreadability annotation: GitHub refusing the coordinate is exactly as
@@ -1774,6 +1778,11 @@ impl Orchestrator {
             let sweeps = self.review_divergent.entry(d.pr.clone()).or_insert(0);
             *sweeps += 1;
             let sweeps = *sweeps;
+            if d.kind == DivergenceKind::ApprovedStillOpen && !d.reason.is_empty() {
+                tracing::warn!(pr = %d.pr, reason = %d.reason,
+                    "stuck-PR sweep: landing-line front moved to the back");
+                continue;
+            }
             // A newly added or CHANGED capacity annotation is its own report transition — whether it
             // is a hold appearing/changing or the unreadable denial appearing. The generic repeat
             // clock alone would let a row that first crossed the threshold WITHOUT an annotation keep
@@ -5550,6 +5559,32 @@ mod store_tests {
             "the enriched line must replace the fallback wording, not sit beside it: {}",
             warn.message
         );
+    }
+
+    #[test]
+    fn rotated_landing_front_is_reported_once_even_while_waiting() {
+        let o = &mut orch(true, "2026-09-14T21:20:00Z");
+        approved_row(o, "alice", "STUDIO-877");
+        run(
+            o,
+            &review_key("makewhatis", "rhapsody", 164, "alice"),
+            "2026-09-12T12:00:00Z",
+            "2026-09-12T12:30:00Z",
+        );
+        let ledger = Arc::new(crate::runautomerge::AutoMergeLedger::default());
+        let pr = PrCoord::new("makewhatis", "rhapsody", 164);
+        ledger.test_landing(&pr, "blocked");
+        ledger.test_landing(&PrCoord::new("makewhatis", "rhapsody", 165), "ready");
+        ledger.test_rotate(&pr, HEAD, "unknown refusal");
+        assert!(ledger.waiting_to_land(&pr));
+        o.automerge_ledger = Some(ledger);
+        o.reconcile_review_divergence();
+        let rows = o.review_divergences();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].reason.contains("moved to the back"));
+        assert!(rows[0].reason.contains("unknown refusal"));
+        o.reconcile_review_divergence();
+        assert!(o.review_divergences().is_empty());
     }
 
     #[test]

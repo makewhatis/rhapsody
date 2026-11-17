@@ -80,6 +80,7 @@ impl Reverter {
             holds,
             reviewers,
             merges: Arc::new(crate::runautomerge::AutoMergeDeps {
+                unstable: Some(gh.clone()),
                 prs: gh.clone(),
                 mergestate: gh.clone(),
                 policy: gh.clone(),
@@ -396,6 +397,7 @@ pub(crate) mod tests {
             reviewers: Vec::new(),
             holds,
             merges: Arc::new(crate::runautomerge::AutoMergeDeps {
+                unstable: None,
                 prs: gh.clone(),
                 mergestate: gh.clone(),
                 policy: gh.clone(),

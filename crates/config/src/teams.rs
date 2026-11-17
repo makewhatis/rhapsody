@@ -793,6 +793,10 @@ pub struct Review {
     /// [`Teams::review_auto_merge_for`] rather than this field directly.
     #[serde(default)]
     pub auto_merge: bool,
+    /// Maximum time a declined strict landing-line front keeps its turn (seconds).
+    /// Running checks are exempt. Zero is clamped to one second by the ledger.
+    #[serde(default = "default_landing_front_timeout_s")]
+    pub landing_front_timeout_s: u64,
     /// The model a REVIEW run uses, per HARNESS, regardless of what the routed teammate's own
     /// profile asks for (STUDIO-901, scoped by harness in STUDIO-908). Unset — the default — means
     /// a review run inherits whatever model it would have used anyway (the routed teammate's
@@ -906,6 +910,7 @@ impl Default for Review {
             done_state: String::new(),
             changes_state: String::new(),
             auto_merge: false,
+            landing_front_timeout_s: default_landing_front_timeout_s(),
             model: HarnessScoped::default(),
             provider: HarnessScoped::default(),
             effort: HarnessScoped::default(),
@@ -921,6 +926,10 @@ fn default_code_review_profiles() -> Vec<String> {
         .into_iter()
         .map(str::to_string)
         .collect()
+}
+
+fn default_landing_front_timeout_s() -> u64 {
+    1200
 }
 
 /// A complete, nonempty change must match the configured UI globs in its entirety.
@@ -3129,6 +3138,28 @@ mod tests {
 
     // ── review.auto_merge (STUDIO-874) ──────────────────────────────────────
 
+    #[test]
+    fn landing_front_timeout_defaults_and_round_trips() {
+        assert_eq!(
+            Teams::parse("enabled: true\n")
+                .unwrap()
+                .review
+                .landing_front_timeout_s,
+            1200
+        );
+        let teams =
+            Teams::parse("enabled: true\nreview:\n  landing_front_timeout_s: 60\n").unwrap();
+        assert_eq!(teams.review.landing_front_timeout_s, 60);
+        let encoded = serde_yaml_ng::to_string(&teams).unwrap();
+        assert_eq!(
+            Teams::parse(&encoded)
+                .unwrap()
+                .review
+                .landing_front_timeout_s,
+            60
+        );
+    }
+
     /// The auto-merge gate's default is OFF, so every `teams.yaml` written
     /// before the key existed keeps merging exactly nobody. An absent, null and
     /// empty `review:` block all mean off, and so does an explicit `false`.
@@ -4134,6 +4165,7 @@ mod tests {
                 done_state: "Done".to_string(),
                 changes_state: "In Progress".to_string(),
                 auto_merge: true,
+                landing_front_timeout_s: 1200,
                 model: HarnessScoped::bare("claude-opus-5"),
                 provider: HarnessScoped::default(),
                 effort: HarnessScoped::bare("high"),

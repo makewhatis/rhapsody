@@ -2996,6 +2996,7 @@ pub(crate) mod tests {
                 *gh.state.lock().unwrap() =
                     (PrStatus::Open, checks.snapshot(2).head_sha, String::new());
                 deps.merges = Arc::new(crate::runautomerge::AutoMergeDeps {
+                    unstable: None,
                     prs: checks.clone(),
                     mergestate: checks.clone(),
                     policy: checks.clone(),
@@ -4154,6 +4155,7 @@ pub(crate) mod tests {
             ci_green: std::sync::atomic::AtomicBool::new(true),
         });
         let merges = Arc::new(crate::runautomerge::AutoMergeDeps {
+            unstable: None,
             prs: gh.clone(),
             mergestate: gh.clone(),
             policy: gh.clone(),
@@ -4382,6 +4384,7 @@ pub(crate) mod tests {
         let mut events = o.take_events_rx().unwrap();
         let sink = ControlWatchSink::new(o.control()).with_auto_merge(Arc::new(
             crate::runautomerge::AutoMergeDeps {
+                unstable: None,
                 prs: gh.clone(),
                 mergestate: gh.clone(),
                 policy: gh.clone(),
