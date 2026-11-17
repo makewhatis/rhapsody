@@ -119,6 +119,33 @@ opens a 0.3.7 store. These are the behaviour changes a 0.3.6 installation will n
 
 ## WORKFLOW.md configuration
 
+### Landing-line width
+
+For repositories requiring branches to be up to date before merging, ticketless auto-merge
+updates and tests the first `review.landing_width` approved PRs in each repository's FIFO line.
+The default is **3**. Set a positive integer globally or override it per project in WORKFLOW.md:
+
+```yaml
+review:
+  landing_width: 3
+projects:
+  - slugs: [my-app]
+    repo: https://github.com/my-org/my-app
+    review:
+      landing_width: 1
+```
+
+Width **1** minimizes CI runs by updating one PR at a time. Higher widths land faster by
+keeping several PRs in flight, at the cost of re-running checks on up to `width - 1` remaining
+in-flight PRs after a merge. Waiting PRs are left alone until a slot opens. Repositories without
+strict up-to-date protection still merge independently. The setting hot-reloads; projects sharing
+a repository use the narrowest effective width. Each in-flight slot retains the existing front
+timeout/rotation policy, and running checks do not time out.
+
+`GET /api/v1/reviews` includes each PR's landing position, configured `width`, `in_flight` flag
+and detailed progress `state`. The dashboard displays **in flight** or **waiting (position N)**
+alongside the width and progress.
+
 ### Owner-scoped GitHub credentials
 
 Opt in to fine-grained GitHub tokens with one Keychain reference per repository owner:
@@ -249,6 +276,15 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Configurable bounded-width landing lines (STUDIO-2140)
+
+The Rhapsody-only strict-repository auto-merge line now admits its first `review.landing_width`
+PRs concurrently, defaulting to three rather than one. WORKFLOW.md supports global and per-project
+positive integer widths; one restores the previous serialization. Timeout rotation applies to
+each in-flight slot. The Reviews API adds `width` and `in_flight` to landing positions and the
+dashboard shows both. See [configuration and CI cost trade-off](#landing-line-width).
+This subsystem has no Go counterpart; parity fixtures, normalization and schemas are unchanged.
+
 ### Optional-only UNSTABLE merges and bounded landing fronts (STUDIO-2137)
 
 Auto-merge also accepts `UNSTABLE` when a fresh, head-pinned GitHub read reports
@@ -286,7 +322,8 @@ result links remain null. This changes the Rhapsody-only route-back path; Go fix
 
 For bases with strict up-to-date status-check protection (classic branch protection or an
 effective ruleset), approved ticketless PRs enter a process-local FIFO when first observed
-merge-eligible. Only the front is updated or merged; it keeps its place while a daemon branch
+merge-eligible. Originally only the front was updated or merged (extended to the configured
+width by STUDIO-2140 above); each in-flight PR keeps its place while a daemon branch
 update runs checks and review. Findings, CI routed to the author, closure, draft and human holds
 release its place. A confirmed merge advances the line on the next observation. Repositories
 without strict protection retain independent merge attempts, and `review.auto_merge: false`

@@ -92,11 +92,18 @@ describe("the Reviews surface", () => {
         status: "approved",
         landing: {
           owner: "makewhatis", repo: "rhapsody", number: 12,
-          position: 2, total: 3, state: "waiting",
+          position: 4, total: 5, state: "waiting", width: 3, in_flight: false,
         },
       })],
     });
-    expect(await screen.findByText("Landing 2 of 3 in makewhatis/rhapsody · waiting")).toBeTruthy();
+    expect(await screen.findByText("Landing 4 of 5 in makewhatis/rhapsody · waiting (position 4) · width 3 · waiting")).toBeTruthy();
+  });
+  it("shows in-flight PR progress and configured width", async () => {
+    mount({ enabled: true, reviews: [job({ landing: {
+      owner: "makewhatis", repo: "rhapsody", number: 12,
+      position: 2, total: 5, state: "checks_running", width: 3, in_flight: true,
+    } })] });
+    expect(await screen.findByText("Landing 2 of 5 in makewhatis/rhapsody · in flight · width 3 · checks running")).toBeTruthy();
   });
   /** **Acceptance 1.** A row per watched (PR, reviewer) with its reviewer, status and read SHA. */
   it("lists each watched pull request with its reviewer, status and reviewed SHA", async () => {

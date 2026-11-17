@@ -70,6 +70,11 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     let scratch = r.scratch.clone().unwrap_or_default();
     scratch.validate().map_err(ConfigError::Parse)?;
     let review = r.review.clone().unwrap_or_default();
+    if review.landing_width == 0 || r.projects.iter().any(|p| p.review.landing_width == Some(0)) {
+        return Err(ConfigError::Parse(
+            "review.landing_width: must be positive".into(),
+        ));
+    }
     if review.ci_failure_escalation_hours == 0 {
         return Err(ConfigError::Parse(
             "review.ci_failure_escalation_hours: must be positive".into(),
@@ -446,6 +451,7 @@ fn decode_project(rp: RawProject) -> Project {
     });
 
     Project {
+        review: rp.review,
         name: rp.name,
         repo: rp.repo,
         slugs: rp.slugs,

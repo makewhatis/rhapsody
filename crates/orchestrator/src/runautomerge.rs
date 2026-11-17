@@ -792,6 +792,7 @@ pub struct AutoMergeLedger(
 
 #[derive(Default)]
 struct LandingQueue {
+    widths: HashMap<(String, String), usize>,
     line: crate::automerge::LandingLine,
     strict: HashMap<(String, String), bool>,
     announced: HashMap<PrCoord, (usize, usize)>,
@@ -810,6 +811,8 @@ pub struct LandingPosition {
     pub number: i64,
     pub position: usize,
     pub total: usize,
+    pub width: usize,
+    pub in_flight: bool,
     pub state: &'static str,
 }
 
@@ -821,6 +824,14 @@ fn repo_key(pr: &PrCoord) -> (String, String) {
 const LEDGER_CAPACITY: usize = 256;
 
 impl AutoMergeLedger {
+    pub(crate) fn set_landing_width(&self, pr: &PrCoord, width: usize) {
+        self.1
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .widths
+            .insert(repo_key(pr), width.max(1));
+    }
+
     fn clear_check_progress(&self, pr: &PrCoord) {
         let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
         // Only THIS attempt's check evidence may exempt a refusal from the timeout. Early exits
@@ -849,10 +860,9 @@ impl AutoMergeLedger {
     fn record_decline(&self, plan: &AutoMergePlan, why: &'static str, now: Instant) {
         let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
         if queue.strict.get(&repo_key(&plan.pr)) != Some(&true)
-            || queue
-                .line
-                .position(&plan.pr)
-                .is_none_or(|(position, _)| position != 1)
+            || queue.line.position(&plan.pr).is_none_or(|(position, _)| {
+                position > queue.widths.get(&repo_key(&plan.pr)).copied().unwrap_or(3)
+            })
         {
             return;
         }
@@ -913,6 +923,9 @@ impl AutoMergeLedger {
         queue.rotations.retain(|pr, _| prs.contains(pr));
         queue.optional_comments.retain(|(pr, _)| prs.contains(pr));
         queue
+            .widths
+            .retain(|key, _| prs.iter().any(|pr| repo_key(pr) == *key));
+        queue
             .strict
             .retain(|key, _| prs.iter().any(|pr| repo_key(pr) == *key));
     }
@@ -971,13 +984,16 @@ impl AutoMergeLedger {
                     return None;
                 }
                 let (position, total) = queue.line.position(&e.pr)?;
+                let width = queue.widths.get(&repo_key(&e.pr)).copied().unwrap_or(3);
                 Some(LandingPosition {
                     owner: e.pr.owner.clone(),
                     repo: e.pr.repo.clone(),
                     number: e.pr.number,
                     position,
                     total,
-                    state: if position > 1 { "waiting" } else { e.state },
+                    width,
+                    in_flight: position <= width,
+                    state: if position > width { "waiting" } else { e.state },
                 })
             })
             .collect()
@@ -988,8 +1004,7 @@ impl AutoMergeLedger {
             p.owner.eq_ignore_ascii_case(&pr.owner)
                 && p.repo.eq_ignore_ascii_case(&pr.repo)
                 && p.number == pr.number
-                && (p.position > 1
-                    || matches!(p.state, "checks_running" | "updating" | "reviewing"))
+                && (!p.in_flight || matches!(p.state, "checks_running" | "updating" | "reviewing"))
         })
     }
 
@@ -1053,7 +1068,7 @@ impl AutoMergeLedger {
         let Some((position, total)) = queue.line.position(pr) else {
             return false;
         };
-        if position == 1 {
+        if position <= queue.widths.get(&repo_key(pr)).copied().unwrap_or(3) {
             return true;
         }
         if queue.announced.insert(pr.clone(), (position, total)) != Some((position, total)) {
@@ -1112,6 +1127,7 @@ impl AutoMergeLedger {
 
     #[cfg(test)]
     pub(crate) fn test_landing(&self, pr: &PrCoord, state: &'static str) {
+        self.set_landing_width(pr, 1);
         self.admit(pr);
         self.landing_turn(pr, true);
         self.set_landing_state(pr, state);
@@ -1561,6 +1577,7 @@ mod tests {
         let ledger = Arc::new(AutoMergeLedger::default());
         let first = numbered(1);
         let next = numbered(2);
+        ledger.set_landing_width(&first.pr, 1);
         ledger.admit(&first.pr);
         ledger.admit(&next.pr);
         let d = AutoMergeDeps {
@@ -1602,6 +1619,7 @@ mod tests {
                     merger.clone(),
                 )
             };
+            d.ledger.set_landing_width(&first.pr, 1);
             d.ledger.admit(&first.pr);
             d.ledger.admit(&next.pr);
             // A successful update need not move HEAD (gh may find it already up to date).
@@ -1684,6 +1702,123 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn landing_width_three_bounds_updates_and_refills_after_merge() {
+        let updater = Arc::new(FakeUpdater::default());
+        let d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            updater: updater.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_BEHIND,
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        let plans: Vec<_> = (1..=5).map(numbered).collect();
+        for p in &plans {
+            d.ledger.admit(&p.pr);
+        }
+        for p in &plans {
+            perform_auto_merge(p, &d).await;
+        }
+        assert_eq!(*updater.calls.lock().unwrap(), [1, 2, 3]);
+        let positions = d.ledger.landing_lines();
+        assert_eq!(
+            positions.iter().map(|p| p.in_flight).collect::<Vec<_>>(),
+            [true, true, true, false, false]
+        );
+        assert!(positions.iter().all(|p| p.width == 3));
+
+        for p in &plans {
+            perform_auto_merge(p, &d).await;
+        }
+        assert_eq!(
+            *updater.calls.lock().unwrap(),
+            [1, 2, 3],
+            "old observations do not repeat updates"
+        );
+        let clean = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ledger: d.ledger.clone(),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        assert!(matches!(
+            perform_auto_merge(&plans[0], &clean).await,
+            AutoMergeOutcome::Merged(_)
+        ));
+        d.ledger.observe_eligibility(&plans[0].pr, false, false);
+        let advanced = AutoMergeDeps {
+            prs: found(OTHER, PrStatus::Open),
+            ..d
+        };
+        for p in &plans[1..] {
+            let updated_head = AutoMergePlan {
+                head: OTHER.into(),
+                ..p.clone()
+            };
+            perform_auto_merge(&updated_head, &advanced).await;
+        }
+        assert_eq!(*updater.calls.lock().unwrap(), [1, 2, 3, 2, 3, 4]);
+        assert_eq!(
+            advanced
+                .ledger
+                .landing_lines()
+                .iter()
+                .map(|p| p.in_flight)
+                .collect::<Vec<_>>(),
+            [true, true, true, false]
+        );
+    }
+
+    #[tokio::test]
+    async fn each_in_flight_slot_rotates_independently_but_running_checks_do_not() {
+        let d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                "BLOCKED",
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        let plans: Vec<_> = (1..=5).map(numbered).collect();
+        for p in &plans {
+            d.ledger.admit(&p.pr);
+        }
+        let pending = AutoMergeDeps {
+            checks: checks(&[("test", "IN_PROGRESS")]),
+            ledger: d.ledger.clone(),
+            policy: Arc::new(StrictPolicy),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                "BLOCKED",
+                all_green(),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        let start = Instant::now();
+        for seconds in [0, 1200] {
+            perform_auto_merge_at(&plans[0], &pending, start + Duration::from_secs(seconds)).await;
+            perform_auto_merge_at(&plans[1], &d, start + Duration::from_secs(seconds)).await;
+        }
+        assert_eq!(
+            d.ledger
+                .landing_lines()
+                .iter()
+                .map(|p| (p.number, p.in_flight))
+                .collect::<Vec<_>>(),
+            [(1, true), (3, true), (4, true), (5, false), (2, false)]
+        );
+        assert!(d.ledger.take_rotation(&plans[1].pr).is_some());
+        assert!(d.ledger.take_rotation(&plans[0].pr).is_none());
+    }
+
+    #[tokio::test]
     async fn landing_line_updates_only_front_and_keeps_it_during_review() {
         let updater = Arc::new(FakeUpdater::default());
         let d = AutoMergeDeps {
@@ -1697,6 +1832,7 @@ mod tests {
             )
         };
         let plans = [numbered(3), numbered(1), numbered(2)];
+        d.ledger.set_landing_width(&plans[0].pr, 1);
         for p in &plans {
             d.ledger.admit(&p.pr);
         }
@@ -1735,6 +1871,7 @@ mod tests {
         let ledger = Arc::new(AutoMergeLedger::default());
         let first = numbered(3);
         let next = numbered(1);
+        ledger.set_landing_width(&first.pr, 1);
         ledger.admit(&first.pr);
         ledger.admit(&next.pr);
         let clean = AutoMergeDeps {
@@ -1787,6 +1924,7 @@ mod tests {
         };
         let a = numbered(1);
         let b = numbered(2);
+        d.ledger.set_landing_width(&a.pr, 1);
         let other = AutoMergePlan {
             pr: PrCoord::new("another", "repo", 4),
             ..plan()
@@ -1820,6 +1958,7 @@ mod tests {
         let first = numbered(1);
         let next = numbered(2);
         let ledger = Arc::new(AutoMergeLedger::default());
+        ledger.set_landing_width(&first.pr, 1);
         ledger.admit(&first.pr);
         ledger.admit(&next.pr);
         let pending = AutoMergeDeps {

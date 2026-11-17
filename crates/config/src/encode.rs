@@ -318,6 +318,7 @@ fn collapsible_to_single(c: &Config) -> bool {
         && p.terminal_states.is_empty()
         && p.canceled_states.is_empty()
         && p.review_states.is_empty()
+        && p.review == crate::review_ci::ProjectReview::default()
         && p.prompt.is_empty()
         && p.prompt_file.is_empty()
         && p.git_flow.is_empty()
@@ -434,6 +435,7 @@ fn raw_project_from_project(
     default_limits: &crate::providers::BrokerLimits,
 ) -> RawProject {
     let mut rp = RawProject {
+        review: p.review.clone(),
         landing: p.landing.clone(),
         name: p.name.clone(),
         repo: p.repo.clone(),

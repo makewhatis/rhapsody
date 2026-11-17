@@ -1425,6 +1425,34 @@ impl Orchestrator {
             }
         }
         if let Some(ledger) = &self.automerge_ledger {
+            if let Some(eff) = &self.eff {
+                for watched in &out {
+                    // A repository shared by projects uses the narrowest effective width.
+                    let width = eff
+                        .cfg
+                        .projects
+                        .iter()
+                        .filter(|p| {
+                            crate::ghsummons::parse_repo(if p.repo.is_empty() {
+                                &eff.cfg.repo
+                            } else {
+                                &p.repo
+                            })
+                            .is_some_and(|(o, r)| {
+                                o.eq_ignore_ascii_case(&watched.pr.owner)
+                                    && r.eq_ignore_ascii_case(&watched.pr.repo)
+                            })
+                        })
+                        .map(|p| {
+                            p.review
+                                .landing_width
+                                .unwrap_or(eff.cfg.review.landing_width)
+                        })
+                        .min()
+                        .unwrap_or(eff.cfg.review.landing_width);
+                    ledger.set_landing_width(&watched.pr, width);
+                }
+            }
             if let Some(teams) = &self.teams {
                 ledger.set_front_timeout(teams.review.landing_front_timeout_s);
             }
@@ -10126,6 +10154,38 @@ mod tests {
             log.at(tracing::Level::WARN).is_empty(),
             "nothing here is a warning: {:?}",
             log.at(tracing::Level::WARN)
+        );
+    }
+
+    #[test]
+    fn workflow_project_landing_width_overrides_global_and_reloads() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        let ledger = Arc::new(crate::runautomerge::AutoMergeLedger::default());
+        o.automerge_ledger = Some(ledger.clone());
+        for n in [64, 65] {
+            introduce(&o, approved_row(n, "bob", HEAD_A));
+            ledger.test_landing(&coord(n), "ready");
+        }
+        let eff = o.eff.as_mut().unwrap();
+        eff.cfg.review.landing_width = 4;
+        eff.cfg.projects = vec![rhapsody_config::model::Project {
+            repo: format!("https://github.com/{}/{}", coord(64).owner, coord(64).repo),
+            review: rhapsody_config::review_ci::ProjectReview {
+                landing_width: Some(1),
+            },
+            ..Default::default()
+        }];
+        o.review_watch_coords();
+        let positions = ledger.landing_lines();
+        assert_eq!(positions[0].width, 1);
+        assert!(!positions[1].in_flight);
+        o.eff.as_mut().unwrap().cfg.projects[0].review.landing_width = None;
+        o.review_watch_coords();
+        assert!(
+            ledger
+                .landing_lines()
+                .iter()
+                .all(|p| p.width == 4 && p.in_flight)
         );
     }
 

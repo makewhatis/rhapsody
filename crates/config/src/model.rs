@@ -389,6 +389,8 @@ pub struct ClaudeOverride {
 /// one setting only the fields they need (`Project { slugs, ..Default::default() }`).
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct Project {
+    /// WORKFLOW.md landing-line override; independent of teams.yaml's review policy.
+    pub review: crate::review_ci::ProjectReview,
     /// Opt-in production verification; absent preserves the historical merge lifecycle.
     pub landing: Option<crate::landing::LandingConfig>,
     pub name: String,
@@ -597,7 +599,7 @@ impl Comms {
 /// The typed runtime view of a workflow (Go `Config`, upstream §4.1.3).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
-    /// CI route-back policy from WORKFLOW.md (not teams.yaml). Hot-reloaded.
+    /// CI route-back and landing-line policy from WORKFLOW.md (not teams.yaml). Hot-reloaded.
     pub review: crate::review_ci::ReviewCi,
     pub github: Option<crate::github::Github>,
     pub tracker: Tracker,
@@ -985,6 +987,7 @@ pub(crate) struct RawMcp {
 #[derive(Debug, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub(crate) struct RawProject {
+    pub review: crate::review_ci::ProjectReview,
     pub landing: Option<crate::landing::LandingConfig>,
     pub name: String,
     pub repo: String,
