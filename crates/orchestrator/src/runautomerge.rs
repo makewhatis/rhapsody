@@ -363,15 +363,14 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
     if !deps.ledger.landing_turn(&plan.pr, strict) {
         return AutoMergeOutcome::Held("waiting its turn to land");
     }
-    if deps.ledger.update_in_flight(&plan.pr, &plan.head) {
-        return AutoMergeOutcome::Held("waiting for the updated head to be observed");
-    }
-
     // 2. GitHub's own verdict on whether this can merge at all.
     let state = match deps.mergestate.merge_state(owner, repo, number).await {
         Ok(state) => state,
         Err(e) => return AutoMergeOutcome::Failed(e.to_string()),
     };
+    if deps.ledger.update_in_flight(&plan.pr, &plan.head, &state) {
+        return AutoMergeOutcome::Held("waiting for the updated head to be observed");
+    }
     if state == MERGE_STATE_BEHIND {
         return update_behind_branch(plan, deps).await;
     }
@@ -751,14 +750,19 @@ impl AutoMergeLedger {
         }
     }
 
-    fn update_in_flight(&self, pr: &PrCoord, head: &str) -> bool {
-        self.1
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .line
-            .entries
-            .iter()
-            .any(|e| e.pr == *pr && e.updated && e.updated_from == head)
+    fn update_in_flight(&self, pr: &PrCoord, head: &str, state: &str) -> bool {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        let Some(entry) = queue.line.entries.iter_mut().find(|e| e.pr == *pr) else {
+            return false;
+        };
+        // Success can mean "already up to date", with no new head to observe. Re-read the gates
+        // once GitHub no longer reports BEHIND, but never repeat a real update on its old head
+        // while that same BEHIND observation persists. A later base advance may need a new update.
+        if state != MERGE_STATE_BEHIND {
+            entry.updated_from.clear();
+            return false;
+        }
+        entry.updated && entry.updated_from == head
     }
 
     fn landing_turn(&self, pr: &PrCoord, strict: bool) -> bool {
@@ -1016,6 +1020,79 @@ mod tests {
             perform_auto_merge(&next, &d).await,
             AutoMergeOutcome::Held("waiting its turn to land")
         );
+    }
+
+    #[tokio::test]
+    async fn landing_successful_noop_update_rechecks_same_head_and_advances() {
+        for state in [MERGE_STATE_CLEAN, "BLOCKED"] {
+            let first = numbered(1);
+            let next = numbered(2);
+            let updater = Arc::new(FakeUpdater::default());
+            let merger = Arc::new(FakeMerger::default());
+            let mut d = AutoMergeDeps {
+                policy: Arc::new(StrictPolicy),
+                updater: updater.clone(),
+                ..deps(
+                    found(HEAD, PrStatus::Open),
+                    MERGE_STATE_BEHIND,
+                    all_green(),
+                    merger.clone(),
+                )
+            };
+            d.ledger.admit(&first.pr);
+            d.ledger.admit(&next.pr);
+            // A successful update need not move HEAD (gh may find it already up to date).
+            assert_eq!(
+                perform_auto_merge(&first, &d).await,
+                AutoMergeOutcome::Updated
+            );
+            d.ledger.observe_eligibility(&first.pr, true, false);
+            assert_eq!(
+                perform_auto_merge(&first, &d).await,
+                AutoMergeOutcome::Held("waiting for the updated head to be observed")
+            );
+            assert_eq!(*updater.calls.lock().unwrap(), [1]);
+
+            d.mergestate = merge_state(Some(state));
+            let outcome = perform_auto_merge(&first, &d).await;
+            if state == MERGE_STATE_CLEAN {
+                assert!(
+                    matches!(outcome, AutoMergeOutcome::Merged(_)),
+                    "{outcome:?}"
+                );
+                assert_eq!(merger.calls.lock().unwrap()[0].3.as_deref(), Some(HEAD));
+            } else {
+                assert!(
+                    matches!(outcome, AutoMergeOutcome::Declined(_)),
+                    "{outcome:?}"
+                );
+                assert!(merger.calls.lock().unwrap().is_empty());
+            }
+            assert!(!d.ledger.waiting_to_land(&first.pr));
+            assert!(d.ledger.waiting_to_land(&next.pr));
+            assert_eq!(
+                perform_auto_merge(&next, &d).await,
+                AutoMergeOutcome::Held("waiting its turn to land")
+            );
+
+            d.mergestate = merge_state(Some(MERGE_STATE_BEHIND));
+            if state == MERGE_STATE_CLEAN {
+                // The confirmed merge releases the next PR only on the following observation.
+                d.ledger.observe_eligibility(&first.pr, false, false);
+                assert_eq!(
+                    perform_auto_merge(&next, &d).await,
+                    AutoMergeOutcome::Updated
+                );
+                assert_eq!(*updater.calls.lock().unwrap(), [1, 2]);
+            } else {
+                // Once observed current, a later base advance requires a fresh update.
+                assert_eq!(
+                    perform_auto_merge(&first, &d).await,
+                    AutoMergeOutcome::Updated
+                );
+                assert_eq!(*updater.calls.lock().unwrap(), [1, 1]);
+            }
+        }
     }
 
     #[tokio::test]
