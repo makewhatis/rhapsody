@@ -397,6 +397,9 @@ impl crate::orchestrator::Orchestrator {
             tracing::warn!(%pr, err = %e, "CI route-back: room post failed");
         }
         if action == CiAction::Summon {
+            if let Some(ledger) = &self.automerge_ledger {
+                ledger.remove_from_line(pr);
+            }
             let completion = crate::reviewnotify::ReviewCompletion {
                 reason: crate::reviewnotify::CompletionReason::CiFailure,
                 owner: pr.owner.clone(),

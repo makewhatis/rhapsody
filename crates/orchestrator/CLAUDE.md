@@ -107,9 +107,12 @@ the `Orchestrator` struct itself. Concretely:
     it; this ledger lock is the one lock the control task shares with the off-loop half, and the
     control task only ever takes it read-only. `None`
     whenever the review watcher never spawned, which the sweep's fallback wording already covers.
-    `peek` is the only method this crate exposes outside `runautomerge.rs`'s own module, so a
-    second write path here would need its own deliberate exception to "a refusal is not surfaced
-    outside the log", which that module's doc still states and this read does not weaken.
+    STUDIO-2126 adds a separate short-locked landing-line cell to this same handle. Control admits
+    eligible PRs and discharges findings/holds/drafts/closure/CI route-backs from fresh observations;
+    off-loop attempts record strict protection and update/check/merge progress. HTTP's Reviews
+    projection reads positions and states through control. Reconciliation reads deliberate waits
+    before reporting ApprovedStillOpen. Neither cell holds a lock across I/O or an await; the
+    refusal map remains off-loop single-writer. An updated front retains admission during review.
 
   - `dispatch.rs`'s `HumanHoldLedger` (`Orchestrator::human_holds: Arc<HumanHoldLedger>`,
     STUDIO-949) — a `Mutex`-guarded handle over four sets behind a `&self`-callable API: the ticket

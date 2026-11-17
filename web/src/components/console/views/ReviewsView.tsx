@@ -292,6 +292,12 @@ function ReviewsRow({
           <TicketChip variant="pr">{row.pr}</TicketChip>
         </ExternalLink>
         <div className="pj">{row.job.introduced_by === "" ? "" : row.job.introduced_by}</div>
+        {row.job.landing ? (
+          <div className="pj">
+            Landing {row.job.landing.position} of {row.job.landing.total} in{" "}
+            {row.job.landing.owner}/{row.job.landing.repo} · {row.job.landing.state.replaceAll("_", " ")}
+          </div>
+        ) : null}
       </td>
       <td>{row.job.reviewer === "" ? "—" : row.job.reviewer}</td>
       <td>

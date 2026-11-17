@@ -2244,6 +2244,14 @@ export async function postTeamsRoom(body: string, refs: string[] = []): Promise<
 // not per-PR: a single reviewed-SHA per pull request would let the first completer stamp it as
 // reviewed and silently drop a second reviewer whose run crashed.
 export interface ReviewJob {
+  landing?: {
+    owner: string;
+    repo: string;
+    number: number;
+    position: number;
+    total: number;
+    state: string;
+  };
   infrastructure?: string;
   owner: string;
   repo: string;

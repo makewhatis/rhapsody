@@ -1421,6 +1421,14 @@ impl Orchestrator {
                 out[idx].requested_shas.push(requested.to_string());
             }
         }
+        if let Some(ledger) = &self.automerge_ledger {
+            let live: Vec<_> = out
+                .iter()
+                .filter(|w| self.review_auto_merge_for_repo(&w.pr.owner, &w.pr.repo))
+                .map(|w| w.pr.clone())
+                .collect();
+            ledger.retain_watched(&live);
+        }
         out
     }
 
@@ -1657,6 +1665,47 @@ impl Orchestrator {
             }
         }
         self.reconcile_review_watch(&mut rows, &mut report);
+        if let Some(ledger) = &self.automerge_ledger {
+            let (held, primed) = self.human_holds.labelled_and_primed();
+            for obs in observed {
+                let mine: Vec<_> = rows.iter().filter(|r| row_is(r, &obs.pr)).collect();
+                let unlocked = primed
+                    && !self.subject_parked(&obs.pr.to_string(), "review")
+                    && self.review_auto_merge_for_repo(&obs.pr.owner, &obs.pr.repo)
+                    && !mine.iter().any(|r| {
+                        crate::reviewdone::origin_ticket(&r.introduced_by)
+                            .is_some_and(|t| held.contains(&t.to_ascii_lowercase()))
+                    });
+                let (eligible, reviewing) = if let PrLookup::Found(snap) = &obs.lookup
+                    && snap.status == PrStatus::Open
+                    && !snap.draft_blocks_merge()
+                    && snap.merge_state != MERGE_STATE_DIRTY
+                    && unlocked
+                    && !self.ci_routed.get(&obs.pr).is_some_and(|c| {
+                        c.head == snap.head_sha && c.red && c.summoned_at.is_some()
+                    }) {
+                    let mut proven: Vec<_> =
+                        obs.unchanged_from.iter().map(String::as_str).collect();
+                    proven.push(&snap.head_sha);
+                    let verdict = crate::automerge::auto_merge_verdict_with_proof(
+                        &mine,
+                        &snap.head_sha,
+                        &proven,
+                    );
+                    (
+                        verdict.is_ok(),
+                        matches!(
+                            verdict,
+                            Err(crate::automerge::AutoMergeRefusal::RoundInFlight
+                                | crate::automerge::AutoMergeRefusal::StaleVerdict)
+                        ) && !mine.iter().any(|r| r.status == REVIEW_STATUS_REVIEWED),
+                    )
+                } else {
+                    (false, false)
+                };
+                ledger.observe_eligibility(&obs.pr, eligible, reviewing);
+            }
+        }
         // The daemon-wide dispatch budget, honoured for the same reason `select` honours it: a
         // review is a full agent run on this machine, and twenty pull requests coming due in one
         // tick would otherwise spawn twenty agents past a cap the operator set. TWO bounds compose
@@ -4516,6 +4565,16 @@ impl Orchestrator {
         }
         match crate::automerge::auto_merge_verdict_with_proof(mine, head, proven) {
             Ok(approved_by) => {
+                if self
+                    .ci_routed
+                    .get(pr)
+                    .is_some_and(|c| c.head == head && c.red && c.summoned_at.is_some())
+                {
+                    return;
+                }
+                if let Some(ledger) = &self.automerge_ledger {
+                    ledger.admit(pr);
+                }
                 if !self.landing_merge_groups(pr).is_empty() {
                     if let Err(err) = self.reserve_landing_merge(mine, pr, (self.now)().timestamp())
                     {
@@ -10064,6 +10123,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn landing_admission_tracks_observed_findings_drafts_holds_and_merges() {
+        let (mut o, _d) = orch(ticketless_automerge(&["alice", "bob"]));
+        let ledger = Arc::new(crate::runautomerge::AutoMergeLedger::default());
+        o.automerge_ledger = Some(ledger.clone());
+        for n in [64, 65, 66] {
+            introduce(&o, approved_row(n, "bob", HEAD_A));
+        }
+        o.handle_review_sweep(&[
+            open_at(65, HEAD_A),
+            open_at(64, HEAD_A),
+            open_at(66, HEAD_A),
+        ]);
+        for n in [65, 64, 66] {
+            ledger.test_landing(&coord(n), "ready");
+        }
+        assert_eq!(
+            ledger
+                .landing_lines()
+                .iter()
+                .map(|p| p.number)
+                .collect::<Vec<_>>(),
+            [65, 64, 66]
+        );
+        let mut findings = approved_row(65, "bob", HEAD_A);
+        findings.status = REVIEW_STATUS_REVIEWED.into();
+        introduce(&o, findings);
+        o.handle_review_sweep(&[open_at(65, HEAD_A)]);
+        assert_eq!(ledger.landing_lines()[0].number, 64);
+        o.handle_review_sweep(&[draft_at(64, HEAD_A)]);
+        assert_eq!(ledger.landing_lines()[0].number, 66);
+        o.handle_review_sweep(&[observed(66, merged_at(HEAD_A))]);
+        assert!(ledger.landing_lines().is_empty());
+        introduce(&o, approved_row(67, "bob", HEAD_A));
+        o.handle_review_sweep(&[open_at(67, HEAD_A)]);
+        ledger.test_landing(&coord(67), "ready");
+        o.human_holds.note_human_label("STUDIO-721");
+        o.handle_review_sweep(&[open_at(67, HEAD_A)]);
+        assert!(
+            ledger.landing_lines().is_empty(),
+            "human holds discharge admission"
+        );
+    }
+
     /// ⚠️ STUDIO-881's second half, at the site that actually dominated the log: the plan line is
     /// announced when it is NEWS and quiet afterwards, while the PLAN itself is re-proposed on
     /// every tick. Both halves matter — the log the ticket was filed from carried 97 identical
@@ -10135,6 +10238,41 @@ mod tests {
     }
 
     // --- the conflict route-back (STUDIO-961) ------------------------------------------------
+
+    #[test]
+    fn landing_ci_route_back_releases_front_and_does_not_readmit_stale_plan() {
+        let mut teams = ticketless_conflict(&["alice", "bob"], "In Progress");
+        teams.review.auto_merge = true;
+        let (mut o, _rx) = conflict_harness(teams);
+        let ledger = Arc::new(crate::runautomerge::AutoMergeLedger::default());
+        o.automerge_ledger = Some(ledger.clone());
+        for n in [12, 13] {
+            introduce(&o, approved_row(n, "bob", HEAD_A));
+        }
+        o.handle_review_sweep(&[open_at(12, HEAD_A), open_at(13, HEAD_A)]);
+        for n in [12, 13] {
+            ledger.test_landing(&coord(n), "ready");
+        }
+        let ci = crate::reviewci::CiSnapshot {
+            head: HEAD_A.into(),
+            failed: vec![crate::reviewci::CiFailure {
+                name: "test".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            o.observe_review_ci(&coord(12), &ci),
+            crate::reviewci::CiAction::Summon
+        );
+        assert_eq!(ledger.landing_lines()[0].number, 13);
+        assert!(
+            o.handle_review_sweep(&[open_at(12, HEAD_A)])
+                .merge
+                .is_empty()
+        );
+        assert_eq!(ledger.landing_lines().len(), 1);
+    }
 
     #[test]
     fn ci_route_back_reaches_the_author_after_approval_and_honors_live_gates() {

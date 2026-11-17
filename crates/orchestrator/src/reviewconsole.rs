@@ -85,6 +85,9 @@ pub struct ReviewJobRow {
     /// Exhausted no-verdict attempts, independently of manager/review-loop decisions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub infrastructure: Option<String>,
+    /// This PR's place and progress in its repository's strict up-to-date landing line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub landing: Option<crate::runautomerge::LandingPosition>,
 }
 
 /// One finding revision a decision dismissed, as the console renders it.
@@ -149,6 +152,7 @@ impl From<ReviewWatchRow> for ReviewJobRow {
             open: row.open,
             manager: None,
             infrastructure: None,
+            landing: None,
         }
     }
 }
@@ -248,6 +252,13 @@ impl Orchestrator {
                 let mut job = ReviewJobRow::from(row);
                 job.selection_reason = reason;
                 job.infrastructure = infrastructure;
+                job.landing = self.automerge_ledger.as_ref().and_then(|l| {
+                    l.landing_lines().into_iter().find(|p| {
+                        p.owner.eq_ignore_ascii_case(&job.owner)
+                            && p.repo.eq_ignore_ascii_case(&job.repo)
+                            && p.number == job.number
+                    })
+                });
                 let key = format!("{}/{}#{}", job.owner, job.repo, job.number).to_ascii_lowercase();
                 job.manager = states
                     .entry(key.clone())
