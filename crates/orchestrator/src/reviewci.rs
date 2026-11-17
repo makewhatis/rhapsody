@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CiFailure {
     pub name: String,
     pub workflow: String,
@@ -12,7 +12,7 @@ pub struct CiFailure {
     pub paths: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CiSnapshot {
     pub head: String,
     /// Routing fallback when no context in the complete inventory is marked required.
@@ -21,6 +21,11 @@ pub struct CiSnapshot {
     pub pending: bool,
     /// Proven only from a complete PR inventory and file evidence for EVERY failing check.
     pub unrelated: bool,
+    /// Current routing-gate jobs, including successful reruns, for the operator flake log.
+    #[serde(default)]
+    pub jobs: Vec<CiFailure>,
+    #[serde(default)]
+    pub rerun_error: Option<String>,
 }
 
 impl CiSnapshot {
@@ -45,7 +50,7 @@ pub(crate) struct CiState {
     pub head: String,
     pub ticket: String,
     pub summoned_at: Option<DateTime<Utc>>,
-    rerun: Option<(DateTime<Utc>, Vec<String>)>,
+    rerun: Option<(DateTime<Utc>, Vec<CiFailure>)>,
     pub red: bool,
 }
 
@@ -76,20 +81,158 @@ impl CiState {
         if !self.red || held || live || self.summoned_at.is_some() {
             return CiAction::None;
         }
-        let ids: Vec<String> = ci.failed.iter().map(|c| c.id.clone()).collect();
-        if let Some((at, previous)) = &self.rerun {
-            // GitHub may still show the old completed attempt before the rerun queues. Do not
-            // summon on that old answer. A failed/never-started rerun cannot silence it forever.
-            if *previous == ids && now.signed_duration_since(*at) < Duration::minutes(5) {
+        if let Some((_, previous)) = &self.rerun {
+            // GitHub can keep showing the original completed attempt until the rerun queues.
+            // Time passing is not evidence of a second failure.
+            if ci.rerun_error.is_none()
+                && ci
+                    .failed
+                    .iter()
+                    .any(|c| previous.iter().any(|p| p.id == c.id))
+            {
                 return CiAction::None;
             }
         } else if ci.unrelated && ci.failed.iter().all(|c| action_job(&c.url).is_some()) {
-            self.rerun = Some((now, ids));
+            self.rerun = Some((now, ci.failed.clone()));
             return CiAction::Rerun;
         }
         self.summoned_at = Some(now);
         CiAction::Summon
     }
+}
+
+fn durable_decide(
+    store: &dyn rhapsody_store::Store,
+    pr: &crate::prstate::PrCoord,
+    state: &mut CiState,
+    ci: &CiSnapshot,
+    now: DateTime<Utc>,
+    held: bool,
+    live: bool,
+) -> Result<CiAction, Box<dyn std::error::Error + Send + Sync>> {
+    if state.head != ci.head {
+        *state = CiState {
+            head: ci.head.clone(),
+            ..Default::default()
+        };
+    }
+    let saved = store.get_ci_rerun(&pr.owner, &pr.repo, pr.number, &ci.head)?;
+    if let Some(row) = &saved {
+        let original: CiSnapshot = serde_json::from_str(&row.original)?;
+        state.rerun = Some((
+            DateTime::parse_from_rfc3339(&row.at)?.with_timezone(&Utc),
+            original.failed,
+        ));
+    }
+    let mut next = state.clone();
+    let action = next.decide(ci, now, held, live);
+    if action == CiAction::Rerun {
+        let row = rhapsody_store::CiRerun {
+            owner: pr.owner.clone(),
+            repo: pr.repo.clone(),
+            number: pr.number,
+            head: ci.head.clone(),
+            at: now.to_rfc3339(),
+            original: serde_json::to_string(ci)?,
+            ..Default::default()
+        };
+        if !store.reserve_ci_rerun(&row)? {
+            if store
+                .get_ci_rerun(&pr.owner, &pr.repo, pr.number, &ci.head)?
+                .is_some()
+            {
+                return Ok(CiAction::None);
+            }
+            // No durable reservation means no GitHub write. Disabled storage retains immediate routing.
+            next.rerun = None;
+            next.summoned_at = None;
+            let mut immediate = ci.clone();
+            immediate.unrelated = false;
+            let action = next.decide(&immediate, now, held, live);
+            *state = next;
+            return Ok(action);
+        }
+    }
+    if let Some(mut row) = saved
+        && !ci.pending
+        && ((ci.failed.is_empty()
+            && state.rerun.as_ref().is_some_and(|(_, previous)| {
+                previous.iter().all(|old| {
+                    ci.jobs.iter().any(|job| {
+                        job.name == old.name && job.workflow == old.workflow && job.id != old.id
+                    })
+                })
+            }))
+            || action == CiAction::Summon)
+    {
+        row.outcome = if ci.rerun_error.is_some() {
+            "request_failed"
+        } else if ci.failed.is_empty() {
+            "passed"
+        } else {
+            "failed"
+        }
+        .into();
+        let result = serde_json::to_string(ci)?;
+        if row.result != result {
+            row.result = result;
+            store.finish_ci_rerun(&row)?;
+        }
+    }
+    *state = next;
+    Ok(action)
+}
+
+/// Bounded operator log, projected from the same durable reservations used for dedupe.
+pub fn flakes(store: &dyn rhapsody_store::Store) -> Result<serde_json::Value, String> {
+    let mut entries = Vec::new();
+    for row in store.list_ci_reruns().map_err(|e| e.to_string())? {
+        let original: CiSnapshot =
+            serde_json::from_str(&row.original).map_err(|e| e.to_string())?;
+        let result: Option<CiSnapshot> = if row.result.is_empty() {
+            None
+        } else {
+            Some(serde_json::from_str(&row.result).map_err(|e| e.to_string())?)
+        };
+        for check in original.failed {
+            let rerun = result.as_ref().and_then(|ci| {
+                ci.jobs
+                    .iter()
+                    .chain(&ci.failed)
+                    .find(|job| job.name == check.name && job.workflow == check.workflow)
+            });
+            let outcome = if row.outcome == "failed"
+                && rerun.is_some()
+                && result.as_ref().is_some_and(|ci| {
+                    !ci.failed
+                        .iter()
+                        .any(|job| job.name == check.name && job.workflow == check.workflow)
+                }) {
+                "passed"
+            } else {
+                &row.outcome
+            };
+            entries.push(serde_json::json!({
+                "repo": format!("{}/{}", row.owner, row.repo), "pr": row.number,
+                "head": row.head, "at": row.at, "check": check.name, "workflow": check.workflow,
+                "tests": check.tests.iter().filter_map(|line| test_name(line)).collect::<Vec<_>>(), "original_job_url": check.url,
+                "rerun_job_url": rerun.map(|job| &job.url), "outcome": outcome,
+            }));
+        }
+    }
+    Ok(serde_json::json!({"flakes": entries}))
+}
+
+fn test_name(line: &str) -> Option<&str> {
+    if let Some((_, rest)) = line.split_once("--- FAIL:") {
+        return rest.split_whitespace().next();
+    }
+    if let Some((_, rest)) = line.split_once("test ")
+        && let Some((name, _)) = rest.split_once(" ... FAILED")
+    {
+        return Some(name.trim());
+    }
+    line.split_once('✘').map(|(_, rest)| rest.trim())
 }
 
 /// An Actions job link, with numeric IDs only; never turn an arbitrary details URL into argv.
@@ -106,7 +249,11 @@ pub(crate) fn action_job(url: &str) -> Option<(&str, &str)> {
 
 pub(crate) fn test_lines(log: &str) -> Vec<String> {
     log.lines()
-        .filter(|l| l.contains("--- FAIL:") || l.contains('✘'))
+        .filter(|l| {
+            l.contains("--- FAIL:")
+                || l.contains('✘')
+                || (l.contains("test ") && l.contains(" ... FAILED"))
+        })
         .take(20)
         .map(|l| l.chars().take(500).collect())
         .collect()
@@ -184,6 +331,20 @@ pub(crate) fn parse_snapshot(value: &serde_json::Value, head: &str) -> Option<Ci
         if !ci.all_checks && !c["isRequired"].as_bool()? {
             continue;
         }
+        ci.jobs.push(CiFailure {
+            name: c["name"].as_str().or_else(|| c["context"].as_str())?.into(),
+            workflow: c["checkSuite"]["workflowRun"]["workflow"]["name"]
+                .as_str()
+                .unwrap_or("")
+                .into(),
+            id: c["id"].as_str().unwrap_or("").into(),
+            url: c["detailsUrl"]
+                .as_str()
+                .or_else(|| c["targetUrl"].as_str())
+                .unwrap_or("")
+                .into(),
+            ..Default::default()
+        });
         let state = if c["__typename"] == "CheckRun" {
             if c["status"] != "COMPLETED" {
                 ci.pending = true;
@@ -361,13 +522,28 @@ impl crate::orchestrator::Orchestrator {
         // Still record recovery/pending observations if the notification task is unavailable;
         // otherwise stale red evidence could keep escalating a check that has already passed.
         let held = !primed || held.contains(&ticket.to_ascii_lowercase()) || performer_missing;
-        let state = self.ci_routed.entry(pr.clone()).or_default();
-        let action = state.decide(ci, (self.now)(), held, live);
+        let mut state = self.ci_routed.get(pr).cloned().unwrap_or_default();
+        let action = match durable_decide(
+            self.store(),
+            pr,
+            &mut state,
+            ci,
+            (self.now)(),
+            held,
+            live,
+        ) {
+            Ok(action) => action,
+            Err(error) => {
+                tracing::warn!(%pr, %error, "CI route-back: durable rerun state unavailable; taking no action");
+                return CiAction::None;
+            }
+        };
         state.ticket = ticket.into();
+        let original = state.rerun.as_ref().map(|(_, failures)| failures.clone());
+        self.ci_routed.insert(pr.clone(), state);
         if action == CiAction::None {
             return action;
         }
-        let reran = state.rerun.is_some();
         let line = if action == CiAction::Rerun {
             format!(
                 "CI route-back on {pr} at {} using {}: failed check file evidence touches no file in the PR diff; rerunning failed jobs once before summoning {ticket}.",
@@ -407,7 +583,7 @@ impl crate::orchestrator::Orchestrator {
                 number: pr.number,
                 author: row.author.clone(),
                 head_sha: ci.head.clone(),
-                verdict_text: failure_details(ci, reran),
+                verdict_text: failure_details(ci, original.as_deref()),
                 summon_token: self.review_summon_token(),
                 changes: self.plan_conflict_route_back(pr, &row.introduced_by),
                 ..Default::default()
@@ -418,7 +594,7 @@ impl crate::orchestrator::Orchestrator {
     }
 }
 
-fn failure_details(ci: &CiSnapshot, reran: bool) -> String {
+fn failure_details(ci: &CiSnapshot, original: Option<&[CiFailure]>) -> String {
     let mut out = format!("Routing gate: {}.\n\n", ci.gate());
     for c in &ci.failed {
         out.push_str(&format!(
@@ -432,10 +608,20 @@ fn failure_details(ci: &CiSnapshot, reran: bool) -> String {
         }
     }
     if ci.unrelated {
-        out.push_str("\nThe failing checks' file evidence touches no file in this PR's diff; this may be unrelated or flaky. Try a rerun first.\n");
+        out.push_str("\nThe failing checks' file evidence touches no file in this PR's diff; this may be unrelated or flaky.\n");
     }
-    if reran {
-        out.push_str("\nThe daemon already requested one rerun of the failed jobs at this head.\n");
+    if let Some(original) = original.filter(|o| !o.is_empty()) {
+        if let Some(error) = &ci.rerun_error {
+            out.push_str(&format!(
+                "\nThe daemon's one rerun request failed: {}.\n",
+                one_line(error)
+            ));
+        } else {
+            out.push_str("\nThe failed jobs were rerun once and failed again at this head. Original job links:\n");
+        }
+        for c in original {
+            out.push_str(&format!("- {} — {}\n", one_line(&c.name), one_line(&c.url)));
+        }
     }
     if out.len() > 48_000 {
         let mut end = 48_000;
@@ -459,6 +645,159 @@ fn one_line(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ghsummons::{GH, PrStateSource};
+
+    #[test]
+    fn durable_rerun_survives_restart_and_records_both_attempts() {
+        use rhapsody_store::{Sqlite, Store, StorePath};
+        let dir = crate::testsupport::TempDir::new();
+        let path = std::path::PathBuf::from(dir.child("reruns.db"));
+        let store = Sqlite::open(StorePath::Disk(path.clone())).unwrap();
+        let pr = crate::prstate::PrCoord::new("o", "r", 1);
+        let now = Utc::now();
+        let mut ci = red("a");
+        ci.unrelated = true;
+        ci.failed[0].url = "https://github.com/o/r/actions/runs/1/job/2".into();
+        assert_eq!(
+            durable_decide(&store, &pr, &mut CiState::default(), &ci, now, false, false).unwrap(),
+            CiAction::Rerun
+        );
+        drop(store);
+        let store = Sqlite::open(StorePath::Disk(path)).unwrap();
+        let decide = |state: &mut CiState, ci: &CiSnapshot| {
+            durable_decide(&store, &pr, state, ci, now, false, false).unwrap()
+        };
+        let mut restarted = CiState::default();
+        assert_eq!(decide(&mut restarted, &ci), CiAction::None);
+        assert_eq!(
+            durable_decide(
+                &store,
+                &pr,
+                &mut restarted,
+                &ci,
+                now + Duration::hours(1),
+                false,
+                false
+            )
+            .unwrap(),
+            CiAction::None,
+            "an unchanged old attempt is not a failed rerun"
+        );
+        ci.failed[0].id = "new".into();
+        ci.failed[0].url = "https://github.com/o/r/actions/runs/1/job/3".into();
+        assert_eq!(decide(&mut restarted, &ci), CiAction::Summon);
+        let details = failure_details(
+            &ci,
+            restarted
+                .rerun
+                .as_ref()
+                .map(|(_, failures)| failures.as_slice()),
+        );
+        assert!(details.contains("rerun once and failed again"));
+        assert!(details.contains("/job/2"));
+        assert!(details.contains("/job/3"));
+        assert_eq!(store.list_ci_reruns().unwrap().len(), 1);
+        assert_eq!(store.list_ci_reruns().unwrap()[0].outcome, "failed");
+        let log = flakes(&store).unwrap();
+        assert_eq!(
+            log["flakes"][0]["original_job_url"],
+            "https://github.com/o/r/actions/runs/1/job/2"
+        );
+        assert_eq!(
+            log["flakes"][0]["rerun_job_url"],
+            "https://github.com/o/r/actions/runs/1/job/3"
+        );
+    }
+
+    #[test]
+    fn durable_rerun_passes_without_summoning_and_waits_for_running_checks() {
+        use rhapsody_store::{Sqlite, Store, StorePath};
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        let pr = crate::prstate::PrCoord::new("o", "r", 1);
+        let mut ci = red("a");
+        ci.unrelated = true;
+        ci.failed[0].url = "https://github.com/o/r/actions/runs/1/job/2".into();
+        let mut state = CiState::default();
+        ci.pending = true;
+        assert_eq!(
+            durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
+            CiAction::None
+        );
+        assert!(store.list_ci_reruns().unwrap().is_empty());
+        ci.pending = false;
+        assert_eq!(
+            durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
+            CiAction::Rerun
+        );
+        let mut job = ci.failed[0].clone();
+        ci.failed.clear();
+        ci.jobs = vec![job.clone()];
+        assert_eq!(
+            durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
+            CiAction::None
+        );
+        assert_eq!(
+            store.list_ci_reruns().unwrap()[0].outcome,
+            "requested",
+            "a stale or disappearing original failure does not prove a green rerun"
+        );
+        job.id = "new".into();
+        job.url = "https://github.com/o/r/actions/runs/1/job/3".into();
+        ci.jobs = vec![job];
+        assert_eq!(
+            durable_decide(
+                &store,
+                &pr,
+                &mut CiState::default(),
+                &ci,
+                Utc::now(),
+                false,
+                false
+            )
+            .unwrap(),
+            CiAction::None
+        );
+        assert_eq!(store.list_ci_reruns().unwrap()[0].outcome, "passed");
+        let log = flakes(&store).unwrap();
+        assert_eq!(
+            log["flakes"][0]["rerun_job_url"],
+            "https://github.com/o/r/actions/runs/1/job/3"
+        );
+    }
+
+    #[test]
+    fn evidence_inside_the_diff_routes_immediately_without_a_reservation() {
+        use rhapsody_store::{Sqlite, Store, StorePath};
+        let store = Sqlite::open(StorePath::InMemory).unwrap();
+        let pr = crate::prstate::PrCoord::new("o", "r", 1);
+        let mut state = CiState::default();
+        let ci = red("a");
+        assert_eq!(
+            durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
+            CiAction::Summon
+        );
+        assert_eq!(
+            durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
+            CiAction::None
+        );
+        assert!(store.list_ci_reruns().unwrap().is_empty());
+    }
+
+    #[test]
+    fn flake_test_names_parse_go_rust_and_browser_failure_lines() {
+        assert_eq!(
+            test_name("2026-11-17 --- FAIL: TestUsage (0.1s)"),
+            Some("TestUsage")
+        );
+        assert_eq!(
+            test_name("test tests::usage ... FAILED"),
+            Some("tests::usage")
+        );
+        assert_eq!(
+            test_name("✘ 1 tests/usage.spec.ts:42 › usage totals"),
+            Some("1 tests/usage.spec.ts:42 › usage totals")
+        );
+        assert_eq!(test_name("not a failing test"), None);
+    }
 
     fn check_payload(state: &str) -> serde_json::Value {
         serde_json::json!({"data":{"repository":{"pullRequest":{
@@ -490,7 +829,8 @@ mod tests {
                     if args[0] == "api" {
                         return match args[1] {
                     "repos/o/r/pulls/1" => Ok(br#"{"head":{"sha":"a"},"base":{"sha":"base"},"changed_files":1,"labels":[]}"#.to_vec()),
-                    "repos/o/r/compare/base...a" => Ok(br#"{"files":[{"filename":"src/usage.go","status":"modified"}]}"#.to_vec()),
+                     "repos/o/r/compare/base...a" => Ok(br#"{"files":[{"filename":"src/usage.go","status":"modified"}]}"#.to_vec()),
+                     "repos/o/r/actions/runs/123" => Ok(br#"{"head_sha":"a","status":"completed"}"#.to_vec()),
                     other => panic!("unexpected endpoint: {other}"),
                 };
                     }
@@ -520,7 +860,7 @@ mod tests {
             assert!(ci.unrelated);
             assert_eq!(ci.failed[0].tests.len(), 2);
             assert!(ci.failed[0].tests[0].contains("TestUsageTotals"));
-            let details = failure_details(&ci, false);
+            let details = failure_details(&ci, None);
             assert!(details.contains("usage.spec.ts:42"));
             assert!(details.contains("https://github.com/o/r/actions/runs/123/job/456"));
             let mut previous = ci.clone();
@@ -541,6 +881,51 @@ mod tests {
                 .unwrap();
             assert!(wrong_head.is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn unrelated_failure_waits_for_the_workflow_even_if_its_required_job_finished() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let finished = Arc::new(AtomicBool::new(false));
+        let observed = finished.clone();
+        let gh = GH::new(
+            "",
+            Some(Box::new(move |args| {
+                if args[..2] == ["api", "graphql"] {
+                    return Ok(serde_json::to_vec(&check_payload("FAILURE")).unwrap());
+                }
+                if args[0] == "api" {
+                    return match args[1] {
+                    "repos/o/r/pulls/1" => Ok(br#"{"head":{"sha":"a"},"base":{"sha":"base"},"changed_files":1,"labels":[]}"#.to_vec()),
+                    "repos/o/r/compare/base...a" => Ok(br#"{"files":[{"filename":"src/usage.go","status":"modified"}]}"#.to_vec()),
+                    "repos/o/r/actions/runs/123" => Ok(serde_json::to_vec(&serde_json::json!({"head_sha":"a", "status":if observed.load(Ordering::SeqCst) { "completed" } else { "in_progress" }})).unwrap()),
+                    endpoint => panic!("unexpected endpoint {endpoint}"),
+                };
+                }
+                assert_eq!(args[0], "run");
+                assert_eq!(args[1], "view");
+                Ok(Vec::new())
+            })),
+        );
+        let pr = crate::prstate::PrCoord::new("o", "r", 1);
+        let ci = gh.review_ci(&pr, "a", None).await.unwrap().unwrap();
+        assert!(ci.pending);
+        let store = rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).unwrap();
+        let mut state = CiState::default();
+        assert_eq!(
+            durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
+            CiAction::None
+        );
+        finished.store(true, Ordering::SeqCst);
+        let ci = gh.review_ci(&pr, "a", Some(&ci)).await.unwrap().unwrap();
+        assert!(!ci.pending);
+        assert_eq!(
+            durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
+            CiAction::Rerun
+        );
     }
 
     #[test]

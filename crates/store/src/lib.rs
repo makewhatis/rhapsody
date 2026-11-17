@@ -126,6 +126,25 @@ impl From<rusqlite::Error> for StoreError {
 /// err)` triple for a single lookup becomes `Result<Option<_>, _>`, and Go pointer fields map to
 /// [`Option`].
 pub trait Store {
+    fn get_ci_rerun(
+        &self,
+        _owner: &str,
+        _repo: &str,
+        _number: i64,
+        _head: &str,
+    ) -> Result<Option<CiRerun>, StoreError> {
+        Ok(None)
+    }
+    /// Insert before the GitHub side effect; false means already reserved or storage disabled.
+    fn reserve_ci_rerun(&self, _row: &CiRerun) -> Result<bool, StoreError> {
+        Ok(false)
+    }
+    fn finish_ci_rerun(&self, _row: &CiRerun) -> Result<(), StoreError> {
+        Ok(())
+    }
+    fn list_ci_reruns(&self) -> Result<Vec<CiRerun>, StoreError> {
+        Ok(Vec::new())
+    }
     fn save_landing(&self, _row: LandingRow) -> Result<i64, StoreError> {
         Ok(0)
     }

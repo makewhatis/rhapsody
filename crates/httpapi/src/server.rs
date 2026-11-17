@@ -39,6 +39,7 @@ use crate::handlers::{
 };
 use crate::handlers_config::{handle_capabilities, handle_config};
 use crate::handlers_drain::handle_drain;
+use crate::handlers_flakes::handle_flakes;
 use crate::handlers_history::{
     handle_event_search, handle_history, handle_history_costs, handle_history_summary,
     handle_issue_counts, handle_issue_history, handle_issue_runs, handle_metrics,
@@ -105,7 +106,7 @@ pub trait StateProvider: Send + Sync {
     ) -> rhapsody_orchestrator::landing::LandingActionOutcome {
         rhapsody_orchestrator::landing::LandingActionOutcome::NotFound
     }
-    /// Notification persistence only (STUDIO-1145). The history surface remains read-only.
+    /// Durable operator records: notifications and the read-only CI flake log.
     fn notification_store(&self) -> Option<Arc<dyn rhapsody_store::Store + Send + Sync>> {
         None
     }
@@ -997,6 +998,7 @@ where
         )
         .route("/api/v1/reviews/clear", operator_write(handle_review_clear))
         .route("/api/v1/landings", any(handle_landings))
+        .route("/api/v1/flakes", any(handle_flakes))
         .route(
             "/api/v1/landings/{id}/retry",
             operator_write(handle_landing_action),

@@ -1547,3 +1547,15 @@ pub struct Notice {
     pub active: bool,
     pub transient: bool,
 }
+/// One durable once-per-PR/head CI rerun reservation (STUDIO-2136; no Go counterpart).
+#[derive(Debug, Clone, Default)]
+pub struct CiRerun {
+    pub owner: String,
+    pub repo: String,
+    pub number: i64,
+    pub head: String,
+    pub at: String,
+    pub original: String,
+    pub result: String,
+    pub outcome: String,
+}
