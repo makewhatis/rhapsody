@@ -295,7 +295,7 @@ function ReviewsRow({
         {row.job.landing ? (
           <div className="pj">
             Landing {row.job.landing.position} of {row.job.landing.total} in{" "}
-            {row.job.landing.owner}/{row.job.landing.repo} · {row.job.landing.state.replaceAll("_", " ")}
+            {row.job.landing.owner}/{row.job.landing.repo} · {row.job.landing.in_flight ? "in flight" : `waiting (position ${row.job.landing.position})`} · width {row.job.landing.width} · {row.job.landing.state.replaceAll("_", " ")}
           </div>
         ) : null}
       </td>

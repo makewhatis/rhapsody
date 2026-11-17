@@ -2250,6 +2250,8 @@ export interface ReviewJob {
     number: number;
     position: number;
     total: number;
+    width: number;
+    in_flight: boolean;
     state: string;
   };
   infrastructure?: string;
