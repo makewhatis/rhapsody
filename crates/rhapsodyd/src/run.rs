@@ -3120,17 +3120,19 @@ mod tests {
     }
 
     // A minimal valid workflow, HERMETIC: the tracker points at a dead loopback address (fetches fail
-    // fast, non-fatal), and workspace.root + logging.dir + storage stay inside the temp dir so a test
-    // NEVER writes into the real `~/.rhapsody` (which on the self-hosted CI runner may hold a live
-    // daemon's DB / runtime.json). `storage_block` + `extra_block` are top-level YAML blocks. Literal
+    // fast, non-fatal), and workspace.root + logging.dir + storage + scratch.root stay inside the
+    // temp dir. The legacy scratch sweep is disabled: TMPDIR may belong to another daemon, and
+    // BootSeams::home does not override either scratch root. No host disk-pressure gate is needed.
+    // `storage_block` + `extra_block` are top-level YAML blocks. Literal
     // api_key (not `$VAR`) avoids a process-global env mutation racing parallel tests — see bootcfg.
     fn write_wf(dir: &TempDir, storage_block: &str, extra_block: &str) -> PathBuf {
         let ws = dir.child("ws");
         let logs = dir.child("logs");
         let body = format!(
-            "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\npolling:\n  interval_ms: 50\nagent:\n  backend: claude\nworkspace:\n  root: {ws}\nlogging:\n  dir: {logs}\n{storage_block}{extra_block}---\nWork the issue.\n",
+            "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\npolling:\n  interval_ms: 50\nagent:\n  backend: claude\nworkspace:\n  root: {ws}\nlogging:\n  dir: {logs}\nscratch:\n  root: {scratch}\n  legacy_ttl_hours: 0\n  min_free_gib: 0\n{storage_block}{extra_block}---\nWork the issue.\n",
             ws = ws.display(),
             logs = logs.display(),
+            scratch = dir.child("scratch").display(),
         );
         let p = dir.child("WORKFLOW.md");
         std::fs::write(&p, body).expect("write WORKFLOW.md");
@@ -3138,6 +3140,105 @@ mod tests {
     }
 
     const OFF_STORAGE: &str = "storage:\n  path: \"off\"\n";
+
+    /// Re-exec gives the fake live installation its own HOME/TMPDIR without racing other tests'
+    /// environment. Its orphaned trash and old legacy directory must survive a test daemon boot.
+    #[test]
+    fn a_test_daemon_leaves_the_default_installation_untouched() {
+        const CHILD: &str = "RHAPSODY_ISOLATION_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.block_on(async {
+                let dir = TempDir::new();
+                let wf = write_wf(&dir, OFF_STORAGE, "");
+                let trash = dir.child("scratch/.trash-test-instance");
+                std::fs::create_dir_all(&trash).unwrap();
+                std::fs::write(trash.join("sentinel"), "test-owned").unwrap();
+                let signal = CancelSignal::new();
+                let ctx = signal.wait();
+                let argv = vec![
+                    "--port".into(),
+                    "0".into(),
+                    wf.to_string_lossy().into_owned(),
+                ];
+                let home = TempDir::new();
+                let seams = BootSeams {
+                    home: Some(home.path.clone()),
+                    ..BootSeams::default()
+                };
+                let task = tokio::spawn(async move {
+                    run_with_seam(ctx, &argv, SharedBuf::new(), false, false, seams).await
+                });
+                let swept = tokio::time::timeout(Duration::from_secs(5), async {
+                    while trash.exists() {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                })
+                .await;
+                signal.cancel();
+                assert_eq!(task.await.unwrap(), 0);
+                assert!(
+                    swept.is_ok(),
+                    "the test daemon must sweep its own scratch tree"
+                );
+            });
+            return;
+        }
+        let live = TempDir::new();
+        let runtime_dir = live.child(".rhapsody");
+        let trash = runtime_dir.join("scratch/.trash-live-instance");
+        let legacy = live.child("opencode/old-live-instance");
+        for path in [&trash, &legacy] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("sentinel"), "live-owned").unwrap();
+        }
+        let old = std::time::SystemTime::now() - Duration::from_secs(72 * 3600);
+        std::fs::File::open(&legacy)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let wf = write_wf(
+            &live,
+            &format!(
+                "storage:\n  path: {}\n",
+                runtime_dir.join("rhapsody.db").display()
+            ),
+            "",
+        );
+        let _lock = crate::runlock::acquire_single_instance_lock(&wf).unwrap();
+        let (_store, durable) = open_store(load_resolved(&wf).as_ref(), "", false);
+        assert!(durable);
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        runtimeport::write_in(&live.path, server.local_addr().unwrap().port() as i32).unwrap();
+        let publication = std::fs::read(runtime_dir.join("runtime.json")).unwrap();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "run::tests::a_test_daemon_leaves_the_default_installation_untouched",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("HOME", &live.path)
+            .env("TMPDIR", &live.path)
+            .output()
+            .unwrap();
+        for path in [&trash, &legacy] {
+            assert_eq!(
+                std::fs::read_to_string(path.join("sentinel")).unwrap(),
+                "live-owned"
+            );
+        }
+        assert!(
+            output.status.success(),
+            "child failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read(runtime_dir.join("runtime.json")).unwrap(),
+            publication
+        );
+    }
 
     async fn read_accounts(port: i32) -> Option<serde_json::Value> {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};

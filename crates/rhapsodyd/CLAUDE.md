@@ -81,7 +81,8 @@ each other — the split is required by the trait-ownership constraint, not acci
   `rhapsody-core`'s runtimeport tests and the orchestrator's `testsupport`. Don't add `tempfile`
   here; follow the existing pattern.
 - **Daemon tests must stay hermetic**: every test workflow points `workspace.root` / `logging.dir`
-  / `storage.path` inside a `TempDir`, and the tracker endpoint at a dead loopback address
+  / `storage.path` / `scratch.root` inside a `TempDir`, disables the ambient `$TMPDIR/opencode`
+  sweep with `scratch.legacy_ttl_hours: 0`, and points the tracker endpoint at a dead loopback address
   (`http://127.0.0.1:9`) so network calls fail fast without touching the real `~/.rhapsody`. A CI
   runner may have a live production daemon; a test that defaults these paths can corrupt its state.
 - **The Rust orchestrator defers disk store-open to the daemon** (unlike Go, where `Orchestrator`
