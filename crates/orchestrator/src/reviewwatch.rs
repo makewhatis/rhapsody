@@ -1214,7 +1214,10 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                                 == crate::reviewci::CiAction::Rerun
                             && let Err(error) = src.rerun_ci(&pr, &ci).await
                         {
-                            tracing::warn!(%pr, %error, "CI route-back: one rerun request failed; author will be summoned after the rerun grace period");
+                            tracing::warn!(%pr, %error, "CI route-back: one rerun request failed");
+                            let mut failed = ci.clone();
+                            failed.rerun_error = Some(error.to_string());
+                            deps.sink.ci(pr.clone(), failed).await;
                         }
                     }
                     Ok(None) => {}

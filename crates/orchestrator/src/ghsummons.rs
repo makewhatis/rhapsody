@@ -2685,52 +2685,80 @@ impl PrStateSource for GH {
                 .map(|c| &c.id)
                 .eq(ci.failed.iter().map(|c| &c.id))
         {
-            return Ok(Some(old.clone()));
-        }
-        // Cheap excerpts only: at most four job logs, twenty failure lines per job. Check names
-        // and links still survive an unavailable log or a non-Actions CI provider.
-        for failure in ci.failed.iter_mut().take(4) {
-            if let Some((_, job)) = crate::reviewci::action_job(&failure.url) {
-                let slug = format!("{}/{}", pr.owner, pr.repo);
-                match self
-                    .run_off_task(vec![
-                        "run".into(),
-                        "view".into(),
-                        "--repo".into(),
-                        slug,
-                        "--job".into(),
-                        job.into(),
-                        "--log-failed".into(),
-                    ])
-                    .await
-                {
-                    Ok(log) => {
-                        failure.tests = crate::reviewci::test_lines(&String::from_utf8_lossy(&log));
-                        let paths = crate::reviewci::test_paths(&failure.tests);
-                        if paths.len() == failure.tests.len() {
-                            failure.paths.extend(paths);
+            ci = old.clone();
+        } else {
+            // Cheap excerpts only: at most four job logs, twenty failure lines per job. Check names
+            // and links still survive an unavailable log or a non-Actions CI provider.
+            for failure in ci.failed.iter_mut().take(4) {
+                if let Some((_, job)) = crate::reviewci::action_job(&failure.url) {
+                    let slug = format!("{}/{}", pr.owner, pr.repo);
+                    match self
+                        .run_off_task(vec![
+                            "run".into(),
+                            "view".into(),
+                            "--repo".into(),
+                            slug,
+                            "--job".into(),
+                            job.into(),
+                            "--log-failed".into(),
+                        ])
+                        .await
+                    {
+                        Ok(log) => {
+                            failure.tests =
+                                crate::reviewci::test_lines(&String::from_utf8_lossy(&log));
+                            let paths = crate::reviewci::test_paths(&failure.tests);
+                            if paths.len() == failure.tests.len() {
+                                failure.paths.extend(paths);
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(%pr, %error, check = %failure.name, "CI route-back: job log unavailable")
                         }
                     }
+                }
+            }
+            if ci.failed.iter().all(|c| !c.paths.is_empty()) {
+                match self
+                    .review_surface(&pr.owner, &pr.repo, pr.number, head)
+                    .await
+                {
+                    Ok(Some(surface)) => {
+                        ci.unrelated = ci
+                            .failed
+                            .iter()
+                            .all(|c| c.paths.iter().all(|p| !surface.files.contains(p)))
+                    }
+                    Ok(None) => {}
                     Err(error) => {
-                        tracing::warn!(%pr, %error, check = %failure.name, "CI route-back: job log unavailable")
+                        tracing::warn!(%pr, %error, "CI route-back: diff unavailable; not inferring an unrelated failure")
                     }
                 }
             }
         }
-        if ci.failed.iter().all(|c| !c.paths.is_empty()) {
-            match self
-                .review_surface(&pr.owner, &pr.repo, pr.number, head)
-                .await
-            {
-                Ok(Some(surface)) => {
-                    ci.unrelated = ci
-                        .failed
-                        .iter()
-                        .all(|c| c.paths.iter().all(|p| !surface.files.contains(p)))
+        if ci.unrelated {
+            let runs: std::collections::BTreeSet<_> = ci
+                .failed
+                .iter()
+                .filter_map(|c| crate::reviewci::action_job(&c.url).map(|(run, _)| run.to_string()))
+                .collect();
+            for run in runs {
+                let bytes = self
+                    .run_off_task(vec![
+                        "api".into(),
+                        format!("repos/{}/{}/actions/runs/{run}", pr.owner, pr.repo),
+                    ])
+                    .await?;
+                let run: serde_json::Value = serde_json::from_slice(&bytes)?;
+                if run["head_sha"].as_str() != Some(head) {
+                    return Ok(None);
                 }
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(%pr, %error, "CI route-back: diff unavailable; not inferring an unrelated failure")
+                match run["status"].as_str() {
+                    Some("completed") => {}
+                    Some("queued" | "in_progress" | "waiting" | "pending" | "requested") => {
+                        ci.pending = true
+                    }
+                    _ => return Err("CI workflow run has an unknown status".into()),
                 }
             }
         }

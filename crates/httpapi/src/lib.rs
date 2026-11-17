@@ -49,6 +49,7 @@ mod config_view;
 mod handlers;
 mod handlers_config;
 mod handlers_drain;
+mod handlers_flakes;
 mod handlers_history;
 mod handlers_landings;
 mod handlers_lead;

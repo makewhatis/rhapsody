@@ -56,7 +56,7 @@ use std::sync::{Mutex, MutexGuard};
 /// Current `PRAGMA user_version` — Go's `schemaVersion`. Each bump appends one step to
 /// [`MIGRATIONS`]; [`migrate`] applies every step whose index is `>=` the DB's current version.
 ///
-/// Go v0.4.0 froze at 6. Steps 7 through 42 are Rhapsody-only (the ticketless review watch
+/// Go v0.4.0 froze at 6. Steps 7 through 43 are Rhapsody-only (the ticketless review watch
 /// set, then its `author` column, then the summons watermark, then per-run provenance, then the
 /// per-pull-request review bound, then the per-review-run verdict, then the durable terminal-move
 /// ledger, then the structured review findings, then the breaker's persisted crossings, then the
@@ -66,7 +66,7 @@ use std::sync::{Mutex, MutexGuard};
 /// evidence-access log, then the manager intervention lifecycle, then the verdict ledger's durable
 /// completion sequence, STUDIO-1440) and are
 /// the one documented reason this number is ahead of the reference — see the module doc above.
-const SCHEMA_VERSION: i64 = 42;
+const SCHEMA_VERSION: i64 = 43;
 
 /// Ordered schema migration steps, copied verbatim from Go's `migrations` slice
 /// (`internal/store/sqlite.go`). `MIGRATIONS[i]` advances `user_version` from `i` to `i+1`.
@@ -846,6 +846,20 @@ CREATE TABLE rhapsody_review_summons (
 CREATE INDEX rhapsody_review_summons_identifier ON rhapsody_review_summons(identifier);
 UPDATE rhapsody_queued_run_messages SET summon_at = '' WHERE delivered_run_id IS NULL;
 "#,
+    // v42 -> v43: durable CI rerun reservation and flake evidence (STUDIO-2136).
+    r#"
+CREATE TABLE rhapsody_ci_rerun (
+    owner TEXT NOT NULL,
+    repo TEXT NOT NULL,
+    number INTEGER NOT NULL,
+    head TEXT NOT NULL,
+    at TEXT NOT NULL,
+    original TEXT NOT NULL,
+    result TEXT NOT NULL DEFAULT '',
+    outcome TEXT NOT NULL DEFAULT 'requested',
+    PRIMARY KEY(owner, repo, number, head)
+);
+"#,
 ];
 
 /// Name prefix carried by every Rhapsody-only schema object, and the ONLY thing that excludes an
@@ -1527,7 +1541,43 @@ fn map_landing(row: &rusqlite::Row<'_>) -> rusqlite::Result<LandingRow> {
     })
 }
 
+fn map_ci_rerun(row: &rusqlite::Row<'_>) -> rusqlite::Result<CiRerun> {
+    Ok(CiRerun {
+        owner: row.get(0)?,
+        repo: row.get(1)?,
+        number: row.get(2)?,
+        head: row.get(3)?,
+        at: row.get(4)?,
+        original: row.get(5)?,
+        result: row.get(6)?,
+        outcome: row.get(7)?,
+    })
+}
+
 impl Store for Sqlite {
+    fn get_ci_rerun(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: i64,
+        head: &str,
+    ) -> Result<Option<CiRerun>, StoreError> {
+        Ok(self.lock().query_row("SELECT owner, repo, number, head, at, original, result, outcome FROM rhapsody_ci_rerun WHERE owner=?1 AND repo=?2 AND number=?3 AND head=?4", params![owner.to_ascii_lowercase(), repo.to_ascii_lowercase(), number, head], map_ci_rerun).optional()?)
+    }
+    fn reserve_ci_rerun(&self, row: &CiRerun) -> Result<bool, StoreError> {
+        Ok(self.lock().execute("INSERT OR IGNORE INTO rhapsody_ci_rerun(owner, repo, number, head, at, original) VALUES (?1,?2,?3,?4,?5,?6)", params![row.owner.to_ascii_lowercase(), row.repo.to_ascii_lowercase(), row.number, row.head, row.at, row.original])? == 1)
+    }
+    fn finish_ci_rerun(&self, row: &CiRerun) -> Result<(), StoreError> {
+        self.lock().execute("UPDATE rhapsody_ci_rerun SET result=?5, outcome=?6 WHERE owner=?1 AND repo=?2 AND number=?3 AND head=?4", params![row.owner.to_ascii_lowercase(), row.repo.to_ascii_lowercase(), row.number, row.head, row.result, row.outcome])?;
+        Ok(())
+    }
+    fn list_ci_reruns(&self) -> Result<Vec<CiRerun>, StoreError> {
+        let conn = self.lock();
+        let mut stmt = conn.prepare("SELECT owner, repo, number, head, at, original, result, outcome FROM rhapsody_ci_rerun ORDER BY at DESC LIMIT 200")?;
+        Ok(stmt
+            .query_map([], map_ci_rerun)?
+            .collect::<rusqlite::Result<Vec<_>>>()?)
+    }
     fn save_landing(&self, row: LandingRow) -> Result<i64, StoreError> {
         let conn = self.lock();
         // Re-observing a merge must never reset a watch window.
@@ -10900,6 +10950,7 @@ mod tests {
                 "rhapsody_queued_run_messages_summon".to_string(),
                 "rhapsody_review_summons".to_string(),
                 "rhapsody_review_summons_identifier".to_string(),
+                "rhapsody_ci_rerun".to_string(),
             ],
             "exactly the documented divergent objects exist today (README `Divergences`)"
         );

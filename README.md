@@ -266,6 +266,22 @@ Rotation logs its reason and is reported once by the stuck-PR
 sweep, including when the rotated PR is now waiting. Timers and notices are process-local.
 This extends the Rhapsody-only auto-merge subsystem; Go parity fixtures are unchanged.
 
+### Durable unrelated-CI reruns and flake log (STUDIO-2136)
+
+Before routing a file-evidenced unrelated CI failure to its author, ticketless review waits for
+the failing workflow runs to finish and requests `gh run rerun --failed` once per PR/head.
+Migration 43 records the reservation before GitHub is called, so restart cannot rerun it twice.
+An unchanged original attempt never counts as a failed rerun merely because time passed. A green
+rerun summons nobody; a second failure summons the author with original and rerun job links.
+Evidence touching the diff still routes immediately. With persistence disabled, routing remains
+immediate because a restart-safe rerun cannot be reserved.
+
+`GET /api/v1/flakes` returns the latest 200 head reservations, expanded by failed check, with
+repository, PR, head, check/workflow, parsed test names, both job URLs and outcome (`requested`,
+`passed`, `failed`, `request_failed`). A reserved request whose delivery was interrupted stays
+`requested` until a fresh result is observed; it is never blindly resent after restart. Missing
+result links remain null. This changes the Rhapsody-only route-back path; Go fixtures are unchanged.
+
 ### Per-repository auto-merge landing lines (STUDIO-2126)
 
 For bases with strict up-to-date status-check protection (classic branch protection or an
@@ -319,7 +335,8 @@ failures remain ignored. Comments and logs name the mode; merge policy is unchan
 `review.ci_failure_routing` defaults on and hot-reloads; `review.ci_failure_escalation_hours` defaults
 to two hours before an unanswered summons is reported as needing a human. Pending checks, live
 author runs and human-held tickets do not summon. File-evidenced unrelated Actions failures get
-one failed-jobs rerun per head first. Like conflict routing, dedupe is process-local. This extends
+one durable failed-jobs rerun per head first (STUDIO-2136). Summons dedupe, like conflict routing,
+is process-local. This extends
 the Rhapsody-only review subsystem; Go-owned config/API goldens, schemas and normalization are
 unchanged. See the plugin's operating guide for bounds and escalation behavior.
 
