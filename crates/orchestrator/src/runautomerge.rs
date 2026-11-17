@@ -430,11 +430,21 @@ async fn perform_auto_merge_at(
     deps: &AutoMergeDeps,
     now: Instant,
 ) -> AutoMergeOutcome {
+    deps.ledger.clear_check_progress(&plan.pr);
     let outcome = attempt_auto_merge(plan, deps).await;
-    if let AutoMergeOutcome::Declined(why) | AutoMergeOutcome::Held(why) = &outcome
-        && *why != "waiting its turn to land"
-    {
-        deps.ledger.record_decline(plan, why, now);
+    match &outcome {
+        AutoMergeOutcome::Declined(why) | AutoMergeOutcome::Held(why)
+            if *why != "waiting its turn to land" =>
+        {
+            deps.ledger.record_decline(plan, why, now);
+        }
+        // Unknown GitHub refusals and transient failures keep their retry/log classification,
+        // but neither may pin this repository's front indefinitely.
+        AutoMergeOutcome::Failed(_) => {
+            deps.ledger
+                .record_decline(plan, "an auto-merge lookup or command failed", now);
+        }
+        _ => {}
     }
     // A pull request that MOVED is a change of subject, so its next refusal is news again. Done in
     // one place rather than on each of the returns that qualify, because a path that forgot would
@@ -811,6 +821,17 @@ fn repo_key(pr: &PrCoord) -> (String, String) {
 const LEDGER_CAPACITY: usize = 256;
 
 impl AutoMergeLedger {
+    fn clear_check_progress(&self, pr: &PrCoord) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        // Only THIS attempt's check evidence may exempt a refusal from the timeout. Early exits
+        // (including BEHIND/update-policy refusals) must not inherit an old pending-check answer.
+        if let Some(entry) = queue.line.entries.iter_mut().find(|e| e.pr == *pr)
+            && entry.state == "checks_running"
+        {
+            entry.state = "blocked";
+        }
+    }
+
     fn claim_optional_comment(&self, pr: &PrCoord, head: &str) -> bool {
         self.1
             .lock()
@@ -1411,6 +1432,94 @@ mod tests {
         };
         assert_eq!(
             perform_auto_merge(&next, &behind).await,
+            AutoMergeOutcome::Updated
+        );
+    }
+
+    #[tokio::test]
+    async fn finished_checks_then_refused_update_rotates_the_front() {
+        struct NoUpdates;
+        #[async_trait]
+        impl BranchUpdateSource for NoUpdates {
+            async fn allows_branch_update(&self, _: &str, _: &str) -> BranchUpdateResult {
+                Ok(false)
+            }
+            async fn requires_up_to_date(&self, _: &str, _: &str, _: i64) -> BranchUpdateResult {
+                Ok(true)
+            }
+        }
+        let first = numbered(1);
+        let next = numbered(2);
+        let mut d = AutoMergeDeps {
+            policy: Arc::new(NoUpdates),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                "BLOCKED",
+                checks(&[("test", "IN_PROGRESS")]),
+                Arc::new(FakeMerger::default()),
+            )
+        };
+        d.ledger.admit(&first.pr);
+        d.ledger.admit(&next.pr);
+        let start = Instant::now();
+        perform_auto_merge_at(&first, &d, start).await;
+        assert_eq!(d.ledger.landing_lines()[0].state, "checks_running");
+        d.mergestate = merge_state(Some(MERGE_STATE_BEHIND));
+        d.checks = all_green();
+        for seconds in [1, 1200] {
+            perform_auto_merge_at(&first, &d, start + Duration::from_secs(seconds)).await;
+            assert_eq!(d.ledger.landing_lines()[0].number, 1);
+        }
+        perform_auto_merge_at(&first, &d, start + Duration::from_secs(1201)).await;
+        assert_eq!(d.ledger.landing_lines()[0].number, 2);
+        assert_eq!(
+            d.ledger.take_rotation(&first.pr),
+            Some("the branch is behind its base and the repository will not update it")
+        );
+        d.policy = Arc::new(StrictPolicy);
+        assert_eq!(
+            perform_auto_merge(&next, &d).await,
+            AutoMergeOutcome::Updated
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_merge_command_failure_rotates_the_front() {
+        let first = numbered(1);
+        let next = numbered(2);
+        let error = "GraphQL: Base branch policy prohibits merge (mergePullRequest)";
+        let merger = Arc::new(FakeMerger {
+            fail: Some(error),
+            ..Default::default()
+        });
+        let mut d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                all_green(),
+                merger.clone(),
+            )
+        };
+        d.ledger.admit(&first.pr);
+        d.ledger.admit(&next.pr);
+        let start = Instant::now();
+        for seconds in [0, 1199, 1200] {
+            assert_eq!(
+                perform_auto_merge_at(&first, &d, start + Duration::from_secs(seconds)).await,
+                AutoMergeOutcome::Failed(error.into())
+            );
+            assert_eq!(
+                d.ledger.landing_lines()[0].number,
+                if seconds < 1200 { 1 } else { 2 }
+            );
+        }
+        assert_eq!(merger.calls.lock().unwrap().len(), 3);
+        assert!(d.ledger.take_rotation(&first.pr).is_some());
+        assert_eq!(d.ledger.take_rotation(&first.pr), None);
+        d.mergestate = merge_state(Some(MERGE_STATE_BEHIND));
+        assert_eq!(
+            perform_auto_merge(&next, &d).await,
             AutoMergeOutcome::Updated
         );
     }

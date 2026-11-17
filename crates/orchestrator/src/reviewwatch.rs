@@ -10246,7 +10246,9 @@ mod tests {
     fn landing_ci_route_back_releases_front_and_does_not_readmit_stale_plan() {
         let mut teams = ticketless_conflict(&["alice", "bob"], "In Progress");
         teams.review.auto_merge = true;
-        let (mut o, _rx) = conflict_harness(teams);
+        let (mut o, _d) = orch(teams);
+        run_of(&o, "STUDIO-721");
+        let mut rx = o.open_review_notify_channel();
         let ledger = Arc::new(crate::runautomerge::AutoMergeLedger::default());
         o.automerge_ledger = Some(ledger.clone());
         for n in [12, 13] {
@@ -10260,6 +10262,10 @@ mod tests {
         for n in [12, 13] {
             ledger.test_landing(&coord(n), "ready");
         }
+        let positions = ledger.landing_lines();
+        assert_eq!(positions.len(), 2);
+        assert_eq!((positions[0].number, positions[0].position), (12, 1));
+        assert_eq!((positions[1].number, positions[1].position), (13, 2));
         let ci = crate::reviewci::CiSnapshot {
             head: HEAD_A.into(),
             failed: vec![crate::reviewci::CiFailure {
@@ -10273,6 +10279,16 @@ mod tests {
             crate::reviewci::CiAction::Summon
         );
         assert_eq!(ledger.landing_lines()[0].number, 13);
+        assert_eq!(ledger.landing_lines().len(), 1);
+        let completion = rx.try_recv().unwrap();
+        assert_eq!(
+            completion.reason,
+            crate::reviewnotify::CompletionReason::CiFailure
+        );
+        assert_eq!(
+            completion.changes.as_ref().unwrap().identifier,
+            "STUDIO-721"
+        );
         assert!(o.handle_review_sweep(&[unstable]).merge.is_empty());
         assert_eq!(ledger.landing_lines().len(), 1);
     }
