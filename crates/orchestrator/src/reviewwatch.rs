@@ -1422,6 +1422,9 @@ impl Orchestrator {
             }
         }
         if let Some(ledger) = &self.automerge_ledger {
+            if let Some(teams) = &self.teams {
+                ledger.set_front_timeout(teams.review.landing_front_timeout_s);
+            }
             let live: Vec<_> = out
                 .iter()
                 .filter(|w| self.review_auto_merge_for_repo(&w.pr.owner, &w.pr.repo))
@@ -10249,7 +10252,11 @@ mod tests {
         for n in [12, 13] {
             introduce(&o, approved_row(n, "bob", HEAD_A));
         }
-        o.handle_review_sweep(&[open_at(12, HEAD_A), open_at(13, HEAD_A)]);
+        let mut unstable = open_at(12, HEAD_A);
+        if let PrLookup::Found(snap) = &mut unstable.lookup {
+            snap.merge_state = "UNSTABLE".into();
+        }
+        o.handle_review_sweep(&[unstable.clone(), open_at(13, HEAD_A)]);
         for n in [12, 13] {
             ledger.test_landing(&coord(n), "ready");
         }
@@ -10266,11 +10273,7 @@ mod tests {
             crate::reviewci::CiAction::Summon
         );
         assert_eq!(ledger.landing_lines()[0].number, 13);
-        assert!(
-            o.handle_review_sweep(&[open_at(12, HEAD_A)])
-                .merge
-                .is_empty()
-        );
+        assert!(o.handle_review_sweep(&[unstable]).merge.is_empty());
         assert_eq!(ledger.landing_lines().len(), 1);
     }
 

@@ -274,7 +274,7 @@ impl GH {
     /// inline call it replaced, which held the control task itself for the same duration. The
     /// timeout does not change that: it releases the CALLER, and says so in its message rather than
     /// claiming the operation did not happen.
-    async fn run_off_task(&self, args: Vec<String>) -> RunResult {
+    pub(crate) async fn run_off_task(&self, args: Vec<String>) -> RunResult {
         let run = Arc::clone(&self.run);
         let exec = tokio::task::spawn_blocking(move || {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();

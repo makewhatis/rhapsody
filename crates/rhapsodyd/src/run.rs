@@ -1711,6 +1711,7 @@ where
         // the key on: `propose_auto_merge` reads the live config and would start handing out plans
         // that a sink built at boot could not perform, warning once per tick forever.
         let automerge = Arc::new(rhapsody_orchestrator::runautomerge::AutoMergeDeps {
+            unstable: Some(gh.clone()),
             prs: Arc::clone(&gh) as Arc<dyn rhapsody_orchestrator::ghsummons::PrStateSource>,
             mergestate: Arc::clone(&gh)
                 as Arc<dyn rhapsody_orchestrator::ghsummons::MergeStateSource>,
