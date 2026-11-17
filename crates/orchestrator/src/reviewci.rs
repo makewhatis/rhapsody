@@ -51,6 +51,7 @@ pub(crate) struct CiState {
     pub ticket: String,
     pub summoned_at: Option<DateTime<Utc>>,
     rerun: Option<(DateTime<Utc>, Vec<CiFailure>)>,
+    rerun_error: Option<String>,
     pub red: bool,
 }
 
@@ -85,6 +86,7 @@ impl CiState {
             // GitHub can keep showing the original completed attempt until the rerun queues.
             // Time passing is not evidence of a second failure.
             if ci.rerun_error.is_none()
+                && self.rerun_error.is_none()
                 && ci
                     .failed
                     .iter()
@@ -123,6 +125,13 @@ fn durable_decide(
             DateTime::parse_from_rfc3339(&row.at)?.with_timezone(&Utc),
             original.failed,
         ));
+        if row.outcome == "request_failed" {
+            let result: CiSnapshot = serde_json::from_str(&row.result)?;
+            state.rerun_error = result.rerun_error;
+        }
+    }
+    if ci.rerun_error.is_some() {
+        state.rerun_error = ci.rerun_error.clone();
     }
     let mut next = state.clone();
     let action = next.decide(ci, now, held, live);
@@ -153,17 +162,25 @@ fn durable_decide(
             return Ok(action);
         }
     }
-    if let Some(mut row) = saved
-        && !ci.pending
-        && ((ci.failed.is_empty()
-            && state.rerun.as_ref().is_some_and(|(_, previous)| {
+    // Outcomes are observations, not notification effects: persist them even while held,
+    // while the author is live, or while the notification performer is unavailable.
+    let completed_rerun = !ci.pending
+        && state.rerun_error.is_none()
+        && state.rerun.as_ref().is_some_and(|(_, previous)| {
+            if ci.failed.is_empty() {
                 previous.iter().all(|old| {
                     ci.jobs.iter().any(|job| {
                         job.name == old.name && job.workflow == old.workflow && job.id != old.id
                     })
                 })
-            }))
-            || action == CiAction::Summon)
+            } else {
+                ci.failed
+                    .iter()
+                    .all(|job| previous.iter().all(|old| old.id != job.id))
+            }
+        });
+    if let Some(mut row) = saved
+        && (ci.rerun_error.is_some() || completed_rerun)
     {
         row.outcome = if ci.rerun_error.is_some() {
             "request_failed"
@@ -540,6 +557,8 @@ impl crate::orchestrator::Orchestrator {
         };
         state.ticket = ticket.into();
         let original = state.rerun.as_ref().map(|(_, failures)| failures.clone());
+        let mut evidence = ci.clone();
+        evidence.rerun_error = state.rerun_error.clone();
         self.ci_routed.insert(pr.clone(), state);
         if action == CiAction::None {
             return action;
@@ -583,7 +602,7 @@ impl crate::orchestrator::Orchestrator {
                 number: pr.number,
                 author: row.author.clone(),
                 head_sha: ci.head.clone(),
-                verdict_text: failure_details(ci, original.as_deref()),
+                verdict_text: failure_details(&evidence, original.as_deref()),
                 summon_token: self.review_summon_token(),
                 changes: self.plan_conflict_route_back(pr, &row.introduced_by),
                 ..Default::default()
@@ -645,6 +664,90 @@ fn one_line(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ghsummons::{GH, PrStateSource};
+
+    #[test]
+    fn deferred_request_failure_survives_restart_without_resending() {
+        use rhapsody_store::{Sqlite, Store, StorePath};
+        for (held, live) in [(true, false), (false, true)] {
+            let dir = crate::testsupport::TempDir::new();
+            let path = std::path::PathBuf::from(dir.child("deferred.db"));
+            let store = Sqlite::open(StorePath::Disk(path.clone())).unwrap();
+            let pr = crate::prstate::PrCoord::new("o", "r", 1);
+            let now = Utc::now();
+            let mut ci = red("a");
+            ci.unrelated = true;
+            ci.failed[0].url = "https://github.com/o/r/actions/runs/1/job/2".into();
+            let mut state = CiState::default();
+            assert_eq!(
+                durable_decide(&store, &pr, &mut state, &ci, now, false, false).unwrap(),
+                CiAction::Rerun
+            );
+            let mut error = ci.clone();
+            error.rerun_error = Some("HTTP 403".into());
+            assert_eq!(
+                durable_decide(&store, &pr, &mut state, &error, now, held, live).unwrap(),
+                CiAction::None
+            );
+            assert_eq!(store.list_ci_reruns().unwrap()[0].outcome, "request_failed");
+            drop(store);
+            let store = Sqlite::open(StorePath::Disk(path)).unwrap();
+            let mut state = CiState::default();
+            assert_eq!(
+                durable_decide(
+                    &store,
+                    &pr,
+                    &mut state,
+                    &ci,
+                    now + Duration::hours(24),
+                    false,
+                    false
+                )
+                .unwrap(),
+                CiAction::Summon
+            );
+            assert_eq!(store.list_ci_reruns().unwrap().len(), 1);
+            assert_eq!(store.list_ci_reruns().unwrap()[0].outcome, "request_failed");
+        }
+    }
+
+    #[test]
+    fn deferred_failed_rerun_is_logged_before_notification() {
+        use rhapsody_store::{Sqlite, Store, StorePath};
+        for (held, live) in [(true, false), (false, true)] {
+            let store = Sqlite::open(StorePath::InMemory).unwrap();
+            let pr = crate::prstate::PrCoord::new("o", "r", 1);
+            let now = Utc::now();
+            let mut ci = red("a");
+            ci.unrelated = true;
+            ci.failed[0].url = "https://github.com/o/r/actions/runs/1/job/2".into();
+            let mut state = CiState::default();
+            assert_eq!(
+                durable_decide(&store, &pr, &mut state, &ci, now, false, false).unwrap(),
+                CiAction::Rerun
+            );
+            ci.failed[0].id = "new".into();
+            ci.failed[0].url = "https://github.com/o/r/actions/runs/1/job/3".into();
+            assert_eq!(
+                durable_decide(&store, &pr, &mut state, &ci, now, held, live).unwrap(),
+                CiAction::None
+            );
+            assert_eq!(store.list_ci_reruns().unwrap()[0].outcome, "failed");
+            let log = flakes(&store).unwrap();
+            assert_eq!(
+                log["flakes"][0]["original_job_url"],
+                "https://github.com/o/r/actions/runs/1/job/2"
+            );
+            assert_eq!(
+                log["flakes"][0]["rerun_job_url"],
+                "https://github.com/o/r/actions/runs/1/job/3"
+            );
+            assert_eq!(
+                durable_decide(&store, &pr, &mut CiState::default(), &ci, now, false, false)
+                    .unwrap(),
+                CiAction::Summon
+            );
+        }
+    }
 
     #[test]
     fn durable_rerun_survives_restart_and_records_both_attempts() {
