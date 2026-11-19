@@ -738,14 +738,26 @@ documents availability, every config/contract field, worked examples and migrati
 With landing absent or disabled, merge completion and auto-merge behavior are unchanged; the
 Go-owned tables, config/API golden shapes and fixture normalization are untouched.
 
-### Hindsight prefetch freshness (STUDIO-1270)
+### Hindsight prefetch freshness (STUDIO-1270, STUDIO-2169)
 
-Worker memory prefetch skips a cached `(identity, ticket)` entry younger than five minutes
-(half its ten-minute TTL), including successful empty answers. Personal and shared-team facts
-refresh together under that entry. Each minute's rotating pass spends at most ten actual bank
-calls, counting both banks; skipped fresh entries spend no calls. Carry-over keeps the original
-timestamp and expiry semantics, bank failures still warn, and dispatch reads only the cache
-without waiting. This Teams-only scheduling change has no frozen Go counterpart.
+Worker memory prefetch skips a cached `(identity, ticket)` entry, including successful empty
+answers, until the ticket's title, labels or state change, this daemon writes to a bank behind the
+entry, or the entry is 30 minutes old. Entries are served for at most 45 minutes. A retain or
+reinstate through the daemon marks the written bank's entries for the next pass; an invalidation
+also removes the record from the cache at once. Personal and shared-team facts share one entry. A
+failed shared recall keeps that ticket's previous team facts, and only the team half is recalled
+once its bank answers again. Each minute's rotating pass spends at most ten actual bank calls,
+counting both banks; skipped fresh entries spend no calls.
+
+Each bank backs off on its own. Its first failure waits two cadences (two minutes), doubling to a
+15-minute ceiling. A backing-off bank is skipped, not retried, and the whole pass backs off only
+when nothing was recalled before the failure. Before STUDIO-2169, unchanged entries refreshed every
+five minutes (about 240 recalls an hour for ten candidates across two banks; now 40). The pass-level
+back-off's first three steps (10, 20 and 40 seconds) also sat under the one-minute cadence, so a
+down bank was retried every pass. The simulated replay behind these figures is
+`cargo test -p rhapsody-orchestrator teamsprefetch_replay -- --nocapture`. Carry-over keeps the
+original timestamp and expiry semantics, bank failures still warn, and dispatch reads only the
+cache without waiting. This Teams-only scheduling change has no frozen Go counterpart.
 
 ### Hindsight recall deadlines and failure diagnostics (STUDIO-1253)
 
@@ -756,7 +768,7 @@ times out after two seconds. Lead operator/team recall failures carry a closed r
 and case packet, without copying backend URLs or bodies into prompts. Worker prefetch reuses the
 poll loop's complete, first-project-wins candidate publication rather than querying Linear again
 or reading the account client whose project slug may be empty. Absent publications or those older
-than the ten-minute prefetch TTL leave the cycle idle; reload invalidates the publication, and
+than ten minutes leave the cycle idle; reload invalidates the publication, and
 failed polls never refresh its timestamp. These memory paths have no frozen Go counterpart; API
 payloads, configuration defaults and parity goldens are unchanged.
 

@@ -156,6 +156,9 @@ mod filetracker_e2e;
 // STUDIO-1896: the simulated-hour Linear request replay behind the PR's per-caller numbers.
 #[cfg(test)]
 mod linear_budget_replay;
+// STUDIO-2169: the simulated recall replay behind the PR's prefetch recalls-per-hour numbers.
+#[cfg(test)]
+mod teamsprefetch_replay;
 
 pub use agentupdate::AgentUpdate;
 pub use backoff::{CONTINUATION_DELAY_MS, failure_backoff_ms};

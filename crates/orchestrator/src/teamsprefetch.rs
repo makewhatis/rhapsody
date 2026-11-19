@@ -50,7 +50,7 @@
 //! back.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
@@ -58,14 +58,13 @@ use rhapsody_config::memory::{Fact, MemoryBackend};
 use rhapsody_config::teams::{MemoryBackend as BackendKind, Teams};
 use rhapsody_core::Issue;
 
-use crate::backoff::failure_backoff_ms;
 use crate::control_loop::CancelWait;
 use crate::teams::{LoadSnapshot, route};
 use crate::teamscompose::{recall_query, team_recall_query};
 
 /// The prefetch pass's own cadence. One minute matches [`triage`]'s and is
 /// slower than the 30s poll on purpose: this is ahead-of-dispatch work nobody
-/// waits on. Only missing or aging entries spend remote recalls.
+/// waits on. Only missing, changed or aging entries spend remote recalls.
 ///
 /// [`triage`]: crate::triage::TRIAGE_INTERVAL
 pub const PREFETCH_INTERVAL: Duration = Duration::from_secs(60);
@@ -76,16 +75,28 @@ pub const PREFETCH_INTERVAL: Duration = Duration::from_secs(60);
 pub const MAX_PREFETCH_BACKOFF_MS: i64 = 15 * 60 * 1000;
 
 /// How long a prefetched entry may be served for. Past this it is a **miss**,
-/// not a stale hit: a fact set fetched an hour ago has had an hour to be
-/// invalidated by the dashboard button §5.2.3 exists for, and rendering it would
-/// undo the correction someone just made.
+/// not a stale hit.
 ///
-/// Comfortably longer than [`PREFETCH_INTERVAL`], so a single skipped cycle (a
-/// slow bank, one back-off step) does not empty the cache.
-pub const PREFETCH_TTL: Duration = Duration::from_secs(10 * 60);
+/// A recall is re-issued as soon as the ticket's recall inputs change
+/// ([`TicketStamp`]) or this daemon writes to the bank behind it
+/// ([`PrefetchCache::note_written`], [`PrefetchCache::note_invalidated`]), so
+/// the TTL only bounds what nothing here can see: a record written to the bank
+/// by another process. It is comfortably longer than [`PREFETCH_REFRESH_AGE`]
+/// plus [`MAX_PREFETCH_BACKOFF_MS`], so one back-off step on a slow bank does
+/// not empty the cache (STUDIO-2169).
+pub const PREFETCH_TTL: Duration = Duration::from_secs(45 * 60);
 
-/// Refresh before expiry, leaving half the TTL for rotation or a slow bank.
-const PREFETCH_REFRESH_AGE: Duration = Duration::from_secs(PREFETCH_TTL.as_secs() / 2);
+/// How old a published candidate set may be before a cycle refuses it. Separate
+/// from [`PREFETCH_TTL`] since STUDIO-2169: the candidate publication ages with
+/// the poll loop, not with the bank, and a cycle routing a board that stopped
+/// polling ten minutes ago would recall for tickets nobody is looking at.
+pub const CANDIDATES_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// Refresh an unchanged entry after this long. Until STUDIO-2169 this was five
+/// minutes, which re-recalled every unchanged candidate twelve times an hour
+/// from both banks — about four recalls a minute on a ten-candidate board, for
+/// facts that had not changed.
+pub const PREFETCH_REFRESH_AGE: Duration = Duration::from_secs(30 * 60);
 
 /// How many actual bank recalls one cycle may make, counting personal and shared
 /// calls. Fresh cache entries spend nothing; missing/aging candidates past this
@@ -107,6 +118,59 @@ pub const MAX_CACHE_ENTRIES: usize = 64;
 /// of hard ceiling `MAX_SECTION_BYTES` puts on the rendered section — enough for
 /// [`MAX_CACHE_ENTRIES`] entries at a full section each, and no more.
 pub const MAX_CACHE_BYTES: usize = 64 * 1024;
+
+/// What a cached recall was recalled FROM: the ticket fields its query is built
+/// of ([`recall_query`]: title and labels; the identifier is the key) plus the
+/// ticket's state (STUDIO-2169).
+///
+/// An entry whose stamp no longer matches the candidate is refreshed on the
+/// next cycle whatever its age, which is what lets an unchanged ticket keep its
+/// entry for [`PREFETCH_REFRESH_AGE`] instead of five minutes. The strings are
+/// kept rather than hashed so two different tickets can never compare equal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TicketStamp {
+    title: String,
+    labels: Vec<String>,
+    state: String,
+}
+
+impl TicketStamp {
+    pub(crate) fn of(iss: &Issue) -> Self {
+        Self {
+            title: iss.title.clone(),
+            labels: iss.labels.clone().unwrap_or_default(),
+            state: iss.state.clone(),
+        }
+    }
+}
+
+/// Which bank a failure backs off: an identity's own bank or the shared team
+/// bank. Two variants rather than one string so an identity named like the team
+/// bank cannot share its back-off.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum BankId {
+    Own(String),
+    Team(String),
+}
+
+/// One bank's failure back-off (STUDIO-2169): how many recalls in a row failed
+/// and when the next may be tried.
+#[derive(Debug, Clone, Copy)]
+struct BankGate {
+    failures: u32,
+    retry_at: DateTime<Utc>,
+}
+
+/// The wait after `failures` consecutive failures: the cadence doubled per
+/// failure, capped at `max_backoff_ms` (but never below one cadence). The FIRST
+/// failure already waits two cadences, so a failed recall is never retried on
+/// the very next cycle — the old schedule's 10s/20s/40s steps were all below the
+/// 60s cadence and so retried every cycle for the first three failures.
+pub(crate) fn backoff_delay(failures: u32, interval: Duration, max_backoff_ms: i64) -> Duration {
+    let cap = Duration::from_millis(max_backoff_ms.max(0) as u64).max(interval);
+    let factor = 1u32.checked_shl(failures.min(31)).unwrap_or(u32::MAX);
+    interval.checked_mul(factor).unwrap_or(cap).min(cap)
+}
 
 /// What identifies one prefetched recall: the teammate whose bank was read and
 /// the ticket the query was built from.
@@ -139,6 +203,30 @@ struct Entry {
     /// team-off cache byte-identical to before this field existed.
     team: Vec<Fact>,
     at: DateTime<Utc>,
+    /// The ticket this entry was recalled for (STUDIO-2169). `None` for entries
+    /// installed through the stampless [`PrefetchCache::sync`] family, which
+    /// then match any ticket and refresh on age alone.
+    stamp: Option<TicketStamp>,
+    /// Whether the team half is a real answer. `false` when the shared recall
+    /// failed or its bank was backing off, so the entry is completed once the
+    /// bank answers again instead of serving "no team facts" for a whole TTL.
+    team_complete: bool,
+    /// Set when this daemon wrote to a bank the entry was recalled from
+    /// ([`PrefetchCache::note_written`]): the entry is still served, but the
+    /// next cycle re-recalls it.
+    dirty: bool,
+}
+
+/// Why a cycle should (or should not) spend recalls on one candidate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Refresh {
+    /// Present, unchanged, young and complete: spend nothing.
+    Fresh,
+    /// Fresh except that the team half never got a real answer: only the
+    /// shared bank needs asking.
+    TeamOnly,
+    /// Missing, changed, aging or dirty: recall both banks.
+    Full,
 }
 
 /// The shared, bounded prefetch cache — written by the off-loop task, read
@@ -150,6 +238,54 @@ struct Entry {
 #[derive(Debug, Default)]
 pub struct PrefetchCache {
     entries: RwLock<HashMap<PrefetchKey, Entry>>,
+    /// Per-bank failure back-off (STUDIO-2169). Lives beside the entries
+    /// because both describe what the prefetch task knows about the banks, but
+    /// only the prefetch task ever reads or writes it — dispatch never does.
+    gates: Mutex<HashMap<BankId, BankGate>>,
+    /// The writes [`note_written`](Self::note_written) and
+    /// [`note_invalidated`](Self::note_invalidated) recorded since the current
+    /// cycle began. A cycle rebuilds the map from a snapshot and recalls that
+    /// were in flight, so [`sync_entries`](Self::sync_entries) re-applies these
+    /// under its write lock — a write that lands mid-cycle is never overwritten.
+    notes: Mutex<Vec<Note>>,
+}
+
+/// A write this daemon made to a bank the cache was recalled from.
+#[derive(Debug, Clone)]
+enum Note {
+    /// A retain or reinstate: `None` is the shared team bank.
+    Written(Option<String>),
+    /// An invalidation of `fact_id`: `None` is the shared team bank.
+    Invalidated(Option<String>, String),
+}
+
+/// How many mid-cycle notes are kept for re-application. Writes are a handful
+/// per run, so this is never reached in practice; past it a note still applies
+/// to the live map at once, and the refresh age bounds the rest.
+const MAX_NOTES: usize = 256;
+
+impl Note {
+    fn apply(&self, entries: &mut HashMap<PrefetchKey, Entry>) {
+        for (key, entry) in entries.iter_mut() {
+            match self {
+                Note::Written(identity) => {
+                    if identity.as_deref().is_none_or(|i| key.identity == i) {
+                        entry.dirty = true;
+                    }
+                }
+                Note::Invalidated(Some(i), fact_id) => {
+                    if key.identity == *i {
+                        entry.facts.retain(|f| f.id != *fact_id);
+                        entry.dirty = true;
+                    }
+                }
+                Note::Invalidated(None, fact_id) => {
+                    entry.team.retain(|f| f.id != *fact_id);
+                    entry.dirty = true;
+                }
+            }
+        }
+    }
 }
 
 impl PrefetchCache {
@@ -200,17 +336,121 @@ impl PrefetchCache {
 
     /// Off-loop freshness check for BOTH banks under this key, including empty
     /// successful answers. No lock or fact copy survives into a remote recall.
-    fn needs_refresh(&self, key: &PrefetchKey, now: DateTime<Utc>) -> bool {
+    ///
+    /// An unchanged ticket stays [`Refresh::Fresh`] for [`PREFETCH_REFRESH_AGE`];
+    /// a changed one ([`TicketStamp`]) or one this daemon has written to the bank
+    /// behind is [`Refresh::Full`] at once (STUDIO-2169).
+    fn needs_refresh(&self, key: &PrefetchKey, stamp: &TicketStamp, now: DateTime<Utc>) -> Refresh {
         let Ok(guard) = self.entries.read() else {
-            return true;
+            return Refresh::Full;
         };
         let Some(entry) = guard.get(key) else {
-            return true;
+            return Refresh::Full;
         };
-        match now.signed_duration_since(entry.at).to_std() {
+        if entry.dirty || entry.stamp.as_ref().is_some_and(|s| s != stamp) {
+            return Refresh::Full;
+        }
+        let aging = match now.signed_duration_since(entry.at).to_std() {
             Ok(age) => age >= PREFETCH_REFRESH_AGE,
             // Like the TTL check, a backwards clock keeps existing entries fresh.
             Err(_) => false,
+        };
+        if aging {
+            Refresh::Full
+        } else if !entry.team_complete {
+            Refresh::TeamOnly
+        } else {
+            Refresh::Fresh
+        }
+    }
+
+    /// The cached entry under `key`, if any — the off-loop half's read of what a
+    /// partial refresh keeps.
+    fn entry(&self, key: &PrefetchKey) -> Option<Entry> {
+        self.entries.read().ok()?.get(key).cloned()
+    }
+
+    /// Whether `bank` may be asked at `now`, i.e. is not backing off.
+    fn bank_ready(&self, bank: &BankId, now: DateTime<Utc>) -> bool {
+        let Ok(gates) = self.gates.lock() else {
+            // A poisoned gate map gates nothing: the cadence still bounds calls.
+            return true;
+        };
+        gates.get(bank).is_none_or(|g| now >= g.retry_at)
+    }
+
+    /// Records a failed recall against `bank` and pushes its next attempt out
+    /// by [`backoff_delay`]. Returns the consecutive-failure count, for the log.
+    fn bank_failed(
+        &self,
+        bank: BankId,
+        now: DateTime<Utc>,
+        interval: Duration,
+        max_ms: i64,
+    ) -> u32 {
+        let Ok(mut gates) = self.gates.lock() else {
+            return 0;
+        };
+        let failures = gates.get(&bank).map_or(0, |g| g.failures).saturating_add(1);
+        let wait = chrono::Duration::from_std(backoff_delay(failures, interval, max_ms))
+            .unwrap_or(chrono::Duration::MAX);
+        let retry_at = now
+            .checked_add_signed(wait)
+            .unwrap_or(DateTime::<Utc>::MAX_UTC);
+        gates.insert(bank, BankGate { failures, retry_at });
+        failures
+    }
+
+    /// Clears `bank`'s back-off after a recall it answered.
+    fn bank_answered(&self, bank: &BankId) {
+        if let Ok(mut gates) = self.gates.lock() {
+            gates.remove(bank);
+        }
+    }
+
+    /// **This daemon wrote to a bank** (a retain or a reinstate through
+    /// `TeamsMemory`, STUDIO-2169): every entry recalled from it is re-recalled
+    /// on the next cycle, but keeps being served until then — exactly what a
+    /// dispatch would have seen before the write.
+    ///
+    /// `identity` names an identity's own bank; `None` names the shared team
+    /// bank, which every entry's team half was recalled from.
+    pub fn note_written(&self, identity: Option<&str>) {
+        self.note(Note::Written(identity.map(str::to_string)));
+    }
+
+    /// **This daemon invalidated a record** (STUDIO-2169): the record is removed
+    /// from every cached entry at once — a correction must not wait out a TTL —
+    /// and the affected entries are re-recalled on the next cycle.
+    ///
+    /// `identity` names an identity's own bank; `None` names the shared team
+    /// bank, so the record is removed from every entry's team half.
+    pub fn note_invalidated(&self, identity: Option<&str>, fact_id: &str) {
+        self.note(Note::Invalidated(
+            identity.map(str::to_string),
+            fact_id.to_string(),
+        ));
+    }
+
+    /// Applies `note` to the live map now, and logs it for the running cycle's
+    /// [`sync_entries`](Self::sync_entries).
+    fn note(&self, note: Note) {
+        if let Ok(mut notes) = self.notes.lock()
+            && notes.len() < MAX_NOTES
+        {
+            notes.push(note.clone());
+        }
+        if let Ok(mut guard) = self.entries.write() {
+            note.apply(&mut guard);
+        }
+    }
+
+    /// Starts a prefetch cycle: notes from before it are already in the map
+    /// (and in whatever this cycle snapshots), so only later ones need
+    /// re-applying.
+    fn begin_cycle(&self) {
+        if let Ok(mut notes) = self.notes.lock() {
+            notes.clear();
         }
     }
 
@@ -261,6 +501,39 @@ impl PrefetchCache {
         live: &HashSet<PrefetchKey>,
         now: DateTime<Utc>,
     ) {
+        // A caller-built install is the whole answer as of now: no earlier
+        // write is pending against it.
+        self.begin_cycle();
+        self.sync_entries(
+            fresh
+                .into_iter()
+                .map(|(key, facts, team)| {
+                    (
+                        key,
+                        Entry {
+                            facts,
+                            team,
+                            at: now,
+                            stamp: None,
+                            team_complete: true,
+                            dirty: false,
+                        },
+                    )
+                })
+                .collect(),
+            live,
+            now,
+        );
+    }
+
+    /// The one writer every `sync` funnels into: `fresh` entries arrive fully
+    /// built (the cycle stamps them), everything else live is carried.
+    fn sync_entries(
+        &self,
+        fresh: Vec<(PrefetchKey, Entry)>,
+        live: &HashSet<PrefetchKey>,
+        now: DateTime<Utc>,
+    ) {
         // Snapshot what survives under the read lock, then release it: the whole
         // rebuild happens outside any lock.
         let mut carried: Vec<(PrefetchKey, Entry)> = match self.entries.read() {
@@ -284,17 +557,8 @@ impl PrefetchCache {
         let mut bytes = 0usize;
         // This cycle's answers first: they are the freshest, and a fresh entry
         // must win over a carried copy of the same key.
-        for (key, facts, team) in fresh {
-            insert_bounded(
-                &mut next,
-                &mut bytes,
-                key,
-                Entry {
-                    facts,
-                    team,
-                    at: now,
-                },
-            );
+        for (key, entry) in fresh {
+            insert_bounded(&mut next, &mut bytes, key, entry);
         }
         for (key, entry) in carried {
             if !next.contains_key(&key) {
@@ -302,6 +566,14 @@ impl PrefetchCache {
             }
         }
         if let Ok(mut guard) = self.entries.write() {
+            // Writes noted since the cycle began are re-applied while the write
+            // lock is held, so none is lost to the swap; a later one applies to
+            // the map this installs.
+            if let Ok(mut notes) = self.notes.lock() {
+                for note in notes.drain(..) {
+                    note.apply(&mut next);
+                }
+            }
             *guard = next;
         }
         // A poisoned write lock leaves the previous contents in place, which the
@@ -327,6 +599,16 @@ impl PrefetchCache {
         self.sync_both(fresh, &live, now);
     }
 
+    /// Whether `(identity, ticket)`'s entry is marked for re-recall.
+    #[cfg(test)]
+    pub(crate) fn is_dirty(&self, identity: &str, ticket: &str) -> bool {
+        self.entries
+            .read()
+            .ok()
+            .and_then(|g| g.get(&PrefetchKey::new(identity, ticket)).map(|e| e.dirty))
+            .unwrap_or(false)
+    }
+
     /// How many entries are cached. Test/observability only — never consulted by
     /// dispatch, which asks about exactly one key.
     pub fn len(&self) -> usize {
@@ -345,8 +627,13 @@ impl PrefetchCache {
 /// backwards clock as "everything is stale" would empty the cache for the whole
 /// interval it takes to catch up.
 fn is_stale(at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    is_older_than(at, now, PREFETCH_TTL)
+}
+
+/// [`is_stale`] against an explicit bound.
+fn is_older_than(at: DateTime<Utc>, now: DateTime<Utc>, ttl: Duration) -> bool {
     match now.signed_duration_since(at).to_std() {
-        Ok(age) => age > PREFETCH_TTL,
+        Ok(age) => age > ttl,
         Err(_) => false,
     }
 }
@@ -435,8 +722,13 @@ pub(crate) enum CycleOutcome {
     Idle,
     /// This many `(identity, ticket)` pairs were cached.
     Prefetched(usize),
-    /// The bank failed or timed out. Back off; dispatch degrades to `none`.
+    /// The bank failed or timed out before anything was recalled. Back off;
+    /// dispatch degrades to `none`.
     BankFailure,
+    /// Something was recalled and cached, then a bank failed. Only that bank
+    /// backs off (STUDIO-2169): the service answered this cycle, so the whole
+    /// schedule does not.
+    Partial,
 }
 
 impl CycleOutcome {
@@ -477,18 +769,18 @@ where
         interval_ms = deps.interval.as_millis() as u64,
         "teams memory prefetch task started (off-loop; dispatch never waits on it)"
     );
-    let mut failures: i64 = 0;
+    let mut failures: u32 = 0;
     // Where the next cycle's window starts (see `prefetch_cycle`). Owned by the
     // schedule so a cycle stays a pure function of its inputs plus this one
     // number, which is also what lets a test drive a cycle at a chosen offset.
     let mut cursor: usize = 0;
     loop {
-        // Back off AT LEAST the normal cadence: retrying a down bank sooner than
-        // we would poll a healthy one is the hot loop the design forbids.
+        // Back off LONGER than the normal cadence: the first failed cycle
+        // already waits two cadences (STUDIO-2169). The old 10s-based steps sat
+        // under the 60s cadence for three failures, so a down bank was retried
+        // every cycle while the log said "backing off".
         let delay = if failures > 0 {
-            deps.interval.max(Duration::from_millis(
-                failure_backoff_ms(failures, deps.max_backoff_ms).max(0) as u64,
-            ))
+            backoff_delay(failures, deps.interval, deps.max_backoff_ms)
         } else {
             deps.interval
         };
@@ -501,7 +793,7 @@ where
         }
         let outcome = prefetch_cycle(&ctx, &deps, &mut cursor).await;
         if outcome.is_failure() {
-            failures += 1;
+            failures = failures.saturating_add(1);
             // LOUD, because the symptom otherwise is a team that silently stops
             // remembering: dispatch degrades to exactly what `backend: none`
             // gives, which looks like nothing at all going wrong.
@@ -541,10 +833,12 @@ pub(crate) async fn prefetch_cycle<TF>(
 where
     TF: Fn() -> Option<PrefetchTarget>,
 {
+    deps.cache.begin_cycle();
     let Some(target) = (deps.target)() else {
         return CycleOutcome::Idle;
     };
-    if is_stale(target.fetched_at, (deps.now)()) {
+    let now = (deps.now)();
+    if is_older_than(target.fetched_at, now, CANDIDATES_TTL) {
         return CycleOutcome::Idle;
     }
     // Poll order is first-project-wins. Preserve that for injected publications too.
@@ -559,7 +853,7 @@ where
         // Nothing routes anywhere: clear the cache rather than leaving
         // yesterday's entries to age out. Being absent from the candidate set is
         // meaningful (§0.11.3).
-        deps.cache.replace(Vec::new(), (deps.now)());
+        deps.cache.replace(Vec::new(), now);
         *cursor = 0;
         return CycleOutcome::Idle;
     }
@@ -573,63 +867,149 @@ where
     // The rotating window. `routed` is in candidate order, which is stable
     // across cycles, so advancing the cursor is what makes coverage fair.
     let start = *cursor % routed.len();
-    let calls_per_candidate = 1 + usize::from(deps.teams.memory.team_bank_enabled());
+    let team_bank = deps
+        .teams
+        .memory
+        .team_bank_enabled()
+        .then(|| BankId::Team(deps.teams.memory.team_bank.clone()));
     let mut calls = 0;
-    let mut fresh: Vec<(PrefetchKey, Vec<Fact>, Vec<Fact>)> = Vec::new();
+    let mut fresh: Vec<(PrefetchKey, Entry)> = Vec::new();
     for offset in 0..routed.len() {
         // A shutdown must not have to wait out a whole cycle of remote recalls.
-        if ctx.is_cancelled() || calls + calls_per_candidate > MAX_PER_CYCLE {
+        if ctx.is_cancelled() {
             break;
         }
         let (identity, iss) = &routed[(start + offset) % routed.len()];
-        *cursor = start + offset + 1;
         let key = PrefetchKey::new(identity, &iss.identifier);
-        if !deps.cache.needs_refresh(&key, (deps.now)()) {
+        let stamp = TicketStamp::of(iss);
+        let refresh = deps.cache.needs_refresh(&key, &stamp, now);
+        let own_bank = BankId::Own(identity.clone());
+        let team_ready = team_bank
+            .as_ref()
+            .is_some_and(|b| deps.cache.bank_ready(b, now));
+        // What this candidate would spend, and whether its banks will take it.
+        // A backing-off bank is SKIPPED, not retried (STUDIO-2169): its
+        // candidates keep whatever the cache already holds for them.
+        let cost = match refresh {
+            Refresh::Fresh => None,
+            Refresh::TeamOnly => team_ready.then_some(1),
+            Refresh::Full => deps
+                .cache
+                .bank_ready(&own_bank, now)
+                .then_some(1 + usize::from(team_ready)),
+        };
+        let Some(cost) = cost else {
+            *cursor = start + offset + 1;
             continue;
+        };
+        if calls + cost > MAX_PER_CYCLE {
+            break;
         }
+        *cursor = start + offset + 1;
         // Reserve both calls before starting so a shared recall cannot overspend.
-        calls += calls_per_candidate;
-        let q = recall_query(&deps.teams, iss);
-        match deps.backend.recall(identity, &q).await {
-            Ok(recalled) => {
-                // "A record that could not be read is skipped LOUDLY, never
-                // fatal" — the same contract `local` has, and this is the caller
-                // that owns the log.
-                for (what, why) in &recalled.skipped {
-                    tracing::warn!(
-                        identity = %identity,
-                        item = %what,
-                        reason = %why,
-                        "teams memory prefetch: skipping an unusable bank record"
-                    );
+        calls += cost;
+        let previous = deps.cache.entry(&key);
+        let own = if refresh == Refresh::TeamOnly {
+            // Only the shared half was missing: keep the own facts AND their
+            // timestamp, so a completed team half extends nothing.
+            previous.as_ref().map(|e| (e.facts.clone(), e.at))
+        } else {
+            None
+        };
+        let (facts, at) = match own {
+            Some(kept) => kept,
+            None => {
+                let q = recall_query(&deps.teams, iss);
+                match deps.backend.recall(identity, &q).await {
+                    Ok(recalled) => {
+                        deps.cache.bank_answered(&own_bank);
+                        // "A record that could not be read is skipped LOUDLY, never
+                        // fatal" — the same contract `local` has, and this is the
+                        // caller that owns the log.
+                        for (what, why) in &recalled.skipped {
+                            tracing::warn!(
+                                identity = %identity,
+                                item = %what,
+                                reason = %why,
+                                "teams memory prefetch: skipping an unusable bank record"
+                            );
+                        }
+                        (recalled.facts, now)
+                    }
+                    Err(e) => {
+                        // Stop the cycle rather than walking the rest of the backlog
+                        // into the same failure: whatever broke is almost certainly
+                        // still broken, and burning every candidate against it is
+                        // the hot loop. What was already recalled is still worth
+                        // caching, and this bank sits out its back-off (STUDIO-2169).
+                        let failures = deps.cache.bank_failed(
+                            own_bank,
+                            now,
+                            deps.interval,
+                            deps.max_backoff_ms,
+                        );
+                        tracing::warn!(
+                            identity = %identity,
+                            ticket = %iss.identifier,
+                            error = %e,
+                            consecutive_failures = failures,
+                            "teams memory prefetch: the remote bank failed; keeping what this \
+                             cycle already recalled and backing off"
+                        );
+                        let any = !fresh.is_empty();
+                        deps.cache.sync_entries(fresh, &live, now);
+                        return if any {
+                            CycleOutcome::Partial
+                        } else {
+                            CycleOutcome::BankFailure
+                        };
+                    }
                 }
-                let team = prefetch_team_facts(deps, iss).await;
-                fresh.push((key, recalled.facts, team));
             }
-            Err(e) => {
-                // Stop the cycle rather than walking the rest of the backlog into
-                // the same failure: whatever broke is almost certainly still
-                // broken, and burning every candidate against it is the hot loop.
-                // What was already recalled is still worth caching.
-                tracing::warn!(
-                    identity = %identity,
-                    ticket = %iss.identifier,
-                    error = %e,
-                    "teams memory prefetch: the remote bank failed; keeping what this cycle \
-                     already recalled and backing off"
-                );
-                deps.cache.sync_both(fresh, &live, (deps.now)());
-                return CycleOutcome::BankFailure;
-            }
-        }
+        };
+        let (team, team_complete) = match team_bank.as_ref() {
+            None => (Vec::new(), true),
+            Some(bank) if team_ready => match prefetch_team_facts(deps, iss).await {
+                Some(team) => {
+                    deps.cache.bank_answered(bank);
+                    (team, true)
+                }
+                None => {
+                    deps.cache
+                        .bank_failed(bank.clone(), now, deps.interval, deps.max_backoff_ms);
+                    (carried_team(previous.as_ref(), &stamp), false)
+                }
+            },
+            Some(_) => (carried_team(previous.as_ref(), &stamp), false),
+        };
+        fresh.push((
+            key,
+            Entry {
+                facts,
+                team,
+                at,
+                stamp: Some(stamp),
+                team_complete,
+                dirty: false,
+            },
+        ));
     }
     let n = fresh.len();
-    deps.cache.sync_both(fresh, &live, (deps.now)());
+    deps.cache.sync_entries(fresh, &live, now);
     if n == 0 {
         CycleOutcome::Idle
     } else {
         CycleOutcome::Prefetched(n)
     }
+}
+
+/// The team facts a candidate keeps when its shared recall could not be made:
+/// the previous entry's, if it was recalled for this same ticket, else none.
+fn carried_team(previous: Option<&Entry>, stamp: &TicketStamp) -> Vec<Fact> {
+    previous
+        .filter(|e| e.stamp.as_ref().is_none_or(|s| s == stamp))
+        .map(|e| e.team.clone())
+        .unwrap_or_default()
 }
 
 /// Recalls the SHARED team bank for one candidate (STUDIO-1040), bounded by
@@ -640,10 +1020,10 @@ where
 /// shared bank being down must not cost every candidate its OWN memory too. The
 /// shared recall is the same ticket-scoped query the identity's own is (see
 /// [`team_recall_query`]), so the two are ranked against the same terms.
-async fn prefetch_team_facts<TF>(deps: &PrefetchDeps<TF>, iss: &Issue) -> Vec<Fact> {
+async fn prefetch_team_facts<TF>(deps: &PrefetchDeps<TF>, iss: &Issue) -> Option<Vec<Fact>> {
     let teams = &deps.teams;
     if !teams.memory.team_bank_enabled() {
-        return Vec::new();
+        return Some(Vec::new());
     }
     let bank = teams.memory.team_bank.as_str();
     let q = team_recall_query(teams, iss);
@@ -657,17 +1037,18 @@ async fn prefetch_team_facts<TF>(deps: &PrefetchDeps<TF>, iss: &Issue) -> Vec<Fa
                     "teams memory prefetch: skipping an unusable team-bank record"
                 );
             }
-            recalled.facts
+            Some(recalled.facts)
         }
         Err(e) => {
             tracing::warn!(
                 bank = %bank,
                 ticket = %iss.identifier,
                 error = %e,
-                "teams memory prefetch: the shared team bank failed; caching no team facts for \
-                 this ticket (the identity's own recall is unaffected)"
+                "teams memory prefetch: the shared team bank failed; backing it off and keeping \
+                 this ticket's previous team facts, if any (the identity's own recall is \
+                 unaffected)"
             );
-            Vec::new()
+            None
         }
     }
 }
@@ -755,6 +1136,8 @@ mod tests {
         /// The facts every shared-bank recall answers with (STUDIO-1040).
         team_facts: Vec<Fact>,
         fail: bool,
+        /// Fails only the shared team bank (STUDIO-2169's per-bank back-off).
+        fail_shared: bool,
         asked: Mutex<Vec<(String, String)>>,
         /// `(bank, ticket, top_k)` for each shared-bank recall. The cap is
         /// recorded, not just the target, so a test can pin that the request
@@ -789,7 +1172,7 @@ mod tests {
                 q.ticket.clone(),
                 q.top_k,
             ));
-            if self.fail {
+            if self.fail || self.fail_shared {
                 return Err(MemoryError::Io("the tailnet is down".to_string()));
             }
             Ok(Recalled {
@@ -983,15 +1366,18 @@ mod tests {
             )],
             at(0),
         );
+        let refresh = PREFETCH_REFRESH_AGE.as_secs() as i64;
+        // Published at the refresh boundary so the candidate set is still
+        // current there; the earlier clocks below read it as "from the future",
+        // which the staleness check treats as fresh.
         let mut d = deps(
             cfg,
             bank.clone(),
             tracker(vec![issue("1", "MT-1", &["rust"])]),
             cache.clone(),
-            0,
+            refresh,
         );
         let mut cursor = 0;
-        let refresh = (PREFETCH_TTL / 2).as_secs() as i64;
         for now in [-60, refresh - 1] {
             d.now = Box::new(move || at(now));
             assert_eq!(
@@ -1180,7 +1566,7 @@ mod tests {
                 cache: cache.clone(),
                 interval: PREFETCH_INTERVAL,
                 max_backoff_ms: MAX_PREFETCH_BACKOFF_MS,
-                now: Box::new(|| at(PREFETCH_TTL.as_secs() as i64 + 1)),
+                now: Box::new(|| at(CANDIDATES_TTL.as_secs() as i64 + 1)),
             };
             let mut cursor = 3;
             assert_eq!(
@@ -1522,31 +1908,30 @@ mod tests {
         );
     }
 
-    /// The published set is usable right up to the TTL boundary.
+    /// The published set is usable right up to its TTL boundary.
     #[tokio::test]
     async fn candidates_at_the_ttl_boundary_are_still_recalled() {
         let bank = bank_with(&[("alice", vec![fact("f1", "x")])]);
         let cache = Arc::new(PrefetchCache::new());
-        let ok = deps(
+        let mut boundary = deps(
             teams(true, BackendKind::Hindsight),
             Arc::clone(&bank),
             tracker(vec![issue("1", "MT-1", &["rust"])]),
             Arc::clone(&cache),
             0,
         );
-        prefetch_cycle(&CancelWait::default(), &ok, &mut 0).await;
-
-        let mut boundary = ok;
-        boundary.now = Box::new(|| at(PREFETCH_TTL.as_secs() as i64));
+        boundary.now = Box::new(|| at(CANDIDATES_TTL.as_secs() as i64));
         assert_eq!(
             prefetch_cycle(&CancelWait::default(), &boundary, &mut 0).await,
             CycleOutcome::Prefetched(1)
         );
-        assert_eq!(bank.asked.lock().unwrap().len(), 2);
+        assert_eq!(bank.asked.lock().unwrap().len(), 1);
     }
 
     /// A cycle that fails partway keeps what it already recalled, so one bad
-    /// candidate does not cost the prompt the candidates before it.
+    /// candidate does not cost the prompt the candidates before it. It reports
+    /// `Partial`, not `BankFailure` (STUDIO-2169): the service answered this
+    /// cycle, so only the failing bank backs off, not the whole schedule.
     #[tokio::test]
     async fn a_partial_cycle_keeps_what_it_got() {
         struct FlakyBank {
@@ -1605,7 +1990,7 @@ mod tests {
         };
         assert_eq!(
             prefetch_cycle(&CancelWait::default(), &d, &mut 0).await,
-            CycleOutcome::BankFailure
+            CycleOutcome::Partial
         );
         assert!(cache.try_get("alice", "MT-1", at(1)).is_some());
         assert!(cache.try_get("alice", "MT-2", at(1)).is_none());
@@ -1850,5 +2235,399 @@ mod tests {
                 .is_empty(),
             "and the cached entry carries no team facts"
         );
+    }
+
+    // ── STUDIO-2169: change-driven refresh and a real back-off ─────────────────────────────────
+
+    /// One cycle at `secs` against the production cadence and back-off ceiling.
+    /// The cache (and so every bank's back-off gate) is shared across calls; the
+    /// bank and the published candidates are whatever this cycle sees.
+    async fn cycle_at(
+        cfg: &Teams,
+        bank: &Arc<FakeBank>,
+        issues: Vec<Issue>,
+        cache: &Arc<PrefetchCache>,
+        cursor: &mut usize,
+        secs: i64,
+    ) -> CycleOutcome {
+        let mut d = deps(
+            cfg.clone(),
+            Arc::clone(bank),
+            tracker(issues),
+            Arc::clone(cache),
+            secs,
+        );
+        d.interval = PREFETCH_INTERVAL;
+        d.max_backoff_ms = MAX_PREFETCH_BACKOFF_MS;
+        prefetch_cycle(&CancelWait::default(), &d, cursor).await
+    }
+
+    fn calls(bank: &FakeBank) -> (usize, usize) {
+        (
+            bank.asked.lock().unwrap().len(),
+            bank.asked_shared.lock().unwrap().len(),
+        )
+    }
+
+    fn with_team_bank() -> Teams {
+        let mut cfg = teams(true, BackendKind::Hindsight);
+        cfg.memory.team_bank = "team".into();
+        cfg
+    }
+
+    /// Acceptance: a second poll cycle with unchanged candidates issues no new
+    /// recall — not at the next cycle, and not at six minutes either, which the
+    /// old five-minute refresh re-recalled every candidate at.
+    #[tokio::test]
+    async fn a_second_cycle_with_unchanged_candidates_issues_no_recall() {
+        let cfg = with_team_bank();
+        let bank = bank_with(&[("alice", vec![fact("own", "note")])]);
+        let cache = Arc::new(PrefetchCache::new());
+        let board = || vec![issue("1", "MT-1", &["rust"]), issue("2", "MT-2", &["web"])];
+        let mut cursor = 0;
+        assert_eq!(
+            cycle_at(&cfg, &bank, board(), &cache, &mut cursor, 0).await,
+            CycleOutcome::Prefetched(2)
+        );
+        assert_eq!(calls(&bank), (2, 2));
+        for secs in [60, 6 * 60, 29 * 60] {
+            assert_eq!(
+                cycle_at(&cfg, &bank, board(), &cache, &mut cursor, secs).await,
+                CycleOutcome::Idle,
+                "unchanged at {secs}s"
+            );
+            assert_eq!(calls(&bank), (2, 2), "no new recall at {secs}s");
+            assert!(cache.try_get("alice", "MT-1", at(secs)).is_some());
+        }
+        // The bounded TTL still refreshes an unchanged ticket eventually.
+        let refresh = PREFETCH_REFRESH_AGE.as_secs() as i64;
+        assert_eq!(
+            cycle_at(&cfg, &bank, board(), &cache, &mut cursor, refresh).await,
+            CycleOutcome::Prefetched(2)
+        );
+        assert_eq!(calls(&bank), (4, 4));
+    }
+
+    /// Acceptance: a changed ticket triggers a fresh recall — of that ticket
+    /// only — whether its title, its labels or its state changed.
+    #[tokio::test]
+    async fn a_changed_ticket_triggers_a_fresh_recall() {
+        type Edit = fn(&mut Issue);
+        let edits: [(&str, Edit); 3] = [
+            ("title", |i| i.title = "work on MT-1, rescoped".into()),
+            ("labels", |i| {
+                i.labels = Some(vec!["rust".into(), "bug".into()])
+            }),
+            ("state", |i| i.state = "In Progress".into()),
+        ];
+        for (what, edit) in edits {
+            let cfg = with_team_bank();
+            let bank = bank_with(&[]);
+            let cache = Arc::new(PrefetchCache::new());
+            let board = || vec![issue("1", "MT-1", &["rust"]), issue("2", "MT-2", &["web"])];
+            let mut cursor = 0;
+            cycle_at(&cfg, &bank, board(), &cache, &mut cursor, 0).await;
+            let mut changed = board();
+            edit(&mut changed[0]);
+            assert_eq!(
+                cycle_at(&cfg, &bank, changed, &cache, &mut cursor, 60).await,
+                CycleOutcome::Prefetched(1),
+                "{what} changed"
+            );
+            assert_eq!(calls(&bank), (3, 3), "{what}: one ticket, both banks");
+            assert_eq!(
+                bank.asked.lock().unwrap()[2],
+                ("alice".to_string(), "MT-1".to_string()),
+                "{what}: the changed ticket is the one re-recalled"
+            );
+            assert_eq!(
+                cache.entries.read().unwrap()[&PrefetchKey::new("alice", "MT-1")].at,
+                at(60),
+                "{what}: and its entry is the fresh answer"
+            );
+        }
+    }
+
+    /// Acceptance: a failed recall backs off and is NOT retried on the next
+    /// cycle; it is retried once the back-off (two cadences) has passed.
+    #[tokio::test]
+    async fn a_failed_recall_is_not_retried_on_the_next_cycle() {
+        let cfg = teams(true, BackendKind::Hindsight);
+        let down = Arc::new(FakeBank {
+            fail: true,
+            ..FakeBank::default()
+        });
+        let cache = Arc::new(PrefetchCache::new());
+        let board = || vec![issue("1", "MT-1", &["rust"])];
+        let mut cursor = 0;
+        assert_eq!(
+            cycle_at(&cfg, &down, board(), &cache, &mut cursor, 0).await,
+            CycleOutcome::BankFailure
+        );
+        assert_eq!(calls(&down), (1, 0));
+        // The next cycle — even with the bank back — leaves it alone.
+        let up = bank_with(&[("alice", vec![fact("own", "note")])]);
+        assert_eq!(
+            cycle_at(&cfg, &up, board(), &cache, &mut cursor, 60).await,
+            CycleOutcome::Idle
+        );
+        assert_eq!(calls(&up), (0, 0), "backing off means not asking");
+        assert_eq!(
+            cycle_at(&cfg, &up, board(), &cache, &mut cursor, 120).await,
+            CycleOutcome::Prefetched(1)
+        );
+        assert_eq!(calls(&up), (1, 0));
+        assert!(cache.try_get("alice", "MT-1", at(120)).is_some());
+    }
+
+    /// Consecutive failures double the wait: retried at 2, then 6, then 14
+    /// minutes — never once a cycle.
+    #[tokio::test]
+    async fn consecutive_failures_back_off_exponentially() {
+        let cfg = teams(true, BackendKind::Hindsight);
+        let down = Arc::new(FakeBank {
+            fail: true,
+            ..FakeBank::default()
+        });
+        let cache = Arc::new(PrefetchCache::new());
+        let mut cursor = 0;
+        let mut asked_at = Vec::new();
+        for minute in 0..15 {
+            let before = calls(&down).0;
+            cycle_at(
+                &cfg,
+                &down,
+                vec![issue("1", "MT-1", &["rust"])],
+                &cache,
+                &mut cursor,
+                minute * 60,
+            )
+            .await;
+            if calls(&down).0 > before {
+                asked_at.push(minute);
+            }
+        }
+        assert_eq!(asked_at, vec![0, 2, 6, 14]);
+    }
+
+    /// A team bank that fails backs off on its own: the next cycle asks
+    /// nothing, and after the back-off only the missing team half is recalled —
+    /// the identity's own facts are kept, not re-recalled.
+    #[tokio::test]
+    async fn a_failed_team_recall_backs_off_and_refreshes_only_the_team_half() {
+        let cfg = with_team_bank();
+        let flaky = Arc::new(FakeBank {
+            facts: [("alice".into(), vec![fact("own", "note")])]
+                .into_iter()
+                .collect(),
+            fail_shared: true,
+            ..FakeBank::default()
+        });
+        let cache = Arc::new(PrefetchCache::new());
+        let board = || vec![issue("1", "MT-1", &["rust"]), issue("2", "MT-2", &["rust"])];
+        let mut cursor = 0;
+        assert_eq!(
+            cycle_at(&cfg, &flaky, board(), &cache, &mut cursor, 0).await,
+            CycleOutcome::Prefetched(2)
+        );
+        assert_eq!(
+            calls(&flaky),
+            (2, 1),
+            "the first team failure gates the second candidate's team recall"
+        );
+        assert_eq!(cache.try_get("alice", "MT-1", at(0)).unwrap().len(), 1);
+        let up = Arc::new(FakeBank {
+            team_facts: vec![fact("shared", "team note")],
+            ..FakeBank::default()
+        });
+        assert_eq!(
+            cycle_at(&cfg, &up, board(), &cache, &mut cursor, 60).await,
+            CycleOutcome::Idle
+        );
+        assert_eq!(calls(&up), (0, 0), "the team bank is backing off");
+        assert_eq!(
+            cycle_at(&cfg, &up, board(), &cache, &mut cursor, 120).await,
+            CycleOutcome::Prefetched(2)
+        );
+        assert_eq!(calls(&up), (0, 2), "only the team half is recalled");
+        assert_eq!(
+            cache.try_get("alice", "MT-1", at(120)).unwrap()[0].id,
+            "own",
+            "the own facts are kept"
+        );
+        assert_eq!(
+            cache.try_get_team("alice", "MT-1", at(120)).unwrap()[0].id,
+            "shared"
+        );
+        assert_eq!(
+            cache.entries.read().unwrap()[&PrefetchKey::new("alice", "MT-1")].at,
+            at(0),
+            "completing the team half extends nothing"
+        );
+    }
+
+    #[test]
+    fn backoff_starts_at_two_cadences_and_is_capped() {
+        let min = Duration::from_secs(60);
+        let cap = MAX_PREFETCH_BACKOFF_MS;
+        let secs = |n| backoff_delay(n, min, cap).as_secs();
+        assert_eq!(
+            (1..=6).map(secs).collect::<Vec<_>>(),
+            vec![120, 240, 480, 900, 900, 900]
+        );
+        assert_eq!(secs(u32::MAX), 900, "no overflow");
+        assert_eq!(
+            backoff_delay(1, min, 0),
+            min,
+            "a ceiling under the cadence never makes it retry faster"
+        );
+    }
+
+    /// A write through `TeamsMemory` makes the next cycle re-recall the bank it
+    /// wrote to, while the entry keeps serving until then.
+    #[tokio::test]
+    async fn a_write_marks_its_bank_for_the_next_cycle() {
+        let cfg = with_team_bank();
+        let bank = bank_with(&[]);
+        let cache = Arc::new(PrefetchCache::new());
+        let board = || vec![issue("1", "MT-1", &["rust"]), issue("2", "MT-2", &["web"])];
+        let mut cursor = 0;
+        cycle_at(&cfg, &bank, board(), &cache, &mut cursor, 0).await;
+        cache.note_written(Some("alice"));
+        assert!(
+            cache.try_get("alice", "MT-1", at(30)).is_some(),
+            "still served"
+        );
+        assert_eq!(
+            cycle_at(&cfg, &bank, board(), &cache, &mut cursor, 60).await,
+            CycleOutcome::Prefetched(1),
+            "only alice's entry"
+        );
+        cache.note_written(None);
+        assert_eq!(
+            cycle_at(&cfg, &bank, board(), &cache, &mut cursor, 120).await,
+            CycleOutcome::Prefetched(2),
+            "a team-bank write touches every entry"
+        );
+    }
+
+    /// An invalidation takes the record out of the cache at once, not after
+    /// the (now longer) refresh age.
+    #[test]
+    fn an_invalidation_drops_the_record_at_once() {
+        let cache = PrefetchCache::new();
+        let alice = PrefetchKey::new("alice", "MT-1");
+        let bob = PrefetchKey::new("bob", "MT-2");
+        cache.replace_both(
+            vec![
+                (
+                    alice.clone(),
+                    vec![fact("a1", "x"), fact("a2", "y")],
+                    vec![fact("t1", "z")],
+                ),
+                (
+                    bob.clone(),
+                    vec![fact("a1", "same id, bob's bank")],
+                    vec![fact("t1", "z")],
+                ),
+            ],
+            at(0),
+        );
+        cache.note_invalidated(Some("alice"), "a1");
+        let own = cache.try_get("alice", "MT-1", at(1)).unwrap();
+        assert_eq!(
+            own.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            ["a2"]
+        );
+        assert_eq!(
+            cache.try_get("bob", "MT-2", at(1)).unwrap().len(),
+            1,
+            "another bank"
+        );
+        cache.note_invalidated(None, "t1");
+        assert!(
+            cache
+                .try_get_team("alice", "MT-1", at(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(cache.try_get_team("bob", "MT-2", at(1)).unwrap().is_empty());
+        let guard = cache.entries.read().unwrap();
+        assert!(
+            guard[&alice].dirty && guard[&bob].dirty,
+            "and both are re-recalled"
+        );
+    }
+
+    /// A write that lands while a cycle's recall is in flight is not lost to
+    /// the cycle's swap: the recall may predate it, so the entry it installs
+    /// is re-recalled next cycle, and an invalidated record stays out.
+    #[tokio::test]
+    async fn a_write_during_a_cycle_survives_its_swap() {
+        /// Answers with `facts`, and while "in flight" sees `TeamsMemory`
+        /// invalidate one of them — exactly the interleaving a swap could undo.
+        struct WriteMidRecall {
+            cache: Arc<PrefetchCache>,
+            asked: Mutex<usize>,
+        }
+        #[async_trait]
+        impl MemoryBackend for WriteMidRecall {
+            async fn retain(&self, _rec: &Record) -> Result<String, MemoryError> {
+                Ok(String::new())
+            }
+            async fn recall(&self, _identity: &str, _q: &Query) -> Result<Recalled, MemoryError> {
+                *self.asked.lock().unwrap() += 1;
+                self.cache.note_invalidated(Some("alice"), "wrong");
+                Ok(Recalled {
+                    facts: vec![
+                        fact("wrong", "corrected since"),
+                        fact("right", "still true"),
+                    ],
+                    skipped: Vec::new(),
+                })
+            }
+            async fn invalidate(
+                &self,
+                _identity: &str,
+                _fact_id: &str,
+                _reason: &str,
+            ) -> Result<bool, MemoryError> {
+                Ok(false)
+            }
+            async fn revalidate(
+                &self,
+                _identity: &str,
+                _fact_id: &str,
+            ) -> Result<bool, MemoryError> {
+                Ok(false)
+            }
+        }
+        let cache = Arc::new(PrefetchCache::new());
+        let bank = Arc::new(WriteMidRecall {
+            cache: Arc::clone(&cache),
+            asked: Mutex::new(0),
+        });
+        let mut d = deps(
+            teams(true, BackendKind::Hindsight),
+            bank_with(&[]),
+            tracker(vec![issue("1", "MT-1", &["rust"])]),
+            Arc::clone(&cache),
+            0,
+        );
+        d.backend = Arc::clone(&bank) as Arc<dyn MemoryBackend>;
+        let mut cursor = 0;
+        prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await;
+        let own = cache.try_get("alice", "MT-1", at(0)).unwrap();
+        assert_eq!(
+            own.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            ["right"]
+        );
+        assert!(
+            cache.entries.read().unwrap()[&PrefetchKey::new("alice", "MT-1")].dirty,
+            "the answer may predate the write, so it is re-recalled"
+        );
+        d.now = Box::new(|| at(60));
+        prefetch_cycle(&CancelWait::default(), &d, &mut cursor).await;
+        assert_eq!(*bank.asked.lock().unwrap(), 2);
     }
 }

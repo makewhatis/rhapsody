@@ -332,6 +332,10 @@ pub struct TeamsMemory {
     /// The third control-side write of the same shape as `runs`: published by the control task at
     /// the end of a selection pass, read by the HTTP task. Never held across an `.await`.
     held: RwLock<HashMap<String, i64>>,
+    /// The prefetch cache dispatch reads (STUDIO-2169), told about every write
+    /// made through here so a correction is never served from a stale recall.
+    /// `None` when no prefetch task runs (every backend but `hindsight`).
+    prefetch: Option<Arc<crate::teamsprefetch::PrefetchCache>>,
 }
 
 impl TeamsMemory {
@@ -378,6 +382,7 @@ impl TeamsMemory {
             runs: RwLock::new(HashMap::new()),
             room: None,
             held: RwLock::new(HashMap::new()),
+            prefetch: None,
         }
     }
 
@@ -387,6 +392,22 @@ impl TeamsMemory {
     pub fn with_room(mut self, room: Arc<dyn RoomLog>) -> Self {
         self.room = Some(room);
         self
+    }
+
+    /// Attaches the prefetch cache (STUDIO-2169). The cache re-recalls only
+    /// changed tickets, so it must hear about this daemon's own writes: a
+    /// retain or reinstate marks the written bank's entries for the next
+    /// cycle, and an invalidation drops the record from the cache at once.
+    pub fn with_prefetch_cache(mut self, cache: Arc<crate::teamsprefetch::PrefetchCache>) -> Self {
+        self.prefetch = Some(cache);
+        self
+    }
+
+    /// Tells the prefetch cache a bank was written; `None` is the team bank.
+    fn note_written(&self, identity: Option<&str>) {
+        if let Some(cache) = &self.prefetch {
+            cache.note_written(identity);
+        }
     }
 
     /// `GET /api/v1/teams/room` — the newest posts in the room, bounded (STUDIO-650, T5).
@@ -924,6 +945,9 @@ impl TeamsMemory {
             return Err(TeamsMemoryError::Invalid("reason is required".to_string()));
         }
         let invalidated = self.backend.invalidate(identity, fact_id, reason).await?;
+        if let Some(cache) = &self.prefetch {
+            cache.note_invalidated(Some(identity), fact_id);
+        }
         Ok(InvalidateView {
             identity: identity.to_string(),
             fact_id: fact_id.to_string(),
@@ -956,6 +980,7 @@ impl TeamsMemory {
             ));
         }
         let reinstated = self.backend.revalidate(identity, fact_id).await?;
+        self.note_written(Some(identity));
         Ok(ReinstateView {
             identity: identity.to_string(),
             fact_id: fact_id.to_string(),
@@ -985,6 +1010,9 @@ impl TeamsMemory {
             .backend
             .invalidate_shared(bank, fact_id, reason)
             .await?;
+        if let Some(cache) = &self.prefetch {
+            cache.note_invalidated(None, fact_id);
+        }
         Ok(InvalidateView {
             identity: bank.to_string(),
             fact_id: fact_id.to_string(),
@@ -1005,6 +1033,7 @@ impl TeamsMemory {
             return Err(TeamsMemoryError::Invalid("fact_id is required".to_string()));
         }
         let reinstated = self.backend.revalidate_shared(bank, fact_id).await?;
+        self.note_written(None);
         Ok(ReinstateView {
             identity: bank.to_string(),
             fact_id: fact_id.to_string(),
@@ -1082,6 +1111,10 @@ impl TeamsMemory {
             Some(bank) => self.backend.retain_shared(bank, &rec).await?,
             None => self.backend.retain(&rec).await?,
         };
+        self.note_written(match shared_bank {
+            Some(_) => None,
+            None => Some(rec.identity.as_str()),
+        });
         Ok(RetainView {
             id,
             identity: rec.identity,
@@ -2001,5 +2034,82 @@ mod tests {
             Err(TeamsMemoryError::Invalid(_))
         ));
         assert_eq!(mem.team_bank(), "");
+    }
+
+    /// STUDIO-2169: the prefetch cache re-recalls only changed tickets, so it
+    /// must hear about this daemon's own writes. A retain marks the bank it
+    /// wrote for re-recall; an invalidation takes the record out at once.
+    #[tokio::test]
+    async fn writes_through_teams_memory_reach_the_prefetch_cache() {
+        use crate::teamsprefetch::{PrefetchCache, PrefetchKey};
+        use rhapsody_config::memory::Fact;
+        let dir = TempDir::new();
+        let mut teams = Teams {
+            enabled: true,
+            roster: vec![ident("alice"), ident("bob")],
+            ..Teams::disabled()
+        };
+        teams.memory.team_bank = "team".to_string();
+        let cache = Arc::new(PrefetchCache::new());
+        let mem = local(&dir, Arc::new(teams)).with_prefetch_cache(Arc::clone(&cache));
+        mem.bind_run(7, bound("alice", "MT-1"));
+        let id = mem
+            .retain_for_run(7, "MT-1 needs a follow-up", now())
+            .await
+            .expect("retain")
+            .id;
+        let fact = |id: &str| Fact {
+            id: id.to_string(),
+            ..Fact::default()
+        };
+        let fill = || {
+            cache.replace_both(
+                vec![
+                    (
+                        PrefetchKey::new("alice", "MT-1"),
+                        vec![fact(&id), fact("other")],
+                        vec![fact("t1")],
+                    ),
+                    (PrefetchKey::new("bob", "MT-2"), vec![], vec![fact("t1")]),
+                ],
+                now(),
+            )
+        };
+
+        fill();
+        mem.retain_for_run(7, "and another", now())
+            .await
+            .expect("retain");
+        assert!(cache.is_dirty("alice", "MT-1"), "alice's bank was written");
+        assert!(!cache.is_dirty("bob", "MT-2"), "bob's was not");
+
+        fill();
+        mem.retain_for_run_scoped(7, "for everyone", true, now())
+            .await
+            .expect("shared retain");
+        assert!(
+            cache.is_dirty("alice", "MT-1") && cache.is_dirty("bob", "MT-2"),
+            "the team bank is every entry's"
+        );
+
+        fill();
+        mem.invalidate("alice", &id, "shipped")
+            .await
+            .expect("invalidate");
+        let own = cache.try_get("alice", "MT-1", now()).expect("still served");
+        assert_eq!(
+            own.len(),
+            1,
+            "the invalidated record left the cache at once"
+        );
+        assert_eq!(own[0].id, "other");
+
+        fill();
+        mem.reinstate("alice", &id).await.expect("reinstate");
+        assert!(
+            cache.is_dirty("alice", "MT-1"),
+            "a reinstate is re-recalled"
+        );
+        assert!(!cache.is_dirty("bob", "MT-2"));
     }
 }
