@@ -2548,6 +2548,11 @@ fn install_teams_memory(
     if let Some(room) = room {
         mem = mem.with_room(Arc::clone(room) as Arc<dyn rhapsody_config::room::RoomLog>);
     }
+    // STUDIO-2169: the cache re-recalls only changed tickets, so it hears about every write made
+    // through the daemon's own memory surface (retain, invalidate, reinstate).
+    if let Some(w) = &wiring {
+        mem = mem.with_prefetch_cache(Arc::clone(&w.cache));
+    }
     o.teams_memory = Some(Arc::new(mem));
     wiring
 }
