@@ -800,6 +800,9 @@ pub struct Orchestrator {
     /// — the state that makes the poke once per head consecutively and the escalation once ever,
     /// rather than once per tick.
     pub(crate) draft_pokes: HashMap<String, crate::draftpoke::DraftPokeState>,
+    /// Open drafts from the watcher's latest observations, for the local-only held-PR report.
+    /// Independent of poke state: a human-held draft must never spend that budget.
+    pub(crate) review_observed_drafts: HashSet<crate::prstate::PrCoord>,
     /// The round each watched pull request was DEFERRED behind a live author run (STUDIO-1025),
     /// keyed by coordinate, holding the run's identifier and the head the branch stood at when the
     /// deferral was recorded. Written and read only by the watcher's loop-side handler, and dropped
@@ -1389,6 +1392,7 @@ impl Orchestrator {
             conflict_routed: HashMap::new(),
             ci_routed: HashMap::new(),
             draft_pokes: HashMap::new(),
+            review_observed_drafts: HashSet::new(),
             review_deferred_by_author: HashMap::new(),
             review_unassignable: HashMap::new(),
             review_capacity_held: crate::reviewwatch::CapacityHolds::new(),

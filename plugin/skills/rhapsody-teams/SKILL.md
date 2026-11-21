@@ -83,9 +83,10 @@ start.** A pull request whose **origin ticket** currently wears `rhapsody:human`
 held for a human; not merging` on every tick. That is the second of a pull request's **two
 independent merge locks** — the first being the draft state — and it is why an operator gating a
 high-blast-radius pull request sets **both**: the draft withholds it from auto-merge, and the label
-refuses every dispatch that could re-engage the author, including the **draft-poke summons** (a
-still-draft pull request whose author has stopped is poked with a comment that summons that run; the
-poke comment is still posted, but the reopen ladder refuses to start a run for a held ticket). The
+refuses every dispatch that could re-engage the author. A held draft is intentionally parked:
+the daemon posts **no draft-poke comment**, starts no draft-exhaustion manager turn and sends no
+draft escalation. Reconciliation reports it as *held for a human*. Removing the label restarts the
+draft-poke budget at zero, so the next observed draft gets its first poke and a full grace window. The
 lock bites only for a pull request that traces back to an **origin ticket** — the daemon's own join
 from `introduced_by` — so one with no origin ticket has only the draft lock. Remove the label to
 release both the dispatch and the merge.

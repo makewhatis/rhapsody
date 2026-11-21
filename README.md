@@ -3991,9 +3991,17 @@ that comment (and, once, the escalation's room post); there is no un-draft seam 
 pull request over, from the adoption sweep finding a parked one, or from a console merge introducing
 one; only the first two carry an origin ticket, and the poke's summons reopens a TICKET's run, so a
 console-introduced row is never poked even if it is a draft. So an observed draft this feature acts
-on is by construction one whose author's run has stopped. The one remaining guard is a LIVE author
+on is by construction one whose author's run has stopped. One guard is a LIVE author
 run: a draft is entirely normal mid-run, so a pull request whose author is running right now (the
 re-engaged run a review's findings reopened) is never poked.
+
+**A draft whose origin ticket wears `rhapsody:human` is intentionally parked (STUDIO-2207).**
+The watcher posts no draft poke and queues no draft-exhaustion lead turn or escalation. The hold
+clears the in-memory poke budget, so removing the label starts again with the first poke and a full
+grace window. Until a complete board read primes the human-hold ledger, poking waits rather than
+assuming the origin is unheld. Reconciliation reports an observed labelled draft as *held for a
+human*, including without adjudication, auto-merge or completed approvals. PRs without an origin
+ticket keep their existing behaviour.
 
 **The poking is bounded on two axes, because the incident shape is a static head.** An author who
 keeps pushing but never publishes is bounded by `MAX_DRAFT_POKES` pokes — an attempt counter, not a
@@ -4014,7 +4022,7 @@ second escalation, once per restart for as long as the draft stands. The escalat
 second edge in the other direction: it is set when the escalation is PLANNED, before either write is
 attempted, so an escalation whose room post and pull-request comment both failed still silences the
 pull request while telling nobody — the WARN reads "the escalation reached no surface — no human was
-told", and only three things clear the latch and re-arm the poke: a daemon restart, a human
+told", and the latch is cleared by a human-label hold (above), a daemon restart, a human
 publishing it by hand, or the pull request leaving the watch set (`retire_review_pr` drops the
 ledger, and it is reached on `gone` and on an untrusted head repository as well as on merged or
 closed, neither of the first two being a publication). Persisting the ladder is a larger decision
