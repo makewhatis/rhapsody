@@ -187,6 +187,9 @@ impl Store for Noop {
     fn retire_resolved_lead_missing_pr(&self, _item: i64) -> Result<bool, StoreError> {
         Ok(false)
     }
+    fn retire_lead_draft_exhaustion(&self, _subject: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
     fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
         Ok(Vec::new())
     }

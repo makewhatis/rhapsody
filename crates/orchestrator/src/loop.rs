@@ -1238,10 +1238,39 @@ impl Orchestrator {
                 ticket,
                 reply,
             } => {
+                // Breaker judgments deliberately carry their own human label. Only a watched
+                // draft makes that label an intentional pause of lead work (STUDIO-2207).
+                let held_draft = if self
+                    .human_holds
+                    .labelled_and_primed()
+                    .0
+                    .contains(&ticket.to_ascii_lowercase())
+                {
+                    match self.store().load_live_review_watch() {
+                        Ok(rows) => rows.iter().any(|row| {
+                            crate::reviewdone::origin_ticket(&row.introduced_by)
+                                .is_some_and(|origin| origin.eq_ignore_ascii_case(&ticket))
+                                && self.review_observed_drafts.contains(
+                                    &crate::prstate::PrCoord::new(
+                                        &row.key.owner,
+                                        &row.key.repo,
+                                        row.key.number,
+                                    ),
+                                )
+                        }),
+                        Err(error) => {
+                            tracing::warn!(%ticket, %error, "lead draft admission unreadable; deferring");
+                            true
+                        }
+                    }
+                } else {
+                    false
+                };
                 let allowed = self.lead_enabled()
                     && self.review_route(&repo).is_some()
                     && (ticket.is_empty()
                         || (!self.ticket_run_live(&ticket)
+                            && !held_draft
                             && !self.subject_parked(&ticket, "lead")));
                 let _ = reply.send(allowed);
             }

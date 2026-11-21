@@ -1633,6 +1633,13 @@ impl Orchestrator {
         // local read, so it is recorded here from the answer itself.
         for obs in observed {
             self.review_watch_unreadable.remove(&obs.pr);
+            if matches!(&obs.lookup, PrLookup::Found(snap)
+                if snap.status == PrStatus::Open && snap.draft_observed())
+            {
+                self.review_observed_drafts.insert(obs.pr.clone());
+            } else {
+                self.review_observed_drafts.remove(&obs.pr);
+            }
             // STUDIO-1005 (review round 1): the observed-head memo is written from the answer itself,
             // "answered ⇒ memo reflects the answer". STUDIO-988 extends the recorded value with the
             // open flag so a REVIEW preparation completion can be revalidated against the last
@@ -2015,6 +2022,22 @@ impl Orchestrator {
         else {
             return;
         };
+        let (held, primed) = self.human_holds.labelled_and_primed();
+        if mine.iter().any(|row| {
+            crate::reviewdone::origin_ticket(&row.introduced_by)
+                .is_some_and(|ticket| held.contains(&ticket.to_ascii_lowercase()))
+        }) {
+            // An intentional park is not an unanswered poke. Releasing it starts at poke zero,
+            // including when the operator applied the label after poking had already begun.
+            self.draft_pokes.remove(&churn_key(pr));
+            if let Err(error) = self.store().retire_lead_draft_exhaustion(&pr.to_string()) {
+                tracing::warn!(%error, %pr, "held draft lead work could not be retired");
+            }
+            return;
+        }
+        if !primed {
+            return; // no complete board read has established whether the origin is held
+        }
         if self.ticket_run_live(identifier) {
             // The author is working on it; a draft is entirely normal there. Re-anchor the
             // unanswered window so a long re-engaged run does not spend the grace: the window is
@@ -2990,6 +3013,7 @@ impl Orchestrator {
         // And the draft-poke bookkeeping (STUDIO-962): a re-introduced pull request must be poked
         // afresh, and an entry for a gone one would be a map that only ever grows.
         self.draft_pokes.remove(&churn_key(pr));
+        self.review_observed_drafts.remove(pr);
         // And the author-deferral record (STUDIO-1025), for the same reason: a pull request that
         // left the watch set owes no round for anyone to arm, and an entry keyed by coordinate would
         // outlive the pull request it names.
@@ -8098,6 +8122,72 @@ mod tests {
         assert_eq!(
             poke_state(&o, 12).map(|s| (s.poked_head, s.pokes)),
             Some((HEAD_A.to_string(), 1))
+        );
+    }
+
+    #[test]
+    fn a_human_held_draft_stays_quiet_and_restarts_pokes_when_released() {
+        for lead in [false, true] {
+            for already_poked in [false, true] {
+                let mut teams = ticketless(&["alice", "bob"]);
+                teams.manager.lead.enabled = lead;
+                let (mut o, dispatched) = orch(teams);
+                introduce(&o, row(12, "bob"));
+                let base = draft_clock();
+                if already_poked {
+                    assert_eq!(
+                        poked_heads(&sweep_at(&mut o, base, &[draft_at(12, HEAD_A)])),
+                        vec![HEAD_A.to_string()]
+                    );
+                }
+                dispatched.lock().expect("dispatches").clear();
+                o.human_holds.note_human_label("studio-721");
+                for tick in 1..=crate::draftpoke::MAX_DRAFT_POKES + 2 {
+                    let at = base + crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED * tick as i32;
+                    let head = if tick % 2 == 0 { HEAD_A } else { HEAD_B };
+                    let report = sweep_at(&mut o, at, &[draft_at(12, head)]);
+                    assert!(report.nudges.is_empty(), "{report:?}");
+                    assert!(o.store().load_lead_items().expect("items").is_empty());
+                    assert!(poke_state(&o, 12).is_none(), "a hold resets the budget");
+                }
+                assert!(dispatched.lock().expect("dispatches").is_empty());
+                o.reconcile_review_divergence();
+                let held = o.review_divergences();
+                assert_eq!(held.len(), 1, "{held:?}");
+                assert_eq!(
+                    held[0].kind,
+                    crate::reviewreconcile::DivergenceKind::HeldForHuman
+                );
+                assert_eq!(held[0].ticket, "STUDIO-721");
+
+                o.human_holds.begin_pass(true); // the next complete poll removed the label
+                let released = sweep_at(
+                    &mut o,
+                    base + chrono::Duration::days(1),
+                    &[draft_at(12, HEAD_A)],
+                );
+                assert!(
+                    matches!(
+                        released.nudges.as_slice(),
+                        [crate::draftpoke::DraftNudge::Poke(p)] if p.pokes == 0
+                    ),
+                    "{released:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_unprimed_hold_ledger_does_not_poke_a_draft() {
+        let (mut o, _) = orch_before_first_pass(ticketless(&["alice", "bob"]));
+        introduce(&o, row(12, "bob"));
+        let report = o.handle_review_sweep(&[draft_at(12, HEAD_A)]);
+        assert!(report.nudges.is_empty(), "{report:?}");
+        assert!(poke_state(&o, 12).is_none());
+        o.human_holds.begin_pass(true);
+        assert_eq!(
+            poked_heads(&o.handle_review_sweep(&[draft_at(12, HEAD_A)])),
+            vec![HEAD_A.to_string()]
         );
     }
 

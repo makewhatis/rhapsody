@@ -354,8 +354,8 @@ impl DivergenceKind {
                 "every required reviewer approved and the pull request is still open"
             }
             DivergenceKind::HeldForHuman => {
-                "every required reviewer approved and the pull request is still open, but its origin \
-                 ticket is held for a human — the daemon will not merge it"
+                "the pull request is still open and its origin ticket is held for a human — the \
+                 daemon will not advance it"
             }
             DivergenceKind::RoundBudgetExhausted => {
                 "the per-pull-request review round budget is spent, so no further review round \
@@ -585,6 +585,8 @@ struct HeldPrFacts {
     live_rows: usize,
     /// Of those, the ones NOT approved. Zero means every live reviewer approved the head.
     unapproved: usize,
+    /// A labelled origin deliberately parking an observed open draft (STUDIO-2207).
+    held_draft: bool,
 }
 
 /// Everything known about ONE pull request this sweep. Grouped per pull request rather than per row
@@ -1058,8 +1060,10 @@ impl Orchestrator {
                         auto_merge,
                         live_rows: 0,
                         unapproved: 0,
+                        held_draft: false,
                     }
                 });
+                entry.held_draft |= labelled_hold && self.review_observed_drafts.contains(&pr);
                 // Only rows that still exist and have not been dropped can hold a merge back, so
                 // only they decide whether this is the merge-gate shape.
                 if row.open && row.status != REVIEW_STATUS_DROPPED {
@@ -1455,14 +1459,14 @@ impl Orchestrator {
         // auto-merge on is the one shape the held-row filter above must NOT silence. The daemon
         // would have merged it but for the `rhapsody:human` hold, so the operator must be told the
         // wait is deliberate. Reported under its own kind so it is never routed to the manager and
-        // never pages a second time. Gated on adjudication being enabled, so an install that never
-        // set `review.adjudicate_after_rounds` keeps exactly its previous behaviour (acceptance).
-        // The SAME `adjudicating` the held-row diversion above reads, so a row is only ever diverted
-        // when this report can replace what the diversion removed (STUDIO-1511 B1).
-        if adjudicating {
-            found.extend(held_order.iter().filter_map(|pr| {
-                let held = held_by_pr.get(pr)?;
-                (held.auto_merge && held.live_rows > 0 && held.unapproved == 0).then(|| {
+        // never pages a second time. Approved merge waits retain the adjudication gate; a labelled
+        // draft is always reported as intentionally held, regardless of approvals or auto-merge
+        // (STUDIO-2207). It must not look like an abandoned draft on installs without adjudication.
+        found.extend(held_order.iter().filter_map(|pr| {
+            let held = held_by_pr.get(pr)?;
+            (held.held_draft
+                || (adjudicating && held.auto_merge && held.live_rows > 0 && held.unapproved == 0))
+                .then(|| {
                     Divergence {
                         pr: pr.to_string(),
                         kind: DivergenceKind::HeldForHuman,
@@ -1482,8 +1486,7 @@ impl Orchestrator {
                         reason: String::new(),
                     }
                 })
-            }));
-        }
+        }));
         // STUDIO-1015: when the manager acts, the stall signals it owns go to the manager INSTEAD
         // OF the human feed — but only once the manager has ADOPTED them. A stall whose launch a
         // §10.2 gate defers, or whose manager is unavailable, must not be swallowed: it stays on the

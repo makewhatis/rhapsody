@@ -307,6 +307,11 @@ pub trait Store {
     fn retire_resolved_lead_missing_pr(&self, _item: i64) -> Result<bool, StoreError> {
         Ok(false)
     }
+    /// Cancel pending draft exhaustion on a human hold, preserving history and freeing its dedupe
+    /// key so a fresh poke ladder can later enqueue a new incident.
+    fn retire_lead_draft_exhaustion(&self, _subject: &str) -> Result<(), StoreError> {
+        Ok(())
+    }
     /// Durable lead queue, oldest first, including parked/completed items.
     fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
         Ok(Vec::new())
