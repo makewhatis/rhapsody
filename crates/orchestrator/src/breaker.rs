@@ -2323,8 +2323,8 @@ mod tests {
         assert_eq!(store.load_lead_items().expect("items"), items);
     }
 
-    #[test]
-    fn lead_breaker_queues_all_crossed_kinds_without_a_notification_task() {
+    #[tokio::test]
+    async fn lead_breaker_queues_all_crossed_kinds_without_a_notification_task() {
         let store = store();
         seed_watch(&store, "STUDIO-1123");
         for _ in 0..5 {
@@ -2344,6 +2344,24 @@ mod tests {
                 pr: "makewhatis/rhapsody#12".into(),
                 kinds: vec!["review rounds".into(), "per-ticket spend".into()],
             }
+        );
+        assert!(!o.subject_parked("STUDIO-1123", "lead"));
+        assert!(
+            o.human_holds
+                .labelled_and_primed()
+                .0
+                .contains("studio-1123")
+        );
+        let (reply, received) = tokio::sync::oneshot::channel();
+        o.drive_event(crate::Event::LeadAllowed {
+            repo: "https://github.com/makewhatis/rhapsody".into(),
+            ticket: "STUDIO-1123".into(),
+            reply,
+        })
+        .await;
+        assert!(
+            received.await.unwrap(),
+            "a breaker judgment must be admitted while its own human hold is active"
         );
     }
 
