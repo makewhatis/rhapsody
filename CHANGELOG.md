@@ -11,6 +11,43 @@
   next run's first prompt across restart; require exact host notification provenance so an author's
   own reply cannot bypass the STUDIO-1045 run-window guard (STUDIO-1835).
 
+## [0.3.9](https://github.com/makewhatis/rhapsody/compare/v0.3.8...v0.3.9) (2026-11-21)
+
+
+### Features
+
+* **github:** scope credentials by repository owner (STUDIO-1804) ([#393](https://github.com/makewhatis/rhapsody/issues/393)) ([5597cdf](https://github.com/makewhatis/rhapsody/commit/5597cdfc149e026ffe272449699bba2aed9765f4))
+* **orchestrator:** apply teams.yaml routing live and add Settings Models (STUDIO-1976) ([#400](https://github.com/makewhatis/rhapsody/issues/400)) ([c3a253d](https://github.com/makewhatis/rhapsody/commit/c3a253d2ccf1d3369ec07d33e2983f62231405e1))
+* **orchestrator:** daemon-owned per-run scratch dirs with a janitor and disk guard (STUDIO-1993) ([#401](https://github.com/makewhatis/rhapsody/issues/401)) ([8b0b902](https://github.com/makewhatis/rhapsody/commit/8b0b9025666de42d08ac8b69e2c2ea258d0fda7e))
+* **orchestrator:** first-class 1Password service-account credentials for agent runs (STUDIO-1584) ([#385](https://github.com/makewhatis/rhapsody/issues/385)) ([2b8cba4](https://github.com/makewhatis/rhapsody/commit/2b8cba43453b6c5063502ef5c7527fcfcc2967e8))
+* **orchestrator:** widen per-repository landing lines (STUDIO-2140) ([#410](https://github.com/makewhatis/rhapsody/issues/410)) ([c63fcdb](https://github.com/makewhatis/rhapsody/commit/c63fcdb0ae747cd36ba674b4a445b08ae81e7730))
+
+
+### Bug Fixes
+
+* **agent:** relaunch the opencode executor when its reserved port is taken (STUDIO-1913) ([#398](https://github.com/makewhatis/rhapsody/issues/398)) ([8727a21](https://github.com/makewhatis/rhapsody/commit/8727a217ef6d3079933264d04426c18d41fdf6b1))
+* **orchestrator:** adopt a ticket whose only watch rows are for a closed pull request (STUDIO-1912) ([#397](https://github.com/makewhatis/rhapsody/issues/397)) ([eed7735](https://github.com/makewhatis/rhapsody/commit/eed77352393f0c8506aca88b73aac64ad5f5a767))
+* **orchestrator:** adopt a ticket's second pull request on a suffixed branch (STUDIO-1839) ([#395](https://github.com/makewhatis/rhapsody/issues/395)) ([4d43bdb](https://github.com/makewhatis/rhapsody/commit/4d43bdbdc8742a5b469fffbcdb0c4a2781af188f))
+* **orchestrator:** cut redundant Teams memory prefetch recalls (STUDIO-2169) ([#412](https://github.com/makewhatis/rhapsody/issues/412)) ([218d8a0](https://github.com/makewhatis/rhapsody/commit/218d8a0768407c8a55ba180253816aacf5fee559))
+* **orchestrator:** discover cross-repo companion pull requests (STUDIO-1691) ([#388](https://github.com/makewhatis/rhapsody/issues/388)) ([edd0716](https://github.com/makewhatis/rhapsody/commit/edd07162da26443093dcefe79c2efeeda33937da))
+* **orchestrator:** honor explicit handoffs and release false blockers (STUDIO-2085) ([#405](https://github.com/makewhatis/rhapsody/issues/405)) ([9b3d647](https://github.com/makewhatis/rhapsody/commit/9b3d64720a93c3c43ad69093ed0bd4d61dfef3dc))
+* **orchestrator:** persist unrelated CI reruns and expose flakes (STUDIO-2136) ([#408](https://github.com/makewhatis/rhapsody/issues/408)) ([24891df](https://github.com/makewhatis/rhapsody/commit/24891df7374b95bacfc50f5a53f5e6a18dd0e3b6))
+* **orchestrator:** prove a no-op rebase from the local mirror, not the compare API (STUDIO-1672) ([#389](https://github.com/makewhatis/rhapsody/issues/389)) ([23846fe](https://github.com/makewhatis/rhapsody/commit/23846fec7371ec9805ae91c77261c02176540b17))
+* **orchestrator:** put a declared HANDOFF's pull request in the review watch set at run exit (STUDIO-1915) ([#399](https://github.com/makewhatis/rhapsody/issues/399)) ([6519f8f](https://github.com/makewhatis/rhapsody/commit/6519f8fa223560ed0d8d9f7cc6bf839b40bb87bb))
+* **orchestrator:** re-dispatch unread mid-run summonses (STUDIO-1835) ([#394](https://github.com/makewhatis/rhapsody/issues/394)) ([1274758](https://github.com/makewhatis/rhapsody/commit/12747584a1c5ce73f304392293652e740f1109bc))
+* **orchestrator:** recover bounded lead memory recalls and expose health (STUDIO-2012) ([#404](https://github.com/makewhatis/rhapsody/issues/404)) ([ca2f6b0](https://github.com/makewhatis/rhapsody/commit/ca2f6b08da15c422d2fb53613fc05c11cbc6f5d5))
+* **orchestrator:** report the real dispatch refusal and hold a missing model (STUDIO-1998) ([#403](https://github.com/makewhatis/rhapsody/issues/403)) ([fbeb5e4](https://github.com/makewhatis/rhapsody/commit/fbeb5e4ff31c8ec3d15907a1362d7021f404fcee))
+* **orchestrator:** respect human-held draft pull requests (STUDIO-2207) ([#413](https://github.com/makewhatis/rhapsody/issues/413)) ([1efe4af](https://github.com/makewhatis/rhapsody/commit/1efe4af74c3da936ff80a010141a828110cab8e5))
+* **orchestrator:** route CI failures when no checks are required (STUDIO-2094) ([#406](https://github.com/makewhatis/rhapsody/issues/406)) ([88c0091](https://github.com/makewhatis/rhapsody/commit/88c0091e94671b518a204899c2008436f1a6c64d))
+* **orchestrator:** route red required CI back to its author (STUDIO-1994) ([#402](https://github.com/makewhatis/rhapsody/issues/402)) ([dad5802](https://github.com/makewhatis/rhapsody/commit/dad58028dbdccb09c966ee3e3690498fefcf24c5))
+* **orchestrator:** run on the resolved selection, not the routed profile (STUDIO-1602) ([#387](https://github.com/makewhatis/rhapsody/issues/387)) ([27ae2af](https://github.com/makewhatis/rhapsody/commit/27ae2af32e4a66c141ee7cb17e9337f9efe4d094))
+* **orchestrator:** serialize strict repository landing updates (STUDIO-2126) ([#407](https://github.com/makewhatis/rhapsody/issues/407)) ([7c24665](https://github.com/makewhatis/rhapsody/commit/7c246657b3a7d78f1413f2cc36a2044a725b14f4))
+* **orchestrator:** stop redundant manager review retries (STUDIO-1801) ([#392](https://github.com/makewhatis/rhapsody/issues/392)) ([d8820fb](https://github.com/makewhatis/rhapsody/commit/d8820fb32360ca8ecf3fd984953f0078cf9c91a7))
+* **orchestrator:** unblock unstable landing-line fronts (STUDIO-2137) ([#409](https://github.com/makewhatis/rhapsody/issues/409)) ([03501e5](https://github.com/makewhatis/rhapsody/commit/03501e5edc13fbfe9c18b44a10b0314a46d503bb))
+* **review:** expose profile eligibility and preserve profile-less reviews (STUDIO-1766) ([#391](https://github.com/makewhatis/rhapsody/issues/391)) ([8e53ba6](https://github.com/makewhatis/rhapsody/commit/8e53ba6de48edc2fa00f4c389b618aa35f3aff76))
+* **review:** require code profiles for non-UI reviews (STUDIO-1305) ([#390](https://github.com/makewhatis/rhapsody/issues/390)) ([1ac6991](https://github.com/makewhatis/rhapsody/commit/1ac6991d20086d7268de1d6f8cd6e26e72020501))
+* **tracker:** budget Linear requests and retry rate-limited completions (STUDIO-1896) ([#396](https://github.com/makewhatis/rhapsody/issues/396)) ([041bcd7](https://github.com/makewhatis/rhapsody/commit/041bcd7dde1f1f2fced5fd6dd932e9bba121ebe1))
+
 ## [0.3.8](https://github.com/makewhatis/rhapsody/compare/v0.3.7...v0.3.8) (2026-10-24)
 
 
