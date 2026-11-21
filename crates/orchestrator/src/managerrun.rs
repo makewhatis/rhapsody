@@ -351,6 +351,50 @@ impl Orchestrator {
         Some(std::sync::Arc::new(runtime))
     }
 
+    /// Recheck draft exhaustion at every launch (including fallback), not just when the watcher
+    /// queues it. Preparation can outlive a hold and even its release; only the durable current
+    /// item may launch. A held incident loses its dedupe key so release starts a fresh ladder.
+    fn lead_draft_launch_allowed(&mut self, item: i64) -> bool {
+        let mut check = || -> Result<bool, rhapsody_store::StoreError> {
+            let Some(item) = self
+                .store()
+                .load_lead_items()?
+                .into_iter()
+                .find(|i| i.id == item)
+            else {
+                return Ok(false);
+            };
+            if !matches!(&item.trigger, rhapsody_store::LeadTrigger::ImpossibleState { kind, .. }
+                if kind == "draft_pokes_exhausted")
+            {
+                return Ok(true);
+            }
+            if item.state == "done" {
+                return Ok(false);
+            }
+            let (held, primed) = self.human_holds.labelled_and_primed();
+            let held_origin = self.store().load_live_review_watch()?.iter().any(|row| {
+                format!("{}/{}#{}", row.key.owner, row.key.repo, row.key.number)
+                    .eq_ignore_ascii_case(&item.subject)
+                    && crate::reviewdone::origin_ticket(&row.introduced_by)
+                        .is_some_and(|ticket| held.contains(&ticket.to_ascii_lowercase()))
+            });
+            if held_origin {
+                self.draft_pokes.remove(&item.subject.to_ascii_lowercase());
+                self.store().retire_lead_draft_exhaustion(&item.subject)?;
+                return Ok(false);
+            }
+            Ok(primed)
+        };
+        match check() {
+            Ok(allowed) => allowed,
+            Err(error) => {
+                tracing::warn!(item, %error, "draft lead admission unreadable; deferring launch");
+                false
+            }
+        }
+    }
+
     pub(crate) fn pump_lead_items(&mut self) {
         if !self.lead_enabled() || self.drain.is_draining() {
             return;
@@ -424,6 +468,9 @@ impl Orchestrator {
             return;
         };
         self.lead_cursor = item.id;
+        if !self.lead_draft_launch_allowed(item.id) {
+            return;
+        }
         self.lead_pending.insert(item.id);
         let events = self.events.clone();
         tokio::spawn(async move {
@@ -530,6 +577,9 @@ impl Orchestrator {
         harness: String,
         model: String,
     ) {
+        if !self.lead_draft_launch_allowed(case.item.id) {
+            return;
+        }
         let Some(runtime) = self.lead_dependencies() else {
             return;
         };
@@ -572,6 +622,12 @@ impl Orchestrator {
         }
         if run.lead_item.is_some() && !self.lead_enabled() {
             return ManagerDispatchOutcome::AuthorityOff;
+        }
+        if run
+            .lead_item
+            .is_some_and(|item| !self.lead_draft_launch_allowed(item))
+        {
+            return ManagerDispatchOutcome::Refused("draft exhaustion held or retired".into());
         }
         if !is_limit && (run.owner.is_empty() || run.repo.is_empty()) {
             return ManagerDispatchOutcome::Refused("pull request has no owner/repo".to_string());
@@ -1386,6 +1442,151 @@ mod tests {
             o.store().load_lead_items().expect("items")[0].state,
             "queued"
         );
+    }
+
+    #[tokio::test]
+    async fn held_draft_cannot_launch_previously_queued_lead() {
+        use crate::ghsummons::{PrLookup, PrSnapshot, PrStatus};
+        use crate::prstate::{PrCoord, PrObservation};
+
+        for sweep_before_launch in [false, true] {
+            let (mut o, dispatched) = orch(ReviewAuthority::Act);
+            o.teams.as_mut().unwrap().manager.lead.enabled = true;
+            pass_self_test(&o, &test_cli_version());
+            o.human_holds.begin_pass(true);
+            let pr = PrCoord::new("makewhatis", "rhapsody", 12);
+            o.store()
+                .save_review_watch(rhapsody_store::ReviewWatchRow {
+                    key: rhapsody_store::ReviewWatchKey {
+                        owner: pr.owner.clone(),
+                        repo: pr.repo.clone(),
+                        number: pr.number,
+                        reviewer: "alice".into(),
+                    },
+                    author: "alice".into(),
+                    introduced_by: "handoff:STUDIO-721".into(),
+                    status: rhapsody_store::REVIEW_STATUS_APPROVED.into(),
+                    open: true,
+                    ..Default::default()
+                })
+                .unwrap();
+            let observation = PrObservation {
+                pr: pr.clone(),
+                lookup: PrLookup::Found(PrSnapshot {
+                    is_draft: Some(true),
+                    head_sha: "a".repeat(40),
+                    status: PrStatus::Open,
+                    merged_at: None,
+                    head_repo: "makewhatis/rhapsody".into(),
+                    merge_state: String::new(),
+                }),
+                unchanged_from: Vec::new(),
+                head_patch_id: String::new(),
+            };
+            let start = chrono::Utc::now();
+            o.now = Box::new(move || start);
+            assert_eq!(
+                o.handle_review_sweep(std::slice::from_ref(&observation))
+                    .nudges
+                    .len(),
+                1
+            );
+            o.now = Box::new(move || start + crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED);
+            assert!(
+                o.handle_review_sweep(std::slice::from_ref(&observation))
+                    .nudges
+                    .is_empty()
+            );
+            let item = o.store().load_lead_items().unwrap().remove(0);
+            let case = LeadCase {
+                item: item.clone(),
+                subject: crate::leadexec::LeadSubject {
+                    open: true,
+                    ticket: Issue {
+                        identifier: "STUDIO-721".into(),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                identities: vec!["alice".into()],
+                evidence: "prepared before hold".into(),
+            };
+            let mut run = manager_run();
+            run.lead_item = Some(item.id);
+            o.store()
+                .save_lead_execution(&rhapsody_store::LeadExecution {
+                    item: item.id,
+                    ..Default::default()
+                })
+                .unwrap();
+
+            // The hold can arrive after preparation, even before the next watcher sweep.
+            o.human_holds.note_human_label("studio-721");
+            let (reply, received) = tokio::sync::oneshot::channel();
+            o.drive_event(crate::Event::LeadAllowed {
+                repo: REPO_URL.into(),
+                ticket: "STUDIO-721".into(),
+                reply,
+            })
+            .await;
+            assert!(
+                !received.await.unwrap(),
+                "held origin refuses lead effects and preparation"
+            );
+            if sweep_before_launch {
+                assert!(
+                    o.handle_review_sweep(std::slice::from_ref(&observation))
+                        .nudges
+                        .is_empty()
+                );
+            }
+            o.handle_lead_prepared(item.id, Ok(Some((case.clone(), run.clone()))));
+            assert!(
+                dispatched.lock().unwrap().is_empty(),
+                "a held origin must suppress a previously queued draft-exhaustion lead"
+            );
+            assert!(
+                o.draft_pokes.is_empty(),
+                "launch also resets the ladder before a watcher sweep"
+            );
+            assert!(
+                o.handle_review_sweep(std::slice::from_ref(&observation))
+                    .nudges
+                    .is_empty()
+            );
+            assert!(o.draft_pokes.is_empty());
+
+            o.human_holds.begin_pass(true);
+            // A late preparation result must stay retired after release, not bypass poke zero.
+            o.handle_lead_prepared(item.id, Ok(Some((case.clone(), run.clone()))));
+            assert!(dispatched.lock().unwrap().is_empty());
+            assert_eq!(
+                o.handle_review_sweep(std::slice::from_ref(&observation))
+                    .nudges
+                    .len(),
+                1
+            );
+            o.now = Box::new(move || start + crate::draftpoke::MAX_DRAFT_POKE_UNANSWERED * 2);
+            o.handle_review_sweep(&[observation]);
+            let items = o.store().load_lead_items().unwrap();
+            assert_eq!(items[0].state, "done");
+            assert_eq!(
+                items.len(),
+                2,
+                "fresh exhaustion gets a fresh item and budget"
+            );
+            let mut fresh = case;
+            fresh.item = items[1].clone();
+            run.lead_item = Some(fresh.item.id);
+            o.store()
+                .save_lead_execution(&rhapsody_store::LeadExecution {
+                    item: fresh.item.id,
+                    ..Default::default()
+                })
+                .unwrap();
+            o.handle_lead_prepared(fresh.item.id, Ok(Some((fresh, run))));
+            assert_eq!(dispatched.lock().unwrap().len(), 1);
+        }
     }
 
     #[test]

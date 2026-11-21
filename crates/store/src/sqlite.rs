@@ -2045,6 +2045,17 @@ impl Store for Sqlite {
         )? == 1)
     }
 
+    fn retire_lead_draft_exhaustion(&self, subject: &str) -> Result<(), StoreError> {
+        self.lock().execute(
+            "UPDATE rhapsody_lead_items SET question = question || ':held:' || id, state = 'done' \
+             WHERE subject = ?1 COLLATE NOCASE AND trigger = 'impossible_state' \
+             AND detail = 'draft_pokes_exhausted' AND question = 'draft_pokes_exhausted' \
+             AND state IN ('queued', 'parked', 'running')",
+            [subject],
+        )?;
+        Ok(())
+    }
+
     fn load_lead_items(&self) -> Result<Vec<LeadItem>, StoreError> {
         let conn = self.lock();
         let mut stmt = conn.prepare(

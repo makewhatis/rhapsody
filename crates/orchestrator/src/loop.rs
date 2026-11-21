@@ -1242,6 +1242,11 @@ impl Orchestrator {
                     && self.review_route(&repo).is_some()
                     && (ticket.is_empty()
                         || (!self.ticket_run_live(&ticket)
+                            && !self
+                                .human_holds
+                                .labelled_and_primed()
+                                .0
+                                .contains(&ticket.to_ascii_lowercase())
                             && !self.subject_parked(&ticket, "lead")));
                 let _ = reply.send(allowed);
             }

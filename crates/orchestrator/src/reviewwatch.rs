@@ -2030,6 +2030,9 @@ impl Orchestrator {
             // An intentional park is not an unanswered poke. Releasing it starts at poke zero,
             // including when the operator applied the label after poking had already begun.
             self.draft_pokes.remove(&churn_key(pr));
+            if let Err(error) = self.store().retire_lead_draft_exhaustion(&pr.to_string()) {
+                tracing::warn!(%error, %pr, "held draft lead work could not be retired");
+            }
             return;
         }
         if !primed {

@@ -3998,7 +3998,9 @@ re-engaged run a review's findings reopened) is never poked.
 **A draft whose origin ticket wears `rhapsody:human` is intentionally parked (STUDIO-2207).**
 The watcher posts no draft poke and queues no draft-exhaustion lead turn or escalation. The hold
 clears the in-memory poke budget, so removing the label starts again with the first poke and a full
-grace window. Until a complete board read primes the human-hold ledger, poking waits rather than
+grace window. Previously queued draft-exhaustion work is retired durably, including its dedupe key;
+launch rechecks the hold and the current queue item so delayed preparation cannot bypass release's
+fresh poke ladder. Until a complete board read primes the human-hold ledger, poking waits rather than
 assuming the origin is unheld. Reconciliation reports an observed labelled draft as *held for a
 human*, including without adjudication, auto-merge or completed approvals. PRs without an origin
 ticket keep their existing behaviour.
