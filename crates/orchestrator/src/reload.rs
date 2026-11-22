@@ -186,6 +186,9 @@ impl Orchestrator {
         let old_review_budget = self.eff.as_ref().map(active_review_budget);
         let new_review_budget = active_review_budget(&eff);
         self.eff = Some(eff);
+        // STUDIO-2316: every workspace removal cleans up the Docker resources the issue's runs
+        // started (or stops doing so when the operator turned `docker_cleanup` off).
+        self.install_docker_removal_hook();
         if old_review_budget != Some(new_review_budget) {
             self.review_capacity_held.clear();
         }
@@ -748,6 +751,60 @@ Do {{ issue.identifier }}.
             3,
             "a reload must republish the live project set"
         );
+    }
+
+    /// STUDIO-2316: a reload installs the Docker removal hook on the top-level workspace manager
+    /// and on every project's (enabled or paused), and a reload with `docker_cleanup.enabled:
+    /// false` clears it from all of them, so removals stop shelling out to `docker`.
+    #[test]
+    fn reload_installs_and_clears_the_docker_removal_hook() {
+        let (path, _dir) = write_workflow(MULTI_PROJECT_WF);
+        let mut o = Orchestrator::new(path.clone());
+        o.reload_from_disk().expect("reload");
+        let eff = o.eff.as_ref().expect("eff built");
+        assert!(
+            eff.workspace.has_removal_hook(),
+            "docker_cleanup defaults on, so the top-level manager carries the hook"
+        );
+        assert_eq!(eff.projects.len(), 3);
+        for p in &eff.projects {
+            assert!(
+                p.workspace.has_removal_hook(),
+                "project {} must carry the hook",
+                p.slug
+            );
+        }
+
+        std::fs::write(
+            &path,
+            MULTI_PROJECT_WF.replacen("---\n", "---\ndocker_cleanup:\n  enabled: false\n", 1),
+        )
+        .unwrap();
+        o.reload_from_disk().expect("reload with cleanup off");
+        let eff = o.eff.as_ref().expect("eff built");
+        assert!(!eff.cfg.docker_cleanup.enabled);
+        assert!(
+            !eff.workspace.has_removal_hook(),
+            "cleanup off clears the top-level hook"
+        );
+        for p in &eff.projects {
+            assert!(
+                !p.workspace.has_removal_hook(),
+                "cleanup off clears project {}'s hook",
+                p.slug
+            );
+        }
+        // A reload may hand back fresh managers, so pin the clearing branch itself: a hook already
+        // installed on the live managers is removed when the feature is off.
+        let noop: rhapsody_workspace::RemovalHook = std::sync::Arc::new(|_| Box::pin(async {}));
+        eff.workspace.set_removal_hook(Some(noop.clone()));
+        for p in &eff.projects {
+            p.workspace.set_removal_hook(Some(noop.clone()));
+        }
+        o.install_docker_removal_hook();
+        let eff = o.eff.as_ref().expect("eff built");
+        assert!(!eff.workspace.has_removal_hook());
+        assert!(eff.projects.iter().all(|p| !p.workspace.has_removal_hook()));
     }
 
     /// STUDIO-978: the control task resolves the roster identities a review dispatch would be

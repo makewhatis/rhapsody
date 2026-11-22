@@ -648,6 +648,8 @@ pub struct Config {
     /// Per-run scratch-directory policy (STUDIO-1993). Rhapsody-only; every field has a working
     /// default, so an install that never writes `scratch:` behaves as before.
     pub scratch: crate::scratch::Scratch,
+    /// Docker leftover-cleanup policy (STUDIO-2316). Rhapsody-only; on by default.
+    pub docker_cleanup: crate::docker_cleanup::DockerCleanup,
 
     /// The operator-notification channels the runaway-loop breaker escalates to (STUDIO-1026).
     /// Rhapsody-only; every channel defaults off, so an install that never writes `notify:` is
@@ -724,6 +726,8 @@ pub(crate) struct Raw {
     /// `scratch:` front-matter block (STUDIO-1993). Rhapsody-only: absent ⇒ defaults. An `Option`
     /// so `encode` can emit the block only when it differs from the default.
     pub scratch: Option<crate::scratch::Scratch>,
+    /// `docker_cleanup:` front-matter block (STUDIO-2316). Rhapsody-only: absent ⇒ defaults.
+    pub docker_cleanup: Option<crate::docker_cleanup::DockerCleanup>,
     pub review: Option<crate::review_ci::ReviewCi>,
     /// `notify:` front-matter block (STUDIO-1026). Rhapsody-only: absent ⇒ every channel off. An
     /// `Option` so `encode` can emit the block only when some channel is configured, keeping an

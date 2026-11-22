@@ -3171,6 +3171,7 @@ dependencies = [
  "chrono",
  "glob",
  "liquid",
+ "regex",
  "reqwest 0.12.28",
  "rhapsody-core",
  "serde",

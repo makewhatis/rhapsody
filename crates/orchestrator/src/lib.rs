@@ -44,6 +44,7 @@ pub mod concurrency;
 #[path = "loop.rs"]
 pub mod control_loop;
 pub mod dispatch;
+pub mod dockercleanup;
 pub mod draftpoke;
 pub mod drain;
 pub mod effective;

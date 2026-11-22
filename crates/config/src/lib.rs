@@ -13,6 +13,7 @@
 pub mod capabilities;
 pub mod comms;
 pub mod decode;
+pub mod docker_cleanup;
 pub mod effective_json;
 pub mod encode;
 pub mod github;
@@ -45,6 +46,7 @@ pub use comms::{
     comms_backend_is_recognized,
 };
 pub use decode::{ConfigError, decode};
+pub use docker_cleanup::DockerCleanup;
 pub use encode::{encode, go_duration_string};
 pub use harness::HARNESS_NAMES;
 pub use limits::Limits;

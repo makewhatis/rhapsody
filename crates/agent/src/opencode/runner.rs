@@ -45,7 +45,10 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::claude::{TRACKER_ENV_VARS, append_me_env, append_review_env, scrub_env, split_command};
+use crate::claude::{
+    TRACKER_ENV_VARS, append_compose_env, append_me_env, append_review_env, scrub_env,
+    split_command,
+};
 use crate::harness::{
     EventFidelity, Harness, HarnessCapabilities, HarnessId, McpSandboxCoupling, Resume, Sandbox,
     StdinPolicy, Steering, ToolEventGranularity, ToolNaming, UsageDetail,
@@ -1510,6 +1513,8 @@ impl OpencodeSession {
             self.run_id.load(Ordering::SeqCst),
         );
         let env = append_review_env(env, &self.locked_review_head());
+        // STUDIO-2316: compose resources the agent starts are attributable to this run.
+        let env = append_compose_env(env, self.run_id.load(Ordering::SeqCst));
         let env = if let Some(params) = self.manager.as_ref() {
             let run_id = self.run_id.load(Ordering::SeqCst).to_string();
             let content = manager::manager_config_content(
@@ -3678,6 +3683,7 @@ printf '{"type":"step_finish","sessionID":"ses_stable","part":{"reason":"stop"}}
         );
         assert_eq!(get("SYMPHONY_ISSUE").as_deref(), Some("STUDIO-902"));
         assert_eq!(get("SYMPHONY_RUN_ID").as_deref(), Some("77"));
+        assert_eq!(get("COMPOSE_PROJECT_NAME").as_deref(), Some("rhapsody-77"));
         assert!(
             !text.contains("lin_api_SECRET"),
             "the tracker credential must be withheld by VALUE, not only by name"

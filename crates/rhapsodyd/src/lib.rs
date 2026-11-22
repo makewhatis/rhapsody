@@ -24,6 +24,7 @@ pub mod banner;
 pub mod bootcfg;
 pub mod broker;
 pub mod credential_client;
+pub mod dockerreap;
 pub mod doctor;
 pub mod github;
 pub mod logsource;

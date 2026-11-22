@@ -28,7 +28,10 @@ pub use billing::{
     BILLING_ENV_VARS, TRACKER_ENV_VARS, billing_guard_enabled, billing_guard_ok, scrub_env,
     scrubbed_env_vars,
 };
-pub use mcpinject::{MERGED_MCP_CONFIG_NAME, append_me_env, append_review_env, inject_daemon_mcp};
+pub use mcpinject::{
+    COMPOSE_PROJECT_PREFIX, MERGED_MCP_CONFIG_NAME, append_compose_env, append_me_env,
+    append_review_env, inject_daemon_mcp,
+};
 pub use parse::{Classified, classify};
 pub use runner::Runner;
 

@@ -1027,6 +1027,8 @@ impl Manager {
         ensure_within_root(&self.root, &path).map_err(|e| {
             Error::WorktreeOutsideRoot(format!("unsafe worktree path {path:?}: {e}"))
         })?;
+        // STUDIO-2316: before the lock, so a slow Docker cleanup never stalls this repo's git ops.
+        self.run_removal_hook(identifier).await;
 
         // Serialize the whole removal under the per-repo mutex (symmetric with ensure_from_repo).
         let _guard = self.repo_lock(repo_url).lock_owned().await;
@@ -1915,6 +1917,24 @@ done
         let md = m.mirror_dir(&origin.path);
         let (out, _) = m.git(&md, &["worktree", "list", "--porcelain"]).await;
         assert!(!out.contains(&ws.path), "worktree not pruned:\n{out}");
+    }
+
+    #[tokio::test]
+    async fn remove_worktree_awaits_the_removal_hook() {
+        // STUDIO-2316: the repo-backed removal path calls the hook too.
+        let origin = init_local_origin();
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        m.ensure_from_repo(&origin.path, "", "MT-11").await.unwrap();
+        let seen = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&seen);
+        m.set_removal_hook(Some(Arc::new(move |id: String| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                sink.lock().unwrap().push(id);
+            })
+        })));
+        m.remove_worktree(&origin.path, "", "MT-11").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["MT-11".to_string()]);
     }
 
     // Mirror of TestRemoveWorktree_MissingIsNoopAndSkipsHook.

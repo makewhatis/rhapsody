@@ -69,6 +69,8 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
     limits.validate().map_err(ConfigError::Parse)?;
     let scratch = r.scratch.clone().unwrap_or_default();
     scratch.validate().map_err(ConfigError::Parse)?;
+    let docker_cleanup = r.docker_cleanup.clone().unwrap_or_default();
+    docker_cleanup.validate().map_err(ConfigError::Parse)?;
     let review = r.review.clone().unwrap_or_default();
     if review.landing_width == 0 || r.projects.iter().any(|p| p.review.landing_width == Some(0)) {
         return Err(ConfigError::Parse(
@@ -407,6 +409,7 @@ pub fn decode(def: &Definition) -> Result<Config, ConfigError> {
         prices: r.prices.into_iter().collect(),
         limits,
         scratch,
+        docker_cleanup,
         review,
         notify,
         comms,

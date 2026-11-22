@@ -241,6 +241,12 @@ the `Orchestrator` struct itself. Concretely:
     the existing NotificationsState queue. Every production `GH` must use `GH::scoped` with this
     handle, including clients constructed outside the boot composition root.
 
+  - `dockercleanup.rs`'s workspace removal hook (STUDIO-2316) is a `RwLock<Option<RemovalHook>>` on
+    each workspace `Manager`. Reload is its only writer; whichever task removes a worktree clones
+    the `Arc` out and awaits it with no lock held. The hook owns only a Store `Arc` (a read on the
+    blocking pool) and the Docker CLI. The daily reaper uses `Event::DockerReap` for its snapshot
+    and the scratch janitor's `ScratchRunInUse` round-trip to re-check each run before removing it.
+
   - `liveness.rs`'s `WorkerEmitTime` (STUDIO-1262) is a per-run `Arc<AtomicI64>` watermark.
     The worker's forwarding callback stamps it before queuing real agent events; stall detection
     reads it directly so control-channel backlog cannot turn a live worker into a wedge. It shares

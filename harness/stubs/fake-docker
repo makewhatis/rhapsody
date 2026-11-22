@@ -1,0 +1,26 @@
+#!/bin/sh
+# fake-docker — a Docker CLI stand-in for the daemon's Docker cleanup tests (STUDIO-2316).
+# No real Docker in CI: every invocation appends its argv (one line, space-joined) to
+# $FAKE_DOCKER_LOG, and the three listing commands print canned rows from files:
+#   docker ps ...          -> cat $FAKE_DOCKER_PS
+#   docker network ls ...  -> cat $FAKE_DOCKER_NETWORKS
+#   docker volume ls ...   -> cat $FAKE_DOCKER_VOLUMES
+# Every other command (rm, network rm/prune, volume rm) prints nothing and succeeds.
+# FAKE_DOCKER_FAIL=1 makes every command fail like a stopped Docker daemon does.
+# FAKE_DOCKER_SLEEP_S=<n> sleeps before answering, like a slow or hung Docker Desktop.
+if [ -n "$FAKE_DOCKER_LOG" ]; then
+  printf '%s\n' "$*" >>"$FAKE_DOCKER_LOG"
+fi
+if [ -n "$FAKE_DOCKER_SLEEP_S" ]; then
+  sleep "$FAKE_DOCKER_SLEEP_S"
+fi
+if [ "$FAKE_DOCKER_FAIL" = "1" ]; then
+  echo "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?" >&2
+  exit 1
+fi
+case "$1 $2" in
+  "ps "*) [ -n "$FAKE_DOCKER_PS" ] && cat "$FAKE_DOCKER_PS" ;;
+  "network ls") [ -n "$FAKE_DOCKER_NETWORKS" ] && cat "$FAKE_DOCKER_NETWORKS" ;;
+  "volume ls") [ -n "$FAKE_DOCKER_VOLUMES" ] && cat "$FAKE_DOCKER_VOLUMES" ;;
+esac
+exit 0
