@@ -88,6 +88,14 @@ impl Manager {
         *self.removal_hook.write().unwrap_or_else(|e| e.into_inner()) = hook;
     }
 
+    /// Whether a [`RemovalHook`] is installed — lets the orchestrator's reload wiring be pinned.
+    pub fn has_removal_hook(&self) -> bool {
+        self.removal_hook
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some()
+    }
+
     /// Awaits the installed [`RemovalHook`] for `identifier`, if any. Called by both removal paths
     /// (legacy [`Self::remove`] and the repo-backed `remove_worktree`) before the directory goes, and
     /// never while a per-repo lock is held, so a slow hook cannot stall another worktree's git ops.
