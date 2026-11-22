@@ -36,9 +36,9 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::claude::{
-    Config, TRACKER_ENV_VARS, append_me_env, append_review_env, billing_guard_enabled,
-    billing_guard_ok, build_args, classify, inject_daemon_mcp, scrub_env, scrubbed_env_vars,
-    split_command,
+    Config, TRACKER_ENV_VARS, append_compose_env, append_me_env, append_review_env,
+    billing_guard_enabled, billing_guard_ok, build_args, classify, inject_daemon_mcp, scrub_env,
+    scrubbed_env_vars, split_command,
 };
 use crate::harness::{
     EventFidelity, Harness, HarnessCapabilities, HarnessId, McpSandboxCoupling, Resume, Sandbox,
@@ -667,7 +667,9 @@ impl Session for ClaudeSession {
             self.run_id.load(Ordering::SeqCst),
         );
         // Review-mode only, and additive: empty (every non-review run) emits nothing (STUDIO-715).
-        let mut env = append_review_env(env, &self.locked_review_head());
+        let env = append_review_env(env, &self.locked_review_head());
+        // STUDIO-2316: compose resources the agent starts are attributable to this run.
+        let mut env = append_compose_env(env, self.run_id.load(Ordering::SeqCst));
         // §4.2: a manager run relocates Claude Code's config root to the dedicated directory, so
         // none of the operator's user-level hooks, plugins, MCP servers or permission rules load.
         // `None` for every non-manager run, so its env is byte-identical.
@@ -2767,6 +2769,11 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"complete-sessi
             "RHAPSODY_RUN_ID (STUDIO-603's twin spelling) must match"
         );
         assert_eq!(
+            env.get("COMPOSE_PROJECT_NAME").map(String::as_str),
+            Some("rhapsody-412"),
+            "STUDIO-2316: compose resources must be attributable to the run"
+        );
+        assert_eq!(
             env.get("SYMPHONY_ISSUE").map(String::as_str),
             Some("MT-RUNID"),
             "SYMPHONY_ISSUE must still be set"
@@ -2829,6 +2836,11 @@ printf '%s\n' '{"type":"result","subtype":"success","session_id":"complete-sessi
         assert!(
             !env.contains_key("SYMPHONY_RUN_ID") && !env.contains_key("RHAPSODY_RUN_ID"),
             "an unset run id must emit no run-id env"
+        );
+        assert_ne!(
+            env.get("COMPOSE_PROJECT_NAME").map(String::as_str),
+            Some("rhapsody-0"),
+            "an unset run id must not pin a run compose project"
         );
     }
 

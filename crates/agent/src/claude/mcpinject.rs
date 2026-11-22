@@ -135,6 +135,27 @@ pub fn append_me_env(mut env: Vec<String>, issue: &str, run_id: i64) -> Vec<Stri
     env
 }
 
+/// The compose project-name prefix every dispatched run's `COMPOSE_PROJECT_NAME` carries
+/// (STUDIO-2316). The orchestrator's Docker cleanup matches `com.docker.compose.project` against
+/// exactly `<prefix><run id>`, so the two must never drift.
+pub const COMPOSE_PROJECT_PREFIX: &str = "rhapsody-";
+
+/// Pins `COMPOSE_PROJECT_NAME=rhapsody-<run id>` on a dispatched run's env (STUDIO-2316), so every
+/// compose project the agent starts is attributable to the run and removable when its workspace is
+/// cleaned up. Any inherited `COMPOSE_PROJECT_NAME` is replaced rather than duplicated. A session
+/// with no run id (a coordinator, or `start_run` failed) is left untouched — `rhapsody-0` would
+/// attribute its resources to no run at all.
+pub fn append_compose_env(mut env: Vec<String>, run_id: i64) -> Vec<String> {
+    if run_id <= 0 {
+        return env;
+    }
+    env.retain(|kv| !kv.starts_with("COMPOSE_PROJECT_NAME="));
+    env.push(format!(
+        "COMPOSE_PROJECT_NAME={COMPOSE_PROJECT_PREFIX}{run_id}"
+    ));
+    env
+}
+
 /// Appends the review-mode env a ticketless review run needs: the pull-request head SHA pinned when
 /// its detached worktree was checked out. Empty (every non-review run) adds nothing, so a daemon
 /// that never dispatches a review produces a byte-identical child env.
@@ -311,6 +332,23 @@ mod tests {
 
     // Mirrors Go `claude.TestAppendMeEnv`: SYMPHONY_ISSUE / SYMPHONY_RUN_ID added only for known
     // values; empty identity injects nothing.
+    #[test]
+    fn append_compose_env_pins_the_run_project_and_replaces_an_inherited_one() {
+        let got = append_compose_env(
+            vec!["A=1".to_string(), "COMPOSE_PROJECT_NAME=mine".to_string()],
+            7,
+        );
+        assert_eq!(
+            got,
+            vec![
+                "A=1".to_string(),
+                "COMPOSE_PROJECT_NAME=rhapsody-7".to_string()
+            ]
+        );
+        let none = append_compose_env(vec!["COMPOSE_PROJECT_NAME=mine".to_string()], 0);
+        assert_eq!(none, vec!["COMPOSE_PROJECT_NAME=mine".to_string()]);
+    }
+
     #[test]
     fn append_me_env_known_and_empty() {
         let got = append_me_env(vec!["A=1".to_string()], "INF-42", 7);
