@@ -58,6 +58,11 @@ Go's real output. If you add a new default-path divergence, it likely needs a ma
   its own and reports that group there — the tool-child leak every real harness has, STUDIO-871).
   `fake-claude-error` and `fake-claude-hang` are one-line wrappers
   that just set the env var and exec `fake-claude` — edit the real logic in `fake-claude` itself.
+- `fake-docker` (STUDIO-2316) stands in for the Docker CLI in the orchestrator's `dockercleanup`
+  tests: it logs each argv to `$FAKE_DOCKER_LOG`, prints canned listings from `$FAKE_DOCKER_PS` /
+  `$FAKE_DOCKER_NETWORKS` / `$FAKE_DOCKER_VOLUMES`. `FAKE_DOCKER_FAIL=1` fails every command like
+  a stopped daemon; `FAKE_DOCKER_SLEEP_S` delays every answer like a hung one. Independent of the
+  `fake-claude*` set.
 - `linear-stub` is a full Rust crate (its own `Cargo.toml`; listed directly in the root workspace
   `members`, not covered by the `crates/*` glob). It answers exactly the GraphQL operations
   enumerated from the Go reference's `query.go` (see `lib.rs`'s module doc for the full list) and

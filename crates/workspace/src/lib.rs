@@ -32,7 +32,7 @@ mod sanitize;
 
 pub use gc::LiveCheck;
 pub use hooks::HookRunner;
-pub use manager::{Config, HookScripts, Manager};
+pub use manager::{Config, HookScripts, Manager, RemovalHook};
 pub use read::{BlobRead, GrepRead, ReadError, TreeEntry, TreeRead};
 pub use repo::repo_key;
 pub use safety::validate_launch;

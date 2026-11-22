@@ -186,6 +186,9 @@ impl Orchestrator {
         let old_review_budget = self.eff.as_ref().map(active_review_budget);
         let new_review_budget = active_review_budget(&eff);
         self.eff = Some(eff);
+        // STUDIO-2316: every workspace removal cleans up the Docker resources the issue's runs
+        // started (or stops doing so when the operator turned `docker_cleanup` off).
+        self.install_docker_removal_hook();
         if old_review_budget != Some(new_review_budget) {
             self.review_capacity_held.clear();
         }

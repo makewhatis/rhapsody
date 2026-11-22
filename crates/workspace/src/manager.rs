@@ -6,7 +6,9 @@
 
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::sync::{Arc, Mutex};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use tokio::sync::Mutex as AsyncMutex;
@@ -25,6 +27,13 @@ pub struct HookScripts {
     pub after_run: String,
     pub before_remove: String,
 }
+
+/// A best-effort callback the [`Manager`] awaits whenever an issue's workspace is removed, handed the
+/// issue identifier (STUDIO-2316: the orchestrator removes the Docker containers that issue's runs
+/// started). It returns nothing because a removal must never fail on its account; anything it wants
+/// to say it logs itself.
+pub type RemovalHook =
+    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Configures a workspace [`Manager`]. The Go `Config.Logger` field is dropped: best-effort logging
 /// is elided in W1 (see [`crate::hooks`]).
@@ -59,6 +68,10 @@ pub struct Manager {
     /// crates' `$HOME`-based tests). Each test's Manager carries its own overlay, so parallel tests
     /// never collide.
     pub(crate) gh_env_overlay: Vec<(OsString, OsString)>,
+    /// The removal hook ([`RemovalHook`]), installed by the orchestrator after construction (like
+    /// the GitHub credentials). `None` ⇒ a removal does exactly what it did before the hook existed.
+    /// The lock is held only to clone the `Arc` out, never across the hook's `.await`.
+    pub(crate) removal_hook: RwLock<Option<RemovalHook>>,
 }
 
 impl Manager {
@@ -68,6 +81,25 @@ impl Manager {
             .read()
             .unwrap_or_else(|e| e.into_inner())
             .clone()
+    }
+
+    /// Installs (or, with `None`, clears) the [`RemovalHook`] every workspace removal awaits.
+    pub fn set_removal_hook(&self, hook: Option<RemovalHook>) {
+        *self.removal_hook.write().unwrap_or_else(|e| e.into_inner()) = hook;
+    }
+
+    /// Awaits the installed [`RemovalHook`] for `identifier`, if any. Called by both removal paths
+    /// (legacy [`Self::remove`] and the repo-backed `remove_worktree`) before the directory goes, and
+    /// never while a per-repo lock is held, so a slow hook cannot stall another worktree's git ops.
+    pub(crate) async fn run_removal_hook(&self, identifier: &str) {
+        let hook = self
+            .removal_hook
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if let Some(hook) = hook {
+            hook(identifier.to_string()).await;
+        }
     }
 
     pub fn set_github_credentials(&self, credentials: Arc<crate::github::Credentials>) {
@@ -118,6 +150,7 @@ impl Manager {
             runner: HookRunner::new(timeout),
             repo_locks: Mutex::new(HashMap::new()),
             gh_env_overlay: Vec::new(),
+            removal_hook: RwLock::new(None),
         })
     }
 
@@ -268,6 +301,7 @@ impl Manager {
         let key = sanitize_key(identifier);
         let path = join(&[&self.root, &key]);
         ensure_within_root(&self.root, &path)?;
+        self.run_removal_hook(identifier).await;
         // Lstat so a planted symlink is rejected before before_remove runs inside the target.
         if let Ok(info) = std::fs::symlink_metadata(&path) {
             if info.file_type().is_symlink() {
@@ -558,6 +592,30 @@ mod tests {
         m.remove("", "never-existed")
             .await
             .expect("removing a missing workspace should be a no-op");
+    }
+
+    /// STUDIO-2316: an installed removal hook is awaited with the issue identifier on the legacy
+    /// path, even for a workspace that is already gone, and clearing it stops the calls.
+    #[tokio::test]
+    async fn remove_awaits_the_removal_hook_with_the_identifier() {
+        let (m, _root) = repo_test_manager(HookScripts::default());
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = Arc::clone(&seen);
+        m.set_removal_hook(Some(Arc::new(move |id: String| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                sink.lock().unwrap().push(id);
+            })
+        })));
+        m.remove("", "MT-7").await.unwrap();
+        assert_eq!(*seen.lock().unwrap(), vec!["MT-7".to_string()]);
+        m.set_removal_hook(None);
+        m.remove("", "MT-8").await.unwrap();
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            1,
+            "a cleared hook is not called"
+        );
     }
 
     // Mirror of TestRemoveFailureWrapsErrWorkspaceRemove: drop write+exec on the workspace dir so

@@ -45,6 +45,7 @@ use tracing::Instrument;
 
 use crate::agentupdate::AgentUpdate;
 use crate::dispatch::dependency_mode_enabled;
+use crate::dockercleanup::with_docker_hint;
 use crate::effective::{Effective, ResolvedProject};
 use crate::ghenrich::{
     DaemonPrLinks, GH_SUMMONS_TIMEOUT, apply_github_summons, enrich_with_github_summons,
@@ -320,6 +321,11 @@ pub enum Event {
     ScratchRunInUse {
         run_id: i64,
         reply: oneshot::Sender<bool>,
+    },
+    /// A request for the Docker reaper's plan (STUDIO-2316; no Go counterpart): the effective
+    /// `docker_cleanup` policy and the live run set, so the daily reap runs off the control loop.
+    DockerReap {
+        reply: oneshot::Sender<crate::dockercleanup::DockerReapPlan>,
     },
     /// The TOCTOU guard: is this worktree path a live running issue RIGHT NOW (Go `evWorkspaceInUse`)?
     WorkspaceInUse {
@@ -1017,6 +1023,9 @@ impl Orchestrator {
             }
             Event::ScratchRunInUse { run_id, reply } => {
                 let _ = reply.send(self.scratch_run_in_use(run_id));
+            }
+            Event::DockerReap { reply } => {
+                let _ = reply.send(self.build_docker_reap_plan());
             }
             Event::WorkspaceInUse { mgr, path, reply } => {
                 let _ = reply.send(self.worktree_in_use(mgr.as_deref(), &path));
@@ -2449,7 +2458,10 @@ impl Orchestrator {
                 as std::sync::Arc<dyn crate::ghsummons::OpenPrSource>);
             deps.run_pr_repo = crate::ghsummons::parse_repo(&deps.repo_url);
         }
-        deps.stack_context = stack_context;
+        deps.stack_context = with_docker_hint(
+            stack_context,
+            eff.cfg.docker_cleanup.enabled && deps.manager.is_none() && deps.landing.is_none(),
+        );
         deps.capabilities_section = capabilities_section;
         deps.teammate_section = teammate_section;
         // The routed teammate's profile model/effort, which the worker lands on the session before

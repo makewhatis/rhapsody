@@ -276,6 +276,30 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Docker leftover cleanup (STUDIO-2316)
+
+Runs no longer leak Docker containers and networks. Every dispatched run's env carries
+`COMPOSE_PROJECT_NAME=rhapsody-<run id>` beside `RHAPSODY_RUN_ID`. Unless `docker_cleanup.enabled`
+is false, the turn-1 prompt of a ticket or review run also asks for
+`--label rhapsody.run=$RHAPSODY_RUN_ID` on any `docker run`. When an issue's workspace is removed,
+the daemon removes the containers labelled with one of that issue's runs or in their compose
+project, then the project's networks and volumes if unused. A reaper runs an hour after boot and
+then daily. It removes a finished run's labelled containers, and unlabelled containers that are
+older than `max_age_days` and match one of `name_patterns`. It also prunes networks unused for an
+hour. It never touches `k8s_*` containers, a live run's containers, or a young unlabelled one.
+A missing `docker` binary or a stopped Docker is logged at debug level and fails nothing.
+
+```yaml
+docker_cleanup:
+  enabled: true        # default
+  max_age_days: 7      # default
+  name_patterns: ["^studio", "^carini-pg", "^study", "^s[0-9]{4}", "^pr_[a-z0-9_]+"]  # default
+  dry_run: false       # true: log each removal (name, age, reason) and remove nothing
+```
+
+This has no Go counterpart; parity fixtures and the config goldens are unchanged (the block is
+emitted only when it differs from the default).
+
 ### Configurable bounded-width landing lines (STUDIO-2140)
 
 The Rhapsody-only strict-repository auto-merge line now admits its first `review.landing_width`

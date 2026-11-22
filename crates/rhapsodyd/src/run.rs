@@ -1088,6 +1088,21 @@ where
         .await;
     });
 
+    // --- Docker reaper (STUDIO-2316; an hour after boot, then daily) ---
+    //
+    // Removes containers runs left behind (a finished run's labelled ones, old ticket-shaped
+    // unlabelled ones) and prunes unused networks. Off-loop through the control handle; a no-op
+    // while `docker_cleanup.enabled` is false.
+    let docker_ctx = shutdown.wait();
+    let docker_handle = handle.clone();
+    let docker_task = tokio::spawn(async move {
+        crate::dockerreap::run_docker_reap_schedule(docker_ctx, move || {
+            let h = docker_handle.clone();
+            async move { h.reap_docker().await }
+        })
+        .await;
+    });
+
     // --- manager self-test watcher (STUDIO-1049, §4.7) ---
     //
     // Spawned for configured authority, even while every entry is failing. Boot waits for a usable
@@ -1897,6 +1912,8 @@ where
     // The scratch janitor is cancelled by the same signal; a sweep already in flight is bounded by
     // the plan round-trip, so joining it here cannot hang shutdown.
     let _ = scratch_task.await;
+    // The Docker reaper shares that signal; each Docker call inside a pass is time-bounded.
+    let _ = docker_task.await;
     // The manager self-test watcher is cancelled by the same signal and checks it around its sleep,
     // so its wait is bounded by one probe (and, at most, one canary turn, itself capped by the turn
     // timeout).
@@ -3128,13 +3145,14 @@ mod tests {
     // fast, non-fatal), and workspace.root + logging.dir + storage + scratch.root stay inside the
     // temp dir. The legacy scratch sweep is disabled: TMPDIR may belong to another daemon, and
     // BootSeams::home does not override either scratch root. No host disk-pressure gate is needed.
+    // Docker cleanup is off so a test daemon never lists or removes the host's containers.
     // `storage_block` + `extra_block` are top-level YAML blocks. Literal
     // api_key (not `$VAR`) avoids a process-global env mutation racing parallel tests — see bootcfg.
     fn write_wf(dir: &TempDir, storage_block: &str, extra_block: &str) -> PathBuf {
         let ws = dir.child("ws");
         let logs = dir.child("logs");
         let body = format!(
-            "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\npolling:\n  interval_ms: 50\nagent:\n  backend: claude\nworkspace:\n  root: {ws}\nlogging:\n  dir: {logs}\nscratch:\n  root: {scratch}\n  legacy_ttl_hours: 0\n  min_free_gib: 0\n{storage_block}{extra_block}---\nWork the issue.\n",
+            "---\ntracker:\n  kind: linear\n  endpoint: http://127.0.0.1:9\n  api_key: tok\n  project_slug: proj\npolling:\n  interval_ms: 50\nagent:\n  backend: claude\nworkspace:\n  root: {ws}\nlogging:\n  dir: {logs}\nscratch:\n  root: {scratch}\n  legacy_ttl_hours: 0\n  min_free_gib: 0\ndocker_cleanup:\n  enabled: false\n{storage_block}{extra_block}---\nWork the issue.\n",
             ws = ws.display(),
             logs = logs.display(),
             scratch = dir.child("scratch").display(),
