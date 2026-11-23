@@ -276,6 +276,18 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Incremental CI-failure routing and queued-runner warnings (STUDIO-2348)
+
+Completed routing-gate failures summon the author even while other checks are queued or running.
+The comment names pending checks; each failing workflow/check is announced once per head, with
+later failures producing incremental follow-ups. Unrelated failures retain their one durable rerun
+when the failing workflow has finished; an unfinished workflow routes immediately instead of
+holding the author behind a runner queue. Immutable failure evidence is cached independently of
+fresh pending-check observations. Each PR/check observed continuously queued without a start for
+more than 60 minutes emits one WARN. Queue age starts at the daemon's first observation (GitHub's
+GraphQL CheckRun has no creation timestamp); timers and notification dedupe are process-local.
+This extends the Rhapsody-only review watcher; Go parity fixtures and schemas are unchanged.
+
 ### Docker leftover cleanup (STUDIO-2316)
 
 Runs no longer leak Docker containers and networks. Every dispatched run's env carries
@@ -394,7 +406,7 @@ check in the complete head inventory is marked required, all checks become the r
 failures, pending and unrelated-file evidence (STUDIO-2094). With any required check, optional
 failures remain ignored. Comments and logs name the mode; merge policy is unchanged. WORKFLOW.md
 `review.ci_failure_routing` defaults on and hot-reloads; `review.ci_failure_escalation_hours` defaults
-to two hours before an unanswered summons is reported as needing a human. Pending checks, live
+to two hours before an unanswered summons is reported as needing a human. Live
 author runs and human-held tickets do not summon. File-evidenced unrelated Actions failures get
 one durable failed-jobs rerun per head first (STUDIO-2136). Summons dedupe, like conflict routing,
 is process-local. This extends
