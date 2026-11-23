@@ -19,6 +19,13 @@ pub struct CiSnapshot {
     pub all_checks: bool,
     pub failed: Vec<CiFailure>,
     pub pending: bool,
+    #[serde(default)]
+    pub pending_checks: Vec<String>,
+    /// Queued check runs that have not acquired a runner, including optional checks.
+    #[serde(default)]
+    pub queued_checks: Vec<String>,
+    #[serde(default)]
+    pub rerun_pending: bool,
     /// Proven only from a complete PR inventory and file evidence for EVERY failing check.
     pub unrelated: bool,
     /// Current routing-gate jobs, including successful reruns, for the operator flake log.
@@ -53,9 +60,38 @@ pub(crate) struct CiState {
     rerun: Option<(DateTime<Utc>, Vec<CiFailure>)>,
     rerun_error: Option<String>,
     pub red: bool,
+    announced: std::collections::BTreeSet<(String, String)>,
+    queued_since: std::collections::BTreeMap<String, DateTime<Utc>>,
+    queue_warned: std::collections::BTreeSet<String>,
 }
 
 impl CiState {
+    fn queue_warnings(&mut self, ci: &CiSnapshot, now: DateTime<Utc>) -> Vec<(String, i64)> {
+        self.queued_since
+            .retain(|name, _| ci.queued_checks.contains(name));
+        let mut warnings = Vec::new();
+        for name in &ci.queued_checks {
+            let since = self.queued_since.entry(name.clone()).or_insert(now);
+            let minutes = now.signed_duration_since(*since).num_minutes();
+            if minutes > 60 && self.queue_warned.insert(name.clone()) {
+                warnings.push((name.clone(), minutes));
+            }
+        }
+        warnings
+    }
+
+    fn new_failures(&self, ci: &CiSnapshot) -> Vec<CiFailure> {
+        ci.failed
+            .iter()
+            .filter(|c| {
+                !self
+                    .announced
+                    .contains(&(c.workflow.clone(), c.name.clone()))
+            })
+            .cloned()
+            .collect()
+    }
+
     fn unanswered(
         &self,
         now: DateTime<Utc>,
@@ -75,11 +111,13 @@ impl CiState {
         if self.head != ci.head {
             *self = Self {
                 head: ci.head.clone(),
+                queue_warned: std::mem::take(&mut self.queue_warned),
                 ..Self::default()
             };
         }
-        self.red = !ci.pending && !ci.failed.is_empty();
-        if !self.red || held || live || self.summoned_at.is_some() {
+        self.red = !ci.failed.is_empty();
+        let fresh = self.new_failures(ci);
+        if !self.red || held || live || fresh.is_empty() {
             return CiAction::None;
         }
         if let Some((_, previous)) = &self.rerun {
@@ -87,18 +125,20 @@ impl CiState {
             // Time passing is not evidence of a second failure.
             if ci.rerun_error.is_none()
                 && self.rerun_error.is_none()
-                && ci
-                    .failed
-                    .iter()
-                    .any(|c| previous.iter().any(|p| p.id == c.id))
+                && fresh.iter().all(|c| previous.iter().any(|p| p.id == c.id))
             {
                 return CiAction::None;
             }
-        } else if ci.unrelated && ci.failed.iter().all(|c| action_job(&c.url).is_some()) {
+        } else if ci.unrelated
+            && !ci.rerun_pending
+            && ci.failed.iter().all(|c| action_job(&c.url).is_some())
+        {
             self.rerun = Some((now, ci.failed.clone()));
             return CiAction::Rerun;
         }
-        self.summoned_at = Some(now);
+        self.announced
+            .extend(fresh.iter().map(|c| (c.workflow.clone(), c.name.clone())));
+        self.summoned_at.get_or_insert(now);
         CiAction::Summon
     }
 }
@@ -115,6 +155,7 @@ fn durable_decide(
     if state.head != ci.head {
         *state = CiState {
             head: ci.head.clone(),
+            queue_warned: std::mem::take(&mut state.queue_warned),
             ..Default::default()
         };
     }
@@ -345,6 +386,15 @@ pub(crate) fn parse_snapshot(value: &serde_json::Value, head: &str) -> Option<Ci
         }
     }
     for (_, c) in latest.into_values() {
+        let name = c["name"].as_str().or_else(|| c["context"].as_str())?;
+        if c["__typename"] == "CheckRun" && c["status"] != "COMPLETED" {
+            ci.pending_checks.push(name.into());
+            if c["status"] == "QUEUED" && c["startedAt"].as_str().is_none_or(str::is_empty) {
+                ci.queued_checks.push(name.into());
+            }
+        } else if c["__typename"] == "StatusContext" && c["state"] == "PENDING" {
+            ci.pending_checks.push(name.into());
+        }
         if !ci.all_checks && !c["isRequired"].as_bool()? {
             continue;
         }
@@ -540,6 +590,11 @@ impl crate::orchestrator::Orchestrator {
         // otherwise stale red evidence could keep escalating a check that has already passed.
         let held = !primed || held.contains(&ticket.to_ascii_lowercase()) || performer_missing;
         let mut state = self.ci_routed.get(pr).cloned().unwrap_or_default();
+        let fresh = if state.head == ci.head {
+            state.new_failures(ci)
+        } else {
+            ci.failed.clone()
+        };
         let action = match durable_decide(
             self.store(),
             pr,
@@ -555,9 +610,15 @@ impl crate::orchestrator::Orchestrator {
                 return CiAction::None;
             }
         };
+        for (check, minutes) in state.queue_warnings(ci, (self.now)()) {
+            tracing::warn!(%pr, %check, minutes, "{check} on {pr} has been queued {minutes} min with no runner");
+        }
         state.ticket = ticket.into();
         let original = state.rerun.as_ref().map(|(_, failures)| failures.clone());
         let mut evidence = ci.clone();
+        if action == CiAction::Summon {
+            evidence.failed = fresh;
+        }
         evidence.rerun_error = state.rerun_error.clone();
         self.ci_routed.insert(pr.clone(), state);
         if action == CiAction::None {
@@ -575,7 +636,8 @@ impl crate::orchestrator::Orchestrator {
                 ci.head,
                 row.author,
                 ci.gate(),
-                ci.failed
+                evidence
+                    .failed
                     .iter()
                     .map(|c| c.name.as_str())
                     .collect::<Vec<_>>()
@@ -626,10 +688,19 @@ fn failure_details(ci: &CiSnapshot, original: Option<&[CiFailure]>) -> String {
             out.push_str(&format!("  > {}\n", line.replace(['\r', '\n'], " ")));
         }
     }
+    if !ci.pending_checks.is_empty() {
+        out.push_str(&format!("\nStill running: {}. Do not wait for these checks before fixing the completed failures.\n", ci.pending_checks.iter().map(|name| one_line(name)).collect::<Vec<_>>().join(", ")));
+    }
     if ci.unrelated {
         out.push_str("\nThe failing checks' file evidence touches no file in this PR's diff; this may be unrelated or flaky.\n");
     }
-    if let Some(original) = original.filter(|o| !o.is_empty()) {
+    if let Some(original) = original.filter(|o| {
+        o.iter().any(|old| {
+            ci.failed
+                .iter()
+                .any(|c| c.name == old.name && c.workflow == old.workflow)
+        })
+    }) {
         if let Some(error) = &ci.rerun_error {
             out.push_str(&format!(
                 "\nThe daemon's one rerun request failed: {}.\n",
@@ -638,7 +709,11 @@ fn failure_details(ci: &CiSnapshot, original: Option<&[CiFailure]>) -> String {
         } else {
             out.push_str("\nThe failed jobs were rerun once and failed again at this head. Original job links:\n");
         }
-        for c in original {
+        for c in original.iter().filter(|old| {
+            ci.failed
+                .iter()
+                .any(|c| c.name == old.name && c.workflow == old.workflow)
+        }) {
             out.push_str(&format!("- {} — {}\n", one_line(&c.name), one_line(&c.url)));
         }
     }
@@ -664,6 +739,86 @@ fn one_line(s: &str) -> String {
 mod tests {
     use super::*;
     use crate::ghsummons::{GH, PrStateSource};
+
+    #[tokio::test]
+    async fn fake_github_routes_incremental_failures_while_other_checks_queue() {
+        for required in [true, false] {
+            let mut payload = check_payload("FAILURE");
+            let nodes = payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+                ["statusCheckRollup"]["contexts"]["nodes"].as_array_mut().unwrap();
+            nodes[0]["isRequired"] = required.into();
+            nodes[0]["detailsUrl"] = "".into();
+            nodes[0]["annotations"]["nodes"] = serde_json::json!([]);
+            let mut queued = nodes[0].clone();
+            queued["id"] = "job-2".into();
+            queued["name"] = "apple-e2e".into();
+            queued["status"] = "QUEUED".into();
+            nodes.push(queued);
+            let payload = std::sync::Arc::new(std::sync::Mutex::new(payload));
+            let response = payload.clone();
+            let gh = GH::new(
+                "",
+                Some(Box::new(move |args| {
+                    assert_eq!(args[..2], ["api", "graphql"]);
+                    Ok(serde_json::to_vec(&*response.lock().unwrap()).unwrap())
+                })),
+            );
+            let pr = crate::prstate::PrCoord::new("o", "r", 1);
+            let mut ci = gh.review_ci(&pr, "a", None).await.unwrap().unwrap();
+            let now = Utc::now();
+            let mut state = CiState::default();
+            assert_eq!(state.decide(&ci, now, false, false), CiAction::Summon);
+            assert!(failure_details(&ci, None).contains("Still running: apple-e2e"));
+            assert_eq!(state.decide(&ci, now, false, false), CiAction::None);
+            assert_eq!(state.queue_warnings(&ci, now), Vec::new());
+            assert!(
+                state
+                    .queue_warnings(&ci, now + Duration::minutes(60))
+                    .is_empty()
+            );
+            assert_eq!(
+                state.queue_warnings(&ci, now + Duration::minutes(61)),
+                vec![("apple-e2e".into(), 61)]
+            );
+            assert!(
+                state
+                    .queue_warnings(&ci, now + Duration::hours(6))
+                    .is_empty()
+            );
+            {
+                let mut payload = payload.lock().unwrap();
+                let nodes = payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+                    ["statusCheckRollup"]["contexts"]["nodes"].as_array_mut().unwrap();
+                let mut second = nodes[0].clone();
+                second["id"] = "job-3".into();
+                second["name"] = "android".into();
+                nodes.push(second);
+            }
+            ci = gh.review_ci(&pr, "a", Some(&ci)).await.unwrap().unwrap();
+            let mut followup = ci.clone();
+            followup.failed = state.new_failures(&ci);
+            let details = failure_details(&followup, None);
+            assert!(details.contains("android"));
+            assert!(!details.contains("go test"));
+            assert_eq!(state.decide(&ci, now, false, false), CiAction::Summon);
+            assert_eq!(state.decide(&ci, now, false, false), CiAction::None);
+            {
+                let mut payload = payload.lock().unwrap();
+                let nodes = payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+                    ["statusCheckRollup"]["contexts"]["nodes"].as_array_mut().unwrap();
+                for node in nodes {
+                    node["conclusion"] = "SUCCESS".into();
+                }
+            }
+            ci = gh.review_ci(&pr, "a", Some(&ci)).await.unwrap().unwrap();
+            assert!(ci.failed.is_empty());
+            assert_eq!(ci.pending_checks, ["apple-e2e"]);
+            assert_eq!(
+                CiState::default().decide(&ci, now, false, false),
+                CiAction::None
+            );
+        }
+    }
 
     #[test]
     fn deferred_request_failure_survives_restart_without_resending() {
@@ -812,7 +967,7 @@ mod tests {
     }
 
     #[test]
-    fn durable_rerun_passes_without_summoning_and_waits_for_running_checks() {
+    fn unfinished_workflow_routes_immediately_and_finished_workflow_can_rerun() {
         use rhapsody_store::{Sqlite, Store, StorePath};
         let store = Sqlite::open(StorePath::InMemory).unwrap();
         let pr = crate::prstate::PrCoord::new("o", "r", 1);
@@ -821,12 +976,15 @@ mod tests {
         ci.failed[0].url = "https://github.com/o/r/actions/runs/1/job/2".into();
         let mut state = CiState::default();
         ci.pending = true;
+        ci.rerun_pending = true;
         assert_eq!(
             durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
-            CiAction::None
+            CiAction::Summon
         );
         assert!(store.list_ci_reruns().unwrap().is_empty());
         ci.pending = false;
+        ci.rerun_pending = false;
+        state = CiState::default();
         assert_eq!(
             durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
             CiAction::Rerun
@@ -987,7 +1145,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unrelated_failure_waits_for_the_workflow_even_if_its_required_job_finished() {
+    async fn unrelated_failure_routes_without_waiting_for_its_workflow() {
         use std::sync::{
             Arc,
             atomic::{AtomicBool, Ordering},
@@ -1015,19 +1173,20 @@ mod tests {
         );
         let pr = crate::prstate::PrCoord::new("o", "r", 1);
         let ci = gh.review_ci(&pr, "a", None).await.unwrap().unwrap();
-        assert!(ci.pending);
+        assert!(ci.rerun_pending);
         let store = rhapsody_store::Sqlite::open(rhapsody_store::StorePath::InMemory).unwrap();
         let mut state = CiState::default();
         assert_eq!(
             durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
-            CiAction::None
+            CiAction::Summon
         );
         finished.store(true, Ordering::SeqCst);
         let ci = gh.review_ci(&pr, "a", Some(&ci)).await.unwrap().unwrap();
-        assert!(!ci.pending);
+        assert!(!ci.rerun_pending);
         assert_eq!(
             durable_decide(&store, &pr, &mut state, &ci, Utc::now(), false, false).unwrap(),
-            CiAction::Rerun
+            CiAction::None,
+            "finishing the workflow must not announce the same failure twice"
         );
     }
 
@@ -1061,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn no_required_checks_summons_the_author_and_defers_pending_or_truncated_answers() {
+    fn no_required_checks_routes_with_pending_but_defers_truncated_answers() {
         let mut payload = check_payload("FAILURE");
         payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
             ["contexts"]["nodes"][0]["isRequired"] = false.into();
@@ -1082,7 +1241,7 @@ mod tests {
         assert_eq!(ci.failed.len(), 1);
         assert_eq!(
             CiState::default().decide(&ci, now, false, false),
-            CiAction::None
+            CiAction::Summon
         );
         payload["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]["statusCheckRollup"]
             ["contexts"]["pageInfo"]["hasNextPage"] = true.into();
@@ -1169,15 +1328,11 @@ mod tests {
     }
 
     #[test]
-    fn ci_routing_is_once_per_head_and_defers_pending_human_and_live_author() {
+    fn ci_routing_dedupes_failures_and_defers_human_and_live_author() {
         let mut state = CiState::default();
         let now = chrono::Utc::now();
         let mut snapshot = red("a");
-        for (held, live, pending) in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
-        ] {
+        for (held, live, pending) in [(true, false, false), (false, true, false)] {
             snapshot.pending = pending;
             assert_eq!(state.decide(&snapshot, now, held, live), CiAction::None);
         }

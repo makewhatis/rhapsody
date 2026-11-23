@@ -1205,8 +1205,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
                         ci_cache.insert(pr.clone(), ci.clone());
                         // Log enrichment can take several bounded calls. Recheck a red head after
                         // that work so an intervening push/close cannot summon on stale evidence.
-                        let current = ci.pending
-                            || ci.failed.is_empty()
+                        let current = ci.failed.is_empty()
                             || matches!(src.pr_state_unconditional(&pr.owner, &pr.repo, pr.number, &deps.allow).await,
                                 Ok(PrLookup::Found(snap)) if snap.status == PrStatus::Open && snap.head_sha == ci.head);
                         if current
@@ -10447,6 +10446,54 @@ mod tests {
     }
 
     #[test]
+    fn queued_checks_warn_once_per_pr_and_check_without_summoning() {
+        use crate::reviewci::{CiAction, CiSnapshot};
+        // Warm the WARN callsite before the assertion pass, as with reconciliation log tests.
+        for warmup in [true, false] {
+            let (mut o, mut rx) =
+                conflict_harness(ticketless_conflict(&["alice", "bob"], "In Progress"));
+            for number in [12, 13] {
+                introduce(&o, approved_row(number, "bob", HEAD_A));
+            }
+            o.handle_review_sweep(&[open_at(12, HEAD_A), open_at(13, HEAD_A)]);
+            let start = (o.now)();
+            let ci = CiSnapshot {
+                head: HEAD_A.into(),
+                pending: true,
+                pending_checks: vec!["apple-e2e".into(), "apple-test".into()],
+                queued_checks: vec!["apple-e2e".into(), "apple-test".into()],
+                ..Default::default()
+            };
+            let (_, events) = crate::testsupport::capture_events(|| {
+                for minutes in [0, 60, 61, 120] {
+                    o.now = Box::new(move || start + chrono::Duration::minutes(minutes));
+                    for number in [12, 13] {
+                        assert_eq!(o.observe_review_ci(&coord(number), &ci), CiAction::None);
+                    }
+                }
+            });
+            if !warmup {
+                let warnings: Vec<_> = events
+                    .iter()
+                    .filter(|e| e.message.contains("with no runner"))
+                    .collect();
+                assert_eq!(warnings.len(), 4);
+                for number in [12, 13] {
+                    for check in ["apple-e2e", "apple-test"] {
+                        assert!(warnings.iter().any(|e| e.level == "WARN"
+                            && e.message
+                                == format!(
+                                    "{check} on {} has been queued 61 min with no runner",
+                                    coord(number)
+                                )));
+                    }
+                }
+            }
+            assert!(rx.try_recv().is_err());
+        }
+    }
+
+    #[test]
     fn ci_route_back_reaches_the_author_after_approval_and_honors_live_gates() {
         use crate::reviewci::CiAction;
         for required in [true, false] {
@@ -10465,6 +10512,8 @@ mod tests {
                 }}]}
             }}}});
             let mut ci = crate::reviewci::parse_snapshot(&payload, HEAD_A).unwrap();
+            ci.pending = true;
+            ci.pending_checks = vec!["apple-e2e".into()];
             ci.failed[0].tests = vec!["--- FAIL: TestUsage".into()];
             o.eff.as_mut().unwrap().cfg.review.ci_failure_routing = false;
             assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
@@ -10490,8 +10539,20 @@ mod tests {
                 "Routing gate: all checks (this repository marks none required)."
             }));
             assert!(body.contains("TestUsage"));
+            assert!(body.contains("Still running: apple-e2e"));
             assert!(body.contains("Do not loosen, skip or delete tests"));
             assert!(crate::reviewnotify::summons_author(&body, &c.summon_token));
+            assert!(rx.try_recv().is_err());
+            ci.failed.push(crate::reviewci::CiFailure {
+                name: "android".into(),
+                id: "2".into(),
+                ..Default::default()
+            });
+            assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::Summon);
+            assert_eq!(o.observe_review_ci(&coord(12), &ci), CiAction::None);
+            let followup = crate::reviewnotify::re_engage_comment(&rx.try_recv().unwrap());
+            assert!(followup.contains("android"));
+            assert!(!followup.contains("TestUsage"));
             assert!(rx.try_recv().is_err());
             let now = (o.now)();
             assert!(

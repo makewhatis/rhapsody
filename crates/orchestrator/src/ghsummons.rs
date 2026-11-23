@@ -2670,7 +2670,7 @@ impl PrStateSource for GH {
         let Some(mut ci) = crate::reviewci::parse_snapshot(&value, head) else {
             return Ok(None);
         };
-        if ci.pending || ci.failed.is_empty() {
+        if ci.failed.is_empty() {
             return Ok(Some(ci));
         }
         // The check conclusion is refreshed every tick, but immutable attempt logs/diff evidence
@@ -2678,14 +2678,14 @@ impl PrStateSource for GH {
         if let Some(old) = previous
             && old.head == ci.head
             && old.all_checks == ci.all_checks
-            && !old.pending
             && old
                 .failed
                 .iter()
                 .map(|c| &c.id)
                 .eq(ci.failed.iter().map(|c| &c.id))
         {
-            ci = old.clone();
+            ci.failed = old.failed.clone();
+            ci.unrelated = old.unrelated;
         } else {
             // Cheap excerpts only: at most four job logs, twenty failure lines per job. Check names
             // and links still survive an unavailable log or a non-Actions CI provider.
@@ -2756,7 +2756,7 @@ impl PrStateSource for GH {
                 match run["status"].as_str() {
                     Some("completed") => {}
                     Some("queued" | "in_progress" | "waiting" | "pending" | "requested") => {
-                        ci.pending = true
+                        ci.rerun_pending = true
                     }
                     _ => return Err("CI workflow run has an unknown status".into()),
                 }
