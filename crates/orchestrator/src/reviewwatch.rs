@@ -494,6 +494,9 @@ pub trait ReviewWatchSink: Send + Sync {
     /// tick, which is also what makes a merge that races a fresh push safe to simply lose.
     async fn merge(&self, plan: crate::automerge::AutoMergePlan);
 
+    /// Restore strict landing FIFO priority after the watcher's rotated observation pass.
+    fn order_merges(&self, _plans: &mut [crate::automerge::AutoMergePlan]) {}
+
     /// Moves ONE merged pull request's implementation ticket to its terminal state (STUDIO-712).
     ///
     /// On the sink rather than inside [`Self::sweep`] because it is a TRACKER write, and the point
@@ -613,6 +616,12 @@ impl ControlWatchSink {
 
 #[async_trait]
 impl ReviewWatchSink for ControlWatchSink {
+    fn order_merges(&self, plans: &mut [crate::automerge::AutoMergePlan]) {
+        if let Some(deps) = &self.automerge {
+            deps.ledger.order_landing_plans(plans);
+        }
+    }
+
     async fn ci(&self, pr: PrCoord, ci: crate::reviewci::CiSnapshot) -> crate::reviewci::CiAction {
         let (reply, rx) = tokio::sync::oneshot::channel();
         if self
@@ -1278,6 +1287,7 @@ pub async fn run_review_watch_task(mut ctx: CancelWait, deps: ReviewWatchDeps) {
         // irreversible one. Before the auto-Done moves below and not after: a merge performed now
         // is observed as MERGED by the NEXT tick, which is what produces its ticket's Done plan
         // through the existing STUDIO-712 path rather than a second one written here.
+        deps.sink.order_merges(&mut report.merge);
         for plan in report.merge {
             if ctx.is_cancelled() {
                 return;

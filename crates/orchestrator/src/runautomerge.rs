@@ -11,7 +11,8 @@
 //!
 //! STUDIO-2126 adds a repository FIFO beside the refusal ledger. Control admits eligible plans
 //! and removes ineligible observations; this task records strict protection and attempt progress.
-//! Only a strict repository's front may update or merge. An updated front keeps admission during
+//! Only a strict repository's ready window may update or merge. Unready PRs yield capacity without
+//! losing FIFO position. An updated front keeps admission during
 //! checks/review, and a merged front is released by the next observation, not mid-batch. The review
 //! API reads positions/states and reconciliation suppresses deliberate waits through this handle.
 //! No lock spans I/O or an await. Admission is process-local and rebuilt on restart.
@@ -509,12 +510,14 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
     // said the pull request is not a draft, and the reader carries that default itself so the draft
     // poke can take the opposite one from the same unstated answer.
     if snap.draft_blocks_merge() {
-        deps.ledger
-            .1
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .line
-            .remove(&plan.pr);
+        {
+            let mut queue = deps.ledger.1.lock().unwrap_or_else(PoisonError::into_inner);
+            queue.line.remove(&plan.pr);
+            queue.yielded.remove(&plan.pr);
+            queue
+                .handoffs
+                .retain(|(from, to, _)| from != &plan.pr && to != &plan.pr);
+        }
         return refuse(plan, deps, DECLINE_DRAFT);
     }
 
@@ -522,9 +525,9 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
         Ok(strict) => strict,
         Err(error) => return AutoMergeOutcome::Failed(error.to_string()),
     };
-    if !deps.ledger.landing_turn(&plan.pr, strict) {
-        return AutoMergeOutcome::Held("waiting its turn to land");
-    }
+    // Register protection/admission before recording readiness, but do not let an unready
+    // front prevent later plans from reading their own gates.
+    deps.ledger.register_landing(&plan.pr, strict);
     // 2. GitHub's own verdict on whether this can merge at all.
     let state = match deps.mergestate.merge_state(owner, repo, number).await {
         Ok(state) => state,
@@ -534,6 +537,10 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
         return AutoMergeOutcome::Held("waiting for the updated head to be observed");
     }
     if state == MERGE_STATE_BEHIND {
+        deps.ledger.resume_turn(&plan.pr);
+        if !deps.ledger.landing_turn(&plan.pr, strict) {
+            return AutoMergeOutcome::Held("waiting its turn to land");
+        }
         return update_behind_branch(plan, deps).await;
     }
     let optional_failures = if state == "UNSTABLE" {
@@ -563,6 +570,10 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
             Err(error) => return AutoMergeOutcome::Failed(error.to_string()),
         };
         deps.ledger.set_landing_state(&plan.pr, progress);
+        deps.ledger.yield_turn(
+            &plan.pr,
+            "GitHub does not report the pull request as mergeable",
+        );
         // Every other value, including one this daemon has never seen. Named in the log rather
         // than in the refusal, which is a fixed phrase.
         return refuse_loudly(
@@ -586,11 +597,15 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
     };
     if checks.is_empty() {
         deps.ledger.set_landing_state(&plan.pr, "blocked");
+        deps.ledger
+            .yield_turn(&plan.pr, "no checks have reported on this head");
         // Not "no checks, so nothing failed": an empty rollup is no EVIDENCE of green, and this
         // repository always runs several. Fails closed.
         return refuse(plan, deps, "no checks have reported on this head");
     }
     if let Some(bad) = blocking_check(&checks).filter(|_| optional_failures.is_none()) {
+        deps.ledger
+            .yield_turn(&plan.pr, "a check is failing or has not finished");
         deps.ledger.set_landing_state(
             &plan.pr,
             if checks.iter().any(|c| {
@@ -612,6 +627,10 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
         });
     }
 
+    deps.ledger.resume_turn(&plan.pr);
+    if !deps.ledger.landing_turn(&plan.pr, strict) {
+        return AutoMergeOutcome::Held("waiting its turn to land");
+    }
     deps.ledger.set_landing_state(&plan.pr, "ready");
 
     // 3b. The manager-approval recheck (STUDIO-1011; §8.3), immediately before the merge command and
@@ -656,8 +675,8 @@ async fn attempt_auto_merge(plan: &AutoMergePlan, deps: &AutoMergeDeps) -> AutoM
             {
                 tracing::warn!(pr = %plan.pr, %error, "auto-merge: merged but could not comment on non-required failures");
             }
-            // Keep the slot until the NEXT observation confirms the merge, so later plans from
-            // this same tick cannot update against a base that just moved.
+            // Hold this repository until the NEXT observation confirms the merge, so later
+            // plans from this same tick cannot update against a base that just moved.
             deps.ledger.set_landing_state(&plan.pr, "merged");
             // The one audit line for a merge. The caller logs nothing further: two INFO lines
             // saying `auto-merge: merged` read as two merges.
@@ -801,6 +820,26 @@ struct LandingQueue {
     rotations: HashMap<PrCoord, &'static str>,
     timeout: Option<Duration>,
     optional_comments: std::collections::HashSet<(PrCoord, String)>,
+    yielded: HashMap<PrCoord, &'static str>,
+    handoffs: std::collections::HashSet<(PrCoord, PrCoord, &'static str)>,
+}
+
+impl LandingQueue {
+    fn in_flight(&self, pr: &PrCoord) -> bool {
+        !self.yielded.contains_key(pr)
+            && !self
+                .line
+                .entries
+                .iter()
+                .any(|e| e.pr != *pr && repo_key(&e.pr) == repo_key(pr) && e.state == "merged")
+            && self
+                .line
+                .entries
+                .iter()
+                .filter(|e| repo_key(&e.pr) == repo_key(pr) && !self.yielded.contains_key(&e.pr))
+                .position(|e| e.pr == *pr)
+                .is_some_and(|index| index < self.widths.get(&repo_key(pr)).copied().unwrap_or(3))
+    }
 }
 
 /// One PR's place in a strict repository's landing line, served by GET /api/v1/reviews.
@@ -824,6 +863,42 @@ fn repo_key(pr: &PrCoord) -> (String, String) {
 const LEDGER_CAPACITY: usize = 256;
 
 impl AutoMergeLedger {
+    pub(crate) fn order_landing_plans(&self, plans: &mut [AutoMergePlan]) {
+        let queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        // The watcher rotates its reads. Recheck older yielded PRs before later arrivals so
+        // freshly green checks restore FIFO priority on this very tick.
+        plans.sort_by_key(|plan| {
+            if queue.strict.get(&repo_key(&plan.pr)) == Some(&true) {
+                queue.line.entries.iter().position(|e| e.pr == plan.pr)
+            } else {
+                None
+            }
+        });
+    }
+
+    fn register_landing(&self, pr: &PrCoord, strict: bool) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        queue.strict.insert(repo_key(pr), strict);
+        if strict && !queue.excluded.contains(pr) {
+            queue.line.admit(pr);
+        }
+    }
+
+    fn yield_turn(&self, pr: &PrCoord, reason: &'static str) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        if queue.strict.get(&repo_key(pr)) == Some(&true) {
+            queue.yielded.insert(pr.clone(), reason);
+            queue.declined_since.remove(pr);
+        }
+    }
+
+    fn resume_turn(&self, pr: &PrCoord) {
+        let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
+        if queue.yielded.remove(pr).is_some() {
+            queue.handoffs.retain(|(from, _, _)| from != pr);
+        }
+    }
+
     pub(crate) fn set_landing_width(&self, pr: &PrCoord, width: usize) {
         self.1
             .lock()
@@ -859,10 +934,9 @@ impl AutoMergeLedger {
 
     fn record_decline(&self, plan: &AutoMergePlan, why: &'static str, now: Instant) {
         let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
-        if queue.strict.get(&repo_key(&plan.pr)) != Some(&true)
-            || queue.line.position(&plan.pr).is_none_or(|(position, _)| {
-                position > queue.widths.get(&repo_key(&plan.pr)).copied().unwrap_or(3)
-            })
+        if queue.yielded.contains_key(&plan.pr)
+            || queue.strict.get(&repo_key(&plan.pr)) != Some(&true)
+            || !queue.in_flight(&plan.pr)
         {
             return;
         }
@@ -922,6 +996,10 @@ impl AutoMergeLedger {
         queue.declined_since.retain(|pr, _| prs.contains(pr));
         queue.rotations.retain(|pr, _| prs.contains(pr));
         queue.optional_comments.retain(|(pr, _)| prs.contains(pr));
+        queue.yielded.retain(|pr, _| prs.contains(pr));
+        queue
+            .handoffs
+            .retain(|(from, to, _)| prs.contains(from) && prs.contains(to));
         queue
             .widths
             .retain(|key, _| prs.iter().any(|pr| repo_key(pr) == *key));
@@ -940,6 +1018,10 @@ impl AutoMergeLedger {
     pub(crate) fn remove_from_line(&self, pr: &PrCoord) {
         let mut queue = self.1.lock().unwrap_or_else(PoisonError::into_inner);
         queue.line.remove(pr);
+        queue.yielded.remove(pr);
+        queue
+            .handoffs
+            .retain(|(from, to, _)| from != pr && to != pr);
         queue.declined_since.remove(pr);
         queue.announced.remove(pr);
         queue.excluded.insert(pr.clone());
@@ -966,6 +1048,10 @@ impl AutoMergeLedger {
                 entry.state = "reviewing";
             } else {
                 queue.line.remove(pr);
+                queue.yielded.remove(pr);
+                queue
+                    .handoffs
+                    .retain(|(from, to, _)| from != pr && to != pr);
                 queue.declined_since.remove(pr);
                 queue.announced.remove(pr);
                 queue.excluded.insert(pr.clone());
@@ -992,8 +1078,12 @@ impl AutoMergeLedger {
                     position,
                     total,
                     width,
-                    in_flight: position <= width,
-                    state: if position > width { "waiting" } else { e.state },
+                    in_flight: queue.in_flight(&e.pr),
+                    state: if queue.yielded.contains_key(&e.pr) || queue.in_flight(&e.pr) {
+                        e.state
+                    } else {
+                        "waiting"
+                    },
                 })
             })
             .collect()
@@ -1004,7 +1094,8 @@ impl AutoMergeLedger {
             p.owner.eq_ignore_ascii_case(&pr.owner)
                 && p.repo.eq_ignore_ascii_case(&pr.repo)
                 && p.number == pr.number
-                && (!p.in_flight || matches!(p.state, "checks_running" | "updating" | "reviewing"))
+                && (p.state == "waiting"
+                    || matches!(p.state, "checks_running" | "updating" | "reviewing"))
         })
     }
 
@@ -1068,7 +1159,25 @@ impl AutoMergeLedger {
         let Some((position, total)) = queue.line.position(pr) else {
             return false;
         };
-        if position <= queue.widths.get(&repo_key(pr)).copied().unwrap_or(3) {
+        if queue.in_flight(pr) {
+            let yielded: Vec<_> = queue
+                .line
+                .entries
+                .iter()
+                .take_while(|e| e.pr != *pr)
+                .filter(|e| repo_key(&e.pr) == repo_key(pr))
+                .filter_map(|e| {
+                    queue
+                        .yielded
+                        .get(&e.pr)
+                        .map(|reason| (e.pr.clone(), *reason))
+                })
+                .collect();
+            for (from, reason) in yielded {
+                if queue.handoffs.insert((from.clone(), pr.clone(), reason)) {
+                    tracing::info!("{from} yields its landing turn to {pr}: {reason}");
+                }
+            }
             return true;
         }
         if queue.announced.insert(pr.clone(), (position, total)) != Some((position, total)) {
@@ -1288,6 +1397,253 @@ mod tests {
         }
     }
 
+    /// Supplies the control task's plans in observation order while keeping the production
+    /// watcher -> ControlWatchSink -> GitHub merge path intact.
+    struct LandingWatchSink {
+        plans: Vec<AutoMergePlan>,
+        control: crate::reviewwatch::ControlWatchSink,
+        attempted: tokio::sync::mpsc::UnboundedSender<i64>,
+    }
+
+    #[async_trait]
+    impl crate::reviewwatch::ReviewWatchSink for LandingWatchSink {
+        async fn watched(&self) -> Vec<crate::reviewwatch::WatchedPr> {
+            self.plans
+                .iter()
+                .map(|p| crate::reviewwatch::WatchedPr::new(p.pr.clone()))
+                .collect()
+        }
+
+        async fn sweep(
+            &self,
+            observed: Vec<crate::prstate::PrObservation>,
+            _: Option<i64>,
+        ) -> (crate::reviewwatch::ReviewSweepReport, i64) {
+            let merge = observed
+                .iter()
+                .map(|o| self.plans.iter().find(|p| p.pr == o.pr).unwrap().clone())
+                .collect();
+            (
+                crate::reviewwatch::ReviewSweepReport {
+                    merge,
+                    ..Default::default()
+                },
+                0,
+            )
+        }
+
+        fn order_merges(&self, plans: &mut [AutoMergePlan]) {
+            self.control.order_merges(plans);
+        }
+
+        async fn merge(&self, plan: AutoMergePlan) {
+            let number = plan.pr.number;
+            self.control.merge(plan).await;
+            self.attempted.send(number).unwrap();
+        }
+
+        async fn unreadable(&self, _: Vec<PrCoord>) {
+            panic!("fake GitHub must answer every observation");
+        }
+        async fn finish(&self, _: crate::reviewdone::ReviewDonePlan) {}
+        async fn nudge(&self, _: crate::draftpoke::DraftNudge) {}
+        async fn adjudicate(&self, _: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_merges_recovered_front_before_a_later_pr_observed_first() {
+        use crate::control_loop::CancelSignal;
+        use crate::reviewwatch::{ControlWatchSink, ReviewWatchDeps, run_review_watch_task};
+
+        let first = numbered(1);
+        let later = numbered(2);
+        let merger = Arc::new(FakeMerger::default());
+        let mut d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                checks(&[("test", "PENDING")]),
+                merger.clone(),
+            )
+        };
+        d.ledger.set_landing_width(&first.pr, 1);
+        d.ledger.admit(&first.pr);
+        d.ledger.admit(&later.pr);
+        assert!(matches!(
+            perform_auto_merge(&first, &d).await,
+            AutoMergeOutcome::Declined(_)
+        ));
+        assert!(!d.ledger.landing_lines()[0].in_flight);
+        assert!(merger.calls.lock().unwrap().is_empty());
+
+        // Checks recover without a new head. The watcher's rotated observation order puts
+        // the later arrival first; only its production ordering hook restores FIFO priority.
+        d.checks = all_green();
+        let o = crate::orchestrator::Orchestrator::new("WORKFLOW.md");
+        let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        let sink = LandingWatchSink {
+            plans: vec![later, first],
+            control: ControlWatchSink::new(o.control()).with_auto_merge(Arc::new(d)),
+            attempted,
+        };
+        let teams = rhapsody_config::teams::Teams {
+            enabled: true,
+            review: rhapsody_config::teams::Review {
+                mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(
+            signal.wait(),
+            ReviewWatchDeps {
+                pr_source: Some(found(HEAD, PrStatus::Open)),
+                allow: HeadAllowlist::none(),
+                teams,
+                sink: Arc::new(sink),
+                diff_source: None,
+                mirror_source: None,
+                poll_interval_ms: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+            },
+        ));
+        let attempted = tokio::time::timeout(Duration::from_secs(5), async {
+            vec![attempts.recv().await, attempts.recv().await]
+        })
+        .await;
+        signal.cancel();
+        task.await.unwrap();
+
+        let attempted = attempted.unwrap();
+        let calls = merger.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "only one PR may merge per strict-repo tick");
+        assert_eq!(calls[0].0, 1, "the recovered older PR must actually merge");
+        assert_eq!(calls[0].3.as_deref(), Some(HEAD));
+        assert_eq!(attempted, vec![Some(1), Some(2)]);
+    }
+
+    #[tokio::test]
+    async fn pending_fronts_yield_to_clean_or_behind_without_losing_fifo_priority() {
+        for state in [MERGE_STATE_CLEAN, MERGE_STATE_BEHIND] {
+            let merger = Arc::new(FakeMerger::default());
+            let updater = Arc::new(FakeUpdater::default());
+            let mut d = AutoMergeDeps {
+                policy: Arc::new(StrictPolicy),
+                updater: updater.clone(),
+                ..deps(
+                    found(HEAD, PrStatus::Open),
+                    "BLOCKED",
+                    checks(&[("desktop", "QUEUED")]),
+                    merger.clone(),
+                )
+            };
+            let plans: Vec<_> = (1..=5).map(numbered).collect();
+            for p in &plans {
+                d.ledger.admit(&p.pr);
+            }
+            for p in &plans[..3] {
+                perform_auto_merge(p, &d).await;
+            }
+            d.mergestate = merge_state(Some(state));
+            d.checks = all_green();
+            let result = perform_auto_merge(&plans[3], &d).await;
+            if state == MERGE_STATE_CLEAN {
+                assert!(matches!(result, AutoMergeOutcome::Merged(_)), "{result:?}");
+                assert_eq!(merger.calls.lock().unwrap()[0].0, 4);
+            } else {
+                assert_eq!(result, AutoMergeOutcome::Updated);
+                assert_eq!(*updater.calls.lock().unwrap(), [4]);
+            }
+            assert_eq!(d.ledger.landing_lines()[0].number, 1);
+
+            // Once the earliest PR is green it regains its original turn, even at width one.
+            d.ledger.observe_eligibility(&plans[3].pr, false, false);
+            d.ledger.set_landing_width(&plans[0].pr, 1);
+            d.mergestate = merge_state(Some(MERGE_STATE_CLEAN));
+            let mut rotated = vec![plans[4].clone(), plans[0].clone()];
+            d.ledger.order_landing_plans(&mut rotated);
+            assert_eq!(rotated[0].pr, plans[0].pr);
+            assert!(matches!(
+                perform_auto_merge(&plans[0], &d).await,
+                AutoMergeOutcome::Merged(_)
+            ));
+            assert_eq!(
+                perform_auto_merge(&plans[4], &d).await,
+                AutoMergeOutcome::Held("waiting its turn to land")
+            );
+            assert_eq!(merger.calls.lock().unwrap().last().unwrap().0, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn unready_gates_release_capacity_and_a_merge_stops_same_tick_base_updates() {
+        for (state, check) in [
+            ("BLOCKED", "SUCCESS"),
+            ("UNKNOWN", "SUCCESS"),
+            ("CLEAN", "PENDING"),
+            ("CLEAN", "IN_PROGRESS"),
+        ] {
+            let merger = Arc::new(FakeMerger::default());
+            let updater = Arc::new(FakeUpdater::default());
+            let mut d = AutoMergeDeps {
+                policy: Arc::new(StrictPolicy),
+                updater: updater.clone(),
+                ..deps(
+                    found(HEAD, PrStatus::Open),
+                    state,
+                    checks(&[("test", check)]),
+                    merger.clone(),
+                )
+            };
+            for number in 1..=3 {
+                d.ledger.admit(&numbered(number).pr);
+            }
+            perform_auto_merge(&numbered(1), &d).await;
+            d.mergestate = merge_state(Some(MERGE_STATE_CLEAN));
+            d.checks = all_green();
+            assert!(matches!(
+                perform_auto_merge(&numbered(2), &d).await,
+                AutoMergeOutcome::Merged(_)
+            ));
+            d.mergestate = merge_state(Some(MERGE_STATE_BEHIND));
+            assert_eq!(
+                perform_auto_merge(&numbered(3), &d).await,
+                AutoMergeOutcome::Held("waiting its turn to land")
+            );
+            assert!(updater.calls.lock().unwrap().is_empty());
+            assert_eq!(merger.calls.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn landing_handoff_is_logged_once_and_nonstrict_order_is_unchanged() {
+        let first = numbered(1);
+        let next = numbered(2);
+        let ledger = AutoMergeLedger::default();
+        ledger.set_landing_width(&first.pr, 1);
+        ledger.admit(&first.pr);
+        ledger.admit(&next.pr);
+        let (_, events) = crate::testsupport::capture_events(|| {
+            ledger.register_landing(&first.pr, true);
+            for _ in 0..3 {
+                ledger.yield_turn(&first.pr, "checks pending");
+                assert!(ledger.landing_turn(&next.pr, true));
+            }
+        });
+        let expected = format!(
+            "{} yields its landing turn to {}: checks pending",
+            first.pr, next.pr
+        );
+        assert_eq!(events.iter().filter(|e| e.message == expected).count(), 1);
+        ledger.register_landing(&first.pr, false);
+        let mut plans = vec![next.clone(), first.clone()];
+        ledger.order_landing_plans(&mut plans);
+        assert_eq!(plans[0].pr, next.pr);
+        assert!(ledger.landing_turn(&first.pr, false));
+        assert!(ledger.landing_turn(&next.pr, false));
+    }
+
     fn unstable_response() -> serde_json::Value {
         serde_json::json!({"data":{"repository":{"pullRequest":{
             "state":"OPEN", "headRefOid":HEAD, "mergeable":"MERGEABLE", "mergeStateStatus":"UNSTABLE",
@@ -1415,7 +1771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn declined_front_rotates_after_twenty_minutes_and_next_updates() {
+    async fn unmergeable_front_yields_without_rotating_even_after_twenty_minutes() {
         let first = numbered(1);
         let next = numbered(2);
         let ledger = Arc::new(AutoMergeLedger::default());
@@ -1436,11 +1792,8 @@ mod tests {
         perform_auto_merge_at(&first, &d, start + Duration::from_secs(1199)).await;
         assert_eq!(ledger.landing_lines()[0].number, 1);
         perform_auto_merge_at(&first, &d, start + Duration::from_secs(1200)).await;
-        assert_eq!(ledger.landing_lines()[0].number, 2);
-        assert_eq!(
-            ledger.take_rotation(&first.pr),
-            Some("GitHub does not report the pull request as mergeable")
-        );
+        assert_eq!(ledger.landing_lines()[0].number, 1);
+        assert!(!ledger.landing_lines()[0].in_flight);
         assert_eq!(ledger.take_rotation(&first.pr), None);
         let behind = AutoMergeDeps {
             mergestate: merge_state(Some(MERGE_STATE_BEHIND)),
@@ -1650,11 +2003,20 @@ mod tests {
                 assert!(merger.calls.lock().unwrap().is_empty());
             }
             assert!(!d.ledger.waiting_to_land(&first.pr));
-            assert!(d.ledger.waiting_to_land(&next.pr));
-            assert_eq!(
-                perform_auto_merge(&next, &d).await,
-                AutoMergeOutcome::Held("waiting its turn to land")
-            );
+            if state == MERGE_STATE_CLEAN {
+                assert!(d.ledger.waiting_to_land(&next.pr));
+                assert_eq!(
+                    perform_auto_merge(&next, &d).await,
+                    AutoMergeOutcome::Held("waiting its turn to land")
+                );
+            } else {
+                // The unmergeable front preserves FIFO position but releases capacity.
+                assert!(!d.ledger.waiting_to_land(&next.pr));
+                assert!(matches!(
+                    perform_auto_merge(&next, &d).await,
+                    AutoMergeOutcome::Declined(_)
+                ));
+            }
 
             d.mergestate = merge_state(Some(MERGE_STATE_BEHIND));
             if state == MERGE_STATE_CLEAN {
@@ -1776,7 +2138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_in_flight_slot_rotates_independently_but_running_checks_do_not() {
+    async fn pending_and_unmergeable_slots_yield_without_rotating() {
         let d = AutoMergeDeps {
             policy: Arc::new(StrictPolicy),
             ..deps(
@@ -1812,9 +2174,9 @@ mod tests {
                 .iter()
                 .map(|p| (p.number, p.in_flight))
                 .collect::<Vec<_>>(),
-            [(1, true), (3, true), (4, true), (5, false), (2, false)]
+            [(1, false), (2, false), (3, true), (4, true), (5, true)]
         );
-        assert!(d.ledger.take_rotation(&plans[1].pr).is_some());
+        assert!(d.ledger.take_rotation(&plans[1].pr).is_none());
         assert!(d.ledger.take_rotation(&plans[0].pr).is_none());
     }
 
@@ -1973,14 +2335,14 @@ mod tests {
         };
         perform_auto_merge(&first, &pending).await;
         assert!(ledger.waiting_to_land(&first.pr));
-        assert!(ledger.waiting_to_land(&next.pr));
+        assert!(!ledger.waiting_to_land(&next.pr));
         let finished = AutoMergeDeps {
             checks: all_green(),
             ..pending
         };
         perform_auto_merge(&first, &finished).await;
         assert!(!ledger.waiting_to_land(&first.pr));
-        assert!(ledger.waiting_to_land(&next.pr));
+        assert!(!ledger.waiting_to_land(&next.pr));
         let unreadable = AutoMergeDeps {
             checks: no_checks(),
             ..finished

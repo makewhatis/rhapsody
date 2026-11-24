@@ -533,9 +533,12 @@ mod tests {
         )]));
         seed_run(&o, "A-1", "a1", "a");
         let w = ws.create_for_issue("", "A-1").await.expect("create ws");
+        // An unstamped (legacy) live run reconciles through the separate top-level tracker.
+        // That keeps run_loaded's immediate poll from contributing reads to the project tracker
+        // whose zero-call assertion below measures only the terminal sweep.
         o.running.insert(
             "a1".into(),
-            running_entry(issue("a1", "A-1", "Done"), "a", "a"),
+            running_entry(issue("a1", "A-1", "Done"), "", "a"),
         );
 
         let signal = CancelSignal::new();
