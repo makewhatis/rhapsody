@@ -1397,6 +1397,132 @@ mod tests {
         }
     }
 
+    /// Supplies the control task's plans in observation order while keeping the production
+    /// watcher -> ControlWatchSink -> GitHub merge path intact.
+    struct LandingWatchSink {
+        plans: Vec<AutoMergePlan>,
+        control: crate::reviewwatch::ControlWatchSink,
+        attempted: tokio::sync::mpsc::UnboundedSender<i64>,
+    }
+
+    #[async_trait]
+    impl crate::reviewwatch::ReviewWatchSink for LandingWatchSink {
+        async fn watched(&self) -> Vec<crate::reviewwatch::WatchedPr> {
+            self.plans
+                .iter()
+                .map(|p| crate::reviewwatch::WatchedPr::new(p.pr.clone()))
+                .collect()
+        }
+
+        async fn sweep(
+            &self,
+            observed: Vec<crate::prstate::PrObservation>,
+            _: Option<i64>,
+        ) -> (crate::reviewwatch::ReviewSweepReport, i64) {
+            let merge = observed
+                .iter()
+                .map(|o| self.plans.iter().find(|p| p.pr == o.pr).unwrap().clone())
+                .collect();
+            (
+                crate::reviewwatch::ReviewSweepReport {
+                    merge,
+                    ..Default::default()
+                },
+                0,
+            )
+        }
+
+        fn order_merges(&self, plans: &mut [AutoMergePlan]) {
+            self.control.order_merges(plans);
+        }
+
+        async fn merge(&self, plan: AutoMergePlan) {
+            let number = plan.pr.number;
+            self.control.merge(plan).await;
+            self.attempted.send(number).unwrap();
+        }
+
+        async fn unreadable(&self, _: Vec<PrCoord>) {
+            panic!("fake GitHub must answer every observation");
+        }
+        async fn finish(&self, _: crate::reviewdone::ReviewDonePlan) {}
+        async fn nudge(&self, _: crate::draftpoke::DraftNudge) {}
+        async fn adjudicate(&self, _: crate::reviewadjudicate::ReviewAdjudicationPlan) {}
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watcher_merges_recovered_front_before_a_later_pr_observed_first() {
+        use crate::control_loop::CancelSignal;
+        use crate::reviewwatch::{ControlWatchSink, ReviewWatchDeps, run_review_watch_task};
+
+        let first = numbered(1);
+        let later = numbered(2);
+        let merger = Arc::new(FakeMerger::default());
+        let mut d = AutoMergeDeps {
+            policy: Arc::new(StrictPolicy),
+            ..deps(
+                found(HEAD, PrStatus::Open),
+                MERGE_STATE_CLEAN,
+                checks(&[("test", "PENDING")]),
+                merger.clone(),
+            )
+        };
+        d.ledger.set_landing_width(&first.pr, 1);
+        d.ledger.admit(&first.pr);
+        d.ledger.admit(&later.pr);
+        assert!(matches!(
+            perform_auto_merge(&first, &d).await,
+            AutoMergeOutcome::Declined(_)
+        ));
+        assert!(!d.ledger.landing_lines()[0].in_flight);
+        assert!(merger.calls.lock().unwrap().is_empty());
+
+        // Checks recover without a new head. The watcher's rotated observation order puts
+        // the later arrival first; only its production ordering hook restores FIFO priority.
+        d.checks = all_green();
+        let o = crate::orchestrator::Orchestrator::new("WORKFLOW.md");
+        let (attempted, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        let sink = LandingWatchSink {
+            plans: vec![later, first],
+            control: ControlWatchSink::new(o.control()).with_auto_merge(Arc::new(d)),
+            attempted,
+        };
+        let teams = rhapsody_config::teams::Teams {
+            enabled: true,
+            review: rhapsody_config::teams::Review {
+                mode: rhapsody_config::teams::ReviewMode::Ticketless,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let signal = CancelSignal::new();
+        let task = tokio::spawn(run_review_watch_task(
+            signal.wait(),
+            ReviewWatchDeps {
+                pr_source: Some(found(HEAD, PrStatus::Open)),
+                allow: HeadAllowlist::none(),
+                teams,
+                sink: Arc::new(sink),
+                diff_source: None,
+                mirror_source: None,
+                poll_interval_ms: Arc::new(std::sync::atomic::AtomicI64::new(1)),
+            },
+        ));
+        let attempted = tokio::time::timeout(Duration::from_secs(5), async {
+            vec![attempts.recv().await, attempts.recv().await]
+        })
+        .await;
+        signal.cancel();
+        task.await.unwrap();
+
+        let attempted = attempted.unwrap();
+        let calls = merger.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "only one PR may merge per strict-repo tick");
+        assert_eq!(calls[0].0, 1, "the recovered older PR must actually merge");
+        assert_eq!(calls[0].3.as_deref(), Some(HEAD));
+        assert_eq!(attempted, vec![Some(1), Some(2)]);
+    }
+
     #[tokio::test]
     async fn pending_fronts_yield_to_clean_or_behind_without_losing_fifo_priority() {
         for state in [MERGE_STATE_CLEAN, MERGE_STATE_BEHIND] {
