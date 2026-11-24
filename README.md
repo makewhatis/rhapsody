@@ -122,7 +122,7 @@ opens a 0.3.7 store. These are the behaviour changes a 0.3.6 installation will n
 ### Landing-line width
 
 For repositories requiring branches to be up to date before merging, ticketless auto-merge
-updates and tests the first `review.landing_width` approved PRs in each repository's FIFO line.
+updates and tests up to `review.landing_width` ready, approved PRs in each repository's FIFO line.
 The default is **3**. Set a positive integer globally or override it per project in WORKFLOW.md:
 
 ```yaml
@@ -137,7 +137,10 @@ projects:
 
 Width **1** minimizes CI runs by updating one PR at a time. Higher widths land faster by
 keeping several PRs in flight, at the cost of re-running checks on up to `width - 1` remaining
-in-flight PRs after a merge. Waiting PRs are left alone until a slot opens. Repositories without
+in-flight PRs after a merge. PRs with pending checks or an unmergeable GitHub state yield capacity
+without losing FIFO position; once ready they regain priority over later arrivals. A `BEHIND` PR
+can take a yielded slot for a branch update. After a merge, further updates/merges in that repository
+wait for the next observation. Repositories without
 strict up-to-date protection still merge independently. The setting hot-reloads; projects sharing
 a repository use the narrowest effective width. Each in-flight slot retains the existing front
 timeout/rotation policy, and running checks do not time out.
@@ -275,6 +278,18 @@ requires byte-identical output. Editing, corrupting, or losing a committed golde
 Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this section says
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
+
+### Readiness-based landing turns (STUDIO-2353)
+
+Strict auto-merge landing lines count ready PRs toward their width. Pending/queued checks, an
+empty check rollup, or a non-mergeable GitHub state release capacity immediately while preserving
+FIFO position. The watcher attempts admitted PRs in FIFO order so a newly green older PR regains
+priority. `BEHIND` PRs can use released capacity for updates; a successful merge holds further
+repository writes until the next observation. Each yielding-PR/recipient/reason handoff logs once
+per yielding episode. These readiness waits no longer rotate to the back on the refusal timeout;
+command/update failures retain the bounded rotation policy. Non-strict repositories and all
+approval, draft, head-pinning and CI merge gates are unchanged. This extends the Rhapsody-only
+auto-merge subsystem; Go fixtures, normalization and schemas are unchanged.
 
 ### Incremental CI-failure routing and queued-runner warnings (STUDIO-2348)
 
