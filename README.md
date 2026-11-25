@@ -279,6 +279,16 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Terminal human-hold cleanup (STUDIO-2365)
+
+The Rhapsody-only parked-ticket sweep also checks label-only entries reported in `held_for_human`.
+A configured terminal state removes both the reported human hold and any durable park, even when
+dispatch is gated or a board read is incomplete. Failed or inconclusive scoped reads keep the hold
+and retry on later ticks using the existing capped exponential failure backoff. The sweep retains
+its 16-ticket batch, four concurrent reads and ten-second deadline. Successful non-terminal reads
+remain eligible for later sweeps; non-terminal `rhapsody:human` holds are unchanged. No Go-owned
+API shape, schema, fixture or normalization changes.
+
 ### Readiness-based landing turns (STUDIO-2353)
 
 Strict auto-merge landing lines count ready PRs toward their width. Pending/queued checks, an
