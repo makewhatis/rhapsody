@@ -739,6 +739,8 @@ pub struct Orchestrator {
     pub(crate) lead_cursor: i64,
     /// Round-robin cursor for bounded state reads of parked tickets, including excluded states.
     pub(crate) parked_state_cursor: usize,
+    /// Consecutive failed/inconclusive scoped reads and their next allowed attempt, by ticket.
+    pub(crate) parked_state_retries: HashMap<String, (i64, tokio::time::Instant)>,
     pub(crate) lead_cases:
         HashMap<String, (crate::leadexec::LeadCase, crate::managerrun::ManagerRun)>,
     /// Intervention ids already handed to the off-loop applier THIS PROCESS, so a `validated` or
@@ -1382,6 +1384,7 @@ impl Orchestrator {
             lead_pending: HashSet::new(),
             lead_cursor: 0,
             parked_state_cursor: 0,
+            parked_state_retries: HashMap::new(),
             lead_cases: HashMap::new(),
             investigate: None,
             manager_apply_submitted: std::collections::HashSet::new(),

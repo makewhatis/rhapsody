@@ -269,12 +269,14 @@ impl Orchestrator {
                 .and_then(|t| t.review_done_state())
                 .is_some_and(|done| rhapsody_core::normalize_state(done) == state)
     }
-    /// Candidate queries intentionally exclude Backlog/Done. A park must therefore observe its
-    /// ticket by identifier too, before dispatch gates, without treating absence as a state move.
+    /// Candidate queries intentionally exclude Backlog/Done. Parks and reported human holds must
+    /// observe their tickets by identifier too, before dispatch gates, without treating absence
+    /// as a state move. Failed/inconclusive reads retry with the shared capped failure backoff.
     /// Owned tracker reads run off-task: at most 16 tickets per tick, 4 concurrent, 10 seconds total.
     /// Rotation prevents an unavailable ticket at the front of the ledger starving later holds.
     pub(crate) async fn reconcile_parked_subject_states(&mut self) {
         let Some(eff) = self.eff.as_ref() else { return };
+        let max_backoff_ms = eff.max_retry_backoff_ms;
         let trackers: Vec<_> = if eff.projects.is_empty() {
             vec![(String::new(), None, eff.tracker.clone())]
         } else {
@@ -300,6 +302,27 @@ impl Orchestrator {
                 return;
             }
         };
+        let human_holds = self.human_holds.held();
+        for held in &human_holds {
+            if !holds
+                .iter()
+                .any(|h| h.subject.eq_ignore_ascii_case(&held.issue_identifier))
+            {
+                // A label-only hold has no durable episode to update or release.
+                holds.push(rhapsody_store::SubjectHold {
+                    subject: held.issue_identifier.clone(),
+                    ..Default::default()
+                });
+            }
+        }
+        self.parked_state_retries
+            .retain(|subject, _| holds.iter().any(|h| h.subject == *subject));
+        let now = tokio::time::Instant::now();
+        holds.retain(|h| {
+            self.parked_state_retries
+                .get(&h.subject)
+                .is_none_or(|(_, due)| *due <= now)
+        });
         if holds.is_empty() {
             return;
         }
@@ -309,6 +332,20 @@ impl Orchestrator {
         let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
         let mut tasks = tokio::task::JoinSet::new();
         for hold in holds.into_iter().take(16) {
+            // Arm before launching: errors, empty responses and cancelled/expired tasks all
+            // remain retryable without hammering Linear every tick. Success clears the gate.
+            let failures = self
+                .parked_state_retries
+                .get(&hold.subject)
+                .map_or(1, |(failures, _)| failures.saturating_add(1));
+            let delay = crate::backoff::failure_backoff_ms(failures, max_backoff_ms).max(1);
+            self.parked_state_retries.insert(
+                hold.subject.clone(),
+                (
+                    failures,
+                    now + std::time::Duration::from_millis(delay as u64),
+                ),
+            );
             let project = match self.store().list_issue_runs(rhapsody_store::RunFilter {
                 issue: hold.subject.clone(),
                 limit: 1,
@@ -317,6 +354,12 @@ impl Orchestrator {
                 Ok(runs) => runs
                     .first()
                     .map(|r| r.project_slug.clone())
+                    .or_else(|| {
+                        human_holds
+                            .iter()
+                            .find(|h| h.issue_identifier.eq_ignore_ascii_case(&hold.subject))
+                            .map(|h| h.project.clone())
+                    })
                     .unwrap_or_default(),
                 Err(error) => {
                     tracing::warn!(ticket = %hold.subject, %error, "park project unreadable; keeping hold");
@@ -356,6 +399,10 @@ impl Orchestrator {
                             .observe_subject_state(&hold.subject, terminal)
                             .map_err(|e| e.to_string())?;
                         if terminal {
+                            self.human_holds.forget_terminal(&hold.subject);
+                            return Ok(());
+                        }
+                        if hold.id == 0 {
                             return Ok(());
                         }
                         let mut snapshot: ParkSnapshot = if hold.snapshot.is_empty() {
@@ -390,6 +437,8 @@ impl Orchestrator {
                     })();
                     if let Err(error) = result {
                         tracing::warn!(ticket = %hold.subject, %error, "park state observation failed; keeping hold");
+                    } else {
+                        self.parked_state_retries.remove(&hold.subject);
                     }
                 }
                 Ok(Some(Ok(_))) => {}
@@ -473,6 +522,7 @@ impl Orchestrator {
                     .observe_subject_state(&issue.identifier, terminal)
                     .map_err(|e| e.to_string())?;
                 if terminal {
+                    self.human_holds.forget_terminal(&issue.identifier);
                     return Ok(());
                 }
             }
@@ -944,6 +994,136 @@ mod tests {
                 .observe_notices(&[stale], "2026-10-10T16:01:00Z")
                 .unwrap();
             assert!(o.store().notices().unwrap().iter().all(|n| !n.active));
+        }
+    }
+
+    #[tokio::test]
+    async fn held_terminal_tickets_leave_the_snapshot_on_the_next_sweep() {
+        for state in ["Canceled", "Done", "Todo"] {
+            for parked in [false, true] {
+                let mut tracker = rhapsody_tracker::fake::Fake::new();
+                let mut issue = crate::testsupport::issue("id", "TEST-1", state);
+                issue.labels = Some(vec![crate::teams::HUMAN_LABEL.into()]);
+                tracker.by_identifier.insert("TEST-1".into(), issue);
+                let mut o = orch(true);
+                let mut eff = crate::testsupport::empty_effective(Arc::new(tracker));
+                eff.terminal_states = crate::testsupport::set_of(&["done", "canceled"]);
+                o.eff = Some(eff);
+                o.human_holds.begin_pass(true);
+                o.human_holds.hold(crate::dispatch::HeldForHuman {
+                    issue_identifier: "TEST-1".into(),
+                    title: "held ticket".into(),
+                    project: String::new(),
+                });
+                if parked {
+                    o.store()
+                        .park_subject(&rhapsody_store::SubjectHold {
+                            subject: "TEST-1".into(),
+                            kind: "escalation".into(),
+                            ..Default::default()
+                        })
+                        .unwrap();
+                }
+                o.reconcile_parked_subject_states().await;
+                assert_eq!(
+                    o.build_snapshot().held_for_human.is_empty(),
+                    state != "Todo",
+                    "{state}/{parked}"
+                );
+                assert_eq!(
+                    o.subject_parked("TEST-1", "author"),
+                    parked && state == "Todo"
+                );
+                assert_eq!(
+                    o.human_holds.labelled_and_primed().0.contains("test-1"),
+                    state == "Todo"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn label_only_hold_uses_its_project_without_a_run_and_terminal_needs_no_label() {
+        let mut tracker = rhapsody_tracker::fake::Fake::new();
+        tracker.by_identifier.insert(
+            "TEST-1".into(),
+            crate::testsupport::issue("id", "TEST-1", "Canceled"),
+        );
+        let mut project =
+            crate::testsupport::proj_with_tracker("project", Arc::new(tracker), "project");
+        project.terminal_states = crate::testsupport::set_of(&["canceled"]);
+        let unrelated = Arc::new(rhapsody_tracker::fake::Fake::new());
+        let mut eff = crate::testsupport::empty_effective(unrelated.clone());
+        eff.terminal_states.clear();
+        eff.projects = vec![
+            crate::testsupport::proj_with_tracker("other", unrelated.clone(), "other"),
+            project,
+        ];
+        let mut o = orch(true);
+        o.eff = Some(eff);
+        o.human_holds.hold(crate::dispatch::HeldForHuman {
+            issue_identifier: "TEST-1".into(),
+            title: "cancelled without a human label".into(),
+            project: "project".into(),
+        });
+        o.reconcile_parked_subject_states().await;
+        assert!(o.build_snapshot().held_for_human.is_empty());
+        assert!(unrelated.by_identifier_calls().is_empty());
+        assert!(
+            !o.human_holds.labelled_and_primed().1,
+            "one scoped read cannot prime the whole board"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_parked_state_read_retries_after_backoff_and_keeps_observing() {
+        for state in ["Done", "In Review"] {
+            let mut failing = rhapsody_tracker::fake::Fake::new();
+            failing.by_identifier_err =
+                Some(rhapsody_tracker::TrackerError::Other("transient".into()));
+            let failing = Arc::new(failing);
+            let mut o = orch(true);
+            let mut eff = crate::testsupport::empty_effective(failing.clone());
+            eff.terminal_states = crate::testsupport::set_of(&["done"]);
+            eff.max_retry_backoff_ms = 300_000;
+            o.eff = Some(eff);
+            let old = crate::testsupport::issue("id", "TEST-1", "In Review");
+            o.store()
+                .park_subject(&rhapsody_store::SubjectHold {
+                    subject: "TEST-1".into(),
+                    kind: "escalation".into(),
+                    snapshot: park_snapshot(o.store(), &old, None, false).unwrap(),
+                    ..Default::default()
+                })
+                .unwrap();
+            o.reconcile_parked_subject_states().await;
+            assert!(o.subject_parked("TEST-1", "author"));
+            o.reconcile_parked_subject_states().await;
+            assert_eq!(
+                failing.by_identifier_calls().len(),
+                1,
+                "no retry before backoff expires"
+            );
+
+            let mut recovered = rhapsody_tracker::fake::Fake::new();
+            recovered.by_identifier.insert(
+                "TEST-1".into(),
+                crate::testsupport::issue("id", "TEST-1", state),
+            );
+            let recovered = Arc::new(recovered);
+            o.eff.as_mut().unwrap().tracker = recovered.clone();
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+            o.reconcile_parked_subject_states().await;
+            assert_eq!(recovered.by_identifier_calls().len(), 1);
+            assert_eq!(o.subject_parked("TEST-1", "author"), state == "In Review");
+            if state == "In Review" {
+                o.reconcile_parked_subject_states().await;
+                assert_eq!(
+                    recovered.by_identifier_calls().len(),
+                    2,
+                    "successful nonterminal reads do not retire the observation"
+                );
+            }
         }
     }
 

@@ -339,6 +339,15 @@ impl HumanHoldLedger {
             .held
             .clone()
     }
+
+    /// A scoped terminal read can retire one ticket even when the whole board is unavailable.
+    /// This does not prime the ledger or change any other ticket's label verdict.
+    pub(crate) fn forget_terminal(&self, identifier: &str) {
+        let mut st = self.inner.lock().unwrap_or_else(PoisonError::into_inner);
+        st.held
+            .retain(|h| !h.issue_identifier.eq_ignore_ascii_case(identifier));
+        st.labelled.remove(&identifier.to_ascii_lowercase());
+    }
 }
 
 /// The STATE half of dispatch eligibility: is `st` (already normalized) a state the daemon
