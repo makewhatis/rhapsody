@@ -300,6 +300,12 @@ its 16-ticket batch, four concurrent reads and ten-second deadline. Successful n
 remain eligible for later sweeps; non-terminal `rhapsody:human` holds are unchanged. No Go-owned
 API shape, schema, fixture or normalization changes.
 
+The sweep also follows tickets moved away from their last run's project (STUDIO-2374). It tries
+that historical project first, then other configured project-scoped trackers, including paused
+projects, and uses the answering project's terminal states. A terminal observation durably releases
+the park, so boot cannot report it again. The same bounds and failure backoff apply to fallback
+reads; a ticket unresolved by every configured tracker keeps its hold.
+
 ### Readiness-based landing turns (STUDIO-2353)
 
 Strict auto-merge landing lines count ready PRs toward their width. Pending/queued checks, an

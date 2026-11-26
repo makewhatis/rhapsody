@@ -283,7 +283,7 @@ impl Orchestrator {
             eff.projects
                 .iter()
                 .enumerate()
-                .filter(|(_, p)| !p.disabled)
+                // Pausing dispatch must not preserve a terminal ticket's durable hold.
                 .map(|(i, p)| (p.slug.clone(), Some(i), p.tracker.clone()))
                 .collect()
         };
@@ -366,11 +366,13 @@ impl Orchestrator {
                     continue;
                 }
             };
-            let owned: Vec<_> = trackers
-                .iter()
-                .filter(|(slug, _, _)| project.is_empty() || *slug == project)
-                .map(|(_, i, tr)| (*i, tr.clone()))
-                .collect();
+            // A run's project is historical: the ticket may since have moved, or the project
+            // may no longer be configured. Prefer it, then try the other scoped trackers.
+            // Each tracker still validates current membership; the answering project supplies
+            // the terminal-state policy. The batch deadline bounds fallback reads too.
+            let mut ordered = trackers.clone();
+            ordered.sort_by_key(|(slug, _, _)| !project.is_empty() && *slug != project);
+            let owned: Vec<_> = ordered.into_iter().map(|(_, i, tr)| (i, tr)).collect();
             let semaphore = semaphore.clone();
             tasks.spawn(async move {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
@@ -395,6 +397,15 @@ impl Orchestrator {
                 Ok(Some(Ok(Some((hold, project, after))))) if !after.trim().is_empty() => {
                     let result = (|| -> Result<(), String> {
                         let terminal = self.park_state_is_terminal(&after, project);
+                        // Paused projects participate only in terminal cleanup; they must not
+                        // grant author resume admission for an ordinary state change.
+                        if !terminal
+                            && project
+                                .and_then(|i| self.eff.as_ref()?.projects.get(i))
+                                .is_some_and(|p| p.disabled)
+                        {
+                            return Ok(());
+                        }
                         self.store()
                             .observe_subject_state(&hold.subject, terminal)
                             .map_err(|e| e.to_string())?;
@@ -1051,6 +1062,99 @@ mod tests {
                     o.human_holds.labelled_and_primed().0.contains("test-1"),
                     state == "Todo"
                 );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn boot_rehydrated_holds_follow_tickets_across_projects_and_stay_released() {
+        for location in ["moved", "removed", "paused"] {
+            for state in ["Canceled", "Done", "In Review"] {
+                for kind in ["blocked", BLOCKED_NO_PR_KIND, "escalation"] {
+                    let dir = crate::testsupport::TempDir::new();
+                    let path = StorePath::Disk(dir.child("holds.db").into());
+                    {
+                        let store = Sqlite::open(path.clone()).unwrap();
+                        store
+                            .start_run(rhapsody_store::RunStart {
+                                issue_identifier: "STUDIO-1755".into(),
+                                project_slug: "old-project".into(),
+                                ..Default::default()
+                            })
+                            .unwrap();
+                        store
+                            .park_subject(&rhapsody_store::SubjectHold {
+                                subject: "STUDIO-1755".into(),
+                                kind: kind.into(),
+                                snapshot: "{\"state\":\"In Review\",\"human\":false,\"heads\":{}}"
+                                    .into(),
+                                ..Default::default()
+                            })
+                            .unwrap();
+                    }
+                    let historical = Arc::new(rhapsody_tracker::fake::Fake::new());
+                    let mut current = rhapsody_tracker::fake::Fake::new();
+                    current.by_identifier.insert(
+                        "STUDIO-1755".into(),
+                        crate::testsupport::issue("id", "STUDIO-1755", state),
+                    );
+                    let current = Arc::new(current);
+                    let mut project = crate::testsupport::proj_with_tracker(
+                        if location == "paused" {
+                            "old-project"
+                        } else {
+                            "new-project"
+                        },
+                        current.clone(),
+                        "project",
+                    );
+                    project.disabled = location == "paused";
+                    project.terminal_states = crate::testsupport::set_of(&["done", "canceled"]);
+                    let mut eff = crate::testsupport::empty_effective(historical.clone());
+                    eff.terminal_states.clear(); // Classify using the project that actually answers.
+                    eff.projects = vec![project];
+                    if location == "moved" {
+                        eff.projects.insert(
+                            0,
+                            crate::testsupport::proj_with_tracker(
+                                "old-project",
+                                historical.clone(),
+                                "old-project",
+                            ),
+                        );
+                    }
+                    let mut o = orch(true);
+                    o.store = Arc::new(Sqlite::open(path.clone()).unwrap());
+                    o.eff = Some(eff);
+                    o.boot_recovery();
+                    assert_eq!(o.build_snapshot().held_for_human.len(), 1);
+                    o.reconcile_parked_subject_states().await;
+                    let terminal = state != "In Review";
+                    assert_eq!(
+                        o.build_snapshot().held_for_human.is_empty(),
+                        terminal,
+                        "{location}/{state}/{kind}"
+                    );
+                    assert_eq!(current.by_identifier_calls().len(), 1);
+                    assert!(!o.store().subject_resume_pending("STUDIO-1755").unwrap());
+                    drop(o);
+
+                    let mut restarted = orch(true);
+                    restarted.store = Arc::new(Sqlite::open(path).unwrap());
+                    restarted.boot_recovery();
+                    assert_eq!(
+                        restarted.build_snapshot().held_for_human.is_empty(),
+                        terminal
+                    );
+                    assert_eq!(
+                        restarted
+                            .store()
+                            .load_subject_observations()
+                            .unwrap()
+                            .is_empty(),
+                        terminal
+                    );
+                }
             }
         }
     }
