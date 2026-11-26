@@ -412,6 +412,7 @@ mod router_tests {
         "/api/v1/runs/7/message",
         // STUDIO-1053: the held-ticket "Human step done → resume" action.
         "/api/v1/runs/7/resume-hold",
+        "/api/v1/issues/7/release-claim",
         // STUDIO-990: the ONE credentialed provider operation — the catalog refresh POST.
         "/api/v1/providers/7/models/refresh",
         // STUDIO-1048: authoring a provider DEFINITION (non-secret config, but still a local write).

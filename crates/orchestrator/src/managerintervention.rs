@@ -535,6 +535,11 @@ impl Orchestrator {
         let mut by_pr: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for d in found {
+            // Ticket-only author stops go to the ticket-oriented lead, not a review intervention
+            // that cannot launch without a PR coordinate. If no lead owns it, keep the human report.
+            if parse_pr_key(&d.pr).is_none() {
+                continue;
+            }
             let Some(kind) = stall_kind_for(d.kind) else {
                 continue;
             };
@@ -1055,8 +1060,8 @@ impl Orchestrator {
         }
     }
 
-    /// The origin ticket of the first live watch row for `pr`, if any (used by the hold and budget
-    /// gates). `None` when the watch set cannot be read or holds no row for the pull request.
+    /// The origin ticket of a live watch row or an author token-ceiling hold (used by the
+    /// case packet, hold and budget gates). A draft need not have a watch row yet.
     pub(crate) fn manager_pr_ticket(&self, pr: &str) -> Option<String> {
         let rows = self.store().load_live_review_watch().ok()?;
         rows.into_iter()
@@ -1065,6 +1070,22 @@ impl Orchestrator {
                     == pr
             })
             .and_then(|r| crate::reviewdone::origin_ticket(&r.introduced_by).map(str::to_string))
+            .or_else(|| {
+                self.token_ceiling_holds.values().find_map(|hold| {
+                    hold.issue
+                        .linked_prs
+                        .as_deref()
+                        .unwrap_or_default()
+                        .iter()
+                        .any(|linked| {
+                            !linked.merged
+                                && PrCoord::new(&linked.owner, &linked.repo, linked.number)
+                                    .to_string()
+                                    .eq_ignore_ascii_case(pr)
+                        })
+                        .then(|| hold.issue.identifier.clone())
+                })
+            })
     }
 
     /// Whether any live watch row for `pr` has an origin ticket wearing the hold. Fails CLOSED on a
@@ -1078,11 +1099,14 @@ impl Orchestrator {
         let Ok(rows) = self.store().load_live_review_watch() else {
             return true;
         };
-        rows.iter().any(|r| {
-            format!("{}/{}#{}", r.key.owner, r.key.repo, r.key.number).to_ascii_lowercase() == pr
-                && crate::reviewdone::origin_ticket(&r.introduced_by)
-                    .is_some_and(|t| labelled.contains(&t.to_ascii_lowercase()))
-        })
+        self.manager_pr_ticket(pr)
+            .is_some_and(|ticket| labelled.contains(&ticket.to_ascii_lowercase()))
+            || rows.iter().any(|r| {
+                format!("{}/{}#{}", r.key.owner, r.key.repo, r.key.number).to_ascii_lowercase()
+                    == pr
+                    && crate::reviewdone::origin_ticket(&r.introduced_by)
+                        .is_some_and(|t| labelled.contains(&t.to_ascii_lowercase()))
+            })
     }
 
     /// Build the trusted [`ManagerRun`] for `pr`: the coordinates parsed from the key, and the

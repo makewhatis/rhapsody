@@ -402,7 +402,7 @@ impl DivergenceKind {
 /// they have. Carries no cause, because the sweep does not know one and must not invent one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Divergence {
-    /// `owner/repo#number`, the form the logs, the room and the design record all use.
+    /// `owner/repo#number`, or `ticket:<identifier>` for an author stop with no linked PR.
     pub pr: String,
     /// How they disagree.
     pub kind: DivergenceKind,
@@ -944,8 +944,10 @@ impl Orchestrator {
     /// past everything when a `gh` lookup answers nothing. A daemon that cannot reach GitHub is
     /// exactly a daemon whose board may have quietly stopped.
     pub(crate) fn reconcile_review_divergence(&mut self) {
+        let mut ceiling = self.token_ceiling_divergences();
         if !self.review_ticketless_enabled() {
-            self.set_review_divergences(Vec::new());
+            self.route_reconciliation_stalls(&mut ceiling);
+            self.set_review_divergences(ceiling);
             return;
         }
         // The merged-but-not-terminal divergences (STUDIO-1007). Read HERE, above the human-hold
@@ -955,7 +957,8 @@ impl Orchestrator {
         // less true. Reading it first also means this report goes out on a daemon whose hold ledger
         // is un-primed, which is exactly the "shows on the operator feed within one sweep" the
         // ticket asks for.
-        let done = self.review_done_divergences();
+        let mut done = self.review_done_divergences();
+        done.extend(ceiling);
         // The current-label set has no writer above `on_tick`'s three early-return gates (STUDIO-949
         // round 11). This sweep deliberately runs ABOVE them, so it keeps executing on a daemon held
         // by a bad config, an armed drain or a dead credential — and on a daemon held since boot NO
@@ -978,6 +981,10 @@ impl Orchestrator {
         if !ledger_primed {
             // The watch-set rules report nothing (above), but the owed-move report does not depend
             // on the label set, so it still goes out.
+            // PR-manager admission also needs a known hold ledger. Report the stop until a
+            // board read can establish that admission is safe, rather than adopting then
+            // superseding the same unlaunchable intervention on every tick.
+            self.route_lead_divergences(&mut done);
             self.set_review_divergences(done);
             return;
         }
@@ -1454,6 +1461,12 @@ impl Orchestrator {
         // is not in the live set the loop walked and nothing there could derive it. The durable
         // owed-move row the merge wrote is the fact, read — not invented — exactly as this module's
         // contract requires: no `gh`, no tracker, local only.
+        // A ticket-level ceiling stop supersedes the watch row's delayed report of that stop.
+        found.retain(|d| {
+            !done.iter().any(|stop| {
+                stop.kind == DivergenceKind::AuthorTokenCeilingStopped && stop.ticket == d.ticket
+            })
+        });
         found.extend(done);
         // STUDIO-964: a held pull request whose every live row APPROVED and whose repo has
         // auto-merge on is the one shape the held-row filter above must NOT silence. The daemon
@@ -1492,30 +1505,7 @@ impl Orchestrator {
         // §10.2 gate defers, or whose manager is unavailable, must not be swallowed: it stays on the
         // human feed wearing the manager's own wording (§10.2). `off` is byte-identical: nothing is
         // routed and nothing is dropped.
-        self.route_lead_divergences(&mut found);
-        let routing = self.route_stalls_to_manager(&found);
-        if !routing.adopted.is_empty() {
-            found.retain(|d| {
-                let manager_owned = crate::managerintervention::stall_kind_for(d.kind).is_some();
-                !(manager_owned
-                    && routing
-                        .adopted
-                        .iter()
-                        .any(|k| k == &d.pr.to_ascii_lowercase()))
-            });
-        }
-        // The not-adopted manager stalls keep their row but carry the reason, and a distinct kind so
-        // the console renders the manager's sentence rather than the generic stall detail.
-        for d in found.iter_mut() {
-            if crate::managerintervention::stall_kind_for(d.kind).is_none() {
-                continue;
-            }
-            let pr = d.pr.to_ascii_lowercase();
-            if let Some((_, reason)) = routing.surfaced.iter().find(|(k, _)| k == &pr) {
-                d.kind = DivergenceKind::ManagerDeferred;
-                d.reason = reason.clone();
-            }
-        }
+        self.route_reconciliation_stalls(&mut found);
         // STUDIO-1018 (§9/§10.2): under `act` the review watcher signals the threshold stall to the
         // manager DIRECTLY (there is no legacy adjudication to yield a `review_escalated` divergence
         // for this sweep to route), so the manager's own deferral would otherwise have no row on the
@@ -1560,6 +1550,75 @@ impl Orchestrator {
         }
         self.route_lead_manager_endings(&mut found);
         self.set_review_divergences(found);
+    }
+
+    /// The run stop owns this fact; no review row, verdict, draft gate or staleness horizon
+    /// is needed to prove that the daemon killed the author and retained its claim.
+    fn token_ceiling_divergences(&self) -> Vec<Divergence> {
+        let now = (self.now)();
+        let mut holds: Vec<_> = self.token_ceiling_holds.iter().collect();
+        holds.sort_by_key(|(_, h)| &h.issue.identifier);
+        holds
+            .into_iter()
+            .filter_map(|(id, hold)| {
+                if !self.claimed.contains(id) || self.running.contains_key(id) {
+                    return None;
+                }
+                if self
+                    .newest_run_moment(&hold.issue.identifier)
+                    .is_some_and(|r| r.outcome != rhapsody_store::OUTCOME_TOKEN_CEILING)
+                {
+                    return None;
+                }
+                let pr = hold
+                    .issue
+                    .linked_prs
+                    .as_deref()
+                    .unwrap_or_default()
+                    .iter()
+                    .find(|pr| !pr.merged)
+                    .map(|pr| PrCoord::new(&pr.owner, &pr.repo, pr.number).to_string())
+                    .unwrap_or_else(|| format!("ticket:{}", hold.issue.identifier));
+                Some(Divergence {
+                    pr,
+                    ticket: hold.issue.identifier.clone(),
+                    kind: DivergenceKind::AuthorTokenCeilingStopped,
+                    reviewer: String::new(),
+                    stale_secs: (now - hold.stopped_at).num_seconds().max(0),
+                    auto_merge_reason: None,
+                    capacity_held: None,
+                    capacity_unreadable: None,
+                    adjudicated_head: String::new(),
+                    current_head: String::new(),
+                    rounds: 0,
+                    findings: Vec::new(),
+                    reason: String::new(),
+                })
+            })
+            .collect()
+    }
+
+    fn route_reconciliation_stalls(&self, found: &mut Vec<Divergence>) {
+        self.route_lead_divergences(found);
+        let routing = self.route_stalls_to_manager(found);
+        found.retain(|d| {
+            !(crate::managerintervention::stall_kind_for(d.kind).is_some()
+                && routing
+                    .adopted
+                    .iter()
+                    .any(|key| key == &d.pr.to_ascii_lowercase()))
+        });
+        for d in found {
+            if crate::managerintervention::stall_kind_for(d.kind).is_some()
+                && let Some((_, reason)) = routing
+                    .surfaced
+                    .iter()
+                    .find(|(key, _)| key == &d.pr.to_ascii_lowercase())
+            {
+                d.kind = DivergenceKind::ManagerDeferred;
+                d.reason = reason.clone();
+            }
+        }
     }
 
     /// The divergences owed to a merged pull request whose ticket is not yet terminal (STUDIO-1007):
@@ -1967,7 +2026,8 @@ impl Orchestrator {
                         sweeps,
                         "review reconciliation: {} — {}. The run was stopped by \
                          `agent.max_run_tokens`; raise the ceiling or split the ticket to make it \
-                         fit, then re-run. This sweep only reports, so it needs a human.",
+                         fit, then post a new summons, move back to Todo, or use the operator \
+                         release-claim endpoint. This sweep only reports, so it needs a human.",
                         d.pr,
                         d.kind.detail()
                     );
@@ -4140,6 +4200,71 @@ mod store_tests {
         let found = o.review_divergences();
         assert_eq!(found.len(), 1, "one divergence, got {found:?}");
         assert_eq!(found[0].kind, DivergenceKind::AuthorTokenCeilingStopped);
+    }
+
+    #[test]
+    fn ceiling_stops_without_watch_rows_reach_the_pr_manager_or_ticket_lead() {
+        for has_pr in [false, true] {
+            // No draft PR review watch is needed for manager admission.
+            let mut o = orch(false, "2026-11-25T23:00:00Z");
+            let teams = o.teams.as_mut().expect("teams");
+            teams.manager.review_authority = ReviewAuthority::Act;
+            teams.manager.lead.enabled = !has_pr;
+            o.eff.as_mut().expect("eff").max_run_tokens = 1_000;
+            let mut iss = issue("ID-2372", "STUDIO-2372", "In Progress");
+            if has_pr {
+                iss.linked_pr = true;
+                iss.linked_prs = Some(vec![rhapsody_core::LinkedPRRef {
+                    owner: "makewhatis".into(),
+                    repo: "rhapsody".into(),
+                    number: 320,
+                    merged: false,
+                }]);
+                o.review_observed_drafts
+                    .insert(PrCoord::new("makewhatis", "rhapsody", 320));
+            }
+            let mut re = running_entry(iss, "rhapsody", "rhapsody");
+            re.cancel = crate::CancelSignal::new();
+            o.persist_start_run(&mut re, 0);
+            o.running.insert("ID-2372".into(), re);
+            o.on_agent_update(crate::agentupdate::AgentUpdate {
+                issue_id: "ID-2372".into(),
+                ev: rhapsody_agent::Event {
+                    event_type: rhapsody_agent::EVENT_NOTIFICATION.into(),
+                    usage: Some(rhapsody_agent::Usage {
+                        total_tokens: 5_000,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            });
+            o.reconcile_review_divergence();
+            o.reconcile_review_divergence();
+            if has_pr {
+                let interventions = o
+                    .store()
+                    .load_manager_interventions()
+                    .expect("interventions");
+                assert_eq!(interventions.len(), 1, "one deduped manager case");
+                assert_eq!(interventions[0].pr, "makewhatis/rhapsody#320");
+                assert_eq!(interventions[0].stall_kinds, ["author_token_ceiling"]);
+                assert_eq!(
+                    o.manager_case_packet(&interventions[0]).ticket,
+                    "STUDIO-2372"
+                );
+            } else {
+                let items = o.store().load_lead_items().expect("lead items");
+                assert_eq!(items.len(), 1, "one deduped ticket case");
+                assert_eq!(items[0].subject, "STUDIO-2372");
+                assert!(
+                    o.store()
+                        .load_manager_interventions()
+                        .expect("interventions")
+                        .is_empty(),
+                    "no unlaunchable review intervention for a nonexistent PR"
+                );
+            }
+        }
     }
 
     /// STUDIO-967's REVIEW half, through the real store — alice's finding on PR #208. A ticketless

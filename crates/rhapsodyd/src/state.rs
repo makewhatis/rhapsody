@@ -348,6 +348,16 @@ impl StateProvider for DaemonState {
             .map_err(|e| RunActionError::new(e.to_string()))
     }
 
+    async fn release_claim(
+        &self,
+        identifier: &str,
+    ) -> Result<rhapsody_orchestrator::ReleaseClaimResult, RunActionError> {
+        self.handle
+            .release_claim(identifier)
+            .await
+            .map_err(|e| RunActionError::new(e.to_string()))
+    }
+
     async fn handoff_run(&self, run_id: i64) -> Result<HandoffResult, RunActionError> {
         // Like stop/resume, no HTTP request-cancel is threaded (the handle's lifetime ctx bounds the
         // reply wait); a failed control round-trip becomes the 500 `handoff_failed` error (TRA-242).

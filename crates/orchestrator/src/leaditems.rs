@@ -649,6 +649,7 @@ impl Orchestrator {
         }
         found.retain(|d| {
             let trigger = match d.kind {
+                DivergenceKind::AuthorTokenCeilingStopped if d.pr.starts_with("ticket:") => LeadTrigger::ImpossibleState { subject: d.ticket.clone(), kind: "author_token_ceiling".into() },
                 DivergenceKind::ReviewEscalated => match review_escalation_trigger(self.store(), &d.pr, &d.adjudicated_head) {
                     Ok(t) => t,
                     Err(e) => {

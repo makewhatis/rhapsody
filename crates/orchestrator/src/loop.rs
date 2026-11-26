@@ -344,6 +344,13 @@ pub enum Event {
         moved: bool,
         reply: oneshot::Sender<()>,
     },
+    /// Operator stale-claim release, serialized with dispatch and run exit (STUDIO-2372).
+    ReleaseClaim {
+        identifier: String,
+        reply: tokio::sync::oneshot::Sender<
+            Result<crate::stop::ReleaseClaimResult, rhapsody_store::StoreError>,
+        >,
+    },
     /// The resume admission check on the loop (Go `evResume`).
     Resume {
         issue_id: String,
@@ -1041,6 +1048,9 @@ impl Orchestrator {
                 self.handle_stop_finalize(&issue_id, moved);
                 let _ = reply.send(());
             }
+            Event::ReleaseClaim { identifier, reply } => {
+                let _ = reply.send(self.handle_release_claim(&identifier));
+            }
             Event::Resume {
                 issue_id,
                 identifier,
@@ -1569,6 +1579,7 @@ impl Orchestrator {
             // and seeds the comment into whichever run answers it. The same step runs on the legacy
             // ladder below — two ladders, two seams.
             self.reengage_on_summons(tagged.iter().map(|t| &t.iss));
+            self.release_token_ceiling_holds(tagged.iter().map(|t| &t.iss));
             // Teams memory re-grounding (STUDIO-645, T4): snapshot what the poller just observed
             // so a recall rendered during THIS tick's dispatch can attach a ticket's current state
             // without asking the tracker anything (§5.2). In-memory, and a no-op with Teams off.
@@ -1730,6 +1741,7 @@ impl Orchestrator {
         // The legacy ladder's half of STUDIO-1502 — a summons re-engages a parked ticket and seeds
         // the comment before selection runs (the multi-project ladder above is the other half).
         self.reengage_on_summons(issues.iter());
+        self.release_token_ceiling_holds(issues.iter());
         self.record_issue_states(issues.iter());
         self.refresh_waiting_retry_issues(issues.iter());
         let retry_identifiers: std::collections::HashSet<_> = self
