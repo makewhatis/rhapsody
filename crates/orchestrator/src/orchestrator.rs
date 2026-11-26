@@ -641,6 +641,8 @@ pub struct Orchestrator {
     pub running: HashMap<String, RunningEntry>,
     /// Issue ids currently claimed (dispatched or in a claim election), a set.
     pub claimed: HashSet<String>,
+    /// Author runs stopped at the token ceiling, independent of the PR review watch set.
+    pub(crate) token_ceiling_holds: HashMap<String, crate::agentupdate::TokenCeilingHold>,
     /// Claims created by rejected-login exits, so removing the human label by hand does not
     /// make resume-hold refuse them. Loop-confined; retired on resume or a new dispatch.
     pub(crate) auth_hold_claims: HashSet<String>,
@@ -1359,6 +1361,7 @@ impl Orchestrator {
             teams_memory: None,
             running: HashMap::new(),
             claimed: HashSet::new(),
+            token_ceiling_holds: HashMap::new(),
             auth_hold_claims: HashSet::new(),
             retry_attempts: HashMap::new(),
             held_for_capacity: HashMap::new(),

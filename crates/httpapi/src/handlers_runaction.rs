@@ -19,6 +19,35 @@ use crate::handlers::require_post;
 use crate::responses::{write_error, write_json};
 use crate::server::StateProvider;
 
+/// Rhapsody-only operator escape hatch for a claim with no live worker.
+pub(crate) async fn handle_release_claim(
+    method: Method,
+    Path(identifier): Path<String>,
+    State(provider): State<Arc<dyn StateProvider>>,
+) -> Response {
+    if let Some(resp) = require_post(&method, "use POST to release a stale claim") {
+        return resp;
+    }
+    match provider.release_claim(&identifier).await {
+        Err(err) => write_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "release_claim_failed",
+            err.to_string(),
+            None,
+        ),
+        Ok(res) if res.live_run => write_error(
+            StatusCode::CONFLICT,
+            "live_run",
+            "cannot release a claim while a run is live",
+            None,
+        ),
+        Ok(res) => write_json(
+            StatusCode::OK,
+            &serde_json::json!({ "identifier": identifier, "released": res.released }),
+        ),
+    }
+}
+
 /// The 200 body for the stop/resume endpoints (Go `runActionJSON`). `moved_to`/`move_error` are
 /// omitted when empty, so a clean success is just `{identifier, moved_to}` and a partial-success kill
 /// is `{identifier, move_error}`. `move_error` only ever travels in a 200 body — a kill/resume that
@@ -309,6 +338,41 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_string()
+    }
+
+    #[tokio::test]
+    async fn release_claim_is_guarded_post_only_and_refuses_live_runs() {
+        for live_run in [false, true] {
+            let provider = FakeProvider::ok(empty_snapshot()).with_release_claim_result(
+                rhapsody_orchestrator::ReleaseClaimResult {
+                    released: !live_run,
+                    live_run,
+                },
+            );
+            let base = spawn(Arc::new(provider)).await;
+            let url = format!("{base}/api/v1/issues/MT-1/release-claim");
+            assert_eq!(
+                reqwest::Client::new()
+                    .post(&url)
+                    .send()
+                    .await
+                    .expect("unguarded")
+                    .status(),
+                403
+            );
+            assert_eq!(do_action(&url, reqwest::Method::GET).await.status(), 405);
+            let response = do_action(&url, reqwest::Method::POST).await;
+            if live_run {
+                assert_eq!(response.status(), 409);
+                assert_eq!(err_code(response).await, "live_run");
+            } else {
+                assert_eq!(response.status(), 200);
+                assert_eq!(
+                    body_json(response).await,
+                    serde_json::json!({"identifier":"MT-1", "released":true})
+                );
+            }
+        }
     }
 
     // Mirrors Go `TestHandleRunStop_PostMovesAndReturnsJSON`.

@@ -381,7 +381,62 @@ impl Orchestrator {
         // entry is already gone, so the worker's exit is a no-op), which is exactly why the sweep
         // must report it rather than leaving it silent.
         self.claimed.insert(issue_id.to_string());
+        if re.review.is_none() && !crate::review::is_non_tracker_key(issue_id) {
+            self.token_ceiling_holds.insert(
+                issue_id.to_string(),
+                TokenCeilingHold {
+                    issue: re.issue.clone(),
+                    run_id: re.run_id,
+                    stopped_at: (self.now)(),
+                },
+            );
+        }
     }
+
+    /// Observe only explicit post-stop signals. An unchanged Todo ticket is not a transition;
+    /// neither an old summons nor an unrelated edit may spend another run's token budget.
+    pub(crate) fn release_token_ceiling_holds<'a>(
+        &mut self,
+        issues: impl IntoIterator<Item = &'a rhapsody_core::Issue>,
+    ) {
+        for iss in issues {
+            let Some(hold) = self.token_ceiling_holds.get_mut(&iss.id) else {
+                continue;
+            };
+            let signal = if iss.latest_summon_at.is_some_and(|at| at > hold.stopped_at) {
+                Some("summons")
+            } else if rhapsody_core::normalize_state(&iss.state) == "todo"
+                && rhapsody_core::normalize_state(&hold.issue.state) != "todo"
+            {
+                Some("Todo transition")
+            } else {
+                None
+            };
+            // Keep fresh PR coordinates and the last observed state, even while holding.
+            hold.issue = iss.clone();
+            if let Some(signal) = signal {
+                self.release_token_ceiling_hold(&iss.id, signal);
+            }
+        }
+    }
+
+    pub(crate) fn release_token_ceiling_hold(&mut self, issue_id: &str, signal: &str) {
+        if self.running.contains_key(issue_id) {
+            return;
+        }
+        if let Some(hold) = self.token_ceiling_holds.remove(issue_id) {
+            self.claimed.remove(issue_id);
+            tracing::info!(issue_identifier = %hold.issue.identifier,
+                "token-ceiling hold released by {signal}");
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct TokenCeilingHold {
+    pub issue: rhapsody_core::Issue,
+    pub run_id: i64,
+    pub stopped_at: chrono::DateTime<chrono::Utc>,
 }
 
 #[cfg(test)]
@@ -1098,6 +1153,120 @@ mod tests {
             rec.retries.is_empty() && rec.claims.is_empty(),
             "claim/retry rows must be dropped: {rec:?}"
         );
+    }
+
+    #[test]
+    fn ceiling_hold_is_reported_without_a_review_watch_even_for_a_draft() {
+        for draft in [false, true] {
+            let (mut o, _) = orch_with_ceiling(1_000);
+            let mut iss = issue("ID-1", "MT-1", "In Progress");
+            if draft {
+                iss.linked_pr = true;
+                iss.linked_prs = Some(vec![rhapsody_core::LinkedPRRef {
+                    owner: "org".into(),
+                    repo: "repo".into(),
+                    number: 320,
+                    merged: false,
+                }]);
+                o.review_observed_drafts
+                    .insert(crate::prstate::PrCoord::new("org", "repo", 320));
+            }
+            let mut re = armed(running_entry(iss, "", ""));
+            o.persist_start_run(&mut re, 0);
+            o.running.insert("ID-1".into(), re);
+            update(&mut o, "ID-1", live_usage(5_000));
+            o.reconcile_review_divergence();
+            let found = o.review_divergences();
+            assert_eq!(found.len(), 1, "draft={draft}: {found:?}");
+            assert_eq!(found[0].ticket, "MT-1");
+            assert_eq!(
+                found[0].kind,
+                crate::reviewreconcile::DivergenceKind::AuthorTokenCeilingStopped
+            );
+            assert!(o.claimed.contains("ID-1"), "reporting must not redispatch");
+        }
+    }
+
+    #[test]
+    fn ceiling_hold_requires_a_later_summons_or_a_todo_transition() {
+        for signal in ["summons", "Todo"] {
+            let (mut o, _) = orch_with_ceiling(1_000);
+            let mut iss = issue("ID-1", "MT-1", "In Progress");
+            let mut re = armed(running_entry(iss.clone(), "", ""));
+            o.persist_start_run(&mut re, 0);
+            o.running.insert(iss.id.clone(), re);
+            update(&mut o, &iss.id, live_usage(5_000));
+            let stopped_at = o.token_ceiling_holds[&iss.id].stopped_at;
+            iss.latest_summon_at = Some(stopped_at);
+            o.release_token_ceiling_holds([&iss]);
+            assert!(o.claimed.contains(&iss.id), "old summons must not resume");
+            if signal == "summons" {
+                iss.latest_summon_at = Some(stopped_at + chrono::Duration::seconds(1));
+            } else {
+                iss.state = "Todo".into();
+            }
+            o.release_token_ceiling_holds([&iss]);
+            assert!(!o.claimed.contains(&iss.id), "{signal} must release");
+            o.reconcile_review_divergence();
+            assert!(o.review_divergences().is_empty());
+        }
+    }
+
+    #[test]
+    fn ceiling_stop_in_todo_is_not_released_by_an_unchanged_todo() {
+        let (mut o, _) = orch_with_ceiling(1_000);
+        let iss = issue("ID-1", "MT-1", "Todo");
+        let mut re = armed(running_entry(iss.clone(), "", ""));
+        o.persist_start_run(&mut re, 0);
+        o.running.insert(iss.id.clone(), re);
+        update(&mut o, &iss.id, live_usage(5_000));
+        o.release_token_ceiling_holds([&iss]);
+        assert!(o.claimed.contains(&iss.id));
+    }
+
+    #[tokio::test]
+    async fn a_post_ceiling_human_signal_allows_the_next_poll_to_dispatch() {
+        for signal in ["summons", "Todo"] {
+            let candidate = Arc::new(std::sync::Mutex::new(issue("ID-1", "MT-1", "In Progress")));
+            let source = candidate.clone();
+            let mut tracker = rhapsody_tracker::fake::Fake::new();
+            tracker.candidates_func = Some(Box::new(move || {
+                Ok(vec![source.lock().expect("candidate").clone()])
+            }));
+            let (mut o, _) = orch_with_ceiling(1_000);
+            let eff = o.eff.as_mut().expect("eff");
+            eff.tracker = Arc::new(tracker);
+            eff.active_states = crate::testsupport::set_of(&["todo", "in progress"]);
+            eff.max_concurrent = 1;
+            eff.cfg.scratch.min_free_gib = 0;
+            o.spawn = Some(Box::new(|_, _, _| {}));
+            let mut re = armed(running_entry(
+                candidate.lock().expect("candidate").clone(),
+                "",
+                "",
+            ));
+            o.persist_start_run(&mut re, 0);
+            o.running.insert("ID-1".into(), re);
+            update(&mut o, "ID-1", live_usage(5_000));
+            o.on_tick().await;
+            assert!(o.running.is_empty(), "no immediate redispatch");
+            assert!(o.claimed.contains("ID-1"));
+            {
+                let mut iss = candidate.lock().expect("candidate");
+                if signal == "summons" {
+                    iss.latest_summon_at = Some(
+                        o.token_ceiling_holds["ID-1"].stopped_at + chrono::Duration::seconds(1),
+                    );
+                } else {
+                    iss.state = "Todo".into();
+                }
+            }
+            o.on_tick().await;
+            assert!(
+                o.running.contains_key("ID-1"),
+                "{signal}: next poll dispatches"
+            );
+        }
     }
 
     // The other half of STUDIO-840's rule: a stop that cannot deliver must NOT be recorded. An

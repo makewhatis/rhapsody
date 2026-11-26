@@ -279,6 +279,17 @@ Rhapsody is a byte-for-byte parity port of Go Symphony v0.4.0 EXCEPT where this 
 otherwise. Each entry is a deliberate, reviewed decision; nothing else may drift from the frozen
 reference (the parity goldens stay byte-strict).
 
+### Ticket-level token-ceiling holds and operator release (STUDIO-2372)
+
+An author stopped by `agent.max_run_tokens` is reported on the next reconciliation sweep even
+with a draft PR or no PR, independently of review-watch rows and the review staleness horizon.
+PR-backed stalls retain manager review routing; ticket-only stalls use the ticket-oriented lead
+when enabled, otherwise stay on the human feed. A summons newer than the stop or an observed
+transition back to Todo releases the in-memory token hold. An unchanged Todo ticket does not.
+Operator-guarded `POST /api/v1/issues/{identifier}/release-claim` clears a stale in-memory claim,
+refuses a live run with `409 live_run`, and leaves tracker state and other admission gates intact.
+These extend the Rhapsody-only per-run ceiling; no schema, fixture or normalization changes.
+
 ### Terminal human-hold cleanup (STUDIO-2365)
 
 The Rhapsody-only parked-ticket sweep also checks label-only entries reported in `held_for_human`.

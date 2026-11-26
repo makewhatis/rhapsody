@@ -254,6 +254,12 @@ pub trait StateProvider: Send + Sync {
     /// (→ 500 `resume_failed`).
     async fn resume_run(&self, run_id: i64) -> Result<ResumeResult, RunActionError>;
 
+    /// Release one stale in-memory claim; a live worker is a business refusal (409).
+    async fn release_claim(
+        &self,
+        identifier: &str,
+    ) -> Result<rhapsody_orchestrator::ReleaseClaimResult, RunActionError>;
+
     /// Move a live run's ticket to the configured review handoff state so it leaves the active set and
     /// the run cleanly ends (`POST /api/v1/runs/{id}/handoff`, TRA-242 — the daemon-mediated review
     /// handoff, NEW beyond Go v0.4.0). Business outcomes travel in the [`HandoffResult`]: no live run
@@ -1102,6 +1108,10 @@ where
         // than fields on runs/{id}: that body is byte-pinned to the Go capture by api/run_detail.json.
         .route("/api/v1/runs/{id}/provenance", any(handle_run_provenance))
         .route("/api/v1/issues/{id}/history", any(handle_issue_history))
+        .route(
+            "/api/v1/issues/{id}/release-claim",
+            operator_write(crate::handlers_runaction::handle_release_claim),
+        )
         // Run actions (H3): kill a running agent (+ move its ticket to Backlog) and resume a stopped
         // run (+ move it back to Todo). More-specific multi-segment POST patterns; axum's matchit
         // dispatches them ahead of the catch-all runs/{id} detail route regardless of order.

@@ -47,6 +47,13 @@ pub struct ResumeResult {
     pub move_err: String,
 }
 
+/// Result of the operator's stale in-memory claim release (STUDIO-2372).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReleaseClaimResult {
+    pub released: bool,
+    pub live_run: bool,
+}
+
 /// The control-task reply for `evStopRun` (Go `stopPlan`): whether a live run was found + the
 /// issue/team the off-loop Backlog move targets.
 #[derive(Debug, Clone, Default)]
@@ -215,6 +222,62 @@ pub struct ControlHandle {
 }
 
 impl crate::orchestrator::Orchestrator {
+    pub(crate) fn handle_release_claim(
+        &mut self,
+        identifier: &str,
+    ) -> Result<ReleaseClaimResult, rhapsody_store::StoreError> {
+        // Resolve and mutate on control, serialized with dispatch and run termination.
+        if self
+            .running
+            .values()
+            .any(|re| re.issue.identifier.eq_ignore_ascii_case(identifier))
+        {
+            return Ok(ReleaseClaimResult {
+                live_run: true,
+                ..Default::default()
+            });
+        }
+        let held_id = self
+            .token_ceiling_holds
+            .iter()
+            .find(|(_, h)| h.issue.identifier.eq_ignore_ascii_case(identifier))
+            .map(|(id, _)| id.clone());
+        let id = match held_id {
+            Some(id) => Some(id),
+            None => self
+                .store()
+                .list_runs(rhapsody_store::RunFilter {
+                    issue: identifier.to_string(),
+                    limit: 1,
+                    ..Default::default()
+                })?
+                .first()
+                .map(|r| r.issue_id.clone()),
+        };
+        let mut released = false;
+        if let Some(id) = id {
+            if self.running.contains_key(&id) {
+                return Ok(ReleaseClaimResult {
+                    live_run: true,
+                    ..Default::default()
+                });
+            }
+            released |= self.claimed.contains(&id);
+            self.release_token_ceiling_hold(&id, "operator endpoint");
+            self.claimed.remove(&id);
+        }
+        released |= self.claimed.remove(identifier);
+        tracing::info!(
+            issue_identifier = identifier,
+            released,
+            "operator stale claim release"
+        );
+        Ok(ReleaseClaimResult {
+            released,
+            live_run: false,
+        })
+    }
+
     /// The off-loop [`ControlHandle`] for driving the daemon's HTTP API while the control task runs.
     /// Snapshots the control-event sender + lifetime ctx + top-level tracker + store, and clones the
     /// SHARED reads cell + retention atomics (so a reload updates what the handle sees). Obtain it
@@ -254,6 +317,22 @@ impl crate::orchestrator::Orchestrator {
 }
 
 impl ControlHandle {
+    /// Clear a stale claim without moving the ticket or killing a worker.
+    pub async fn release_claim(&self, identifier: &str) -> Result<ReleaseClaimResult, StopError> {
+        let (reply, rx) = tokio::sync::oneshot::channel();
+        self.events
+            .send(Event::ReleaseClaim {
+                identifier: identifier.to_string(),
+                reply,
+            })
+            .map_err(|_| StopError::Canceled)?;
+        let mut lifetime = self.ctx.clone();
+        tokio::select! {
+            result = rx => result.map_err(|_| StopError::Canceled)?.map_err(StopError::Store),
+            _ = lifetime.cancelled() => Err(StopError::Canceled),
+        }
+    }
+
     /// The shared Teams memory runtime backing the `/api/v1/teams/*` handlers (STUDIO-645, T4).
     /// `None` when the daemon has no Teams runtime, which the handlers render as `teams_disabled`.
     pub fn teams_memory(&self) -> Option<&std::sync::Arc<crate::teamsmemory::TeamsMemory>> {
@@ -844,6 +923,34 @@ mod tests {
                 store,
             },
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn release_claim_clears_a_stale_claim_but_never_a_live_run() {
+        for live in [false, true] {
+            let (mut o, env) = stop_orch(Arc::new(Fake::new()));
+            seed_run(
+                env.store.as_ref(),
+                "ID-9",
+                "MT-9",
+                "TEAM-9",
+                Some(OUTCOME_STOPPED),
+            );
+            o.claimed.insert("ID-9".into());
+            if live {
+                let re =
+                    crate::testsupport::running_entry(issue("ID-9", "MT-9", "In Progress"), "", "");
+                o.running.insert("ID-9".into(), re);
+            }
+            let (task, handle) = start(o, &env.signal);
+            let result = handle.release_claim("MT-9").await.expect("release claim");
+            assert_eq!(result.live_run, live);
+            assert_eq!(result.released, !live);
+            env.signal.cancel();
+            let o = task.await.expect("loop");
+            assert_eq!(o.claimed.contains("ID-9"), live);
+            assert_eq!(o.running.contains_key("ID-9"), live);
+        }
     }
 
     /// Snapshots the control handle and launches the loop, returning its task (which yields the

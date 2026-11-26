@@ -89,6 +89,7 @@ pub(crate) struct FakeProvider {
     stop_err: Option<String>,
     stop_run_id: AtomicI64,
     resume_result: ResumeResult,
+    release_claim_result: rhapsody_orchestrator::ReleaseClaimResult,
     resume_err: Option<String>,
     resume_run_id: AtomicI64,
     /// H-lane handoff surface (TRA-242): canned result, an optional control-round-trip error (the 500
@@ -265,6 +266,7 @@ impl FakeProvider {
             stop_err: None,
             stop_run_id: AtomicI64::new(0),
             resume_result: ResumeResult::default(),
+            release_claim_result: Default::default(),
             resume_err: None,
             resume_run_id: AtomicI64::new(0),
             handoff_result: HandoffResult::default(),
@@ -440,6 +442,14 @@ impl FakeProvider {
     /// Set the canned `resume_run` result (Go's `&fakeProvider{resumeResult: …}`).
     pub(crate) fn with_resume_result(mut self, result: ResumeResult) -> Self {
         self.resume_result = result;
+        self
+    }
+
+    pub(crate) fn with_release_claim_result(
+        mut self,
+        result: rhapsody_orchestrator::ReleaseClaimResult,
+    ) -> Self {
+        self.release_claim_result = result;
         self
     }
 
@@ -943,6 +953,14 @@ impl StateProvider for FakeProvider {
             Some(message) => Err(RunActionError::new(message.clone())),
             None => Ok(self.resume_result.clone()),
         }
+    }
+
+    async fn release_claim(
+        &self,
+        _identifier: &str,
+    ) -> Result<rhapsody_orchestrator::ReleaseClaimResult, RunActionError> {
+        self.touch();
+        Ok(self.release_claim_result.clone())
     }
 
     async fn handoff_run(&self, run_id: i64) -> Result<HandoffResult, RunActionError> {

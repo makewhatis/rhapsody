@@ -28,6 +28,32 @@ curl -sS -X POST http://127.0.0.1:$PORT/api/v1/refresh \
 Use `127.0.0.1` in the URL, and always pass `Content-Type: application/json`: curl's `-d` otherwise
 labels the body as a form, and the guard refuses form posts. Reads (`GET`) need none of this.
 
+### Releasing a stale claim after a token-ceiling stop
+
+`agent.max_run_tokens` stops the run but preserves its workspace and branch. Its ticket stays
+claimed to prevent an immediate repeat of the same spend. The next reconciliation sweep reports
+`author_token_ceiling_stopped`, including draft-PR and no-PR tickets. PR-backed stalls go to the
+review manager when it owns them; a no-PR stall goes to the ticket-oriented lead when enabled,
+otherwise it remains on the human feed.
+
+After adjusting the ceiling or splitting the work, post a **new summons on the ticket** or move
+it **back to Todo**. Only a summons newer than the stop or an observed transition to Todo releases
+the token hold; leaving an already-Todo ticket unchanged does not. The log names the signal as
+`token-ceiling hold released by summons` or `token-ceiling hold released by Todo transition`.
+
+For a stale in-memory claim, the operator can release just that ticket without restarting:
+
+```sh
+curl -sS -X POST "http://127.0.0.1:$PORT/api/v1/issues/ENG-123/release-claim" \
+  -H 'X-Rhapsody-Operator: 1' -H 'Content-Type: application/json' -d '{}'
+```
+
+Success is `200 {"identifier":"ENG-123","released":true}`; an already-unclaimed or unknown
+ticket returns `released:false`. A live run returns `409 live_run` and changes nothing. A control
+or store failure returns `500 release_claim_failed`. The operation clears only the in-memory
+claim, never kills an agent or moves the ticket. Normal human-label, linked-PR, capacity and
+other dispatch gates still apply on the next poll.
+
 ## Where a verdict actually lives
 
 - `gh pr view --json comments` returns **issue comments only** and can mis-render. Use
