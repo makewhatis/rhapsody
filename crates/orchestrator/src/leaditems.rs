@@ -649,7 +649,19 @@ impl Orchestrator {
         }
         found.retain(|d| {
             let trigger = match d.kind {
-                DivergenceKind::AuthorTokenCeilingStopped if d.pr.starts_with("ticket:") => LeadTrigger::ImpossibleState { subject: d.ticket.clone(), kind: "author_token_ceiling".into() },
+                DivergenceKind::AuthorTokenCeilingStopped if d.pr.starts_with("ticket:") => {
+                    let Some(hold) = self.token_ceiling_holds.values().find(|hold| {
+                        hold.issue.identifier == d.ticket && hold.run_id > 0
+                    }) else {
+                        return true;
+                    };
+                    // Completing one stop must not swallow a later run's incident. The run ID
+                    // stays stable across sweeps, even when two stops share a clock timestamp.
+                    LeadTrigger::ImpossibleState {
+                        subject: d.ticket.clone(),
+                        kind: format!("author_token_ceiling:{}", hold.run_id),
+                    }
+                },
                 DivergenceKind::ReviewEscalated => match review_escalation_trigger(self.store(), &d.pr, &d.adjudicated_head) {
                     Ok(t) => t,
                     Err(e) => {

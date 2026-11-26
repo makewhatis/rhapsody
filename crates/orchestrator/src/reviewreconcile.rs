@@ -4267,6 +4267,58 @@ mod store_tests {
         }
     }
 
+    #[test]
+    fn successive_no_pr_ceiling_stops_get_actionable_lead_items() {
+        let mut o = orch(false, "2026-11-25T23:00:00Z");
+        o.teams.as_mut().expect("teams").manager.lead.enabled = true;
+        o.eff.as_mut().expect("eff").max_run_tokens = 1_000;
+        let mut iss = issue("ID-2372", "STUDIO-2372", "In Progress");
+        let mut previous_item = None;
+        for incident in 0..2 {
+            let mut re = running_entry(iss.clone(), "rhapsody", "rhapsody");
+            re.cancel = crate::CancelSignal::new();
+            o.persist_start_run(&mut re, 0);
+            assert!(re.run_id > 0, "use the real SQLite run ledger");
+            o.running.insert(iss.id.clone(), re);
+            o.on_agent_update(crate::agentupdate::AgentUpdate {
+                issue_id: iss.id.clone(),
+                ev: rhapsody_agent::Event {
+                    event_type: rhapsody_agent::EVENT_NOTIFICATION.into(),
+                    usage: Some(rhapsody_agent::Usage {
+                        total_tokens: 5_000,
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            });
+            assert!(!o.running.contains_key(&iss.id));
+            assert!(o.claimed.contains(&iss.id));
+            o.reconcile_review_divergence();
+            o.reconcile_review_divergence();
+            let items = o.store().load_lead_items().expect("lead items");
+            let queued: Vec<_> = items.iter().filter(|item| item.state == "queued").collect();
+            assert_eq!(queued.len(), 1, "incident {incident}: {items:?}");
+            assert_eq!(items.len(), incident + 1, "dedupe repeated sweeps");
+            assert_eq!(queued[0].subject, iss.identifier);
+            assert_ne!(Some(queued[0].id), previous_item);
+            assert!(o.review_divergences().is_empty(), "lead owns the report");
+            previous_item = Some(queued[0].id);
+            o.store()
+                .set_lead_item_state(queued[0].id, "done")
+                .expect("complete incident");
+            // Completion settles this incident; another sweep must not rearm it.
+            o.reconcile_review_divergence();
+            assert_eq!(
+                o.store().load_lead_items().expect("lead items").len(),
+                incident + 1
+            );
+            iss.latest_summon_at =
+                Some(o.token_ceiling_holds[&iss.id].stopped_at + chrono::Duration::seconds(1));
+            o.release_token_ceiling_holds([&iss]);
+            assert!(!o.claimed.contains(&iss.id));
+        }
+    }
+
     /// STUDIO-967's REVIEW half, through the real store — alice's finding on PR #208. A ticketless
     /// review stopped at the ceiling parks its row `truncated` and its run carries
     /// `token_ceiling`; the sweep must name the ceiling on BOTH surfaces, not the

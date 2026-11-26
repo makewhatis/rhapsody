@@ -386,6 +386,7 @@ impl Orchestrator {
                 issue_id.to_string(),
                 TokenCeilingHold {
                     issue: re.issue.clone(),
+                    run_id: re.run_id,
                     stopped_at: (self.now)(),
                 },
             );
@@ -434,6 +435,7 @@ impl Orchestrator {
 #[derive(Debug, Clone)]
 pub(crate) struct TokenCeilingHold {
     pub issue: rhapsody_core::Issue,
+    pub run_id: i64,
     pub stopped_at: chrono::DateTime<chrono::Utc>,
 }
 
